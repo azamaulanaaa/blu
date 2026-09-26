@@ -196,11 +196,13 @@ async fn concurrency_does_not_change_the_snapshot() {
     fs::create_dir_all(&source).unwrap();
 
     // Several distinct files plus shared content between them, so a run has
-    // chunks to deduplicate as well as chunks to keep in order.
+    // chunks to deduplicate as well as chunks to keep in order. The shared part
+    // is what makes two chunks with the same hash race for the same cell.
+    let shared = common::noisy(48 * 1024);
     for i in 0..6 {
         let mut bytes = common::noisy(40 * 1024 + i * 997);
-        bytes.extend_from_slice(&common::noisy(20 * 1024));
-        fs::write(source.join(format!("file{i}.bin")), &bytes).unwrap();
+        bytes.extend_from_slice(&shared);
+        fs::write(source.join(format!("file{i}.bin")), bytes).unwrap();
     }
 
     let serial = {
@@ -219,7 +221,73 @@ async fn concurrency_does_not_change_the_snapshot() {
     };
 
     for concurrency in [2, 8, 32] {
-        let blob = dir.path().join(format!("parallel{concurrency}.bin"));
+        // Repeated, because the failure this guards against is a race: it takes
+        // a later-read duplicate reaching a hash's cell before the earlier-read
+        // one does, which is a matter of scheduling rather than of input. A
+        // single run can pass by luck, and did.
+        for _ in 0..4 {
+            let blob = dir.path().join(format!("parallel{concurrency}.bin"));
+            let key = common::run_backup_with(
+                &source,
+                &blob,
+                None,
+                Options {
+                    concurrency,
+                    ..Options::default()
+                },
+            )
+            .await;
+            let parallel = snapshot(&blob, &key).await;
+
+            // Compared on what the design actually promises.
+            //
+            // `file_chunks` carries the chunk *indices*, so it transitively pins
+            // the hash-to-index mapping, which is the part that has to be a
+            // function of read order. `chunks` is compared on hashes only and
+            // not on storage locations: a location is a byte offset in whichever
+            // store this run wrote to, and two chunks that finished storing in a
+            // different order land at different offsets. Nothing ever promised
+            // otherwise, and asserting it made this test fail on a correct
+            // implementation.
+            assert_eq!(
+                serial.file_chunks, parallel.file_chunks,
+                "concurrency {concurrency} laid the chunks out differently"
+            );
+            assert_eq!(
+                serial.files, parallel.files,
+                "concurrency {concurrency} recorded the files differently"
+            );
+            assert_eq!(
+                serial.chunks.iter().map(|c| c.hash).collect::<Vec<_>>(),
+                parallel.chunks.iter().map(|c| c.hash).collect::<Vec<_>>(),
+                "concurrency {concurrency} indexed the stored content differently"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_two_stored_chunks_share_content() {
+    // The invariant the commit order exists to keep: one entry per distinct
+    // content, however many chunks referred to it and in whatever order they
+    // finished storing.
+    //
+    // Asserted directly rather than inferred, because the bug it guards against
+    // surfaced as a failed backup rather than as a wrong snapshot, so nothing
+    // about the output would have given it away.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    // Constant content, so the chunker cuts at its maximum size and every file
+    // is a single chunk. That maximises how many chunks collide on one hash.
+    let shared = vec![0x5au8; 64 * 1024];
+    for name in ["a", "b", "c", "d"] {
+        fs::write(source.join(format!("{name}.bin")), &shared).unwrap();
+    }
+
+    for concurrency in [1usize, 8, 32] {
+        let blob = dir.path().join(format!("store{concurrency}.bin"));
         let key = common::run_backup_with(
             &source,
             &blob,
@@ -230,19 +298,26 @@ async fn concurrency_does_not_change_the_snapshot() {
             },
         )
         .await;
-        let parallel = snapshot(&blob, &key).await;
+        let snapshot = snapshot(&blob, &key).await;
 
-        assert_eq!(
-            serial.chunks, parallel.chunks,
-            "concurrency {concurrency} stored a different set of chunks"
-        );
-        assert_eq!(
-            serial.file_chunks, parallel.file_chunks,
-            "concurrency {concurrency} laid the chunks out differently"
-        );
-        assert_eq!(
-            serial.files, parallel.files,
-            "concurrency {concurrency} recorded the files differently"
-        );
+        let mut seen = std::collections::BTreeSet::new();
+        for chunk in &snapshot.chunks {
+            assert!(
+                seen.insert(chunk.hash),
+                "with concurrency {concurrency}, content was stored more than once: \
+                 {} chunks for 4 identical files",
+                snapshot.chunks.len()
+            );
+        }
+
+        // And every reference must resolve to an entry that exists.
+        for slice in &snapshot.file_chunks {
+            assert!(
+                snapshot.chunks.get(slice.chunk_index as usize).is_some(),
+                "a slice points at chunk {} but only {} are stored",
+                slice.chunk_index,
+                snapshot.chunks.len()
+            );
+        }
     }
 }

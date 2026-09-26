@@ -50,28 +50,25 @@ struct Pending {
 struct Stored {
     seq: u64,
     hash: [u8; 32],
-    /// Which chunk first turned up with this content. Equal to `seq` for the one
-    /// that did the storing.
-    first_seq: u64,
     /// The file slices this chunk covers.
     sources: Vec<reader::ChunkSource>,
     /// Where the content lives, once someone has put it there.
+    ///
+    /// The same value for every chunk of the same content, whichever of them did
+    /// the storing, so the committer can allocate a chunk index from whichever
+    /// of them it reaches first and have the rest reuse it.
     chunk: metadata::Chunk,
 }
 
-/// One hash's entry in the run's deduplication map.
+/// One hash's cell in the run's deduplication map, filled exactly once.
 ///
-/// The cell is filled exactly once, by whichever chunk reaches it first. Every
-/// later chunk with the same content waits on the same cell instead of storing
-/// a second copy, which is what keeps deduplication exact now that chunks are
-/// in flight at the same time.
-struct Slot {
-    first_seq: u64,
-    stored: OnceCell<metadata::Chunk>,
-}
+/// Every chunk with the same content fills the same cell: the first to arrive
+/// stores it, the rest wait and reuse the result. Nothing is stored twice,
+/// however many stores happen to be running.
+type Slot = Arc<OnceCell<metadata::Chunk>>;
 
-/// Deduplication state shared by every upload in flight.
-type Slots = Arc<Mutex<HashMap<[u8; 32], Arc<Slot>>>>;
+/// Deduplication state shared by every store in flight.
+type Slots = Arc<Mutex<HashMap<[u8; 32], Slot>>>;
 
 /// Lock the deduplication map, ignoring poisoning.
 ///
@@ -79,7 +76,7 @@ type Slots = Arc<Mutex<HashMap<[u8; 32], Arc<Slot>>>>;
 /// that runs under it is a hash insert, which cannot panic. Unwinding through
 /// this function would abort the run anyway, so the poison carries no
 /// information worth propagating.
-fn lock_slots(slots: &Slots) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Arc<Slot>>> {
+fn lock_slots(slots: &Slots) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Slot>> {
     slots.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -288,21 +285,28 @@ fn commit_ready<S>(
     snapshot: &mut metadata::Snapshot,
 ) -> io::Result<()> {
     while let Some(stored) = ready.remove(next_seq) {
-        let chunk_index = if stored.first_seq == *next_seq {
-            // First time this content has been seen: it gets the next index.
+        // Uniqueness is decided here, by read order, and nowhere else.
+        //
+        // An earlier attempt recorded which chunk had reached a hash's cell
+        // first, on the assumption that the earliest-read chunk of some content
+        // would be the first to arrive. That does not hold: stores finish out of
+        // order, so a later-read duplicate can claim the cell before the
+        // earlier-read one does, and the committer would then look for a chunk
+        // index that had not been handed out yet. It surfaced as a backup that
+        // failed outright at high concurrency, under load.
+        //
+        // Deciding by the order results are committed in removes the assumption
+        // entirely. Every chunk of the same content carries the same stored
+        // location, so whichever reaches this point first allocates the index and
+        // the rest reuse it — which is the same answer a purely sequential run
+        // gives, and the same one every time.
+        let chunk_index = if let Some(&existing) = index_of.get(&stored.hash) {
+            existing
+        } else {
             let index = index_to_u32(snapshot.chunks.len())?;
             snapshot.chunks.push(stored.chunk);
             index_of.insert(stored.hash, index);
             index
-        } else {
-            // An earlier chunk already stored it, and was committed first
-            // because it has the lower sequence number.
-            *index_of.get(&stored.hash).ok_or_else(|| {
-                io::Error::other(format!(
-                    "chunk {} reuses content whose original was never committed",
-                    stored.seq
-                ))
-            })?
         };
 
         let mut chunk_offset: u32 = 0;
@@ -356,16 +360,10 @@ async fn store_chunk<S: storage::StoragePut + 'static>(
 
     let slot = {
         let mut map = lock_slots(&pipeline.slots);
-        Arc::clone(map.entry(hash).or_insert_with(|| {
-            Arc::new(Slot {
-                first_seq: seq,
-                stored: OnceCell::new(),
-            })
-        }))
+        Arc::clone(map.entry(hash).or_insert_with(|| Arc::new(OnceCell::new())))
     };
 
     let chunk = slot
-        .stored
         .get_or_try_init(|| async {
             // Content the base snapshot already holds is not stored again,
             // which is the whole point of an incremental backup.
@@ -395,7 +393,6 @@ async fn store_chunk<S: storage::StoragePut + 'static>(
     Ok(Stored {
         seq,
         hash,
-        first_seq: slot.first_seq,
         sources,
         chunk: chunk.clone(),
     })
