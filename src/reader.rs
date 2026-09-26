@@ -112,7 +112,7 @@ impl FileRegistry {
     /// registered and being read.
     #[instrument(level = "trace", skip(self))]
     pub fn resolve_chunk(&self, global_start: u64, length: u32) -> Vec<ChunkSource> {
-        let global_end = global_start + length as u64;
+        let global_end = global_start + u64::from(length);
         let mut mappings = Vec::new();
 
         let start_index = self
@@ -129,7 +129,14 @@ impl FileRegistry {
             let overlap_start_global = std::cmp::max(global_start, entry.global_offset);
             let overlap_end_global = std::cmp::min(global_end, file_end_global);
 
-            let overlap_len = overlap_end_global.saturating_sub(overlap_start_global) as u32;
+            // Both endpoints lie within `[global_start, global_end]`, so the
+            // difference cannot exceed `global_end - global_start`, which is
+            // `length` and already a `u32`. Clamping keeps that true even if a
+            // future change breaks the invariant, instead of wrapping to a
+            // plausible-looking wrong length.
+            let overlap_len = overlap_end_global
+                .saturating_sub(overlap_start_global)
+                .min(u64::from(length)) as u32;
 
             if overlap_len > 0 {
                 let file_local_offset = overlap_start_global - entry.global_offset;
@@ -329,7 +336,10 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        let wanted = std::cmp::min(self.remaining(), buf.remaining() as u64) as usize;
+        // `wanted` is bounded by `self.remaining()`, a `u64`, so narrowing it to
+        // `usize` is exact on every target that can hold a `u32` limit.
+        let offered = u64::try_from(buf.remaining()).unwrap_or(u64::MAX);
+        let wanted = usize::try_from(self.remaining().min(offered)).unwrap_or(0);
 
         // The caller has no room. Polling the inner reader with an empty buffer
         // would make it report end of stream, which it would then keep doing —
@@ -387,10 +397,19 @@ where
             ));
         }
 
-        let delta = new_position as i128 - self.position as i128;
+        // Move the inner reader by a relative delta rather than an absolute
+        // position, because its own origin is wherever the caller left it.
+        let delta = i128::from(new_position) - i128::from(self.position);
         self.position = new_position;
 
-        Pin::new(&mut self.inner).start_seek(io::SeekFrom::Current(delta as i64))
+        let delta = i64::try_from(delta).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek delta is too large to express as a relative seek",
+            )
+        })?;
+
+        Pin::new(&mut self.inner).start_seek(io::SeekFrom::Current(delta))
     }
 
     #[instrument(level = "trace", skip(self, cx), ret)]

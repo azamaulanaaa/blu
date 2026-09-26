@@ -173,8 +173,8 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
         .files
         .iter()
         .enumerate()
-        .map(|(index, file)| (file.path.as_path(), index as u32))
-        .collect();
+        .map(|(index, file)| Ok((file.path.as_path(), index_to_u32(index)?)))
+        .collect::<io::Result<_>>()?;
 
     let chunker = reader::Chunker::new(paths, config)?;
 
@@ -207,7 +207,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
                     }
                 };
 
-                let index = snapshot.chunks.len() as u32;
+                let index = index_to_u32(snapshot.chunks.len())?;
                 snapshot.chunks.push(chunk);
                 emitted.insert(hash, index);
 
@@ -215,7 +215,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
             }
         };
 
-        let mut chunk_offset = 0;
+        let mut chunk_offset: u32 = 0;
         for source in chunk.sources {
             let source_rel_path = source.path.strip_prefix(&root).map_err(io::Error::other)?;
 
@@ -259,6 +259,21 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
 /// Best-effort normalisation used only for comparing excluded paths.
 fn normalise(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Narrow a collection index to the `u32` the snapshot format stores.
+///
+/// Wrapping instead of failing would point a file or chunk reference at a
+/// different entry, so the limit is reported rather than crossed. At the
+/// default chunk size `u32::MAX` chunks is a quarter of a petabyte of data, and
+/// `u32::MAX` files is unreachable in practice.
+fn index_to_u32(index: usize) -> io::Result<u32> {
+    u32::try_from(index).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the tree needs more than {} entries", u32::MAX),
+        )
+    })
 }
 
 /// Assert that every file's chunk slices add up to the length recorded during

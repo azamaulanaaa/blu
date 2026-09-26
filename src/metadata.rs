@@ -126,12 +126,15 @@ impl From<std::time::SystemTime> for Timestamp {
     fn from(time: std::time::SystemTime) -> Self {
         match time.duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => Self {
-                secs: d.as_secs() as i64,
+                // Saturate rather than wrap: a timestamp beyond `i64::MAX`
+                // seconds is far outside anything a filesystem reports, and a
+                // wrapped negative value would be a worse answer than a clamp.
+                secs: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
                 nanos: d.subsec_nanos(),
             },
             // Before the epoch, report the distance as a negative offset.
             Err(e) => Self {
-                secs: -(e.duration().as_secs() as i64),
+                secs: i64::try_from(e.duration().as_secs()).map_or(i64::MIN, |secs| -secs),
                 nanos: e.duration().subsec_nanos(),
             },
         }
@@ -140,10 +143,13 @@ impl From<std::time::SystemTime> for Timestamp {
 
 impl From<Timestamp> for std::time::SystemTime {
     fn from(time: Timestamp) -> Self {
-        if time.secs >= 0 {
-            std::time::UNIX_EPOCH + std::time::Duration::new(time.secs as u64, time.nanos)
-        } else {
-            std::time::UNIX_EPOCH - std::time::Duration::new(time.secs as u64, time.nanos)
+        match u64::try_from(time.secs) {
+            Ok(secs) => std::time::UNIX_EPOCH + std::time::Duration::new(secs, time.nanos),
+            // `unsigned_abs` is exact for `i64::MIN`, where negating overflows.
+            Err(_) => {
+                let before = std::time::Duration::new(time.secs.unsigned_abs(), time.nanos);
+                std::time::UNIX_EPOCH - before
+            }
         }
     }
 }

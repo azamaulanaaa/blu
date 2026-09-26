@@ -66,7 +66,12 @@ where
             return Poll::Ready(Ok(0));
         }
 
-        let limit = std::cmp::min(self.remaining, buf.len() as u64) as usize;
+        // Clamped in `usize` space, where `buf.len()` already is. Taking the
+        // minimum in `u64` and narrowing afterwards would be lossy on a 32-bit
+        // target; converting the limit first is exact everywhere, because a
+        // limit above `usize::MAX` can only mean "more than any buffer".
+        let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        let limit = std::cmp::min(remaining, buf.len());
 
         let result = Pin::new(&mut self.inner).poll_write(cx, &buf[..limit]);
 

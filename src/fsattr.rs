@@ -36,7 +36,9 @@ pub fn mtime_of(meta: &fs::Metadata) -> Option<Timestamp> {
 
         Some(Timestamp {
             secs: meta.mtime(),
-            nanos: meta.mtime_nsec().max(0) as u32,
+            // Sub-second precision is below one second by definition, so this
+            // always fits; the fallback only covers a platform that disagrees.
+            nanos: u32::try_from(meta.mtime_nsec().max(0)).unwrap_or(0),
         })
     }
 

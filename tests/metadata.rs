@@ -86,3 +86,44 @@ fn a_corrupt_body_is_reported_as_a_decode_error() {
         Err(Error::Decode(_))
     ));
 }
+
+#[test]
+fn timestamps_round_trip_on_both_sides_of_the_epoch() {
+    for original in [
+        std::time::UNIX_EPOCH,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        // Before the epoch, where the sign has to survive the round trip.
+        std::time::UNIX_EPOCH - std::time::Duration::from_secs(1),
+        std::time::UNIX_EPOCH - std::time::Duration::from_secs(1_000_000),
+    ] {
+        let timestamp: metadata::Timestamp = original.into();
+        let restored: std::time::SystemTime = timestamp.into();
+
+        assert_eq!(
+            restored, original,
+            "{original:?} became {timestamp:?} and back to {restored:?}"
+        );
+    }
+}
+
+#[test]
+fn an_extreme_timestamp_does_not_wrap_into_the_opposite_of_itself() {
+    // A negative `secs` must stay negative on the way back, or the pre-epoch
+    // branch subtracts a huge unsigned duration from the epoch and lands
+    // billions of years in the future.
+    let before_epoch = metadata::Timestamp {
+        secs: -1_000_000_000,
+        nanos: 500,
+    };
+
+    let restored: std::time::SystemTime = before_epoch.into();
+
+    assert!(
+        restored < std::time::UNIX_EPOCH,
+        "a pre-epoch timestamp restored to {restored:?}"
+    );
+    assert_eq!(
+        restored,
+        std::time::UNIX_EPOCH - std::time::Duration::new(1_000_000_000, 500)
+    );
+}
