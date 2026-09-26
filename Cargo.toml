@@ -9,9 +9,17 @@ description = "Content-defined-chunking backup tool with deduplicated, versioned
 readme = "README.md"
 keywords = ["backup", "deduplication", "content-addressed", "incremental"]
 categories = ["command-line-utilities", "filesystem"]
-# The on-disk format is not stable yet, so this is not published. Set
-# `repository` alongside flipping this when it is.
+repository = "https://github.com/azamaulanaaa/lepatch"
+# The on-disk format is not stable yet, so this is not published to crates.io.
+# Set `repository` alongside flipping `publish` when it is.
+#
+# `dist = true` is what keeps the binary releaseable while that is true: without
+# it, `publish = false` hides the binary from cargo-dist and there is nothing to
+# announce.
 publish = false
+
+[package.metadata.dist]
+dist = true
 
 [[bin]]
 name = "lepatch"
@@ -65,4 +73,9 @@ pedantic = "deny"
 # `.clippy.toml` exemption for tests is what keeps the test suite readable.
 unwrap_used = "deny"
 expect_used = "deny"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 

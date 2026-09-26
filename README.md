@@ -92,6 +92,29 @@ Pass the previous run's key as `Options::base_key` to deduplicate against it.
 The `WRITE` const generic on `BlobFileStorage` is what stops a read-only restore
 from being handed something that can append to the store.
 
+## Releases
+
+Releases are built by [cargo-dist](https://axodotdev.github.io/cargo-dist).
+`dist-workspace.toml` holds the target matrix, and a tag push triggers
+`.github/workflows/release.yml`, which publishes one archive per target with a
+sha256 each plus a combined `sha256.sum`.
+
+```console
+$ mise run dist-plan    # what a tag would produce, without building
+$ mise run dist-build   # build the archive for this machine
+$ mise run dist-check   # confirm the release config and workflow gate hold
+$ git tag v0.1.0 && git push --tags
+```
+
+A tag's build is gated on the full CI suite, so nothing is published from a
+commit that does not pass. That gate is a hand edit to the generated release
+workflow, and the `release-config` CI job fails if a regeneration drops it.
+
+Archives only — no shell installer, MSI or Homebrew formula. That keeps a
+release to files whose published checksums a user can verify by hand, which is
+the property that matters for a tool whose job is to be trusted with a copy of
+your data.
+
 ## Development
 
 `mise` is the task runner. `mise install` fetches the pinned toolchain plus

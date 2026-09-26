@@ -14,6 +14,8 @@ rust = { version = "stable", components = "rust-analyzer" }
 "cargo:cargo-llvm-cov" = "latest"
 # Advisories, licences and duplicate-version checks over the resolved graph.
 "cargo:cargo-deny" = "latest"
+# Release artifacts: builds the platform archives and drives the release CI.
+"cargo:cargo-dist" = "latest"
 
 [tasks.build]
 run = "cargo build --all-targets --all-features"
@@ -67,5 +69,36 @@ run = "cargo doc --no-deps --all-features"
 env = { RUSTDOCFLAGS = "-D warnings" }
 
 [tasks.check]
-depends = ["lint", "test", "deps", "msrv", "doc"]
+depends = ["lint", "test", "deps", "msrv", "doc", "dist-check"]
 description = "Run every check CI runs"
+
+# ---------------------------------------------------------------------------
+# Releases, via cargo-dist.
+# ---------------------------------------------------------------------------
+
+[tasks.dist-plan]
+run = "dist plan"
+description = "List the artifacts a release would produce, without building"
+
+[tasks.dist-check]
+run = "dist plan --output-format=human > /dev/null"
+description = "Check that the release plan resolves and the release workflow still gates on CI"
+
+[tasks.dist-generate]
+run = "dist generate"
+description = """
+Regenerate .github/workflows/release.yml from dist-workspace.toml.
+
+Then re-apply the two local edits the header of that file describes: the
+`checks` job, and `checks` in the `needs:` of `build-local-artifacts`.
+"""
+
+[tasks.dist-build]
+run = "dist build --artifacts=local --target=\"$(rustc -vV | sed -n 's/^host: //p')\""
+description = """
+Build the release archive for this machine into target/distrib.
+
+Only the host triple: macOS and Windows artifacts need their own runners, which
+is what the release workflow's matrix is for. Use `dist plan` to see the full
+set a tag would produce.
+"""
