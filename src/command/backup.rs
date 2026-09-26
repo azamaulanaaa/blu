@@ -40,11 +40,6 @@ impl Default for Options {
     }
 }
 
-enum ChunkStatus {
-    Available(metadata::Chunk),
-    Reuse(u32),
-}
-
 #[instrument(skip(storage, options), ret, err)]
 pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::StorageGet>(
     root: P,
@@ -57,7 +52,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
         chunker: config,
     } = options;
 
-    let mut dedup_cache = match base_key {
+    let base_chunks: HashMap<[u8; 32], metadata::Chunk> = match base_key {
         Some(v) => {
             let mut reader = storage.get(&v).await?;
             let mut buffer = Vec::new();
@@ -65,16 +60,18 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
             let snapshot = metadata::Snapshot::from_bytes(buffer.as_slice())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-            let map: HashMap<[u8; 32], ChunkStatus> = snapshot
+            snapshot
                 .chunks
                 .into_iter()
-                .map(|v| (v.hash, ChunkStatus::Available(v)))
-                .collect();
-
-            Some(map)
+                .map(|chunk| (chunk.hash, chunk))
+                .collect()
         }
-        None => None,
+        None => HashMap::new(),
     };
+
+    // Chunks already emitted by this run, so repeated content is only ever
+    // uploaded once regardless of whether a base snapshot was supplied.
+    let mut emitted: HashMap<[u8; 32], u32> = HashMap::new();
 
     let mut snapshot = metadata::Snapshot::new();
 
@@ -177,50 +174,34 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
 
         let buffer = {
             let mut buffer = Vec::new();
-            let n = chunk.reader.read_to_end(&mut buffer).await?;
-            buffer.truncate(n);
-
+            chunk.reader.read_to_end(&mut buffer).await?;
             buffer
         };
 
         let hash = *blake3::hash(&buffer).as_bytes();
 
-        let chunk_index = {
-            let ref_index = match dedup_cache.as_mut() {
-                Some(map) => match map.get(&hash) {
-                    Some(ChunkStatus::Available(chunk)) => {
-                        let index = snapshot.chunks.len() as u32;
-                        snapshot.chunks.push(chunk.clone());
-                        let _ = map.insert(hash, ChunkStatus::Reuse(index));
+        let chunk_index = match emitted.get(&hash) {
+            // Already emitted by this run, or carried over from the base
+            // snapshot on first sight.
+            Some(&index) => index,
+            None => {
+                let chunk = match base_chunks.get(&hash) {
+                    Some(chunk) => chunk.clone(),
+                    None => {
+                        let len = buffer.len() as u64;
+                        let key = storage
+                            .put(Box::new(Cursor::new(buffer)), len)
+                            .await?;
 
-                        Some(index)
+                        metadata::Chunk { hash, location: key }
                     }
-                    Some(ChunkStatus::Reuse(index)) => Some(*index),
-                    None => None,
-                },
-                None => None,
-            };
+                };
 
-            match ref_index {
-                Some(index) => index,
-                None => {
-                    let index = snapshot.chunks.len() as u32;
-                    let len = buffer.len() as u64;
+                let index = snapshot.chunks.len() as u32;
+                snapshot.chunks.push(chunk);
+                emitted.insert(hash, index);
 
-                    let key = {
-                        let reader = Box::new(Cursor::new(buffer));
-                        let key = storage.put(reader, len).await?;
-
-                        key
-                    };
-
-                    snapshot.chunks.push(metadata::Chunk {
-                        hash,
-                        location: key,
-                    });
-
-                    index
-                }
+                index
             }
         };
 
