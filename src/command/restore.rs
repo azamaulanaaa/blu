@@ -1,4 +1,4 @@
-use std::{io, path::Path};
+use std::io;
 
 use tokio::{
     fs,
@@ -6,12 +6,18 @@ use tokio::{
 };
 
 use crate::{
-    metadata,
+    metadata::{self, FileChunk},
     reader::{self, StreamReadSeeker},
     storage, writer,
 };
 
-pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
+/// Reassemble the snapshot identified by `key` under `root`.
+///
+/// # Errors
+///
+/// Returns an error if the snapshot cannot be read or decoded, if it refers to
+/// a file or chunk it does not contain, or if a destination cannot be written.
+pub async fn restore<P: AsRef<std::path::Path>, S: storage::StorageGet>(
     root: P,
     key: String,
     storage: S,
@@ -20,63 +26,82 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
         let mut reader: StreamReadSeeker = storage.get(&key).await?;
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
-        let snapshot = metadata::Snapshot::from_bytes(buffer.as_slice())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        snapshot
+        metadata::Snapshot::from_bytes(buffer.as_slice())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     };
 
     let root = root.as_ref();
 
-    for file_chunk in snapshot.file_chunks.iter() {
-        let file = snapshot
-            .files
-            .get(file_chunk.file_index as usize)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "file metadata not found for given file chunk",
-                )
-            })?;
-        let chunk = snapshot
-            .chunks
-            .get(file_chunk.chunk_index as usize)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "chunk metadata not found for given file chunk",
-                )
-            })?;
+    // Group the chunk slices by the file they belong to so that each
+    // destination is opened once rather than once per slice.
+    let mut slices: Vec<Vec<&FileChunk>> = vec![Vec::new(); snapshot.files.len()];
+    for file_chunk in &snapshot.file_chunks {
+        let index = file_chunk.file_index as usize;
+        let bucket = slices.get_mut(index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "chunk slice references file {index}, which the snapshot does not contain"
+                ),
+            )
+        })?;
+        bucket.push(file_chunk);
+    }
 
-        let mut file = {
-            let file_path = root.join(&file.path);
+    for (index, file) in snapshot.files.iter().enumerate() {
+        if slices[index].is_empty() {
+            continue;
+        }
 
-            let parent = &file_path
-                .parent()
-                .ok_or_else(|| io::Error::other("internal error, file parent not found"))?;
+        let file_path = root.join(&file.path);
+        if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent).await?;
+        }
 
-            let mut file: fs::File = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(&file_path)
-                .await?;
+        // Opened without truncation: slices are written at their recorded
+        // offsets and the final length is asserted by the caller.
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&file_path)
+            .await?;
 
-            file.seek(io::SeekFrom::Start(file_chunk.file_offset))
-                .await?;
+        for file_chunk in slices[index].iter().copied() {
+            let chunk = snapshot.chunks.get(file_chunk.chunk_index as usize).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "chunk slice references chunk {}, which the snapshot does not contain",
+                        file_chunk.chunk_index
+                    ),
+                )
+            })?;
 
-            writer::SliceAsyncWriter::new(file, file_chunk.length.into())
-        };
+            let length = u64::from(file_chunk.length);
 
-        let mut chunk = {
-            let mut chunk: StreamReadSeeker = storage.get(&chunk.location).await?;
-            chunk
+            handle.seek(io::SeekFrom::Start(file_chunk.file_offset)).await?;
+
+            let mut source: StreamReadSeeker = storage.get(&chunk.location).await?;
+            source
                 .seek(io::SeekFrom::Start(file_chunk.chunk_offset.into()))
                 .await?;
 
-            reader::SliceAsyncReader::new(chunk, file_chunk.length.into())
-        };
+            let mut source = reader::SliceAsyncReader::new(source, length);
+            let mut sink = writer::SliceAsyncWriter::new(&mut handle, length);
 
-        tokio::io::copy(&mut chunk, &mut file).await?;
+            let written = tokio::io::copy(&mut source, &mut sink).await?;
+
+            if written != length {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "chunk at {} is shorter than the {} bytes recorded for {}",
+                        chunk.location, length, file.path.display()
+                    ),
+                ));
+            }
+        }
     }
 
     Ok(())
