@@ -190,19 +190,15 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
 
         // A check that died is reported against its own chunk below, so one bad
         // task cannot lose the results of the others.
-        //
-        // Nested `if let` rather than a `let` chain: clippy prefers the chain,
-        // but it needs a compiler newer than this crate's MSRV, and the MSRV is
-        // the one that has to hold.
-        if let Some(Ok(done)) = running.join_next().await {
-            if let Some(slot) = checked.get_mut(done.index) {
-                // Read off `done` rather than the slot: the slot is still empty
-                // at this point, and would report zero bytes for every chunk.
-                progress.add("checked", 1);
-                progress.add("read", done.bytes);
-                progress.report();
-                *slot = Some(done);
-            }
+        if let Some(Ok(done)) = running.join_next().await
+            && let Some(slot) = checked.get_mut(done.index)
+        {
+            // Read off `done` rather than the slot: the slot is still empty at
+            // this point, and would report zero bytes for every chunk.
+            progress.add("checked", 1);
+            progress.add("read", done.bytes);
+            progress.report();
+            *slot = Some(done);
         }
     }
 

@@ -2,7 +2,22 @@
 name = "lepatch"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Minimum supported Rust version.
+#
+# Kept at the latest stable rather than as low as the code would allow, and that
+# is a deliberate trade. The crate is not published to crates.io and ships as
+# binaries through cargo-dist, so almost nobody compiles it: what the floor really
+# governs is which toolchain a contributor needs, and "the current stable" is a
+# far easier thing to say out loud than a number that has to be re-tested as
+# dependencies move.
+#
+# The cost is concrete and was measured. At 1.85, `fastcdc` 5 does not compile —
+# it uses `is_multiple_of`, stabilised in 1.87 — and it declares no
+# `rust-version`, so cargo's MSRV-aware resolver cannot hold it back and offers
+# it anyway. Raising the floor is what makes that upgrade possible; the chunking
+# it produces is byte-identical to 3.2.1's, so existing backup sets still
+# deduplicate against new ones.
+rust-version = "1.98"
 # The bundled LICENSE is GPL-2.0 with the "or any later version" option.
 license = "GPL-2.0-or-later"
 description = "Content-defined-chunking backup tool with deduplicated, versioned snapshots"

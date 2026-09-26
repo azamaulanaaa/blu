@@ -294,31 +294,28 @@ fn check_clean_destination(
     // The directories a mistyped or truncated path lands on. None of these is
     // ever a restore destination somebody meant, and all of them are
     // unrecoverable if emptied.
-    //
-    // Nested rather than a `let` chain, which needs a compiler newer than this
-    // crate's MSRV.
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        if target == absolutise(&home) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to clean your home directory ({})",
-                    target.display()
-                ),
-            ));
-        }
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from)
+        && target == absolutise(&home)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to clean your home directory ({})",
+                target.display()
+            ),
+        ));
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        if target == absolutise(&cwd) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "refusing to clean the working directory ({})",
-                    target.display()
-                ),
-            ));
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && target == absolutise(&cwd)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to clean the working directory ({})",
+                target.display()
+            ),
+        ));
     }
 
     // Ahead of nothing in particular, but before the claim is taken: `/` would

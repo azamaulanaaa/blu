@@ -77,20 +77,30 @@ jobs:
           retention-days: 7
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Kept in step with `rust-version` in Cargo.toml. The floor is edition
-      # 2024, which needs Cargo 1.85, so a lower claim would not build.
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85.0
+      # Pinned to an exact version rather than `stable`, so a new release
+      # breaking the build is caught here rather than being blamed on the floor.
+      #
+      # Note what this job is and is not for any more. The floor is the latest
+      # stable, so `lint` and `test` already build with the same or a newer
+      # toolchain and this catches nothing they would not. What it still catches
+      # is a *declared* floor that does not build: a typo, a version that does
+      # not exist yet, or a dependency quietly requiring more than the manifest
+      # claims. That is worth a job, and is the only thing left here worth one.
+      - name: Read the declared floor
+        id: floor
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Install the declared floor
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
       - name: Cache build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      # Catches a dependency or a language feature raising the real floor above
-      # what the manifest claims, which nothing else here would notice.
       - run: cargo check --all-targets --all-features --locked
 
   doc:
