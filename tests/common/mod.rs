@@ -126,11 +126,19 @@ pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
 
 /// Back up `source` into a fresh blob store and return the snapshot key.
 pub(crate) async fn run_backup(source: &Path, blob: &Path, base_key: Option<String>) -> String {
+    run_backup_with(source, blob, base_key, Options::default()).await
+}
+
+/// Back up `source` with specific options, for tests that need to pin a knob the
+/// defaults would otherwise choose.
+pub(crate) async fn run_backup_with(
+    source: &Path,
+    blob: &Path,
+    base_key: Option<String>,
+    opts: Options,
+) -> String {
     let storage = BlobFileStorage::<true>::new(blob).await.unwrap();
-    let opts = Options {
-        base_key,
-        ..options()
-    };
+    let opts = Options { base_key, ..opts };
     backup(source, opts, storage).await.unwrap()
 }
 

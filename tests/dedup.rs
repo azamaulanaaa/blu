@@ -10,7 +10,10 @@ mod common;
 
 use std::fs;
 
-use lepatch::storage::{BlobFileStorage, StorageGet};
+use lepatch::{
+    command::Options,
+    storage::{BlobFileStorage, StorageGet},
+};
 
 /// Read a snapshot back out of a blob store.
 async fn snapshot(blob: &std::path::Path, key: &str) -> lepatch::metadata::Snapshot {
@@ -123,4 +126,123 @@ async fn deduplication_does_not_change_the_restored_tree() {
     common::run_restore(&blob, &key, &destination).await;
 
     assert_eq!(common::describe(&source), common::describe(&destination));
+}
+
+#[tokio::test]
+async fn chunks_are_deduplicated_however_many_are_in_flight() {
+    // Every one of these files is one 64 KiB run of identical bytes, which the
+    // chunker cuts at its maximum size — so each file is exactly one chunk and
+    // all of them hash the same. That is the case worth racing on: the same
+    // content reaching several stores at once, where a deduplication check that
+    // only works in sequence would store a copy per worker.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    let shared = vec![0x5au8; 64 * 1024];
+    for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        fs::write(source.join(format!("{name}.bin")), &shared).unwrap();
+    }
+
+    // Plus content that must *not* be deduplicated, so a run cannot pass simply
+    // by collapsing everything into one entry.
+    fs::write(source.join("one.bin"), common::noisy(70 * 1024)).unwrap();
+    fs::write(source.join("two.bin"), common::noisy(70 * 1024)).unwrap();
+
+    let serial = count_at(&dir.path().join("serial.bin"), &source, 1).await;
+
+    // The eight identical files must have become one chunk, not eight.
+    assert!(
+        serial < 8,
+        "eight identical files produced {serial} stored chunks, so they were not \
+         deduplicated at all"
+    );
+
+    for concurrency in [2, 4, 8, 16, 32] {
+        let blob = dir.path().join(format!("parallel{concurrency}.bin"));
+        assert_eq!(
+            count_at(&blob, &source, concurrency).await,
+            serial,
+            "with {concurrency} stores in flight a different number of chunks was stored"
+        );
+    }
+}
+
+/// Back up `source` with `concurrency` stores in flight, and report how many
+/// distinct chunks ended up stored.
+async fn count_at(blob: &std::path::Path, source: &std::path::Path, concurrency: usize) -> usize {
+    let key = common::run_backup_with(
+        source,
+        blob,
+        None,
+        Options {
+            concurrency,
+            ..Options::default()
+        },
+    )
+    .await;
+
+    snapshot(blob, &key).await.chunks.len()
+}
+
+#[tokio::test]
+async fn concurrency_does_not_change_the_snapshot() {
+    // Uploads finish in whatever order the store lets them, but the snapshot
+    // must depend only on the order chunks were read in. If this drifts, two
+    // backups of the same tree stop being comparable and the concurrency knob
+    // stops being safe to touch.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    // Several distinct files plus shared content between them, so a run has
+    // chunks to deduplicate as well as chunks to keep in order.
+    for i in 0..6 {
+        let mut bytes = common::noisy(40 * 1024 + i * 997);
+        bytes.extend_from_slice(&common::noisy(20 * 1024));
+        fs::write(source.join(format!("file{i}.bin")), &bytes).unwrap();
+    }
+
+    let serial = {
+        let blob = dir.path().join("serial.bin");
+        let key = common::run_backup_with(
+            &source,
+            &blob,
+            None,
+            Options {
+                concurrency: 1,
+                ..Options::default()
+            },
+        )
+        .await;
+        snapshot(&blob, &key).await
+    };
+
+    for concurrency in [2, 8, 32] {
+        let blob = dir.path().join(format!("parallel{concurrency}.bin"));
+        let key = common::run_backup_with(
+            &source,
+            &blob,
+            None,
+            Options {
+                concurrency,
+                ..Options::default()
+            },
+        )
+        .await;
+        let parallel = snapshot(&blob, &key).await;
+
+        assert_eq!(
+            serial.chunks, parallel.chunks,
+            "concurrency {concurrency} stored a different set of chunks"
+        );
+        assert_eq!(
+            serial.file_chunks, parallel.file_chunks,
+            "concurrency {concurrency} laid the chunks out differently"
+        );
+        assert_eq!(
+            serial.files, parallel.files,
+            "concurrency {concurrency} recorded the files differently"
+        );
+    }
 }
