@@ -1,0 +1,20 @@
+#!/bin/sh
+#
+# Runs the fast checks on every commit, so a lint failure shows up while the
+# change is still in the editor's memory rather than in a CI log afterwards.
+#
+# Enable with:  git config core.hooksPath .githooks
+#
+# Bypass for a commit that genuinely cannot pass yet:  git commit --no-verify
+
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Nothing staged: nothing to check.
+if ! git diff --cached --quiet; then
+    echo "pre-commit: running fmt and clippy"
+    exec make lint-quick
+fi
+
+exit 0

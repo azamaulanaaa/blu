@@ -95,15 +95,30 @@ from being handed something that can append to the store.
 ## Development
 
 ```console
-$ cargo test              # unit and integration tests
-$ cargo clippy --all-targets --all-features
-$ cargo fmt --check
-$ cargo doc --no-deps --open
+$ make check      # everything below
+$ make lint       # cargo fmt --check + clippy
+$ make test       # the test suite
+$ make msrv       # builds against the declared minimum Rust version
+$ make doc        # rustdoc with warnings denied
 ```
+
+Or through cargo directly: `cargo clippy --all-targets --all-features`,
+`cargo test --all-features`, `cargo fmt --check`.
 
 The integration tests are the interesting ones: they build a tree, back it up,
 restore it, and compare the two structures — including link identity — rather
 than just checking that the command exited 0.
+
+Lint levels live in `Cargo.toml` under `[lints]` rather than in CI, so they
+apply to a local `cargo build` and not only to a push. `missing_docs`,
+`missing_errors_doc` and `clippy::pedantic` are all denied; the two places that
+carry an `#[allow]` say why in a comment.
+
+To have `make lint` run on every commit:
+
+```console
+$ git config core.hooksPath .githooks
+```
 
 ## License
 

@@ -7,12 +7,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Fails the build on a warning rather than printing it and carrying on.
+  # Backstop for lint groups. The lint levels themselves live in Cargo.toml under
+  # `[lints]` so that they apply to a local build too, not only to CI.
   RUSTFLAGS: -D warnings
 
 jobs:
   check:
-    name: check
+    name: fmt and clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +23,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features
-      - run: cargo check --all-targets --all-features
+
+  msrv:
+    name: msrv (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Kept in step with `rust-version` in Cargo.toml. The floor is edition
+        # 2024, which needs Cargo 1.85; a lower claim would not build.
+        toolchain: ["1.85.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # Catches a dependency or a language feature raising the real floor above
+      # what the manifest claims, which nothing else here would notice.
+      - run: cargo check --all-targets --all-features --locked
 
   test:
     name: test (${{ matrix.os }})
@@ -35,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      - run: cargo test --all-features --locked
 
   doc:
     name: doc
