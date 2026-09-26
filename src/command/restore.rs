@@ -61,7 +61,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
                 .open(&file_path)
                 .await?;
 
-            file.seek(io::SeekFrom::Start(file_chunk.file_index.into()))
+            file.seek(io::SeekFrom::Start(file_chunk.file_offset))
                 .await?;
 
             writer::SliceAsyncWriter::new(file, file_chunk.length.into())
