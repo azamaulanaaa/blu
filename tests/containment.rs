@@ -79,7 +79,7 @@ impl Forged {
     async fn restore_into(&self, dest: &Path) -> Result<(), String> {
         let storage = BlobFileStorage::<false>::new(&self.blob).await.unwrap();
         match restore(dest, self.key.clone(), storage).await {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
     }

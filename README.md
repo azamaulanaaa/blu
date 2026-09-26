@@ -21,6 +21,34 @@ $ lepatch restore /tmp/docs-restored docs
 `--version N` selects a specific version; without it, restore and verify use the
 most recent one that completed successfully.
 
+### Restoring
+
+A restore **merges**: it writes everything the snapshot describes and leaves
+anything else in the destination alone. That is the safer default — a restore
+into a directory that turns out to be the wrong one should not have deleted it
+first — but it does mean the destination may end up holding more than the
+snapshot accounts for, and the run says so when it does.
+
+`--clean` empties the destination first, so the result is exactly the snapshot:
+
+```console
+$ lepatch restore /tmp/docs-restored docs --clean
+```
+
+That is the only operation here that destroys data, so it is deliberately hard to
+talk into. It refuses a destination that holds the backup set being restored
+from, your home directory, the working directory, and the filesystem root. A
+restore also takes a claim beside the destination for its duration, so two
+restores into one directory cannot interleave; a claim left by a killed run has
+to be removed by hand.
+
+Nothing is ever written outside the destination. Recorded paths that are
+absolute, or that contain `..`, are refused before the first file is created —
+a backup set is a file that gets synced and shared, so its contents are treated
+as untrusted input. A symbolic link's *target* is exempt, because it is stored
+verbatim and resolved by whoever follows it: a tree containing a link to
+`/etc/passwd` is an ordinary tree.
+
 ### Layout
 
 A backup set is named after a base path, which is treated as an opaque prefix:
@@ -45,8 +73,6 @@ not valid UTF-8 are stored as raw bytes rather than aborting the backup.
 
 Ownership, ACLs, extended attributes, and hard-link relationships that point
 outside the tree being backed up. Device nodes, FIFOs and sockets are skipped.
-A restore overwrites files it describes and leaves anything else in the
-destination alone, so it is a merge rather than a wipe.
 
 ## Failure behaviour
 

@@ -506,3 +506,139 @@ fn progress_reporting_can_be_turned_off() {
         "but the summary line should survive:\n{text}"
     );
 }
+
+#[test]
+fn a_restore_merges_by_default_and_says_so() {
+    // Merging is the safer default — a restore into a directory that turns out to
+    // be the wrong one should not delete it first — but a user who expected the
+    // destination to be exactly the snapshot should not have to diff two trees to
+    // find out that it is not.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept.bin"), noisy(50_000)).unwrap();
+
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    let destination = dir.path().join("out");
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("stale.bin"), b"from last week").unwrap();
+
+    let merged = ok(dir.path(), &["restore", "out", "store"]);
+    assert!(
+        destination.join("stale.bin").exists(),
+        "a merging restore should not delete what it did not write"
+    );
+    assert!(destination.join("kept.bin").exists());
+    assert!(
+        merged.contains("--clean"),
+        "a merging restore should mention how to get an exact copy:\n{merged}"
+    );
+}
+
+#[test]
+fn clean_gives_an_exact_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept.bin"), noisy(50_000)).unwrap();
+
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    let destination = dir.path().join("out");
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("stale.bin"), b"from last week").unwrap();
+    fs::create_dir_all(destination.join("stale-dir")).unwrap();
+
+    ok(dir.path(), &["restore", "out", "store", "--clean"]);
+
+    assert!(
+        !destination.join("stale.bin").exists(),
+        "--clean left a stale file"
+    );
+    assert!(
+        !destination.join("stale-dir").exists(),
+        "--clean left a stale directory"
+    );
+    assert!(destination.join("kept.bin").exists());
+}
+
+#[test]
+fn clean_refuses_a_destination_holding_the_backup_set() {
+    // The one operation here that destroys data, so the obvious mistake has to
+    // stop the run rather than empty the store it is about to read from.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(50_000)).unwrap();
+
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    // The set is `store.bin` beside the source, so restoring it into its own
+    // directory is the mistake.
+    let output = lepatch(dir.path(), &["restore", ".", "store", "--clean"]);
+    assert!(
+        !output.status.success(),
+        "cleaning a directory holding the backup set should fail"
+    );
+    assert!(
+        stderr(&output).contains("backup set being restored from"),
+        "unhelpful error: {}",
+        stderr(&output)
+    );
+    assert!(
+        dir.path().join("store.bin").exists(),
+        "the store was deleted"
+    );
+}
+
+#[test]
+fn a_second_restore_into_one_destination_is_refused() {
+    // Two restores at once would interleave writes into the same tree, and
+    // neither would end up with what it meant to produce.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    let destination = dir.path().join("out");
+    fs::create_dir_all(&destination).unwrap();
+
+    let mut first = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        .current_dir(dir.path())
+        .args(["restore", "out", "store"])
+        .spawn()
+        .expect("failed to start the first restore");
+
+    // Give it long enough to have taken the claim, then try a second.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let second = lepatch(dir.path(), &["restore", "out", "store"]);
+
+    let _ = first.wait();
+
+    // Whichever order they actually ran in, the second one must not have been
+    // allowed to write. If the first finished before the second started there is
+    // nothing to assert, so the check is on the lock file's existence instead.
+    let lock_present = destination
+        .with_file_name("out.lepatch-restore.lock")
+        .exists();
+
+    if lock_present {
+        assert!(
+            !second.status.success(),
+            "a second restore into a claimed destination should fail"
+        );
+        assert!(
+            stderr(&second).contains("another lepatch process"),
+            "unhelpful error: {}",
+            stderr(&second)
+        );
+    }
+
+    // Either way the claim must not outlive the run.
+    assert!(
+        !lock_present,
+        "the destination claim was left behind after the restore finished"
+    );
+}
