@@ -1,0 +1,443 @@
+//! End-to-end tests that drive the `lepatch` binary as a subprocess.
+//!
+//! The library integration tests call `backup` and `restore` directly, which
+//! left `src/bin/mod.rs` at zero coverage: version selection, the cross-process
+//! write lock, the exclude list, argument parsing, exit codes and every error
+//! message the user sees were all untested. These tests go through the real
+//! binary so those paths are exercised as a user would meet them.
+
+// `.clippy.toml` exempts code inside a `#[test]` function; the `lepatch` helper
+// below is a plain fn called from many.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
+
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
+
+use common::noisy;
+
+/// Run the binary in `dir` and return its output.
+fn lepatch(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("failed to run the lepatch binary")
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn ok(dir: &Path, args: &[&str]) -> String {
+    let output = lepatch(dir, args);
+    assert!(
+        output.status.success(),
+        "`lepatch {}` failed with {:?}\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        output.status.code(),
+        stdout(&output),
+        stderr(&output)
+    );
+    stdout(&output)
+}
+
+fn fails(dir: &Path, args: &[&str]) -> String {
+    let output = lepatch(dir, args);
+    assert!(
+        !output.status.success(),
+        "`lepatch {}` unexpectedly succeeded\nstdout: {}",
+        args.join(" "),
+        stdout(&output)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failure should exit 1, got {:?}\nstderr: {}",
+        output.status.code(),
+        stderr(&output)
+    );
+    stderr(&output)
+}
+
+/// A tree with the shapes a backup has to survive.
+fn build_tree(dir: &Path) {
+    let source = dir.join("src");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::create_dir_all(source.join("empty-dir")).unwrap();
+    fs::write(source.join("large.bin"), noisy(120_000)).unwrap();
+    fs::write(source.join("nested/small.txt"), b"hello\n").unwrap();
+    fs::write(source.join("empty-file"), b"").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("large.bin", source.join("link")).unwrap();
+        fs::hard_link(source.join("large.bin"), source.join("hard")).unwrap();
+    }
+}
+
+#[test]
+fn backup_then_restore_reproduces_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    let before = common::describe(&dir.path().join("src"));
+    let after = common::describe(&dir.path().join("out"));
+
+    assert_eq!(before, after, "the restored tree differs from the source");
+    assert!(before.contains_key(Path::new("empty-dir")));
+    assert!(before.contains_key(Path::new("empty-file")));
+}
+
+#[test]
+fn each_backup_claims_the_next_version() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    for _ in 0..3 {
+        ok(dir.path(), &["backup", "src", "snap"]);
+    }
+
+    for version in 1..=3 {
+        assert!(
+            dir.path().join(format!("snap.{version:03}.idx")).is_file(),
+            "version {version} index is missing"
+        );
+    }
+    assert!(dir.path().join("snap.bin").is_file());
+}
+
+#[test]
+fn a_second_backup_of_an_unchanged_tree_uploads_only_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    let after_first = fs::metadata(dir.path().join("snap.bin")).unwrap().len();
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    let after_second = fs::metadata(dir.path().join("snap.bin")).unwrap().len();
+
+    let growth = after_second - after_first;
+    assert!(
+        growth < 8 * 1024,
+        "the store grew by {growth} bytes, so chunk data was uploaded again"
+    );
+}
+
+#[test]
+fn restore_can_select_an_earlier_version() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    // Change the tree, then take a second version.
+    fs::write(dir.path().join("src/large.bin"), b"replaced").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    ok(
+        dir.path(),
+        &["restore", "from-v1", "snap", "--version", "1"],
+    );
+    assert_eq!(
+        fs::read(dir.path().join("from-v1/large.bin")).unwrap(),
+        noisy(120_000),
+        "version 1 should hold the original contents"
+    );
+
+    ok(dir.path(), &["restore", "from-v2", "snap"]);
+    assert_eq!(
+        fs::read(dir.path().join("from-v2/large.bin")).unwrap(),
+        b"replaced",
+        "the latest version should hold the replacement"
+    );
+}
+
+#[test]
+fn the_backup_set_is_excluded_from_its_own_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("inner");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("data.bin"), noisy(80_000)).unwrap();
+
+    // Back up the directory the store is about to be written into.
+    ok(&source, &["backup", ".", "self"]);
+
+    let listing = fs::read_dir(&source)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert!(listing.contains(&"self.bin".to_string()));
+    assert!(listing.contains(&"self.001.idx".to_string()));
+
+    // The store grew while it was being read, so if it had been chunked the
+    // offsets would have shifted and the restore would not match.
+    ok(dir.path(), &["restore", "out", "inner/self"]);
+    assert_eq!(
+        fs::read(dir.path().join("out/data.bin")).unwrap(),
+        noisy(80_000)
+    );
+}
+
+#[test]
+fn verify_reports_a_clean_store() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let report = ok(dir.path(), &["verify", "snap"]);
+
+    assert!(
+        report.contains("all chunks match their recorded hashes"),
+        "unexpected verify output: {report}"
+    );
+}
+
+#[test]
+fn verify_fails_and_restore_refuses_on_a_damaged_store() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    // Flip a byte well inside the chunk data.
+    let store = dir.path().join("snap.bin");
+    let mut bytes = fs::read(&store).unwrap();
+    let target = bytes.len() / 2;
+    bytes[target] ^= 0xff;
+    fs::write(&store, &bytes).unwrap();
+
+    // The per-chunk detail and the final error go to stderr; the summary line
+    // goes to stdout, so both streams have to be read.
+    let verify = lepatch(dir.path(), &["verify", "snap"]);
+    assert!(!verify.status.success());
+
+    let summary = stdout(&verify);
+    assert!(
+        summary.contains("FAILED"),
+        "the summary should report the failure: {summary}"
+    );
+
+    let detail = stderr(&verify);
+    assert!(
+        detail.contains("expected hash") && detail.contains("found"),
+        "the detail should name both hashes: {detail}"
+    );
+
+    let refused = fails(dir.path(), &["restore", "out", "snap"]);
+    assert!(
+        refused.contains("refusing to restore"),
+        "restore should say it refused: {refused}"
+    );
+    assert!(
+        !dir.path().join("out/large.bin").exists(),
+        "nothing should have been written from a damaged store"
+    );
+}
+
+#[test]
+fn a_failed_backup_leaves_no_index_behind() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = fails(dir.path(), &["backup", "no-such-directory", "snap"]);
+    assert!(
+        error.contains("no-such-directory"),
+        "the error should name the path it could not read: {error}"
+    );
+
+    assert!(
+        !dir.path().join("snap.001.idx").exists(),
+        "a failed backup must not leave an index that looks like a version"
+    );
+}
+
+#[test]
+fn an_empty_index_left_by_a_crash_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    // A process killed after claiming version 2 leaves the file but never fills
+    // it in. It must not be mistaken for the latest usable version.
+    fs::write(dir.path().join("snap.002.idx"), b"").unwrap();
+
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    assert!(
+        dir.path().join("snap.003.idx").is_file(),
+        "version 2 should have been skipped, not reused"
+    );
+}
+
+#[test]
+fn a_second_backup_is_refused_while_the_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    fs::write(dir.path().join("snap.lock"), b"").unwrap();
+
+    let error = fails(dir.path(), &["backup", "src", "snap"]);
+    assert!(
+        error.contains("locked by another lepatch process") && error.contains("remove it"),
+        "the error should say how to recover: {error}"
+    );
+}
+
+#[test]
+fn restoring_a_name_with_no_snapshots_explains_itself() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = fails(dir.path(), &["restore", "out", "ghost"]);
+    assert!(
+        error.contains("no usable snapshot") && error.contains("ghost"),
+        "the error should name what was looked for: {error}"
+    );
+}
+
+#[test]
+fn restoring_an_absent_version_names_the_version() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let error = fails(dir.path(), &["restore", "out", "snap", "--version", "42"]);
+    assert!(
+        error.contains("42") && error.contains("empty or malformed"),
+        "the error should name the version and why: {error}"
+    );
+}
+
+#[test]
+fn errors_are_reported_as_messages_not_debug_output() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = fails(dir.path(), &["restore", "out", "ghost"]);
+
+    // The old behaviour was `Error: Custom { kind: NotFound, error: "..." }`,
+    // which says nothing about what went wrong.
+    assert!(
+        !error.contains("Custom {"),
+        "error output should not be a Debug dump: {error}"
+    );
+    assert!(
+        !error.contains("Os { code:"),
+        "error output should not be a Debug dump: {error}"
+    );
+}
+
+#[test]
+fn a_backup_set_named_with_an_extension_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "photos.tar"]);
+
+    assert!(dir.path().join("photos.tar.bin").is_file());
+    assert!(dir.path().join("photos.tar.001.idx").is_file());
+    assert!(
+        !dir.path().join("photos.bin").exists(),
+        "the base name's extension should not be replaced"
+    );
+}
+
+#[test]
+fn a_backup_set_can_live_in_a_subdirectory() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "data/deep/snap"]);
+    ok(dir.path(), &["backup", "src", "data/deep/snap"]);
+    ok(dir.path(), &["restore", "out", "data/deep/snap"]);
+
+    assert!(dir.path().join("data/deep/snap.001.idx").is_file());
+    assert!(dir.path().join("data/deep/snap.002.idx").is_file());
+    assert_eq!(
+        common::describe(&dir.path().join("src")),
+        common::describe(&dir.path().join("out"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn paths_that_are_not_valid_utf8_survive_a_round_trip() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    let raw = OsStr::from_bytes(b"bad-\xff\xfe-name.bin");
+    fs::write(PathBuf::from(&source).join(raw), noisy(20_000)).unwrap();
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    assert_eq!(
+        common::describe(&source),
+        common::describe(&dir.path().join("out"))
+    );
+}
+
+#[test]
+fn quiet_suppresses_progress_and_verbose_adds_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    let quiet = ok(dir.path(), &["--quiet", "backup", "src", "snap"]);
+    assert!(
+        quiet.is_empty(),
+        "--quiet should print nothing on success, got: {quiet}"
+    );
+
+    let verbose = ok(dir.path(), &["--verbose", "backup", "src", "snap"]);
+    assert!(
+        !verbose.is_empty(),
+        "--verbose should report more than the default"
+    );
+}
+
+#[test]
+fn quiet_and_verbose_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = lepatch(
+        dir.path(),
+        &["--quiet", "--verbose", "backup", "src", "snap"],
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn the_binary_reports_its_version_and_help() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let version = ok(dir.path(), &["--version"]);
+    assert!(
+        version.contains("lepatch") && version.contains(env!("CARGO_PKG_VERSION")),
+        "unexpected --version output: {version}"
+    );
+
+    let help = ok(dir.path(), &["--help"]);
+    for command in ["backup", "restore", "verify"] {
+        assert!(help.contains(command), "--help should list {command}");
+    }
+}
+
+#[test]
+fn an_unknown_subcommand_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = lepatch(dir.path(), &["frobnicate"]);
+    assert!(!output.status.success());
+}
