@@ -4,6 +4,9 @@ fn sample() -> Snapshot {
     let mut snapshot = Snapshot::new();
     snapshot.files.push(metadata::File {
         path: "a/b.bin".into(),
+        len: 10,
+        mode: 0o644,
+        mtime: None,
     });
     snapshot.chunks.push(metadata::Chunk {
         hash: [7u8; 32],

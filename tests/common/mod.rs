@@ -9,18 +9,13 @@ use std::{
 };
 
 use lepatch::{
-    command::{backup, restore},
-    reader::ChunkerConfig,
+    command::{Options, backup, restore},
     storage::BlobFileStorage,
 };
 
 /// Default chunker configuration, mirroring the CLI defaults.
-pub fn chunker_config() -> ChunkerConfig {
-    ChunkerConfig {
-        min_size: 8 * 1024,
-        avg_size: 16 * 1024,
-        max_size: 64 * 1024,
-    }
+pub fn options() -> Options {
+    Options::default()
 }
 
 /// A flattened description of an entry in a directory tree.
@@ -109,9 +104,11 @@ pub fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
 /// Back up `source` into a fresh blob store and return the snapshot key.
 pub async fn run_backup(source: &Path, blob: &Path, base_key: Option<String>) -> String {
     let storage = BlobFileStorage::<true>::new(blob).await.unwrap();
-    backup(source, base_key, storage, chunker_config())
-        .await
-        .unwrap()
+    let opts = Options {
+        base_key,
+        ..options()
+    };
+    backup(source, opts, storage).await.unwrap()
 }
 
 /// Restore `key` from the blob store at `blob` into `destination`.

@@ -71,7 +71,15 @@ async fn main() -> io::Result<()> {
             let storage_path = PathBuf::from(&name).with_extension(BLOB_EXTENSION);
             let storage = storage::BlobFileStorage::new(storage_path).await?;
 
-            let key = backup(source, None, storage, config).await?;
+            let key = backup(
+                source,
+                lepatch::command::Options {
+                    chunker: config,
+                    ..Default::default()
+                },
+                storage,
+            )
+            .await?;
 
             index_file.write_all(key.as_bytes())?;
             index_file.flush()?;

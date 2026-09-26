@@ -105,20 +105,58 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A point in time, stored explicitly so that the encoding does not depend on
+/// the platform representation of `SystemTime`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timestamp {
+    /// Seconds since the Unix epoch.
+    pub secs: i64,
+    /// Sub-second component in nanoseconds.
+    pub nanos: u32,
+}
+
+impl From<std::time::SystemTime> for Timestamp {
+    fn from(time: std::time::SystemTime) -> Self {
+        match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => Self {
+                secs: d.as_secs() as i64,
+                nanos: d.subsec_nanos(),
+            },
+            // Before the epoch, report the distance as a negative offset.
+            Err(e) => Self {
+                secs: -(e.duration().as_secs() as i64),
+                nanos: e.duration().subsec_nanos(),
+            },
+        }
+    }
+}
+
+impl From<Timestamp> for std::time::SystemTime {
+    fn from(time: Timestamp) -> Self {
+        if time.secs >= 0 {
+            std::time::UNIX_EPOCH + std::time::Duration::new(time.secs as u64, time.nanos)
+        } else {
+            std::time::UNIX_EPOCH - std::time::Duration::new(time.secs as u64, time.nanos)
+        }
+    }
+}
+
 /// A complete description of one backup: the directory tree, the set of
 /// distinct chunk contents, and how the chunks map back onto the files.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Layout version of this snapshot, see [`FORMAT_VERSION`].
     pub version: u32,
     /// Regular files, in the order they were chunked.
     pub files: Vec<File>,
+    /// Directories, including ones that contain no files.
+    pub dirs: Vec<Dir>,
     /// Distinct chunk contents, referenced by `FileChunk::chunk_index`.
     pub chunks: Vec<Chunk>,
     /// Placement of each chunk slice within each file.
     pub file_chunks: Vec<FileChunk>,
-    /// Symbolic and hard links.
-    pub file_symlink: Vec<FileSymlink>,
+    /// Symbolic and hard links, which carry no content of their own.
+    pub links: Vec<Link>,
 }
 
 impl Snapshot {
@@ -127,9 +165,10 @@ impl Snapshot {
         Self {
             version: FORMAT_VERSION,
             files: Vec::new(),
+            dirs: Vec::new(),
             chunks: Vec::new(),
             file_chunks: Vec::new(),
-            file_symlink: Vec::new(),
+            links: Vec::new(),
         }
     }
 
@@ -190,18 +229,29 @@ pub struct Chunk {
     pub location: String,
 }
 
-/// A symbolic or hard link, recorded but not chunked.
+/// Whether a [`Link`] shares an inode with another file or points elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkKind {
+    /// Shares its contents with [`Link::target`], which is another path in the
+    /// same backup.
+    Hard,
+    /// A symbolic link whose [`Link::target`] is stored verbatim and may point
+    /// anywhere, including outside the backup.
+    Symbolic,
+}
+
+/// A symbolic or hard link, recorded but never chunked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileSymlink {
+pub struct Link {
     /// Path of the link relative to the backup root.
     #[serde(with = "path_bytes")]
     pub path: PathBuf,
     /// For a symbolic link, the raw link target; for a hard link, the path of
-    /// the file whose contents are shared.
+    /// the file within the backup whose contents are shared.
     #[serde(with = "path_bytes")]
-    pub source: PathBuf,
-    /// Whether this is a hard link rather than a symbolic one.
-    pub is_hard: bool,
+    pub target: PathBuf,
+    /// Which kind of link this is.
+    pub kind: LinkKind,
 }
 
 /// A regular file.
@@ -210,6 +260,25 @@ pub struct File {
     /// Path relative to the backup root.
     #[serde(with = "path_bytes")]
     pub path: PathBuf,
+    /// Length in bytes at the time the tree was walked. Restore asserts that
+    /// the reassembled file reaches exactly this size.
+    pub len: u64,
+    /// Platform permission bits, see [`crate::fsattr::mode_of`].
+    pub mode: u32,
+    /// Last modification time, if the platform reports one.
+    pub mtime: Option<Timestamp>,
+}
+
+/// A directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dir {
+    /// Path relative to the backup root.
+    #[serde(with = "path_bytes")]
+    pub path: PathBuf,
+    /// Platform permission bits, see [`crate::fsattr::mode_of`].
+    pub mode: u32,
+    /// Last modification time, if the platform reports one.
+    pub mtime: Option<Timestamp>,
 }
 
 /// The placement of one chunk slice within one file.
