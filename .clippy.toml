@@ -29,3 +29,8 @@ allow-dbg-in-tests = true
 # threshold stops clippy pushing towards bundling them into a struct that would
 # then have to be constructed at every call site for no benefit.
 too-many-arguments-threshold = 6
+
+# `syn` is a proc-macro crate: it runs inside rustc and is never linked into the
+# binary, so two versions of it cannot affect the artifact. See the reasoning in
+# the commit that introduced this.
+allowed-duplicate-crates = ["syn"]
