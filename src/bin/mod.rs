@@ -1,137 +1,195 @@
-use std::{
-    fs,
-    io::{self, Read, Write},
-    path::PathBuf,
-};
+use std::{error::Error as _, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use lepatch::{
-    command::{backup, restore},
-    reader::ChunkerConfig,
+    command::{Options, backup, restore},
+    index::IndexSet,
     storage,
 };
 use tracing::level_filters::LevelFilter;
-use walkdir::WalkDir;
-
-const INDEX_EXTENSION: &str = "idx";
-const BLOB_EXTENSION: &str = "bin";
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Clone, Parser)]
+#[command(name = "lepatch", version, about, long_about = None)]
 struct Args {
     #[command(subcommand)]
-    command: Commands,
-    #[arg(long, default_value_t = false)]
+    command: Command,
+
+    /// Log everything, including per-chunk tracing.
+    #[arg(long, short)]
     verbose: bool,
+
+    /// Only report warnings and errors.
+    #[arg(long, short, conflicts_with = "verbose")]
+    quiet: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum Commands {
+enum Command {
+    /// Snapshot a directory into a new version of a backup set.
     Backup {
-        source: PathBuf,
-        name: String,
+        /// Directory to back up.
+        source: std::path::PathBuf,
+        /// Base path of the backup set, e.g. `photos` creates `photos.bin`,
+        /// `photos.001.idx` and so on.
+        name: std::path::PathBuf,
     },
+    /// Rebuild a directory from a backup set.
     Restore {
-        destination: PathBuf,
-        name: String,
-        version: Option<u16>,
+        /// Directory to restore into.
+        destination: std::path::PathBuf,
+        /// Base path of the backup set to restore from.
+        name: std::path::PathBuf,
+        /// Version to restore, defaulting to the most recent usable one.
+        #[arg(long, short)]
+        version: Option<u32>,
     },
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> ExitCode {
     let args = Args::parse();
 
-    let log_level = if args.verbose {
+    init_tracing(args.verbose, args.quiet);
+
+    match run(args.command).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Printing the `Debug` form of an `io::Error` is what made failures
+            // unreadable; show the message and the chain instead.
+            eprintln!("error: {e}");
+
+            let mut cause = e.source();
+            while let Some(error) = cause {
+                eprintln!("  caused by: {error}");
+                cause = error.source();
+            }
+
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn init_tracing(verbose: bool, quiet: bool) {
+    let default = if verbose {
         LevelFilter::TRACE
+    } else if quiet {
+        LevelFilter::WARN
     } else {
         LevelFilter::INFO
     };
 
-    tracing_subscriber::fmt().with_max_level(log_level).init();
+    let filter = EnvFilter::builder()
+        .with_default_directive(default.into())
+        .from_env_lossy();
 
-    match args.command {
-        Commands::Backup { source, name } => {
-            let last_version = get_last_version(&name).unwrap_or(1);
-            let index_extension = format!("{:03}.{}", last_version + 1, INDEX_EXTENSION);
-            let index_path = PathBuf::from(&name).with_extension(index_extension);
+    let _ = fmt().with_env_filter(filter).try_init();
+}
 
-            let mut index_file = {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(index_path)?
-            };
-
-            let config = ChunkerConfig {
-                min_size: 8 * 1024,
-                avg_size: 16 * 1024,
-                max_size: 64 * 1024,
-            };
-
-            let storage_path = PathBuf::from(&name).with_extension(BLOB_EXTENSION);
-            let storage = storage::BlobFileStorage::new(storage_path).await?;
-
-            let key = backup(
-                source,
-                lepatch::command::Options {
-                    chunker: config,
-                    ..Default::default()
-                },
-                storage,
-            )
-            .await?;
-
-            index_file.write_all(key.as_bytes())?;
-            index_file.flush()?;
-        }
-        Commands::Restore {
+async fn run(command: Command) -> std::io::Result<()> {
+    match command {
+        Command::Backup { source, name } => run_backup(&source, &name).await,
+        Command::Restore {
             destination,
             name,
             version,
-        } => {
-            let version = match version {
-                Some(v) => v,
-                None => get_last_version(&name).unwrap_or(1),
-            };
-
-            let index_extension = format!("{:03}.{}", version, INDEX_EXTENSION);
-            let index_path = PathBuf::from(&name).with_extension(index_extension);
-            let mut index_file = fs::File::open(index_path)?;
-
-            let mut key = String::new();
-            index_file.read_to_string(&mut key)?;
-
-            let storage_path = PathBuf::from(&name).with_extension(BLOB_EXTENSION);
-            let storage = storage::BlobFileStorage::<false>::new(storage_path).await?;
-
-            restore(destination, key, storage).await?;
-        }
+        } => run_restore(&destination, &name, version).await,
     }
+}
+
+async fn run_backup(source: &std::path::Path, name: &std::path::Path) -> std::io::Result<()> {
+    let set = IndexSet::new(name);
+
+    // Refuse to run against a backup set another process is writing to: the
+    // blob store is append-only and shared, so interleaved writes from two
+    // processes would corrupt both.
+    let _lock = set.lock()?;
+
+    let versions = set.versions()?;
+
+    // Reuse the newest usable snapshot so unchanged chunks are not re-uploaded.
+    let base_key = versions.latest.as_ref().map(|(_, key)| key.clone());
+    if base_key.is_none() {
+        tracing::debug!(name = %set.base().display(), "no earlier version to deduplicate against");
+    }
+
+    let reservation = set.reserve()?;
+    let version = reservation.version();
+
+    let blob_path = set.blob_path();
+    let lock_path = set.lock_path();
+
+    // The store and the lock live next to the tree being read and grow while it
+    // is being read, so they must not be swept into the backup.
+    let options = Options {
+        base_key,
+        exclude: vec![blob_path.clone(), lock_path.clone()],
+        ..Options::default()
+    };
+
+    let store = storage::BlobFileStorage::<true>::new(&blob_path).await?;
+
+    let key = match backup(source, options, store).await {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!(
+                name = %set.base().display(),
+                version,
+                "backup failed; leaving no index behind"
+            );
+            return Err(e);
+        }
+    };
+
+    reservation.commit(&key)?;
+
+    tracing::info!(
+        name = %set.base().display(),
+        version,
+        store = %blob_path.display(),
+        "backup complete"
+    );
 
     Ok(())
 }
 
-fn get_last_version(name: &str) -> Option<u16> {
-    WalkDir::new(".")
-        .max_depth(1)
-        .into_iter()
-        .filter_map(|v| v.ok())
-        .filter(|v| v.file_type().is_file())
-        .filter_map(|v| {
-            let filename = v.file_name().to_str()?.split('.').collect::<Vec<_>>();
-            match filename.as_slice() {
-                [basename, num, INDEX_EXTENSION] => {
-                    if *basename != name {
-                        return None;
-                    }
-                    if num.len() != 3 {
-                        return None;
-                    }
-                    let num: u16 = num.parse().ok()?;
-                    Some(num)
-                }
-                _ => None,
-            }
-        })
-        .max()
+async fn run_restore(
+    destination: &std::path::Path,
+    name: &std::path::Path,
+    version: Option<u32>,
+) -> std::io::Result<()> {
+    let set = IndexSet::new(name);
+    let versions = set.versions()?;
+
+    let version = match (version, &versions.latest) {
+        (Some(version), _) => version,
+        (None, Some((version, _))) => *version,
+        (None, None) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no usable snapshot found for {} (looked for {}",
+                    set.base().display(),
+                    set.directory().display()
+                ),
+            ));
+        }
+    };
+
+    let key = set.read_key(version)?;
+
+    tracing::info!(
+        name = %set.base().display(),
+        version,
+        destination = %destination.display(),
+        "restoring"
+    );
+
+    let store = storage::BlobFileStorage::<false>::new(set.blob_path()).await?;
+
+    restore(destination, key, store).await?;
+
+    tracing::info!("restore complete");
+
+    Ok(())
 }
