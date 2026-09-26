@@ -2,10 +2,19 @@
 name = "lepatch"
 version = "0.1.0"
 edition = "2024"
-license-file = "LICENSE"
+rust-version = "1.85"
+# The bundled LICENSE is GPL-2.0 with the "or any later version" option.
+license = "GPL-2.0-or-later"
+description = "Content-defined-chunking backup tool with deduplicated, versioned snapshots"
+readme = "README.md"
+keywords = ["backup", "deduplication", "content-addressed", "incremental"]
+categories = ["command-line-utilities", "filesystem"]
+# The on-disk format is not stable yet, so this is not published. Set
+# `repository` alongside flipping this when it is.
+publish = false
 
 [[bin]]
-name = "main"
+name = "lepatch"
 path = "src/bin/mod.rs"
 
 [dependencies]
