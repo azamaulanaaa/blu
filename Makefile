@@ -8,13 +8,13 @@
 #
 #   git config core.hooksPath .githooks
 
-.PHONY: check lint lint-quick fmt test msrv doc clean
+.PHONY: check lint lint-quick fmt test msrv deps doc clean
 
 # Read the claimed floor from the manifest rather than repeating it here, so the
 # two cannot drift apart.
 MSRV := $(shell sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
 
-check: lint test msrv doc
+check: lint test msrv deps doc
 
 lint: fmt clippy
 
@@ -35,6 +35,12 @@ test:
 msrv:
 	@echo "checking against the declared MSRV ($(MSRV))"
 	cargo +$(MSRV) check --all-targets --all-features --locked
+
+# Needs the toolchain once: cargo install cargo-deny
+deps:
+	@command -v cargo-deny >/dev/null 2>&1 \
+		|| { echo "cargo-deny is not installed: cargo install cargo-deny"; exit 1; }
+	cargo deny check
 
 doc:
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features

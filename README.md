@@ -99,6 +99,7 @@ $ make check      # everything below
 $ make lint       # cargo fmt --check + clippy
 $ make test       # the test suite
 $ make msrv       # builds against the declared minimum Rust version
+$ make deps       # cargo deny: advisories, licences, sources
 $ make doc        # rustdoc with warnings denied
 ```
 
