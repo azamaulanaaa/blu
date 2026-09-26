@@ -63,18 +63,19 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     };
 
     let root = root.as_ref();
+    let storage = Arc::new(storage);
 
     // Nothing below can detect damaged chunk data on its own — a short read
     // would just leave a file quietly filled with the wrong bytes — so the
     // whole snapshot is checked against the hashes recorded at backup time
     // before a single byte is written.
-    super::verify::check(&snapshot, &storage)
+    super::verify::check(&snapshot, Arc::clone(&storage))
         .await
         .into_result()
         .map_err(|e| io::Error::new(e.kind(), format!("refusing to restore {key}: {e}")))?;
 
     restore_directories(root, &snapshot).await?;
-    restore_files(root, &snapshot, storage).await?;
+    restore_files(root, &snapshot, Arc::clone(&storage)).await?;
     restore_links(root, &snapshot)?;
     restore_attributes(root, &snapshot)?;
 
@@ -98,7 +99,7 @@ async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()>
 async fn restore_files<S: storage::StorageGet + 'static>(
     root: &Path,
     snapshot: &Snapshot,
-    storage: S,
+    storage: Arc<S>,
 ) -> io::Result<()> {
     // Group the chunk slices by the file they belong to so that each
     // destination is opened once rather than once per slice.
@@ -115,7 +116,6 @@ async fn restore_files<S: storage::StorageGet + 'static>(
     }
 
     let chunks = Arc::new(snapshot.chunks.clone());
-    let storage = Arc::new(storage);
     let concurrency = restore_concurrency();
 
     let mut writing = JoinSet::new();
