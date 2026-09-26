@@ -6,19 +6,8 @@ use std::fs;
 
 use lepatch::{
     command::{Report, restore, verify},
-    storage::{BlobFileStorage, StorageGet},
+    storage::BlobFileStorage,
 };
-
-async fn snapshot(blob: &std::path::Path, key: &str) -> lepatch::metadata::Snapshot {
-    use tokio::io::AsyncReadExt;
-
-    let storage = BlobFileStorage::<false>::new(blob).await.unwrap();
-    let mut reader = storage.get(key).await.unwrap();
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await.unwrap();
-
-    lepatch::metadata::Snapshot::from_bytes(&buffer).unwrap()
-}
 
 /// Non-uniform content, so the chunker finds real boundaries and the chunks
 /// differ from one another. A run of identical bytes would be deduplicated
@@ -93,10 +82,11 @@ async fn a_store_truncated_before_its_snapshot_is_reported() {
     let storage = BlobFileStorage::<false>::new(&blob).await.unwrap();
     let error = verify(key, storage).await.unwrap_err();
 
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    // Caught by the store's bounds check before the snapshot is even decoded.
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     assert!(
-        error.to_string().contains("truncated"),
-        "the error should name the cause, got: {error}"
+        error.to_string().contains("the store is only"),
+        "the error should explain the store is too short, got: {error}"
     );
 }
 
