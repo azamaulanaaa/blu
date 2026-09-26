@@ -234,8 +234,20 @@ impl Chunker {
     pub fn new(paths: Vec<PathBuf>, config: ChunkerConfig) -> io::Result<Self> {
         let registry = Arc::new(FileRegistry::new(paths.iter())?);
 
+        // The chunker takes its bounds as `usize`, where the snapshot format
+        // stores chunk lengths as `u32`. Widening is exact in this direction on
+        // every platform that can hold a `u32`, and the reverse — a chunk longer
+        // than `u32::MAX` — is caught in `next`, where it can still be reported
+        // against the chunk that caused it.
+        let widen = |value: u32| usize::try_from(value).unwrap_or(usize::MAX);
+
         let stream = GlobalStream::new(paths.iter());
-        let cdc = StreamCDC::new(stream, config.min_size, config.avg_size, config.max_size);
+        let cdc = StreamCDC::new(
+            stream,
+            widen(config.min_size),
+            widen(config.avg_size),
+            widen(config.max_size),
+        );
 
         Ok(Self {
             registry,
