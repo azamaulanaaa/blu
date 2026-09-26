@@ -50,8 +50,12 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
     let paths = WalkDir::new(&root)
         .sort_by_file_name()
         .into_iter()
-        .filter_map(|v| v.map(|v| v.into_path()).ok())
-        .collect::<Vec<_>>();
+        .map(|entry| {
+            entry
+                .map(walkdir::DirEntry::into_path)
+                .map_err(|e| io::Error::other(format!("failed to walk backup root: {e}")))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
 
     let paths = paths
         .into_iter()
