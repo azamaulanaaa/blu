@@ -183,15 +183,9 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
     let chunker = reader::Chunker::new(paths, config)?;
 
     for chunk in chunker {
-        let mut chunk = chunk?;
+        let chunk = chunk?;
 
-        let buffer = {
-            let mut buffer = Vec::new();
-            chunk.reader.read_to_end(&mut buffer).await?;
-            buffer
-        };
-
-        let hash = *blake3::hash(&buffer).as_bytes();
+        let hash = *blake3::hash(&chunk.data).as_bytes();
 
         let chunk_index = if let Some(&index) = emitted.get(&hash) {
             // Already emitted by this run, or carried over from the base
@@ -201,8 +195,17 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
             let chunk = if let Some(chunk) = base_chunks.get(&hash) {
                 chunk.clone()
             } else {
-                let len = buffer.len() as u64;
-                let location = storage.put(Box::new(Cursor::new(buffer)), len).await?;
+                let len = u64::try_from(chunk.data.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "chunk of {} bytes does not fit in a blob length",
+                            chunk.data.len()
+                        ),
+                    )
+                })?;
+
+                let location = storage.put(Box::new(Cursor::new(chunk.data)), len).await?;
 
                 metadata::Chunk { hash, location }
             };

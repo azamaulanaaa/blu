@@ -9,8 +9,8 @@ use tracing::instrument;
 use crate::{
     fsattr,
     metadata::{self, FileChunk, Snapshot},
-    reader::{self, StreamReadSeeker},
-    storage, writer,
+    slice,
+    storage::{self, StreamReadSeeker},
 };
 
 /// Reassemble the snapshot identified by `key` under `root`.
@@ -145,8 +145,8 @@ async fn restore_files<S: storage::StorageGet>(
                 .seek(io::SeekFrom::Start(file_chunk.chunk_offset.into()))
                 .await?;
 
-            let mut source = reader::SliceAsyncReader::new(source, length);
-            let mut sink = writer::SliceAsyncWriter::new(&mut handle, length);
+            let mut source = slice::SliceAsyncReader::new(source, length);
+            let mut sink = slice::SliceAsyncWriter::new(&mut handle, length);
 
             let written = tokio::io::copy(&mut source, &mut sink).await?;
 

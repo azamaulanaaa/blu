@@ -5,14 +5,14 @@ use std::io::Cursor;
 use lepatch::storage::{BlobFileStorage, StorageGet, StoragePut};
 use tokio::io::AsyncReadExt;
 
-fn reader(bytes: Vec<u8>) -> lepatch::reader::StreamReadSeeker {
+fn reader(bytes: Vec<u8>) -> lepatch::storage::StreamReadSeeker {
     Box::new(Cursor::new(bytes))
 }
 
 /// `StreamReadSeeker` is not `Debug`, so `unwrap_err` is not available on
 /// `StorageGet::get`.
 fn expect_get_error(
-    error: Result<lepatch::reader::StreamReadSeeker, std::io::Error>,
+    error: Result<lepatch::storage::StreamReadSeeker, std::io::Error>,
 ) -> std::io::Error {
     match error {
         Ok(_) => panic!("expected get to fail, but it succeeded"),

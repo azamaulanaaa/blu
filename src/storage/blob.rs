@@ -14,8 +14,8 @@ use tokio::{
 use tracing::instrument;
 
 use crate::{
-    reader::{self, SliceAsyncReader},
-    storage,
+    slice::SliceAsyncReader,
+    storage::{self, StreamReadSeeker},
 };
 
 /// Layout version of a blob key, so a key written by an incompatible build is
@@ -109,7 +109,7 @@ impl<const WRITE: bool> BlobFileStorage<WRITE> {
 #[async_trait]
 impl<const WRITE: bool> storage::StorageGet for BlobFileStorage<WRITE> {
     #[instrument(skip_all, err)]
-    async fn get(&self, key: &str) -> io::Result<reader::StreamReadSeeker> {
+    async fn get(&self, key: &str) -> io::Result<StreamReadSeeker> {
         let entry = Self::decode(key)?;
 
         let file = fs::File::open(&self.file_path).await?;
@@ -149,7 +149,7 @@ impl storage::StoragePut for BlobFileStorage<true> {
     /// truncated blob that nothing would ever be able to read back whole, and a
     /// long one would silently misalign every later blob's recorded offset, so
     /// both are rejected.
-    async fn put(&self, mut reader: reader::StreamReadSeeker, len: u64) -> io::Result<String> {
+    async fn put(&self, mut reader: StreamReadSeeker, len: u64) -> io::Result<String> {
         let _guard = self.write_lock.lock().await;
 
         let mut file = fs::OpenOptions::new()

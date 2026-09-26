@@ -7,8 +7,7 @@ use tracing::instrument;
 
 use crate::{
     metadata::Snapshot,
-    reader::StreamReadSeeker,
-    storage::{self, StorageGet},
+    storage::{self, StorageGet, StreamReadSeeker},
 };
 
 /// A chunk that could not be read back, or whose contents did not match the

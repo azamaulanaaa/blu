@@ -40,5 +40,5 @@ pub mod fsattr;
 pub mod index;
 pub mod metadata;
 pub mod reader;
+pub mod slice;
 pub mod storage;
-pub mod writer;

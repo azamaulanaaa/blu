@@ -9,28 +9,13 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     fs::File,
-    io::{self, Cursor, Read},
+    io::{self, Read},
     path::PathBuf,
-    pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
 };
 
 use fastcdc::v2020::StreamCDC;
-use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tracing::instrument;
-
-/// A stream that is both [`AsyncRead`] and [`AsyncSeek`].
-///
-/// This exists because `trait_alias` is still unstable. Every type that is both
-/// implements it automatically, so it is never implemented by hand; use
-/// [`StreamReadSeeker`] rather than naming it.
-pub trait AsyncReadSeek: AsyncRead + AsyncSeek {}
-
-impl<T: AsyncRead + AsyncSeek + ?Sized> AsyncReadSeek for T {}
-
-/// A boxed, seekable async stream, as handed out by a storage backend.
-pub type StreamReadSeeker = Box<dyn AsyncReadSeek + Unpin + Send>;
 
 /// The part of one file that a chunk covers.
 #[derive(Debug, Clone)]
@@ -49,14 +34,22 @@ pub struct Chunk {
     /// means the chunk spans a file boundary.
     pub sources: Vec<ChunkSource>,
     /// The chunk's contents.
-    pub reader: StreamReadSeeker,
+    ///
+    /// Held directly rather than behind a reader: the chunker has already
+    /// materialised these bytes to find the boundary, so wrapping them in a
+    /// `Cursor` and reading them straight back out again was a copy of every
+    /// byte of the tree for no benefit.
+    pub data: Vec<u8>,
 }
 
 impl Debug for Chunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `StreamReadSeeker` is a trait object, so only the shape is shown.
+        // The contents are left out on purpose: a `Debug` that dumped every
+        // chunk of a backup would be a way to print the user's data, and its
+        // length says everything useful anyway.
         f.debug_struct("Chunk")
             .field("sources", &self.sources)
+            .field("len", &self.data.len())
             .finish_non_exhaustive()
     }
 }
@@ -280,157 +273,9 @@ impl Iterator for Chunker {
 
         let sources = self.registry.resolve_chunk(cdc_chunk.offset, length);
 
-        let reader = Cursor::new(cdc_chunk.data);
-        let reader = Box::new(reader);
-
-        Some(Ok(Chunk { sources, reader }))
-    }
-}
-
-/// An [`AsyncRead`] over at most the first `limit` bytes of `inner`.
-///
-/// Reads stop at the limit, which is reported as end of stream in the usual way
-/// — a `Ready(Ok(()))` that fills nothing.
-pub struct SliceAsyncReader<R> {
-    inner: R,
-    position: u64,
-    limit: u64,
-}
-
-impl<R> Debug for SliceAsyncReader<R> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Deliberately not derived: `R` is an arbitrary stream type, and
-        // requiring `R: Debug` here would be a needless bound.
-        f.debug_struct("SliceAsyncReader")
-            .field("position", &self.position)
-            .field("limit", &self.limit)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Size of the stack scratch buffer used to stage bytes out of the inner
-/// reader.
-///
-/// The inner reader cannot be handed the caller's buffer directly, because only
-/// this type knows how much of it is within the limit. Matches
-/// `tokio::io::copy`'s own buffer size so a copy through this reader does not
-/// split every read in two.
-const SCRATCH: usize = 8 * 1024;
-
-impl<R> SliceAsyncReader<R> {
-    /// Read at most `limit` bytes from `reader`.
-    #[instrument(level = "trace", skip(reader))]
-    pub fn new(reader: R, limit: u64) -> Self {
-        Self {
-            inner: reader,
-            position: 0,
-            limit,
-        }
-    }
-
-    /// How many of the permitted bytes are left.
-    #[must_use]
-    pub fn remaining(&self) -> u64 {
-        self.limit.saturating_sub(self.position)
-    }
-}
-
-impl<R> AsyncRead for SliceAsyncReader<R>
-where
-    R: AsyncRead + Unpin,
-{
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        // `wanted` is bounded by `self.remaining()`, a `u64`, so narrowing it to
-        // `usize` is exact on every target that can hold a `u32` limit.
-        let offered = u64::try_from(buf.remaining()).unwrap_or(u64::MAX);
-        let wanted = usize::try_from(self.remaining().min(offered)).unwrap_or(0);
-
-        // The caller has no room. Polling the inner reader with an empty buffer
-        // would make it report end of stream, which it would then keep doing —
-        // so the inner reader is left untouched and only the caller's
-        // zero-length request is answered.
-        if wanted == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        let mut scratch = [0u8; SCRATCH];
-        let limit = std::cmp::min(wanted, scratch.len());
-
-        let mut temp = ReadBuf::new(&mut scratch[..limit]);
-
-        match Pin::new(&mut self.inner).poll_read(cx, &mut temp) {
-            Poll::Ready(Ok(())) => {
-                let filled = temp.filled();
-                let n = filled.len();
-
-                if n > 0 {
-                    buf.put_slice(filled);
-                    self.position += n as u64;
-                }
-
-                Poll::Ready(Ok(()))
-            }
-            other => other,
-        }
-    }
-}
-
-impl<R> AsyncSeek for SliceAsyncReader<R>
-where
-    R: AsyncSeek + Unpin,
-{
-    /// Seeks are per slice rather than per read, so tracing them is cheap.
-    #[instrument(level = "trace", skip(self), err)]
-    fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
-        let new_position = match position {
-            io::SeekFrom::Start(n) => n,
-            io::SeekFrom::Current(n) => self
-                .position
-                .checked_add_signed(n)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))?,
-            io::SeekFrom::End(n) => self
-                .limit
-                .checked_add_signed(n)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start"))?,
-        };
-
-        if new_position > self.limit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek outside limit",
-            ));
-        }
-
-        // Move the inner reader by a relative delta rather than an absolute
-        // position, because its own origin is wherever the caller left it.
-        let delta = i128::from(new_position) - i128::from(self.position);
-        self.position = new_position;
-
-        let delta = i64::try_from(delta).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek delta is too large to express as a relative seek",
-            )
-        })?;
-
-        Pin::new(&mut self.inner).start_seek(io::SeekFrom::Current(delta))
-    }
-
-    #[instrument(level = "trace", skip(self, cx), ret)]
-    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
-        let result = Pin::new(&mut self.inner).poll_complete(cx);
-
-        match result {
-            Poll::Ready(Ok(_n)) => Poll::Ready(Ok(self.position)),
-            other => other,
-        }
+        Some(Ok(Chunk {
+            sources,
+            data: cdc_chunk.data,
+        }))
     }
 }
