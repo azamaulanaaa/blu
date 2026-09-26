@@ -14,6 +14,7 @@ use tracing::instrument;
 use crate::{
     fsattr,
     metadata::{self, FileChunk, Snapshot},
+    progress::Progress,
     slice,
     storage::{self, StreamReadSeeker},
 };
@@ -210,6 +211,13 @@ async fn restore_files<S: storage::StorageGet + 'static>(
 
     let chunks = Arc::new(snapshot.chunks.clone());
     let concurrency = restore_concurrency();
+    let total_files = u64::try_from(snapshot.files.len()).unwrap_or(0);
+
+    // Unlike a backup, the work is known up front: the snapshot says how many
+    // files there are, so this one can say how far along it is.
+    let mut progress = Progress::new("restore");
+    progress.set("files", total_files);
+    progress.report();
 
     let mut writing = JoinSet::new();
     let mut next = 0usize;
@@ -243,8 +251,15 @@ async fn restore_files<S: storage::StorageGet + 'static>(
             Some(Err(join)) => {
                 return Err(io::Error::other(format!("a restore task failed: {join}")));
             }
-            // A file that finished, or an empty set, both mean keep going.
-            _ => {}
+            // A finished file reports how many bytes it actually wrote, which is
+            // what the rate is computed from.
+            Some(Ok(Ok(written))) => {
+                progress.add("done", 1);
+                progress.add("written", written);
+                progress.report();
+            }
+            // An empty set means keep going.
+            None => {}
         }
     }
 
@@ -261,7 +276,7 @@ struct RestoreJob {
 }
 
 /// Create one file at its final length and write its chunk slices into it.
-async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) -> io::Result<()> {
+async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) -> io::Result<u64> {
     let RestoreJob {
         path,
         file,
@@ -340,7 +355,8 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
     // hole of zeroes in the middle of the file.
     handle.set_len(file.len).await?;
 
-    Ok(())
+    // What the file turned out to be, for the progress line.
+    Ok(file.len)
 }
 
 /// Recreate hard links and symbolic links.

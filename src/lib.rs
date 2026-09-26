@@ -39,6 +39,7 @@ pub mod command;
 pub mod fsattr;
 pub mod index;
 pub mod metadata;
+pub mod progress;
 pub mod reader;
 pub mod slice;
 pub mod storage;

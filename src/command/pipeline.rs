@@ -35,7 +35,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::{command::backup::index_to_u32, metadata, reader, storage};
+use crate::{command::backup::index_to_u32, metadata, progress::Progress, reader, storage};
 
 /// A chunk that has been read and hashed, waiting to be stored.
 struct Pending {
@@ -171,6 +171,7 @@ impl<S: storage::StoragePut + storage::StorageGet + 'static> Pipeline<S> {
         paths: Vec<PathBuf>,
         config: reader::ChunkerConfig,
         concurrency: usize,
+        files: u64,
         snapshot: &mut metadata::Snapshot,
     ) -> io::Result<()> {
         // A bounded channel between the two halves: a slow store throttles the
@@ -179,7 +180,7 @@ impl<S: storage::StoragePut + storage::StorageGet + 'static> Pipeline<S> {
 
         let producer = tokio::task::spawn_blocking(move || produce(paths, config, tx));
 
-        let committed = commit(Arc::clone(&self), &mut rx, concurrency, snapshot).await;
+        let committed = commit(Arc::clone(&self), &mut rx, concurrency, snapshot, files).await;
 
         if let Err(e) = committed {
             // Dropping the receiver makes the producer's next send fail, so it
@@ -211,6 +212,7 @@ async fn commit<S: storage::StoragePut + 'static>(
     rx: &mut mpsc::Receiver<Pending>,
     concurrency: usize,
     snapshot: &mut metadata::Snapshot,
+    files: u64,
 ) -> io::Result<()> {
     let mut in_flight = JoinSet::new();
 
@@ -224,6 +226,16 @@ async fn commit<S: storage::StoragePut + 'static>(
     // the same content reuses it instead of being stored again.
     let mut index_of: HashMap<[u8; 32], u32> = HashMap::new();
 
+    // What the run has done so far. The committer sees every chunk exactly
+    // once, so it is the one place that can count them all.
+    //
+    // The file count comes from the walk and is the only thing known before any
+    // content has been read // so it is what the opening line says. A first line
+    // reporting one chunk and nineteen kilobytes would be true and useless.
+    let mut progress = Progress::new("backup");
+    progress.set("files", files);
+    progress.report();
+
     let mut producer_finished = false;
 
     loop {
@@ -233,6 +245,10 @@ async fn commit<S: storage::StoragePut + 'static>(
                 producer_finished = true;
                 break;
             };
+
+            progress.add("chunks", 1);
+            progress.add("read", u64::try_from(pending.data.len()).unwrap_or(0));
+            progress.report();
 
             in_flight.spawn(store_chunk(pending, Arc::clone(&pipeline)));
         }
@@ -254,6 +270,13 @@ async fn commit<S: storage::StoragePut + 'static>(
                     &mut index_of,
                     snapshot,
                 )?;
+
+                // Distinct content is what actually costs storage, so it is the
+                // number worth watching on a tree that deduplicates well.
+                progress.set(
+                    "distinct",
+                    u64::try_from(snapshot.chunks.len()).unwrap_or(0),
+                );
             }
             // The first failure ends the run; the rest of the stores are dropped
             // with it, and the receiver goes with them.

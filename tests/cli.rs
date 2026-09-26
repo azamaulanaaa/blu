@@ -441,3 +441,68 @@ fn an_unknown_subcommand_is_rejected() {
     let output = lepatch(dir.path(), &["frobnicate"]);
     assert!(!output.status.success());
 }
+
+#[test]
+fn a_run_says_that_it_is_making_progress() {
+    // A backup of a real dataset takes minutes to hours. Until it reported
+    // anything at all, a user watching a silent terminal could not tell a
+    // working backup from a hung one, and the first thing they would do about
+    // that is kill it.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
+    fs::write(source.join("b.bin"), noisy(200_000)).unwrap();
+
+    let backup = ok(dir.path(), &["backup", "source", "store"]);
+    assert!(
+        backup.contains("in progress"),
+        "a backup said nothing while it ran:\n{backup}"
+    );
+    // The opening line is the file count, which the walk knows before any
+    // content has been read — the only thing worth saying at that point.
+    assert!(
+        backup.contains("files=2"),
+        "the opening progress line should report the file count:\n{backup}"
+    );
+
+    let restored = ok(dir.path(), &["restore", "out", "store"]);
+    assert!(
+        restored.contains("in progress"),
+        "a restore said nothing while it ran:\n{restored}"
+    );
+
+    let verified = ok(dir.path(), &["verify", "store"]);
+    assert!(
+        verified.contains("in progress"),
+        "a verify said nothing while it ran:\n{verified}"
+    );
+}
+
+#[test]
+fn progress_reporting_can_be_turned_off() {
+    // Someone reading only the summary lines should be able to have them, and
+    // the running commentary is opt-out rather than something to filter out of
+    // the whole log.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(100_000)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        .current_dir(dir.path())
+        .env("RUST_LOG", "lepatch=info,lepatch::progress=warn")
+        .args(["backup", "source", "store"])
+        .output()
+        .expect("failed to run the lepatch binary");
+
+    let text = stdout(&output);
+    assert!(
+        !text.contains("in progress"),
+        "progress was not silenced:\n{text}"
+    );
+    assert!(
+        text.contains("backup complete"),
+        "but the summary line should survive:\n{text}"
+    );
+}

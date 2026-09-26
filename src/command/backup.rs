@@ -160,10 +160,15 @@ pub async fn backup<
         .await
         .map_err(|join| io::Error::other(format!("the walk thread failed: {join}")))??;
 
+    // Counted before the index is moved into the pipeline, for its opening
+    // progress line: the walk knows how many files there are before a single one
+    // has been read.
+    let files = u64::try_from(file_index.len()).unwrap_or(0);
+
     let pipeline = pipeline::Pipeline::new(root.to_path_buf(), file_index, base_chunks, storage);
 
     Arc::clone(&pipeline)
-        .run(paths, config, concurrency, &mut snapshot)
+        .run(paths, config, concurrency, files, &mut snapshot)
         .await?;
 
     // The chunker stats each file when it is registered and reads it again
