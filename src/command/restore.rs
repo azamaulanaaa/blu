@@ -1,6 +1,6 @@
 use std::{
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
@@ -74,6 +74,12 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         .into_result()
         .map_err(|e| io::Error::new(e.kind(), format!("refusing to restore {key}: {e}")))?;
 
+    // And the paths it would write are checked here, for the same reason and
+    // with the same guarantee: a snapshot is untrusted input, and nothing should
+    // be created on disk until it is known to be safe to create it.
+    check_paths(&snapshot)
+        .map_err(|e| io::Error::new(e.kind(), format!("refusing to restore {key}: {e}")))?;
+
     restore_directories(root, &snapshot).await?;
     restore_files(root, &snapshot, Arc::clone(&storage)).await?;
     restore_links(root, &snapshot)?;
@@ -82,10 +88,97 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     Ok(())
 }
 
+/// Resolve a path recorded in a snapshot against the restore root, refusing
+/// anything that would land outside it.
+///
+/// A snapshot is a blob in a file that gets synced, shared and backed up like
+/// anything else, so its contents are untrusted input: a tampered or hostile
+/// store would otherwise choose what a restore writes and where. Every recorded
+/// path goes through here — directories, files, and both halves of a link — and
+/// the check is on the *recorded* path, before it is joined, because a `..`
+/// buried in the middle is just as effective as one at the front.
+///
+/// Only `..` and absolute paths are rejected. `.` and repeated separators are
+/// harmless and normalise to the same place, so there is no reason to refuse
+/// them.
+fn resolve(root: &Path, recorded: &Path, kind: &str) -> io::Result<PathBuf> {
+    if recorded.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the snapshot records {kind} with an empty path"),
+        ));
+    }
+
+    // On Windows this also covers a drive or UNC prefix, which `is_absolute`
+    // would catch but a bare `C:foo` would not.
+    for component in recorded.components() {
+        match component {
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{kind} {} steps outside the restore root",
+                        recorded.display()
+                    ),
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{kind} {} is an absolute path, which a restore cannot place",
+                        recorded.display()
+                    ),
+                ));
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+
+    Ok(root.join(recorded))
+}
+
+/// Check every path a snapshot records, before anything is written.
+///
+/// The verify pass already refuses a damaged store before a single byte is
+/// written, and a hostile snapshot deserves the same courtesy: finding out that
+/// entry 900,001 of a million escapes the destination after writing the other
+/// 900,000 would leave a tree that is neither the old one nor the new one.
+fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
+    let probe = Path::new(".");
+
+    for dir in &snapshot.dirs {
+        resolve(probe, &dir.path, "a directory")?;
+    }
+
+    for file in &snapshot.files {
+        resolve(probe, &file.path, "a file")?;
+    }
+
+    for link in &snapshot.links {
+        resolve(probe, &link.path, "a link")?;
+
+        // A hard link's target names another entry in the tree, so it is
+        // resolved against the root and has to stay inside it.
+        //
+        // A symbolic link's target does not: it is written into the link
+        // verbatim and resolved by whoever follows it later, wherever it
+        // happens to point. A tree containing a link to `/etc/passwd` is an
+        // ordinary tree, and reproducing it faithfully is the whole job — so
+        // refusing those would break restoring real backups to accommodate a
+        // threat that does not apply to them.
+        if link.kind == metadata::LinkKind::Hard {
+            resolve(probe, &link.target, "a hard link target")?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Create every recorded directory, including ones that hold no files.
 async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     for dir in &snapshot.dirs {
-        fs_async::create_dir_all(root.join(&dir.path)).await?;
+        fs_async::create_dir_all(resolve(root, &dir.path, "a directory")?).await?;
     }
 
     Ok(())
@@ -125,7 +218,7 @@ async fn restore_files<S: storage::StorageGet + 'static>(
         // Keep as many files in flight as asked for.
         while next < snapshot.files.len() && writing.len() < concurrency {
             let job = RestoreJob {
-                path: root.join(&snapshot.files[next].path),
+                path: resolve(root, &snapshot.files[next].path, "a file")?,
                 file: snapshot.files[next].clone(),
                 slices: std::mem::take(&mut slices[next]),
                 chunks: Arc::clone(&chunks),
@@ -182,6 +275,17 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
     if let Some(parent) = path.parent() {
         fs_async::create_dir_all(parent).await?;
     }
+
+    // Anything already at this path is removed before the file is created,
+    // rather than being opened and truncated in place.
+    //
+    // A restore merges into its destination, so on a second run the path may
+    // hold a symbolic link from the first — and opening a file for writing
+    // *follows* a symbolic link. A tree that once had `link -> /etc` would end
+    // up with the next restore writing through `link` and truncating whatever
+    // it pointed at. Links are already removed before they are recreated; this
+    // is the same rule applied to files, and it closes the same hole.
+    remove_existing(&path)?;
 
     let mut handle = fs_async::OpenOptions::new()
         .write(true)
@@ -242,14 +346,14 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
 /// Recreate hard links and symbolic links.
 fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     for link in &snapshot.links {
-        let path = root.join(&link.path);
+        let path = resolve(root, &link.path, "a link")?;
 
         // Restoring over an existing tree must not trip over the old entry.
         remove_existing(&path)?;
 
         match link.kind {
             metadata::LinkKind::Hard => {
-                let target = root.join(&link.target);
+                let target = resolve(root, &link.target, "a hard link target")?;
                 fsattr::hard_link(&target, &path).map_err(|e| {
                     io::Error::new(
                         e.kind(),
@@ -283,12 +387,12 @@ fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
 /// Apply permission bits and modification times, files before directories.
 fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     for file in &snapshot.files {
-        let path = root.join(&file.path);
+        let path = resolve(root, &file.path, "a file")?;
         apply(&path, file.mode, file.mtime)?;
     }
 
     for dir in &snapshot.dirs {
-        let path = root.join(&dir.path);
+        let path = resolve(root, &dir.path, "a directory")?;
         apply(&path, dir.mode, dir.mtime)?;
     }
 
