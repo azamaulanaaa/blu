@@ -1,69 +1,82 @@
-# Dependency policy for `cargo deny`.
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
 #
-# A backup tool is only as trustworthy as the code it links, so the dependency
-# graph is checked rather than assumed: known advisories, licences, duplicate
-# versions, and sources.
+# `mise run licenses`, `mise run advisories` and `mise run bans` each run one of
+# these checks, and CI runs all three as separate jobs, so a failure names the
+# check that failed instead of arriving as one aggregate error.
+#
+# `cargo deny check bans` is the graph-level half of dependency hygiene;
+# clippy's `cargo` lint group is the source-level half, catching a wildcard
+# requirement or missing crate metadata before it is ever resolved.
 
 [graph]
-# Only the crates actually built, not every target's worth of dependencies.
 all-features = true
-no-default-features = false
+
+[licenses]
+version = 2
+# Licences observed across the dependency graph. Anything not listed — copyleft,
+# proprietary, unknown — fails the check and has to be reviewed before it is
+# added, rather than waved through by a wildcard entry.
+allow = [
+    # This crate's own licence, which the check also evaluates.
+    "GPL-2.0-or-later",
+    "MIT",
+    # constant_time_eq
+    "MIT-0",
+    "Apache-2.0",
+    # blake3
+    "Apache-2.0 WITH LLVM-exception",
+    # arrayref
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # unicode-ident
+    "Unicode-3.0",
+    # memchr, walkdir, same-file, winapi-util
+    "Unlicense",
+    "CC0-1.0",
+]
+# Some crates ship licence text without an SPDX expression. 0.9 rather than the
+# usual 0.8: a file this tool writes has to stay readable, so an unrecognised
+# licence is worth a second look.
+confidence-threshold = 0.9
+
+[bans]
+# Warn rather than fail on duplicate versions. Several transitive dependencies
+# ship more than one version of a shared crate, and collapsing those is not
+# worth the effort at this size. The count is still reported, so a regression
+# is visible.
+multiple-versions = "warn"
+# A wildcard requirement resolves to whatever is newest at install time, which
+# is not a reviewable decision and can change without a commit.
+wildcards = "deny"
+allow-wildcard-paths = false
 
 [advisories]
 version = 2
-# A vulnerability with no fixed version is still worth failing on: this is a
-# tool that reads untrusted directory trees.
+# Denied rather than warned: a yanked release is one whose author has asked for
+# it not to be used, and a backup tool has no business resolving to one. This is
+# stricter than a warn default on purpose.
 yanked = "deny"
 
 # RUSTSEC-2025-0141: the bincode team ceased development permanently after a
 # doxxing incident. Version 1.3.3 is considered complete, so there is no fix
-# coming and no CVE either — the crate is simply never going to change again.
+# coming and no vulnerability either — the crate is simply never going to change
+# again.
 #
-# It is depended on for the snapshot encoding, which is the one place where
-# depending on someone else's stability policy is uncomfortable: a backup has to
-# stay readable for as long as the backups exist.
-#
-# The exposure is contained. `Snapshot::to_bytes` and `Snapshot::from_bytes` are
-# the only code that touches bincode, and both sit behind the explicit magic
-# prefix and `FORMAT_VERSION` header, so replacing the encoding — with bincode
-# 2, or with something hand-written — is a change to two functions plus a
-# version bump. Old snapshots stay readable by keeping the old decoder around
-# until a migration runs.
+# It is depended on for the snapshot encoding, which is the one place a backup
+# cannot afford to be left behind by someone else's policy. The exposure is
+# contained: `Snapshot::to_bytes` and `Snapshot::from_bytes` are the only code
+# that touches bincode, and both sit behind the explicit magic prefix and
+# `FORMAT_VERSION` header, so replacing the encoding — with bincode 2, or with
+# something hand-written — is a change to two functions plus a version bump.
+# Old snapshots stay readable by keeping the old decoder until a migration runs.
 #
 # Remove this entry when that replacement lands.
 ignore = ["RUSTSEC-2025-0141"]
 
-[licenses]
-version = 2
-# GPL-2.0-or-later is this crate's own licence. The rest are dependencies whose
-# licence is compatible with it and which are not worth auditing individually.
-allow = [
-    "GPL-2.0-or-later",
-    "MIT",
-    "Apache-2.0",
-    "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "Unicode-3.0",
-    # blake3's dependencies.
-    "CC0-1.0",
-]
-confidence-threshold = 0.9
-
-[bans]
-# Duplicates are reported but do not fail the build: several transitive
-# dependencies ship more than one version of a shared crate, and collapsing
-# those is not worth the work for a tool this size.
-multiple-versions = "warn"
-wildcards = "deny"
-# A crate pulled in only to pull in another crate is a supply-chain risk for no
-# benefit.
-allow-wildcard-paths = false
-
 [sources]
+# Denied rather than warned. The lockfile is what makes a build reproducible, so
+# a registry or git source that is not the expected one has to be a deliberate,
+# recorded decision.
 unknown-registry = "deny"
 unknown-git = "deny"
-# The lockfile is what makes a build reproducible, so a registry that is not
-# crates.io has to be a deliberate, recorded decision.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
