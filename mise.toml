@@ -102,3 +102,33 @@ Only the host triple: macOS and Windows artifacts need their own runners, which
 is what the release workflow's matrix is for. Use `dist plan` to see the full
 set a tag would produce.
 """
+
+# ---------------------------------------------------------------------------
+# Benchmarks.
+#
+# Two tools, because they answer different questions and only one of them is
+# trustworthy on a shared machine. `bench` for component costs and for ratios
+# measured inside a single run; `bench-ab` for any before/after claim, where
+# criterion's stored baseline is not to be trusted. See `examples/ab.rs`.
+# ---------------------------------------------------------------------------
+
+[tasks.bench]
+run = "cargo bench"
+description = """
+Criterion benchmarks: component costs and the concurrency curve.
+
+Good for "what does this cost" and for ratios between rows measured in the same
+run. Do not trust its change-detection across runs on a shared machine — it
+reports a 0.9% interval around numbers that then move 16% on the next run.
+"""
+
+[tasks.bench-ab]
+run = "cargo run --release --example ab -- compare"
+description = """
+Interleaved backup throughput by concurrency, minimum of several rounds.
+
+This is the one to quote. Interleaving means a slow patch from a neighbour lands
+on every variant, and the minimum is the closest observation to the uncontaminated
+cost — interference can only ever make a run slower. Reports its own
+contamination ratio so a noisy machine is visible in the output.
+"""

@@ -44,7 +44,40 @@ walkdir = "2.5.0"
 experimental = []
 
 [dev-dependencies]
+# `default-features = false` drops criterion's `plotters`, `rayon` and
+# `cargo_bench_support`, taking 20 crates out of the graph — including every
+# `wasm-bindgen` one, which exist to draw plots in a browser and are dead weight
+# in a native build.
+#
+# What is given up is the HTML report and criterion's parallel sampling of
+# independent benchmark functions. Neither is what a benchmark is *for* here: the
+# regression verdict ("change: -12.3% ... has regressed") comes from the text
+# output, and the code under test manages its own threads, so criterion sampling
+# it in parallel would only measure the sampler. Add the features back if the
+# plots are ever wanted.
+criterion = { version = "0.7", default-features = false }
 tempfile = "3.27.0"
+
+# Criterion is not a libtest harness, so each bench target opts out of it.
+[[bench]]
+name = "hotpath"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+# Benchmarks are the one place a number gets compared against a previous run, so
+# the profile they are built with is part of the measurement.
+#
+# `codegen-units = 1` because cross-crate inlining is exactly what makes a
+# backup pipeline's throughput move around between runs otherwise. It costs
+# compile time, and only on `cargo bench`.
+[profile.bench]
+inherits = "release"
+codegen-units = 1
+# Symbols, so a benchmark that turns out to be slow can be profiled.
+debug = true
 
 # Lint levels, declared here so that they apply to every build rather than only
 # to the ones CI happens to set `RUSTFLAGS` on. A warning that only fails in CI is
