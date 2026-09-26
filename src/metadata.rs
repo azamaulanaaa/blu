@@ -11,6 +11,55 @@ use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Serde helpers for [`PathBuf`].
+///
+/// `PathBuf`'s own `Serialize` impl round-trips through `str`, so a single
+/// path that is not valid UTF-8 fails the entire backup with "path contains
+/// invalid UTF-8 characters" — after the storage backend has already been
+/// written to. On unix the raw bytes are preserved instead; on other
+/// platforms paths are already valid Unicode and travel as a string.
+mod path_bytes {
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            serializer.serialize_bytes(path.as_os_str().as_bytes())
+        }
+
+        #[cfg(not(unix))]
+        {
+            match path.to_str() {
+                Some(path) => serializer.serialize_str(path),
+                None => Err(serde::ser::Error::custom(
+                    "path is not valid Unicode and cannot be stored on this platform",
+                )),
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            let bytes = <Vec<u8> as Deserialize>::deserialize(deserializer)?;
+            Ok(PathBuf::from(OsString::from_vec(bytes)))
+        }
+
+        #[cfg(not(unix))]
+        {
+            let path = <String as Deserialize>::deserialize(deserializer)?;
+            Ok(PathBuf::from(path))
+        }
+    }
+}
+
 /// Magic prefix identifying a lepatch snapshot blob.
 pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
 
@@ -145,9 +194,11 @@ pub struct Chunk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSymlink {
     /// Path of the link relative to the backup root.
+    #[serde(with = "path_bytes")]
     pub path: PathBuf,
     /// For a symbolic link, the raw link target; for a hard link, the path of
     /// the file whose contents are shared.
+    #[serde(with = "path_bytes")]
     pub source: PathBuf,
     /// Whether this is a hard link rather than a symbolic one.
     pub is_hard: bool,
@@ -157,6 +208,7 @@ pub struct FileSymlink {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct File {
     /// Path relative to the backup root.
+    #[serde(with = "path_bytes")]
     pub path: PathBuf,
 }
 
