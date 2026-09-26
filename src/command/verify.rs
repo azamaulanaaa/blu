@@ -77,7 +77,7 @@ impl Report {
 /// Every failure is collected rather than stopping at the first, so a damaged
 /// store can be assessed in one pass. An unreadable store is reported as a
 /// failure of the chunks it holds rather than aborting the run.
-#[instrument(skip(storage), ret, err)]
+#[instrument(level = "info", skip(storage), err)]
 pub async fn verify<S: storage::StorageGet>(key: String, storage: S) -> io::Result<Report> {
     let snapshot = {
         let mut reader: StreamReadSeeker = storage.get(&key).await?;

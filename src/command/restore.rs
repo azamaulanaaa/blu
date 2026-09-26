@@ -32,7 +32,7 @@ use crate::{
 ///
 /// Returns an error if the snapshot cannot be read or decoded, if it refers to
 /// a file or chunk it does not contain, or if the tree cannot be written.
-#[instrument(skip(storage, root), ret, err)]
+#[instrument(level = "info", skip(storage, root), err)]
 pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
     root: P,
     key: String,

@@ -120,7 +120,6 @@ impl GlobalStream {
 }
 
 impl Read for GlobalStream {
-    #[instrument(level = "trace", skip(self, buf), ret, err)]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if let Some(ref mut file) = self.current_file {
@@ -175,6 +174,9 @@ impl Chunker {
 impl Iterator for Chunker {
     type Item = io::Result<Chunk>;
 
+    /// One chunk per call, so this is the natural place to trace how the
+    /// stream was split up.
+    #[instrument(level = "debug", skip_all)]
     fn next(&mut self) -> Option<Self::Item> {
         let cdc_chunk = self.cdc_iter.next()?;
         let cdc_chunk = match cdc_chunk {
@@ -214,7 +216,6 @@ impl<R> AsyncRead for SliceAsyncReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    #[instrument(level = "trace", skip(self, cx), ret)]
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -256,6 +257,7 @@ impl<R> AsyncSeek for SliceAsyncReader<R>
 where
     R: AsyncSeek + Unpin,
 {
+    /// Seeks are per slice rather than per read, so tracing them is cheap.
     #[instrument(level = "trace", skip(self), err)]
     fn start_seek(mut self: Pin<&mut Self>, position: io::SeekFrom) -> io::Result<()> {
         let new_position = match position {

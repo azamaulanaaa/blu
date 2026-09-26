@@ -4,8 +4,14 @@ use std::{
 };
 
 use tokio::io::AsyncWrite;
-use tracing::instrument;
 
+/// An [`AsyncWrite`] that forwards at most `limit` bytes to `inner` and then
+/// reports end of stream.
+///
+/// Reporting end of stream by returning `Ok(0)` is what makes
+/// [`tokio::io::copy`] stop at exactly the limit. It is *not* a valid response
+/// for [`tokio::io::AsyncWriteExt::write_all`], which treats a zero-length
+/// write as an error, so this type is for `copy` and similar.
 pub struct SliceAsyncWriter<W>
 where
     W: AsyncWrite + Unpin,
@@ -18,12 +24,18 @@ impl<W> SliceAsyncWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    #[instrument(level = "trace", skip(writer))]
+    /// Wrap `writer`, allowing at most `limit` bytes through.
     pub fn new(writer: W, limit: u64) -> Self {
         Self {
             inner: writer,
             remaining: limit,
         }
+    }
+
+    /// How many of the permitted bytes have not been written yet.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.remaining
     }
 }
 
@@ -31,7 +43,6 @@ impl<W> AsyncWrite for SliceAsyncWriter<W>
 where
     W: AsyncWrite + Unpin,
 {
-    #[instrument(level = "trace", skip(self, cx, buf), ret)]
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -52,7 +63,6 @@ where
         result
     }
 
-    #[instrument(level = "trace", skip(self, cx), ret)]
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -60,7 +70,6 @@ where
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    #[instrument(level = "trace", skip(self, cx), ret)]
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

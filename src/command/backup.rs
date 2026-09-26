@@ -40,7 +40,16 @@ impl Default for Options {
     }
 }
 
-#[instrument(skip(storage, options), ret, err)]
+/// Snapshot a directory tree and return the storage key of the snapshot.
+///
+/// The returned snapshot can be passed back as [`Options::base_key`] on a later
+/// run so that unchanged chunks are not uploaded again.
+///
+/// # Errors
+///
+/// Returns an error if the tree cannot be walked, if a file changes while it is
+/// being read, or if the storage backend rejects a write.
+#[instrument(level = "info", skip(storage, options), err)]
 pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::StorageGet>(
     root: P,
     options: Options,

@@ -143,7 +143,6 @@ impl storage::StoragePut for BlobFileStorage<true> {
     /// truncated blob that nothing would ever be able to read back whole, and a
     /// long one would silently misalign every later blob's recorded offset, so
     /// both are rejected.
-    #[instrument(skip(reader), err)]
     async fn put(&self, mut reader: reader::StreamReadSeeker, len: u64) -> io::Result<String> {
         let _guard = self.write_lock.lock().await;
 
