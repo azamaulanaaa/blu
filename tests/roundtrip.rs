@@ -4,7 +4,7 @@ mod common;
 
 use std::fs;
 
-use common::assert_round_trip;
+use common::{assert_round_trip, noisy};
 
 /// Build a tree that exercises the shapes a backup tool has to survive:
 /// nested directories, and files both smaller and much larger than the
@@ -37,8 +37,7 @@ async fn round_trip_preserves_exact_bytes_across_chunk_boundaries() {
     // Sizes straddling the 8 KiB minimum and 16 KiB average so that chunks
     // both fall inside a single file and span a file boundary.
     for size in [1usize, 8_191, 8_192, 16_384, 65_536, 200_000] {
-        let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-        fs::write(source.join(format!("f{size}.bin")), &bytes).unwrap();
+        fs::write(source.join(format!("f{size}.bin")), noisy(size)).unwrap();
     }
 
     assert_round_trip(&source).await;
@@ -52,10 +51,7 @@ async fn round_trip_handles_files_larger_than_the_chunk_maximum() {
 
     // 1 MiB of non-repeating data forces many chunks and exercises the
     // multi-chunk write path within a single file.
-    let bytes: Vec<u8> = (0..1_048_576u32)
-        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
-        .collect();
-    fs::write(source.join("big.bin"), &bytes).unwrap();
+    fs::write(source.join("big.bin"), noisy(1_048_576)).unwrap();
 
     assert_round_trip(&source).await;
 }

@@ -98,8 +98,7 @@ impl fmt::Display for Error {
             Self::Decode(e) => write!(f, "failed to decode snapshot: {e}"),
             Self::BadMagic(found) => write!(
                 f,
-                "not a lepatch snapshot: expected magic {:?}, found {:?}",
-                MAGIC, found
+                "not a lepatch snapshot: expected magic {MAGIC:?}, found {found:?}"
             ),
             Self::UnsupportedVersion { found, supported } => write!(
                 f,
@@ -143,14 +142,13 @@ impl From<std::time::SystemTime> for Timestamp {
 
 impl From<Timestamp> for std::time::SystemTime {
     fn from(time: Timestamp) -> Self {
-        match u64::try_from(time.secs) {
-            Ok(secs) => std::time::UNIX_EPOCH + std::time::Duration::new(secs, time.nanos),
-            // `unsigned_abs` is exact for `i64::MIN`, where negating overflows.
-            Err(_) => {
-                let before = std::time::Duration::new(time.secs.unsigned_abs(), time.nanos);
-                std::time::UNIX_EPOCH - before
-            }
+        if let Ok(secs) = u64::try_from(time.secs) {
+            return std::time::UNIX_EPOCH + std::time::Duration::new(secs, time.nanos);
         }
+
+        // `unsigned_abs` is exact for `i64::MIN`, where negating overflows.
+        let before = std::time::Duration::new(time.secs.unsigned_abs(), time.nanos);
+        std::time::UNIX_EPOCH - before
     }
 }
 
@@ -174,6 +172,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// An empty snapshot stamped with the current format version.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             version: FORMAT_VERSION,

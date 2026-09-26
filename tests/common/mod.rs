@@ -18,6 +18,27 @@ pub(crate) fn options() -> Options {
     Options::default()
 }
 
+/// Pseudo-random bytes with no long runs.
+///
+/// Deliberately not a repeating pattern: content-defined chunking finds
+/// boundaries where the data changes, so a constant or short-cycle byte stream
+/// either produces one enormous chunk or collapses to a single deduplicated
+/// entry, and neither exercises what these tests are for.
+pub(crate) fn noisy(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            // A splitmix64 finaliser, truncated to a byte.
+            let mut x = u64::try_from(i)
+                .unwrap_or(0)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            u8::try_from(x & 0xff).unwrap_or(0)
+        })
+        .collect()
+}
+
 /// A flattened description of an entry in a directory tree.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Entry {
@@ -40,22 +61,20 @@ pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
         out: &mut BTreeMap<PathBuf, Entry>,
         inodes: &mut BTreeMap<(u64, u64), PathBuf>,
     ) {
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
         };
 
-        let mut names: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        names.sort_by_key(|e| e.file_name());
+        let mut names: Vec<_> = entries.filter_map(Result::ok).collect();
+        names.sort_by_key(std::fs::DirEntry::file_name);
 
         for entry in names {
             let path = entry.path();
             let relative = path.strip_prefix(root).unwrap().to_path_buf();
 
             // `symlink_metadata` does not follow the link.
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(_) => continue,
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
             };
 
             if meta.file_type().is_symlink() {
@@ -80,18 +99,17 @@ pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
             #[cfg(not(unix))]
             let key: Option<(u64, u64)> = None;
 
-            match (key, inodes.get(&key.unwrap())) {
-                (Some(_), Some(first)) => {
-                    out.insert(relative, Entry::HardLink(first.clone()));
-                }
-                _ => {
-                    if let Some(key) = key {
-                        inodes.insert(key, relative.clone());
-                    }
-                    let contents = fs::read(&path).unwrap();
-                    out.insert(relative, Entry::File(contents));
-                }
+            if let Some(first) = key.and_then(|key| inodes.get(&key)) {
+                out.insert(relative, Entry::HardLink(first.clone()));
+                continue;
             }
+
+            if let Some(key) = key {
+                inodes.insert(key, relative.clone());
+            }
+
+            let contents = fs::read(&path).unwrap();
+            out.insert(relative, Entry::File(contents));
         }
     }
 
@@ -133,17 +151,28 @@ pub(crate) async fn assert_round_trip(source: &Path) {
 
     let mut problems = Vec::new();
     for (path, expected) in &before {
+        // The comparison is exact; only the failure message renders the path
+        // lossily, which is the right trade for readability.
         match after.get(path) {
             Some(actual) if actual == expected => {}
             Some(actual) => {
-                problems.push(format!("{path:?}: expected {expected:?}, got {actual:?}"))
+                problems.push(format!(
+                    "{}: expected {expected:?}, got {actual:?}",
+                    path.display()
+                ));
             }
-            None => problems.push(format!("{path:?}: missing from restore ({expected:?})")),
+            None => problems.push(format!(
+                "{}: missing from restore ({expected:?})",
+                path.display()
+            )),
         }
     }
     for path in after.keys() {
         if !before.contains_key(path) {
-            problems.push(format!("{path:?}: unexpectedly present in restore"));
+            problems.push(format!(
+                "{}: unexpectedly present in restore",
+                path.display()
+            ));
         }
     }
 

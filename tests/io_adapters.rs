@@ -6,7 +6,9 @@ use lepatch::{reader::SliceAsyncReader, writer::SliceAsyncWriter};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 fn bytes(len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i % 251) as u8).collect()
+    (0..len)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect()
 }
 
 #[tokio::test]

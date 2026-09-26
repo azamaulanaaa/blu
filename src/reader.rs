@@ -131,12 +131,12 @@ impl FileRegistry {
 
             // Both endpoints lie within `[global_start, global_end]`, so the
             // difference cannot exceed `global_end - global_start`, which is
-            // `length` and already a `u32`. Clamping keeps that true even if a
-            // future change breaks the invariant, instead of wrapping to a
-            // plausible-looking wrong length.
-            let overlap_len = overlap_end_global
-                .saturating_sub(overlap_start_global)
-                .min(u64::from(length)) as u32;
+            // `length` and already a `u32`. Clamping to `length` keeps that true
+            // even if a future change breaks the invariant, instead of wrapping
+            // to a plausible-looking wrong length.
+            let overlap = overlap_end_global.saturating_sub(overlap_start_global);
+
+            let overlap_len = u32::try_from(overlap).unwrap_or(length);
 
             if overlap_len > 0 {
                 let file_local_offset = overlap_start_global - entry.global_offset;
@@ -165,7 +165,7 @@ impl GlobalStream {
     /// Build a stream over `paths`, opening each one as it is reached.
     #[instrument(level = "trace", skip(paths))]
     pub fn new<P: Into<PathBuf>, I: Iterator<Item = P>>(paths: I) -> Self {
-        let paths = paths.map(|v| v.into()).collect();
+        let paths = paths.map(Into::into).collect();
 
         Self {
             paths,
@@ -264,9 +264,21 @@ impl Iterator for Chunker {
             Err(e) => return Some(Err(io::Error::other(e))),
         };
 
-        let sources = self
-            .registry
-            .resolve_chunk(cdc_chunk.offset, cdc_chunk.length as u32);
+        // The chunker is configured with a `u32` `max_size`, so a chunk cannot
+        // exceed `u32::MAX`. Narrowing it anyway is a configuration error worth
+        // reporting rather than truncating into a length that maps the chunk to
+        // the wrong files.
+        let Ok(length) = u32::try_from(cdc_chunk.length) else {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "chunker produced a {} byte chunk, over the u32 limit",
+                    cdc_chunk.length
+                ),
+            )));
+        };
+
+        let sources = self.registry.resolve_chunk(cdc_chunk.offset, length);
 
         let reader = Cursor::new(cdc_chunk.data);
         let reader = Box::new(reader);

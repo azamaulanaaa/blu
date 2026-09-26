@@ -4,6 +4,7 @@ mod common;
 
 use std::fs;
 
+use common::noisy;
 use lepatch::{
     command::{Report, restore, verify},
     storage::BlobFileStorage,
@@ -13,9 +14,7 @@ use lepatch::{
 /// differ from one another. A run of identical bytes would be deduplicated
 /// down to a single chunk.
 fn varied(len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-        .collect()
+    noisy(len)
 }
 
 #[tokio::test]

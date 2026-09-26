@@ -52,6 +52,7 @@ broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
 
 [lints.clippy]
+pedantic = { level = "deny", priority = -2 }
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "deny", priority = -1 }
 # Restore used to open a file with `create` and no stated truncate behaviour,

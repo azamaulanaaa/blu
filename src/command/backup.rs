@@ -49,6 +49,10 @@ impl Default for Options {
 ///
 /// Returns an error if the tree cannot be walked, if a file changes while it is
 /// being read, or if the storage backend rejects a write.
+// The phases are a linear pipeline — walk, chunk, upload, serialise — and
+// splitting them would mean threading the snapshot, the chunk index and the
+// dedup maps through each stage for no gain in clarity.
+#[allow(clippy::too_many_lines)]
 #[instrument(level = "info", skip(storage, options), err)]
 pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::StorageGet>(
     root: P,
@@ -164,7 +168,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
 
             Ok(Some(path))
         })
-        .filter_map(|v| v.transpose())
+        .filter_map(Result::transpose)
         .collect::<io::Result<Vec<_>>>()?;
 
     // Index the files by relative path so chunk sources resolve in constant
@@ -189,30 +193,25 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
 
         let hash = *blake3::hash(&buffer).as_bytes();
 
-        let chunk_index = match emitted.get(&hash) {
+        let chunk_index = if let Some(&index) = emitted.get(&hash) {
             // Already emitted by this run, or carried over from the base
             // snapshot on first sight.
-            Some(&index) => index,
-            None => {
-                let chunk = match base_chunks.get(&hash) {
-                    Some(chunk) => chunk.clone(),
-                    None => {
-                        let len = buffer.len() as u64;
-                        let key = storage.put(Box::new(Cursor::new(buffer)), len).await?;
+            index
+        } else {
+            let chunk = if let Some(chunk) = base_chunks.get(&hash) {
+                chunk.clone()
+            } else {
+                let len = buffer.len() as u64;
+                let location = storage.put(Box::new(Cursor::new(buffer)), len).await?;
 
-                        metadata::Chunk {
-                            hash,
-                            location: key,
-                        }
-                    }
-                };
+                metadata::Chunk { hash, location }
+            };
 
-                let index = index_to_u32(snapshot.chunks.len())?;
-                snapshot.chunks.push(chunk);
-                emitted.insert(hash, index);
+            let index = index_to_u32(snapshot.chunks.len())?;
+            snapshot.chunks.push(chunk);
+            emitted.insert(hash, index);
 
-                index
-            }
+            index
         };
 
         let mut chunk_offset: u32 = 0;
@@ -339,7 +338,11 @@ impl FileId {
         None
     }
 
+    // The signature is uniform across platforms even though the unix
+    // implementation below always succeeds: the other `cfg` variants genuinely
+    // return `None`, and callers should not have to care which one they got.
     #[cfg(unix)]
+    #[allow(clippy::unnecessary_wraps)]
     fn from_metadata(meta: &fs::Metadata) -> Option<FileId> {
         use std::os::unix::fs::MetadataExt;
         Some(FileId {
