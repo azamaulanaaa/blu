@@ -1,2 +1,71 @@
+# Toolchain and task aliases, so every check is one word and the versions are
+# pinned in one place:
+#
+#   mise install     # fetch the tools below
+#   mise run check   # everything
+#
+# Tasks mirror the CI jobs one-for-one, so anything CI enforces can be run
+# locally with the same name and the same arguments.
+
 [tools]
-rust = "stable"
+rust = { version = "stable", components = "rust-analyzer" }
+# Coverage: llvm-cov instruments the test binary rather than sampling, so the
+# numbers are exact and reproducible.
+"cargo:cargo-llvm-cov" = "latest"
+# Advisories, licences and duplicate-version checks over the resolved graph.
+"cargo:cargo-deny" = "latest"
+
+[tasks.build]
+run = "cargo build --all-targets --all-features"
+
+[tasks.test]
+run = "cargo test --all-targets --all-features"
+
+[tasks.cov]
+run = "cargo llvm-cov --all-features --summary-only"
+description = "Print a coverage summary for the test suite"
+
+[tasks.cov-html]
+run = "cargo llvm-cov --all-features --html --open"
+description = "Write an HTML coverage report and open it"
+
+[tasks.fmt]
+run = "cargo fmt --all --check"
+
+[tasks.clippy]
+run = "cargo clippy --all-targets --all-features"
+
+# The lint levels live in Cargo.toml under `[lints]`, so a bare `cargo clippy`
+# already fails on a violation. `-D warnings` additionally covers the lint
+# groups' own warnings and anything rustc emits outside the declared set.
+[tasks.lint]
+depends = ["fmt", "clippy"]
+
+[tasks.licenses]
+run = "cargo deny check licenses"
+description = "Every locked dependency's licence must be compatible with GPL-2.0-or-later"
+
+[tasks.advisories]
+run = "cargo deny check advisories"
+description = "Known vulnerabilities and yanked releases in the resolved graph"
+
+[tasks.bans]
+run = "cargo deny check bans"
+description = "Wildcard dependencies, duplicate versions and unused crates"
+
+[tasks.deps]
+depends = ["licenses", "advisories", "bans"]
+
+# Fails if the real floor has drifted above `rust-version` in Cargo.toml. Needs
+# the toolchain once: rustup toolchain install 1.85
+[tasks.msrv]
+run = "cargo +1.85 check --all-targets --all-features --locked"
+description = "Build against the declared minimum supported Rust version"
+
+[tasks.doc]
+run = "cargo doc --no-deps --all-features"
+env = { RUSTDOCFLAGS = "-D warnings" }
+
+[tasks.check]
+depends = ["lint", "test", "deps", "msrv", "doc"]
+description = "Run every check CI runs"

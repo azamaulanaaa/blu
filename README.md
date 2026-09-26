@@ -94,28 +94,35 @@ from being handed something that can append to the store.
 
 ## Development
 
+`mise` is the task runner. `mise install` fetches the pinned toolchain plus
+`cargo-llvm-cov` and `cargo-deny`; every task then runs the same command CI
+runs.
+
 ```console
-$ make check      # everything below
-$ make lint       # cargo fmt --check + clippy
-$ make test       # the test suite
-$ make msrv       # builds against the declared minimum Rust version
-$ make deps       # cargo deny: advisories, licences, sources
-$ make doc        # rustdoc with warnings denied
+$ mise run check       # every task below, in dependency order
+$ mise run lint        # cargo fmt --check + clippy
+$ mise run test        # the test suite
+$ mise run cov         # coverage summary
+$ mise run cov-html    # coverage report, opened in a browser
+$ mise run msrv        # builds against the declared minimum Rust version
+$ mise run licenses    # cargo deny: dependency licences
+$ mise run advisories  # cargo deny: vulnerabilities and yanks
+$ mise run bans        # cargo deny: wildcards, duplicates, unused crates
+$ mise run doc         # rustdoc with warnings denied
 ```
 
-Or through cargo directly: `cargo clippy --all-targets --all-features`,
-`cargo test --all-features`, `cargo fmt --check`.
+`mise tasks` lists them with their descriptions.
 
 The integration tests are the interesting ones: they build a tree, back it up,
 restore it, and compare the two structures — including link identity — rather
 than just checking that the command exited 0.
 
 Lint levels live in `Cargo.toml` under `[lints]` rather than in CI, so they
-apply to a local `cargo build` and not only to a push. `missing_docs`,
-`missing_errors_doc` and `clippy::pedantic` are all denied; the two places that
-carry an `#[allow]` say why in a comment.
+apply to a local `cargo build` and not only to a push. `all`, `cargo` and
+`pedantic` are all denied, along with `unwrap_used` and `expect_used`; the two
+`#[allow]`s in library code say why in a comment.
 
-To have `make lint` run on every commit:
+To have the fast checks run on every commit:
 
 ```console
 $ git config core.hooksPath .githooks

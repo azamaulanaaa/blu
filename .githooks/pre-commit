@@ -12,9 +12,18 @@ set -e
 cd "$(git rev-parse --show-toplevel)"
 
 # Nothing staged: nothing to check.
-if ! git diff --cached --quiet; then
-    echo "pre-commit: running fmt and clippy"
-    exec make lint-quick
+if git diff --cached --quiet; then
+    exit 0
 fi
 
-exit 0
+# The lint levels live in Cargo.toml under `[lints]`, so a bare clippy already
+# fails on a violation. mise is the task runner this project uses, but the
+# fallback keeps the hook useful for anyone who has not installed it.
+if command -v mise >/dev/null 2>&1; then
+    echo "pre-commit: mise run lint"
+    exec mise run lint
+fi
+
+echo "pre-commit: cargo fmt --check && cargo clippy (mise not found)"
+cargo fmt --all --check
+cargo clippy --all-targets --all-features
