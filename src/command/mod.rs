@@ -2,6 +2,7 @@
 //! checking that a stored snapshot is still intact.
 
 mod backup;
+mod pipeline;
 mod restore;
 mod verify;
 
