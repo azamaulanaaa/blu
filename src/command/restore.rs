@@ -1,23 +1,39 @@
-use std::io;
-
-use tokio::{
+use std::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io,
+    path::Path,
 };
 
+use tokio::{
+    fs as fs_async,
+    io::{AsyncReadExt, AsyncSeekExt},
+};
+use tracing::instrument;
+
 use crate::{
-    metadata::{self, FileChunk},
+    fsattr,
+    metadata::{self, FileChunk, Snapshot},
     reader::{self, StreamReadSeeker},
     storage, writer,
 };
 
 /// Reassemble the snapshot identified by `key` under `root`.
 ///
+/// Restoration runs in four phases so that ordering constraints hold:
+///
+/// 1. directories, so that every parent exists;
+/// 2. regular files, created at their final length before any content is
+///    written, which is what makes empty files and hard link targets exist;
+/// 3. links, which may only be created once their targets do;
+/// 4. attributes, last, because writing into a directory updates its
+///    modification time.
+///
 /// # Errors
 ///
 /// Returns an error if the snapshot cannot be read or decoded, if it refers to
-/// a file or chunk it does not contain, or if a destination cannot be written.
-pub async fn restore<P: AsRef<std::path::Path>, S: storage::StorageGet>(
+/// a file or chunk it does not contain, or if the tree cannot be written.
+#[instrument(skip(storage, root), ret, err)]
+pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
     root: P,
     key: String,
     storage: S,
@@ -31,6 +47,48 @@ pub async fn restore<P: AsRef<std::path::Path>, S: storage::StorageGet>(
     };
 
     let root = root.as_ref();
+
+    restore_directories(root, &snapshot).await?;
+    restore_files(root, &snapshot, &storage).await?;
+    restore_links(root, &snapshot)?;
+    restore_attributes(root, &snapshot)?;
+
+    Ok(())
+}
+
+/// Create every recorded directory, including ones that hold no files.
+async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    for dir in &snapshot.dirs {
+        fs_async::create_dir_all(root.join(&dir.path)).await?;
+    }
+
+    Ok(())
+}
+
+/// Create every regular file at its final size, then fill in the content.
+async fn restore_files<S: storage::StorageGet>(
+    root: &Path,
+    snapshot: &Snapshot,
+    storage: &S,
+) -> io::Result<()> {
+    // Create every file up front so that hard links have something to point
+    // at, and so that a file with no chunk slices still comes back.
+    for file in &snapshot.files {
+        let path = root.join(&file.path);
+
+        if let Some(parent) = path.parent() {
+            fs_async::create_dir_all(parent).await?;
+        }
+
+        let handle = fs_async::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .await?;
+
+        handle.set_len(file.len).await?;
+    }
 
     // Group the chunk slices by the file they belong to so that each
     // destination is opened once rather than once per slice.
@@ -53,18 +111,10 @@ pub async fn restore<P: AsRef<std::path::Path>, S: storage::StorageGet>(
             continue;
         }
 
-        let file_path = root.join(&file.path);
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        // Opened without truncation: slices are written at their recorded
-        // offsets and the final length is asserted by the caller.
-        let mut handle = fs::OpenOptions::new()
+        let mut handle = fs_async::OpenOptions::new()
             .write(true)
-            .create(true)
             .truncate(false)
-            .open(&file_path)
+            .open(root.join(&file.path))
             .await?;
 
         for file_chunk in slices[index].iter().copied() {
@@ -102,7 +152,95 @@ pub async fn restore<P: AsRef<std::path::Path>, S: storage::StorageGet>(
                 ));
             }
         }
+
+        // Guard against a gap in the recorded slices, which would otherwise
+        // leave a hole of zeroes in the middle of the file.
+        handle.set_len(file.len).await?;
     }
 
     Ok(())
+}
+
+/// Recreate hard links and symbolic links.
+fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    for link in &snapshot.links {
+        let path = root.join(&link.path);
+
+        // Restoring over an existing tree must not trip over the old entry.
+        remove_existing(&path)?;
+
+        match link.kind {
+            metadata::LinkKind::Hard => {
+                let target = root.join(&link.target);
+                fsattr::hard_link(&target, &path).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to link {} to {}: {e}", path.display(), target.display()),
+                    )
+                })?;
+            }
+            metadata::LinkKind::Symbolic => {
+                let target_is_dir = symlink_points_at_directory(&path, &link.target);
+                fsattr::symlink(&link.target, &path, target_is_dir).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to create symlink {} -> {}: {e}",
+                            path.display(),
+                            link.target.display()
+                        ),
+                    )
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply permission bits and modification times, files before directories.
+fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    for file in &snapshot.files {
+        let path = root.join(&file.path);
+        apply(&path, file.mode, file.mtime)?;
+    }
+
+    for dir in &snapshot.dirs {
+        let path = root.join(&dir.path);
+        apply(&path, dir.mode, dir.mtime)?;
+    }
+
+    Ok(())
+}
+
+fn apply(path: &Path, mode: u32, mtime: Option<metadata::Timestamp>) -> io::Result<()> {
+    fsattr::set_mode(path, mode)?;
+    if let Some(mtime) = mtime {
+        fsattr::set_mtime(path, mtime)?;
+    }
+
+    Ok(())
+}
+
+/// Remove whatever currently occupies `path`, if anything.
+fn remove_existing(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Resolve a link target the way the link itself would, and report whether it
+/// names a directory. Only Windows needs this to pick a symlink flavour.
+fn symlink_points_at_directory(link: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return target.is_dir();
+    }
+
+    match link.parent() {
+        Some(parent) => parent.join(target).is_dir(),
+        None => target.is_dir(),
+    }
 }
