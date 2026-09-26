@@ -23,7 +23,7 @@ mod path_bytes {
 
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -42,7 +42,9 @@ mod path_bytes {
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<PathBuf, D::Error> {
         #[cfg(unix)]
         {
             use std::ffi::OsString;

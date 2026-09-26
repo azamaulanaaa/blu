@@ -38,12 +38,18 @@ experimental = []
 [dev-dependencies]
 tempfile = "3.27.0"
 
-# Lint levels. Denying the groups below means a regression fails CI rather than
-# waiting to be noticed in review.
+# Lint levels, declared here so that they apply to every build rather than only
+# to the ones CI happens to set `RUSTFLAGS` on. A warning that only fails in CI is
+# a warning nobody sees until after they have pushed.
 [lints.rust]
-missing_docs = "warn"
-missing_debug_implementations = "warn"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
 unsafe_code = "forbid"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
 
 [lints.clippy]
 correctness = { level = "deny", priority = -1 }
@@ -51,6 +57,4 @@ suspicious = { level = "deny", priority = -1 }
 # Restore used to open a file with `create` and no stated truncate behaviour,
 # which is how a shorter file inherited the tail of a longer one.
 suspicious_open_options = "deny"
-# A backup has to be able to say which file it could not read.
-missing_errors_doc = "allow"
 

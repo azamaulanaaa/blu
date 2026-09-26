@@ -14,13 +14,13 @@ use lepatch::{
 };
 
 /// Default chunker configuration, mirroring the CLI defaults.
-pub fn options() -> Options {
+pub(crate) fn options() -> Options {
     Options::default()
 }
 
 /// A flattened description of an entry in a directory tree.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Entry {
+pub(crate) enum Entry {
     /// A regular file and its exact contents.
     File(Vec<u8>),
     /// A symbolic link and the raw text of its target.
@@ -33,7 +33,7 @@ pub enum Entry {
 
 /// Recursively describe `root`, resolving hard links to the first path that
 /// shares their inode so that link structure is compared rather than contents.
-pub fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
+pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
     fn walk(
         root: &Path,
         dir: &Path,
@@ -102,7 +102,7 @@ pub fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
 }
 
 /// Back up `source` into a fresh blob store and return the snapshot key.
-pub async fn run_backup(source: &Path, blob: &Path, base_key: Option<String>) -> String {
+pub(crate) async fn run_backup(source: &Path, blob: &Path, base_key: Option<String>) -> String {
     let storage = BlobFileStorage::<true>::new(blob).await.unwrap();
     let opts = Options {
         base_key,
@@ -112,7 +112,7 @@ pub async fn run_backup(source: &Path, blob: &Path, base_key: Option<String>) ->
 }
 
 /// Restore `key` from the blob store at `blob` into `destination`.
-pub async fn run_restore(blob: &Path, key: &str, destination: &Path) {
+pub(crate) async fn run_restore(blob: &Path, key: &str, destination: &Path) {
     let storage = BlobFileStorage::<false>::new(blob).await.unwrap();
     restore(destination, key.to_string(), storage)
         .await
@@ -120,7 +120,7 @@ pub async fn run_restore(blob: &Path, key: &str, destination: &Path) {
 }
 
 /// Back up `source`, restore it, and assert the two trees are identical.
-pub async fn assert_round_trip(source: &Path) {
+pub(crate) async fn assert_round_trip(source: &Path) {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store.bin");
     let key = run_backup(source, &blob, None).await;
