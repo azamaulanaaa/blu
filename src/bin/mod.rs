@@ -2,7 +2,7 @@ use std::{error::Error as _, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use lepatch::{
-    command::{Options, backup, restore},
+    command::{Options, backup, restore, verify},
     index::IndexSet,
     storage,
 };
@@ -41,6 +41,14 @@ enum Command {
         /// Base path of the backup set to restore from.
         name: std::path::PathBuf,
         /// Version to restore, defaulting to the most recent usable one.
+        #[arg(long, short)]
+        version: Option<u32>,
+    },
+    /// Check a snapshot's stored chunks against their recorded hashes.
+    Verify {
+        /// Base path of the backup set to check.
+        name: std::path::PathBuf,
+        /// Version to check, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
     },
@@ -94,6 +102,25 @@ async fn run(command: Command) -> std::io::Result<()> {
             name,
             version,
         } => run_restore(&destination, &name, version).await,
+        Command::Verify { name, version } => run_verify(&name, version).await,
+    }
+}
+
+/// Resolve which version to operate on, or explain why there is none.
+fn select_version(set: &IndexSet, requested: Option<u32>) -> std::io::Result<(u32, String)> {
+    let versions = set.versions()?;
+
+    match (requested, versions.latest) {
+        (Some(version), _) => Ok((version, set.read_key(version)?)),
+        (None, Some(found)) => Ok(found),
+        (None, None) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no usable snapshot found for {} (looked in {})",
+                set.base().display(),
+                set.directory().display()
+            ),
+        )),
     }
 }
 
@@ -159,24 +186,7 @@ async fn run_restore(
     version: Option<u32>,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let versions = set.versions()?;
-
-    let version = match (version, &versions.latest) {
-        (Some(version), _) => version,
-        (None, Some((version, _))) => *version,
-        (None, None) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "no usable snapshot found for {} (looked for {}",
-                    set.base().display(),
-                    set.directory().display()
-                ),
-            ));
-        }
-    };
-
-    let key = set.read_key(version)?;
+    let (version, key) = select_version(&set, version)?;
 
     tracing::info!(
         name = %set.base().display(),
@@ -192,4 +202,31 @@ async fn run_restore(
     tracing::info!("restore complete");
 
     Ok(())
+}
+
+async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Result<()> {
+    let set = IndexSet::new(name);
+    let (version, key) = select_version(&set, version)?;
+
+    tracing::info!(name = %set.base().display(), version, "verifying");
+
+    let store = storage::BlobFileStorage::<false>::new(set.blob_path()).await?;
+    let report = verify(key, store).await?;
+
+    for failure in &report.failures {
+        eprintln!("error: {}", failure.detail);
+    }
+
+    println!(
+        "checked {} chunks ({} bytes) in version {version}: {}",
+        report.chunks,
+        report.bytes,
+        if report.is_ok() {
+            "all chunks match their recorded hashes".to_string()
+        } else {
+            format!("{} chunks FAILED", report.failures.len())
+        }
+    );
+
+    report.into_result()
 }

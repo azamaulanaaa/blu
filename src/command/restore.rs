@@ -48,6 +48,17 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
 
     let root = root.as_ref();
 
+    // Nothing below can detect damaged chunk data on its own — a short read
+    // would just leave a file quietly filled with the wrong bytes — so the
+    // whole snapshot is checked against the hashes recorded at backup time
+    // before a single byte is written.
+    super::verify::check(&snapshot, &storage)
+        .await
+        .into_result()
+        .map_err(|e| {
+            io::Error::new(e.kind(), format!("refusing to restore {key}: {e}"))
+        })?;
+
     restore_directories(root, &snapshot).await?;
     restore_files(root, &snapshot, &storage).await?;
     restore_links(root, &snapshot)?;
