@@ -68,7 +68,10 @@ async fn a_second_run_reuses_chunks_from_its_base_snapshot() {
     let second = common::run_backup(&source, &blob, Some(first.clone())).await;
     let after_second = fs::metadata(&blob).unwrap().len();
 
-    assert_ne!(first, second, "each run should produce its own snapshot key");
+    assert_ne!(
+        first, second,
+        "each run should produce its own snapshot key"
+    );
 
     // The second run still writes its own snapshot blob, so the store grows a
     // little. It must not grow by anything like the size of the data.

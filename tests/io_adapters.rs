@@ -2,10 +2,7 @@
 
 use std::io::{Cursor, SeekFrom};
 
-use lepatch::{
-    reader::SliceAsyncReader,
-    writer::SliceAsyncWriter,
-};
+use lepatch::{reader::SliceAsyncReader, writer::SliceAsyncWriter};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 fn bytes(len: usize) -> Vec<u8> {

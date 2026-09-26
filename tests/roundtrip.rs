@@ -1,3 +1,5 @@
+//! Content round-tripping through backup and restore.
+
 mod common;
 
 use std::fs;
@@ -50,7 +52,9 @@ async fn round_trip_handles_files_larger_than_the_chunk_maximum() {
 
     // 1 MiB of non-repeating data forces many chunks and exercises the
     // multi-chunk write path within a single file.
-    let bytes: Vec<u8> = (0..1_048_576u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let bytes: Vec<u8> = (0..1_048_576u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
     fs::write(source.join("big.bin"), &bytes).unwrap();
 
     assert_round_trip(&source).await;

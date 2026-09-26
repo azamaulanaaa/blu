@@ -135,7 +135,9 @@ pub async fn assert_round_trip(source: &Path) {
     for (path, expected) in &before {
         match after.get(path) {
             Some(actual) if actual == expected => {}
-            Some(actual) => problems.push(format!("{path:?}: expected {expected:?}, got {actual:?}")),
+            Some(actual) => {
+                problems.push(format!("{path:?}: expected {expected:?}, got {actual:?}"))
+            }
             None => problems.push(format!("{path:?}: missing from restore ({expected:?})")),
         }
     }

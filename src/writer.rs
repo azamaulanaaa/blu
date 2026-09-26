@@ -1,3 +1,5 @@
+//! Bounded async writes.
+
 use std::{
     pin::Pin,
     task::{Context, Poll},
@@ -18,6 +20,18 @@ where
 {
     inner: W,
     remaining: u64,
+}
+
+impl<W> std::fmt::Debug for SliceAsyncWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately not derived: `W` is an arbitrary writer type.
+        f.debug_struct("SliceAsyncWriter")
+            .field("remaining", &self.remaining)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<W> SliceAsyncWriter<W>

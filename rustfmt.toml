@@ -1,0 +1,7 @@
+# Formatting for `cargo fmt`.
+#
+# Defaults, with the import grouping spelled out so that `use` blocks stay
+# sorted the same way everywhere.
+
+edition = "2024"
+max_width = 100

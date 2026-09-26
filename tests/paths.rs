@@ -1,3 +1,5 @@
+//! Path handling, in particular paths that are not valid UTF-8.
+
 mod common;
 
 use std::fs;
@@ -22,7 +24,11 @@ async fn round_trip_preserves_paths_that_are_not_valid_utf8() {
     // A file in a directory whose own name is not valid UTF-8.
     let raw_dir = OsStr::from_bytes(b"dir-\xff");
     fs::create_dir(PathBuf::from(&source).join(raw_dir)).unwrap();
-    fs::write(PathBuf::from(&source).join(raw_dir).join("inner"), b"nested").unwrap();
+    fs::write(
+        PathBuf::from(&source).join(raw_dir).join("inner"),
+        b"nested",
+    )
+    .unwrap();
 
     assert_round_trip(&source).await;
 }

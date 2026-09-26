@@ -23,7 +23,25 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 walkdir = "2.5.0"
 
 [features]
+# Windows file identity, needed to detect hard links there.
 experimental = []
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# Lint levels. Denying the groups below means a regression fails CI rather than
+# waiting to be noticed in review.
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+# Restore used to open a file with `create` and no stated truncate behaviour,
+# which is how a shorter file inherited the tail of a longer one.
+suspicious_open_options = "deny"
+# A backup has to be able to say which file it could not read.
+missing_errors_doc = "allow"
+

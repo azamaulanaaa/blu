@@ -60,7 +60,10 @@ async fn blobs_appended_in_sequence_do_not_overlap() {
 
     for (key, marker) in keys {
         let data = read_all(&store, &key).await.unwrap();
-        assert!(data.iter().all(|b| *b == marker), "blob {key} came back wrong");
+        assert!(
+            data.iter().all(|b| *b == marker),
+            "blob {key} came back wrong"
+        );
     }
 }
 
@@ -106,7 +109,9 @@ async fn a_reader_longer_than_the_declared_length_is_rejected() {
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(
-        error.to_string().contains("more than the declared 10 bytes"),
+        error
+            .to_string()
+            .contains("more than the declared 10 bytes"),
         "the error should name the declared length, got: {error}"
     );
 }
@@ -128,7 +133,9 @@ async fn a_key_pointing_past_the_end_of_the_store_is_rejected() {
 
     assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     assert!(
-        error.to_string().contains("the store is only 50 bytes long"),
+        error
+            .to_string()
+            .contains("the store is only 50 bytes long"),
         "the error should quantify the shortfall, got: {error}"
     );
 }

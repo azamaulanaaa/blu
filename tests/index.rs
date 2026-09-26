@@ -22,10 +22,7 @@ fn derived_paths_do_not_clobber_an_extension_in_the_base_name() {
 fn derived_paths_honour_a_directory_component() {
     let set = IndexSet::new("backups/photos");
 
-    assert_eq!(
-        set.blob_path(),
-        std::path::Path::new("backups/photos.bin")
-    );
+    assert_eq!(set.blob_path(), std::path::Path::new("backups/photos.bin"));
     assert_eq!(
         set.index_path(12),
         std::path::Path::new("backups/photos.012.idx")

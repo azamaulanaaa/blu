@@ -108,7 +108,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
 
             let relative_path = path
                 .strip_prefix(&root)
-                .map_err(|e| io::Error::other(e))?
+                .map_err(io::Error::other)?
                 .to_path_buf();
 
             // The backup root itself is the destination on restore, so it is
@@ -198,11 +198,12 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
                     Some(chunk) => chunk.clone(),
                     None => {
                         let len = buffer.len() as u64;
-                        let key = storage
-                            .put(Box::new(Cursor::new(buffer)), len)
-                            .await?;
+                        let key = storage.put(Box::new(Cursor::new(buffer)), len).await?;
 
-                        metadata::Chunk { hash, location: key }
+                        metadata::Chunk {
+                            hash,
+                            location: key,
+                        }
                     }
                 };
 
@@ -216,10 +217,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
 
         let mut chunk_offset = 0;
         for source in chunk.sources {
-            let source_rel_path = source
-                .path
-                .strip_prefix(&root)
-                .map_err(|e| io::Error::other(e))?;
+            let source_rel_path = source.path.strip_prefix(&root).map_err(io::Error::other)?;
 
             let Some(&file_index) = file_index.get(source_rel_path) else {
                 return Err(io::Error::new(
@@ -249,19 +247,13 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
     // against what the walk recorded turns that into a hard failure.
     verify_file_lengths(&snapshot)?;
 
-    let key = {
-        let buffer = snapshot
-            .to_bytes()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let buffer = snapshot
+        .to_bytes()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let len = buffer.len() as u64;
-        let reader = Box::new(Cursor::new(buffer));
-        let key = storage.put(reader, len).await?;
+    let len = buffer.len() as u64;
 
-        key
-    };
-
-    Ok(key)
+    storage.put(Box::new(Cursor::new(buffer)), len).await
 }
 
 /// Best-effort normalisation used only for comparing excluded paths.

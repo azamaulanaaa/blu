@@ -1,3 +1,5 @@
+//! The `lepatch` command line interface.
+
 use std::{error::Error as _, process::ExitCode};
 
 use clap::{Parser, Subcommand};

@@ -1,3 +1,5 @@
+//! Tests for the snapshot encoding: framing, versioning and error reporting.
+
 use lepatch::metadata::{self, Error, Snapshot};
 
 fn sample() -> Snapshot {
@@ -53,10 +55,7 @@ fn an_unknown_format_version_is_reported_as_such() {
     encoded[version_at..version_at + 4].copy_from_slice(&999u32.to_le_bytes());
 
     match Snapshot::from_bytes(&encoded) {
-        Err(Error::UnsupportedVersion {
-            found,
-            supported,
-        }) => {
+        Err(Error::UnsupportedVersion { found, supported }) => {
             assert_eq!(found, 999);
             assert_eq!(supported, metadata::FORMAT_VERSION);
         }

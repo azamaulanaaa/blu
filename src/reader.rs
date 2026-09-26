@@ -1,3 +1,10 @@
+//! Splitting a set of files into content-defined chunks.
+//!
+//! Files are read as if they had been concatenated into one stream, so a chunk
+//! may span a file boundary. A [`FileRegistry`] records where each file sits in
+//! that stream, which lets a chunk's global range be mapped back onto the one or
+//! more file slices it covers.
+
 use std::{
     collections::VecDeque,
     fmt::Debug,
@@ -13,35 +20,66 @@ use fastcdc::v2020::StreamCDC;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tracing::instrument;
 
+/// A stream that is both [`AsyncRead`] and [`AsyncSeek`].
+///
+/// This exists because `trait_alias` is still unstable. Every type that is both
+/// implements it automatically, so it is never implemented by hand; use
+/// [`StreamReadSeeker`] rather than naming it.
 pub trait AsyncReadSeek: AsyncRead + AsyncSeek {}
 
 impl<T: AsyncRead + AsyncSeek + ?Sized> AsyncReadSeek for T {}
 
+/// A boxed, seekable async stream, as handed out by a storage backend.
 pub type StreamReadSeeker = Box<dyn AsyncReadSeek + Unpin + Send>;
 
+/// The part of one file that a chunk covers.
 #[derive(Debug, Clone)]
 pub struct ChunkSource {
+    /// Path of the file, as it was passed to [`FileRegistry::new`].
     pub path: PathBuf,
+    /// Byte offset of this slice within the file.
     pub offset: u64,
+    /// Length of this slice in bytes.
     pub length: u32,
 }
 
+/// One chunk of the concatenated stream, and where it came from.
 pub struct Chunk {
+    /// The file slices this chunk covers, in stream order. More than one entry
+    /// means the chunk spans a file boundary.
     pub sources: Vec<ChunkSource>,
+    /// The chunk's contents.
     pub reader: StreamReadSeeker,
 }
 
+impl Debug for Chunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `StreamReadSeeker` is a trait object, so only the shape is shown.
+        f.debug_struct("Chunk")
+            .field("sources", &self.sources)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
 struct EntryFileRegistry {
     path: PathBuf,
     length: u64,
     global_offset: u64,
 }
 
+/// Where each file sits within the concatenated stream.
+#[derive(Debug)]
 pub struct FileRegistry {
     entries: Vec<EntryFileRegistry>,
 }
 
 impl FileRegistry {
+    /// Record the length of each file, in the order given.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any file cannot be stat'ed.
     #[instrument(level = "trace", skip(paths), err)]
     pub fn new<P: Into<PathBuf>, I: Iterator<Item = P>>(paths: I) -> io::Result<Self> {
         let mut global_offset = 0;
@@ -66,6 +104,12 @@ impl FileRegistry {
         Ok(Self { entries })
     }
 
+    /// Map a global range of the concatenated stream onto the file slices it
+    /// covers.
+    ///
+    /// An empty result means the range lies in a file that was not registered,
+    /// which for a well-formed chunker means a file changed size between being
+    /// registered and being read.
     #[instrument(level = "trace", skip(self))]
     pub fn resolve_chunk(&self, global_start: u64, length: u32) -> Vec<ChunkSource> {
         let global_end = global_start + length as u64;
@@ -102,12 +146,16 @@ impl FileRegistry {
     }
 }
 
+/// The files in `paths` presented as one continuous byte stream, as if
+/// concatenated in order.
+#[derive(Debug)]
 pub struct GlobalStream {
     paths: VecDeque<PathBuf>,
     current_file: Option<File>,
 }
 
 impl GlobalStream {
+    /// Build a stream over `paths`, opening each one as it is reached.
     #[instrument(level = "trace", skip(paths))]
     pub fn new<P: Into<PathBuf>, I: Iterator<Item = P>>(paths: I) -> Self {
         let paths = paths.map(|v| v.into()).collect();
@@ -144,19 +192,44 @@ impl Read for GlobalStream {
     }
 }
 
+/// Content-defined chunking parameters.
+///
+/// Boundaries are chosen from the content itself rather than at fixed offsets,
+/// so inserting or removing bytes shifts only the chunks around the change
+/// instead of every chunk after it. That is what makes deduplication work
+/// across revisions of a file.
 #[derive(Debug, Clone)]
 pub struct ChunkerConfig {
+    /// No boundary is taken before this many bytes.
     pub min_size: u32,
+    /// The size the boundary probability curve is centred on.
     pub avg_size: u32,
+    /// A boundary is forced once this many bytes have accumulated.
     pub max_size: u32,
 }
 
+/// Splits a set of files into chunks, yielding each chunk's contents along with
+/// the file slices it covers.
 pub struct Chunker {
     registry: Arc<FileRegistry>,
     cdc_iter: StreamCDC<GlobalStream>,
 }
 
+impl Debug for Chunker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `StreamCDC` is not `Debug`.
+        f.debug_struct("Chunker")
+            .field("files", &self.registry.entries.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Chunker {
+    /// Chunk `paths` according to `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any file cannot be stat'ed while being registered.
     #[instrument(level = "trace", skip(paths), err)]
     pub fn new(paths: Vec<PathBuf>, config: ChunkerConfig) -> io::Result<Self> {
         let registry = Arc::new(FileRegistry::new(paths.iter())?);
@@ -186,7 +259,7 @@ impl Iterator for Chunker {
 
         let sources = self
             .registry
-            .resolve_chunk(cdc_chunk.offset as u64, cdc_chunk.length as u32);
+            .resolve_chunk(cdc_chunk.offset, cdc_chunk.length as u32);
 
         let reader = Cursor::new(cdc_chunk.data);
         let reader = Box::new(reader);
@@ -203,6 +276,17 @@ pub struct SliceAsyncReader<R> {
     inner: R,
     position: u64,
     limit: u64,
+}
+
+impl<R> Debug for SliceAsyncReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately not derived: `R` is an arbitrary stream type, and
+        // requiring `R: Debug` here would be a needless bound.
+        f.debug_struct("SliceAsyncReader")
+            .field("position", &self.position)
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Size of the stack scratch buffer used to stage bytes out of the inner

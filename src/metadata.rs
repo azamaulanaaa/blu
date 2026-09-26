@@ -79,7 +79,12 @@ pub enum Error {
     /// The blob did not start with [`MAGIC`].
     BadMagic([u8; 8]),
     /// The blob was written by a newer or older layout than this build knows.
-    UnsupportedVersion { found: u32, supported: u32 },
+    UnsupportedVersion {
+        /// The version the blob claims.
+        found: u32,
+        /// The version this build understands.
+        supported: u32,
+    },
     /// The blob ended before the header was complete.
     Truncated,
 }

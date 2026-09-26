@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    io,
-    path::Path,
-};
+use std::{fs, io, path::Path};
 
 use tokio::{
     fs as fs_async,
@@ -55,9 +51,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
     super::verify::check(&snapshot, &storage)
         .await
         .into_result()
-        .map_err(|e| {
-            io::Error::new(e.kind(), format!("refusing to restore {key}: {e}"))
-        })?;
+        .map_err(|e| io::Error::new(e.kind(), format!("refusing to restore {key}: {e}")))?;
 
     restore_directories(root, &snapshot).await?;
     restore_files(root, &snapshot, &storage).await?;
@@ -109,9 +103,7 @@ async fn restore_files<S: storage::StorageGet>(
         let bucket = slices.get_mut(index).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "chunk slice references file {index}, which the snapshot does not contain"
-                ),
+                format!("chunk slice references file {index}, which the snapshot does not contain"),
             )
         })?;
         bucket.push(file_chunk);
@@ -129,19 +121,24 @@ async fn restore_files<S: storage::StorageGet>(
             .await?;
 
         for file_chunk in slices[index].iter().copied() {
-            let chunk = snapshot.chunks.get(file_chunk.chunk_index as usize).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "chunk slice references chunk {}, which the snapshot does not contain",
-                        file_chunk.chunk_index
-                    ),
-                )
-            })?;
+            let chunk = snapshot
+                .chunks
+                .get(file_chunk.chunk_index as usize)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "chunk slice references chunk {}, which the snapshot does not contain",
+                            file_chunk.chunk_index
+                        ),
+                    )
+                })?;
 
             let length = u64::from(file_chunk.length);
 
-            handle.seek(io::SeekFrom::Start(file_chunk.file_offset)).await?;
+            handle
+                .seek(io::SeekFrom::Start(file_chunk.file_offset))
+                .await?;
 
             let mut source: StreamReadSeeker = storage.get(&chunk.location).await?;
             source
@@ -158,7 +155,9 @@ async fn restore_files<S: storage::StorageGet>(
                     io::ErrorKind::UnexpectedEof,
                     format!(
                         "chunk at {} is shorter than the {} bytes recorded for {}",
-                        chunk.location, length, file.path.display()
+                        chunk.location,
+                        length,
+                        file.path.display()
                     ),
                 ));
             }
@@ -186,7 +185,11 @@ fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
                 fsattr::hard_link(&target, &path).map_err(|e| {
                     io::Error::new(
                         e.kind(),
-                        format!("failed to link {} to {}: {e}", path.display(), target.display()),
+                        format!(
+                            "failed to link {} to {}: {e}",
+                            path.display(),
+                            target.display()
+                        ),
                     )
                 })?;
             }

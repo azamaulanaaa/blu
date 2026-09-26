@@ -77,7 +77,10 @@ impl IndexSet {
     /// Directory the set's files live in.
     #[must_use]
     pub fn directory(&self) -> &Path {
-        self.base.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
+        self.base
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
     }
 
     /// Create the directory the set lives in, if it does not exist.
@@ -119,7 +122,11 @@ impl IndexSet {
                 continue;
             };
 
-            versions.highest_existing = Some(versions.highest_existing.map_or(version, |v| v.max(version)));
+            versions.highest_existing = Some(
+                versions
+                    .highest_existing
+                    .map_or(version, |v| v.max(version)),
+            );
 
             // A version whose index is empty or malformed is still counted as
             // existing — it just is not a candidate for "latest", so a backup
@@ -166,7 +173,10 @@ impl IndexSet {
         read_key(&path)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("index for version {version} at {} is empty or malformed", path.display()),
+                format!(
+                    "index for version {version} at {} is empty or malformed",
+                    path.display()
+                ),
             )
         })
     }
@@ -188,7 +198,11 @@ impl IndexSet {
         for _ in 0..64 {
             let path = self.index_path(version);
 
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(file) => {
                     return Ok(Reservation {
                         path,
@@ -203,7 +217,10 @@ impl IndexSet {
 
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("could not claim a version number for {}", self.base.display()),
+            format!(
+                "could not claim a version number for {}",
+                self.base.display()
+            ),
         ))
     }
 
@@ -217,8 +234,15 @@ impl IndexSet {
 
         let path = self.lock_path();
 
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => Ok(Lock { path, file: Some(file) }),
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => Ok(Lock {
+                path,
+                file: Some(file),
+            }),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
                 e.kind(),
                 format!(
