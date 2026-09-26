@@ -96,9 +96,34 @@ The parts that matter when a backup runs unattended:
   duration. If the process is killed the lock survives; the error message says
   to remove it once you are sure nothing is running.
 
-Restore is a merge, so restoring twice into the same directory is safe, and
-restoring over a file that is larger than the backed-up one replaces it rather
-than leaving the old tail behind.
+Restore is a merge by default, so restoring twice into the same directory is
+safe, and restoring over a file that is larger than the backed-up one replaces it
+rather than leaving the old tail behind. See [Restoring](#restoring) for
+`--clean` and the destination claim.
+
+## Limits worth knowing
+
+Stated rather than discovered:
+
+- **Memory scales with the tree, not with the file being read.** A snapshot is
+  held whole in memory while it is verified, restored and re-serialised, and a
+  restore holds a second copy of the chunk table so its write tasks can share it.
+  That is tens of megabytes for a tree of a million files and rather more beyond,
+  which is comfortable for photographs and documents and not for a filesystem
+  image. Chunk data itself is never all resident: the pipeline holds a bounded
+  number of chunks, and verify streams each one past a fixed scratch buffer.
+- **A restore is not atomic.** It is interrupted by a full disk or a kill, the
+  destination is left partly written, and there is no journal to resume from. Run
+  it somewhere you can throw away and start again.
+- **Ctrl-C is not handled.** There is no handler and no cleanup: the process dies
+  where it stands. That is survivable rather than dangerous — a killed backup
+  leaves its version unclaimed and its uploaded chunks unreferenced, and a killed
+  restore leaves a partial tree — but nothing is tidied up on the way out.
+- **A lock left by a killed process has to be removed by hand**, for a backup set
+  or a restore destination alike. The error message says so.
+- **The on-disk format is not stable.** `FORMAT_VERSION` guards it, so a
+  mismatched snapshot is reported rather than misread, but versions of this tool
+  are not interchangeable and the crate is not published.
 
 ## Library
 
