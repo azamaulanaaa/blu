@@ -1,5 +1,10 @@
 //! Shared helpers for the integration tests.
 
+// The crate denies `unwrap_used` and `expect_used`, and `.clippy.toml` exempts
+// code inside a `#[test]` function. These helpers are plain functions that tests
+// call, so they fall outside that exemption and need their own: a helper that
+// cannot read the tree it was asked to describe has nothing useful to report.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
 use std::{

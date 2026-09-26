@@ -1,9 +1,0 @@
-# Settings for `cargo clippy` that have no `#[allow]` equivalent.
-#
-# Lint *levels* live in Cargo.toml under `[lints]`; this file is only for the
-# thresholds clippy exposes as configuration.
-
-# The public API takes a root, a key, a store and a config. Raising this stops
-# clippy pushing towards bundling them into a struct that would then have to be
-# constructed at every call site for no benefit.
-too-many-arguments-threshold = 6

@@ -1,0 +1,31 @@
+# Clippy configuration.
+# See https://rust-lang.github.io/rust-clippy/master/index.html
+#
+# Lint *levels* live in Cargo.toml under `[lints]`. This file is only for the
+# handful of settings clippy exposes as configuration, plus the test exemptions
+# that let `unwrap_used` and `expect_used` be denied crate-wide.
+#
+# Note: clippy caches this file. Editing it does not by itself invalidate a
+# cached result, so touch a source file (or `cargo clean`) before concluding a
+# change here had no effect.
+
+# The crate denies `unwrap_used` and `expect_used`: a backup that panics
+# part-way through has lost the guarantee it was taking, so a failed invariant
+# is an error to propagate rather than something to unwrap. Library and binary
+# code satisfies both without a single exception.
+#
+# Test code is a different contract. A test that cannot create its fixture or
+# read back what it wrote has nothing useful to say, and threading `?` through
+# every call site to reach the same panic would bury what each test asserts.
+# This only covers code inside a `#[test]` function — shared helpers in
+# `tests/common/` carry their own `allow` for that reason.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# `dbg!` is a debugging aid, not something to leave committed.
+allow-dbg-in-tests = true
+
+# The public API takes a root, a key, a store and a config. Raising the
+# threshold stops clippy pushing towards bundling them into a struct that would
+# then have to be constructed at every call site for no benefit.
+too-many-arguments-threshold = 6

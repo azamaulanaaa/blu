@@ -1,6 +1,11 @@
 //! Deduplication: repeated content must be stored once, both within a single
 //! run and across runs that share a base snapshot.
 
+// `.clippy.toml` exempts code inside a `#[test]` function; the `snapshot`
+// helper below is a plain async fn called from one, so it needs the exemption
+// spelled out.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 mod common;
 
 use std::fs;

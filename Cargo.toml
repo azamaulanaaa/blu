@@ -52,12 +52,17 @@ broken_intra_doc_links = "deny"
 private_intra_doc_links = "deny"
 
 [lints.clippy]
-pedantic = { level = "deny", priority = -2 }
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "deny", priority = -1 }
-# Restore used to open a file with `create` and no stated truncate behaviour,
-# which is how a shorter file inherited the tail of a longer one.
-suspicious_open_options = "deny"
-# A backup has to be able to say which file it could not read.
-missing_errors_doc = "deny"
+# `all` covers correctness, suspicious, style, complexity and perf. `pedantic`
+# adds the stricter stylistic and documentation lints, which is what makes a
+# fallible function state what it can fail with. `cargo` covers crate metadata
+# and dependency hygiene, and pairs with the `[bans]` section of deny.toml.
+all = "deny"
+cargo = "deny"
+pedantic = "deny"
+# A backup that panics mid-run has lost the guarantee it was taking, so a failed
+# invariant is an error to propagate rather than an `unwrap`. Both of these
+# currently hold in library and binary code without a single exception; the
+# `.clippy.toml` exemption for tests is what keeps the test suite readable.
+unwrap_used = "deny"
+expect_used = "deny"
 
