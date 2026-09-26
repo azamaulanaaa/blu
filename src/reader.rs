@@ -195,13 +195,27 @@ impl Iterator for Chunker {
     }
 }
 
+/// An [`AsyncRead`] over at most the first `limit` bytes of `inner`.
+///
+/// Reads stop at the limit, which is reported as end of stream in the usual way
+/// — a `Ready(Ok(()))` that fills nothing.
 pub struct SliceAsyncReader<R> {
     inner: R,
     position: u64,
     limit: u64,
 }
 
+/// Size of the stack scratch buffer used to stage bytes out of the inner
+/// reader.
+///
+/// The inner reader cannot be handed the caller's buffer directly, because only
+/// this type knows how much of it is within the limit. Matches
+/// `tokio::io::copy`'s own buffer size so a copy through this reader does not
+/// split every read in two.
+const SCRATCH: usize = 8 * 1024;
+
 impl<R> SliceAsyncReader<R> {
+    /// Read at most `limit` bytes from `reader`.
     #[instrument(level = "trace", skip(reader))]
     pub fn new(reader: R, limit: u64) -> Self {
         Self {
@@ -209,6 +223,12 @@ impl<R> SliceAsyncReader<R> {
             position: 0,
             limit,
         }
+    }
+
+    /// How many of the permitted bytes are left.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(self.position)
     }
 }
 
@@ -221,24 +241,28 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let remaining = self.limit.saturating_sub(self.position);
-
-        if remaining == 0 {
+        if self.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
 
-        let mut stack_buf = [0u8; 4096];
+        let wanted = std::cmp::min(self.remaining(), buf.remaining() as u64) as usize;
 
-        let limit = std::cmp::min(remaining, buf.remaining() as u64) as usize;
-        let limit = std::cmp::min(limit, stack_buf.len());
+        // The caller has no room. Polling the inner reader with an empty buffer
+        // would make it report end of stream, which it would then keep doing —
+        // so the inner reader is left untouched and only the caller's
+        // zero-length request is answered.
+        if wanted == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
-        let mut temp_buf = ReadBuf::new(&mut stack_buf[..limit]);
+        let mut scratch = [0u8; SCRATCH];
+        let limit = std::cmp::min(wanted, scratch.len());
 
-        let result = Pin::new(&mut self.inner).poll_read(cx, &mut temp_buf);
+        let mut temp = ReadBuf::new(&mut scratch[..limit]);
 
-        match result {
+        match Pin::new(&mut self.inner).poll_read(cx, &mut temp) {
             Poll::Ready(Ok(())) => {
-                let filled = temp_buf.filled();
+                let filled = temp.filled();
                 let n = filled.len();
 
                 if n > 0 {
@@ -279,7 +303,7 @@ where
             ));
         }
 
-        let delta = (new_position as i128 - self.position as i128) as i64;
+        let delta = new_position as i128 - self.position as i128;
         self.position = new_position;
 
         Pin::new(&mut self.inner).start_seek(io::SeekFrom::Current(delta as i64))
