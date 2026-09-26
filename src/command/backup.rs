@@ -29,7 +29,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
             let mut reader = storage.get(&v).await?;
             let mut buffer = Vec::new();
             reader.read_to_end(&mut buffer).await?;
-            let snapshot: metadata::Snapshot = bincode::deserialize(buffer.as_slice())
+            let snapshot = metadata::Snapshot::from_bytes(buffer.as_slice())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             let map: HashMap<[u8; 32], ChunkStatus> = snapshot
@@ -43,12 +43,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
         None => None,
     };
 
-    let mut snapshot = metadata::Snapshot {
-        files: Vec::new(),
-        chunks: Vec::new(),
-        file_chunks: Vec::new(),
-        file_symlink: Vec::new(),
-    };
+    let mut snapshot = metadata::Snapshot::new();
 
     let mut inode_map: HashMap<FileId, PathBuf> = HashMap::new();
 
@@ -199,7 +194,9 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + storage::St
     }
 
     let key = {
-        let buffer = bincode::serialize(&snapshot).map_err(|e| io::Error::other(e))?;
+        let buffer = snapshot
+            .to_bytes()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let len = buffer.len() as u64;
         let reader = Box::new(Cursor::new(buffer));

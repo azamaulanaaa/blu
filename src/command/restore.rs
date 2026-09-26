@@ -20,7 +20,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet>(
         let mut reader: StreamReadSeeker = storage.get(&key).await?;
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
-        let snapshot: metadata::Snapshot = bincode::deserialize(buffer.as_slice())
+        let snapshot = metadata::Snapshot::from_bytes(buffer.as_slice())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         snapshot
     };
