@@ -7,46 +7,32 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Backstop for lint groups. The lint levels themselves live in Cargo.toml under
-  # `[lints]` so that they apply to a local build too, not only to CI.
-  RUSTFLAGS: -D warnings
+
+# One job per check, named after the mise task that runs the same command, so a
+# failure here is reproducible locally with `mise run <name>`.
 
 jobs:
-  check:
-    name: fmt and clippy
+  lint:
+    name: Lint (fmt & clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features
-
-  msrv:
-    name: msrv (${{ matrix.toolchain }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Kept in step with `rust-version` in Cargo.toml. The floor is edition
-        # 2024, which needs Cargo 1.85; a lower claim would not build.
-        toolchain: ["1.85.0"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.toolchain }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: msrv
-      # Catches a dependency or a language feature raising the real floor above
-      # what the manifest claims, which nothing else here would notice.
-      - run: cargo check --all-targets --all-features --locked
+          components: rustfmt, clippy
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        # The lint levels are already denied in Cargo.toml under `[lints]`, so
+        # this fails on a violation without the flag. `-D warnings` additionally
+        # covers anything rustc or a lint group emits outside the declared set.
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
-    name: test (${{ matrix.os }})
+    name: Test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -54,31 +40,112 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features --locked
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --all-features --locked
 
-  deps:
-    name: dependency policy
+  coverage:
+    name: Coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
         with:
-          # Advisories, licences, duplicate versions and sources. A backup tool
-          # is only as trustworthy as what it links, and `deny.toml` records the
-          # one advisory that is knowingly accepted.
-          command: check
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      # llvm-cov instruments the test binary rather than sampling, so the number
+      # is exact and does not drift between runs of the same commit.
+      - name: Measure coverage
+        run: cargo llvm-cov --all-features --summary-only --locked
+      # An HTML report is uploaded rather than only summarised: a bare percentage
+      # says which commit regressed, not which lines.
+      - name: Collect HTML report
+        run: cargo llvm-cov --all-features --html --locked --output-path target/llvm-cov
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: target/llvm-cov
+          retention-days: 7
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Kept in step with `rust-version` in Cargo.toml. The floor is edition
+      # 2024, which needs Cargo 1.85, so a lower claim would not build.
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # Catches a dependency or a language feature raising the real floor above
+      # what the manifest claims, which nothing else here would notice.
+      - run: cargo check --all-targets --all-features --locked
 
   doc:
-    name: doc
+    name: Docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check rustdoc
+        run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  licenses:
+    name: Licences (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check dependency licences
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: licenses
+
+  advisories:
+    name: Advisories (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check advisories (vulns / yanks)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: advisories
+
+  bans:
+    name: Bans (cargo deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache build artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check wildcards and duplicate versions
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: bans
