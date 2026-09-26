@@ -84,6 +84,11 @@ impl IndexSet {
     }
 
     /// Create the directory the set lives in, if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created, for instance
+    /// because a parent is a regular file or the caller lacks permission.
     pub fn ensure_directory(&self) -> io::Result<()> {
         fs::create_dir_all(self.directory())
     }
@@ -106,6 +111,11 @@ impl IndexSet {
     /// A missing directory is reported as an empty set rather than an error, so
     /// that the first backup of a fresh location does not have to special-case
     /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory exists but cannot be read, or if an
+    /// index file exists but cannot be read.
     pub fn versions(&self) -> io::Result<Versions> {
         let directory = self.directory();
         let entries = match fs::read_dir(directory) {
@@ -167,6 +177,11 @@ impl IndexSet {
     }
 
     /// Read the snapshot key recorded for `version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::NotFound`] if that version has no index, or if
+    /// its index is empty or malformed.
     pub fn read_key(&self, version: u32) -> io::Result<String> {
         let path = self.index_path(version);
 
@@ -188,6 +203,12 @@ impl IndexSet {
     /// this run's result. If the run then fails, the claim is rolled back; if
     /// the process is killed outright the number is merely skipped, and
     /// [`Versions::latest`] ignores the empty file it leaves behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the containing directory cannot be created, if the
+    /// index cannot be created, or if 64 consecutive version numbers are
+    /// already claimed.
     pub fn reserve(&self) -> io::Result<Reservation> {
         self.ensure_directory()?;
 
@@ -229,6 +250,11 @@ impl IndexSet {
     /// The lock is advisory and self-releasing only for a clean exit: if the
     /// process is killed the file survives, and the error message says how to
     /// recover.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::AlreadyExists`] if another process holds the
+    /// lock, and an error if the lock file cannot be created.
     pub fn lock(&self) -> io::Result<Lock> {
         self.ensure_directory()?;
 
@@ -271,6 +297,11 @@ impl Reservation {
     }
 
     /// Write `key` into the claimed index and flush it to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key cannot be written or flushed. Either way the
+    /// claim is rolled back on drop, so the version is not left half-published.
     pub fn commit(mut self, key: &str) -> io::Result<()> {
         let mut file = self
             .file

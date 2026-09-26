@@ -57,4 +57,6 @@ suspicious = { level = "deny", priority = -1 }
 # Restore used to open a file with `create` and no stated truncate behaviour,
 # which is how a shorter file inherited the tail of a longer one.
 suspicious_open_options = "deny"
+# A backup has to be able to say which file it could not read.
+missing_errors_doc = "deny"
 

@@ -54,6 +54,12 @@ impl<const WRITE: bool> BlobFileStorage<WRITE> {
     ///
     /// For a writable store the file itself is created too, so that a backup
     /// of an empty tree still leaves a store behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the containing directory or the store cannot be
+    /// created, for instance because the path is a directory or the caller
+    /// lacks permission.
     #[instrument(skip_all, err)]
     pub async fn new<P: Into<PathBuf> + Debug>(path: P) -> io::Result<Self> {
         let file_path = path.into();

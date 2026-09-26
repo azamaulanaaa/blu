@@ -40,6 +40,12 @@ impl Report {
     }
 
     /// Turn a failed report into an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error summarising the failures if any were recorded, and
+    /// `Ok(())` otherwise. Up to five are named in the message, with a count of
+    /// the remainder.
     pub fn into_result(self) -> io::Result<()> {
         if self.is_ok() {
             return Ok(());
@@ -77,6 +83,12 @@ impl Report {
 /// Every failure is collected rather than stopping at the first, so a damaged
 /// store can be assessed in one pass. An unreadable store is reported as a
 /// failure of the chunks it holds rather than aborting the run.
+///
+/// # Errors
+///
+/// Returns an error only if the snapshot itself cannot be read or decoded.
+/// Damaged chunk data is reported through [`Report::failures`] rather than as an
+/// error, so a single call assesses the whole store.
 #[instrument(level = "info", skip(storage), err)]
 pub async fn verify<S: storage::StorageGet>(key: String, storage: S) -> io::Result<Report> {
     let snapshot = {

@@ -186,6 +186,11 @@ impl Snapshot {
     }
 
     /// Serialise into the framed on-disk representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Encode`] if the snapshot contains something the
+    /// encoding cannot represent.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let body = bincode::serialize(self).map_err(Error::Encode)?;
 
@@ -199,6 +204,14 @@ impl Snapshot {
 
     /// Parse the framed on-disk representation, reporting a bad magic or an
     /// unsupported version as a distinct, actionable error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Truncated`] if the header is incomplete,
+    /// [`Error::BadMagic`] if the blob is not a snapshot,
+    /// [`Error::UnsupportedVersion`] if it was written by an incompatible
+    /// layout, and [`Error::Decode`] if the body does not match this version's
+    /// shape.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let header = MAGIC.len() + 4;
         if bytes.len() < header {

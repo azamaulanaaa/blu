@@ -52,6 +52,11 @@ pub fn mtime_of(meta: &fs::Metadata) -> Option<Timestamp> {
 ///
 /// A no-op where the platform has no equivalent, and where `mode` carries no
 /// information.
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be found, or its permissions cannot be
+/// changed — for instance because the caller does not own the file.
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -72,6 +77,12 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 }
 
 /// Apply a modification time captured by [`mtime_of`].
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be found, or the timestamp cannot be
+/// applied to it. A symbolic link is skipped rather than followed, so no error
+/// is reported for one.
 pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
     let time = filetime::FileTime::from_unix_time(mtime.secs, mtime.nanos);
 
@@ -88,6 +99,12 @@ pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
 ///
 /// `target_is_dir` selects the Windows flavour of symlink, which has no
 /// equivalent on other platforms.
+///
+/// # Errors
+///
+/// Returns an error if `link` already exists, if its parent directory is
+/// missing, if the platform does not support symbolic links, or — on Windows —
+/// if the caller lacks the privilege required to create one.
 pub fn symlink(target: &Path, link: &Path, target_is_dir: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -118,6 +135,12 @@ pub fn symlink(target: &Path, link: &Path, target_is_dir: bool) -> io::Result<()
 }
 
 /// Create a hard link at `link` sharing the contents of `existing`.
+///
+/// # Errors
+///
+/// Returns an error if `existing` does not exist, if `link` already exists, or
+/// if the two paths are on different filesystems — which is the usual reason a
+/// restore fails to recreate a hard link.
 pub fn hard_link(existing: &Path, link: &Path) -> io::Result<()> {
     fs::hard_link(existing, link)
 }
