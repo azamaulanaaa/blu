@@ -4,7 +4,9 @@ use std::{error::Error as _, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use lepatch::{
-    command::{Options, backup, lock_destination, restore, verify},
+    command::{
+        Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, backup, lock_destination, restore, verify,
+    },
     index::IndexSet,
     storage,
 };
@@ -307,27 +309,22 @@ async fn run_restore(
     // interleave writes into the same tree.
     let _claim = lock_destination(destination)?;
 
-    if clean {
-        empty_destination(destination)?;
-    }
-
     let store = storage::BlobFileStorage::<false>::new(set.blob_path()).await?;
 
-    let restored = restore(destination, key, store).await?;
+    if clean {
+        // Restored beside the destination and swapped in, rather than emptied
+        // and refilled. A restore that dies part-way through then leaves the
+        // destination exactly as it was, instead of holding some prefix of the
+        // snapshot.
+        restore_atomically(destination, key, store).await?;
+    } else {
+        let restored = restore(destination, key, store).await?;
+        report_restored(&restored);
 
-    tracing::info!(
-        files = restored.files,
-        dirs = restored.dirs,
-        links = restored.links,
-        chunks = restored.chunks,
-        "restore complete"
-    );
-
-    // A merging restore leaves the destination holding more than the snapshot
-    // accounts for, and it cannot say what: the snapshot is inside the library
-    // call by then. So it says the one thing that is true and actionable rather
-    // than guessing at a count.
-    if !clean {
+        // A merging restore leaves the destination holding more than the snapshot
+        // accounts for, and it cannot say which: the snapshot is inside the
+        // library call by then. So it says the one thing that is true and
+        // actionable rather than guessing at a count.
         tracing::info!(
             "the destination may also hold files that are not in this snapshot; \
              pass --clean to restore into an exact copy"
@@ -335,6 +332,101 @@ async fn run_restore(
     }
 
     Ok(())
+}
+
+/// Restore into a directory beside the destination, then swap it in.
+///
+/// The two are siblings so the swap is a rename on one filesystem. Renaming a
+/// directory over an existing one is refused by the OS, so the swap is two
+/// renames and there is a window between them — but it is a window measured in
+/// microseconds, against a restore that took minutes, and the new tree is
+/// already complete on disk throughout it. The alternative is a window measured
+/// in minutes.
+///
+/// Costs the disk space for two trees at once. That is the trade for a failure
+/// leaving nothing behind.
+async fn restore_atomically<S: storage::StorageGet + 'static>(
+    destination: &std::path::Path,
+    key: String,
+    store: S,
+) -> std::io::Result<()> {
+    let partial = sibling(destination, PARTIAL_SUFFIX);
+    let previous = sibling(destination, PREVIOUS_SUFFIX);
+
+    // Left behind by a killed run. Safe to clear: it is either a half-written
+    // restore that never became the destination, or a superseded tree.
+    for path in [&partial, &previous] {
+        if path.exists() {
+            tracing::warn!(
+                path = %path.display(),
+                "removing a directory left by an earlier restore"
+            );
+            std::fs::remove_dir_all(path)?;
+        }
+    }
+
+    let restored = match restore(&partial, key, store).await {
+        Ok(restored) => restored,
+        Err(e) => {
+            // The destination has not been touched, so there is nothing to put
+            // back — only the half-written tree to clear away.
+            let _ = std::fs::remove_dir_all(&partial);
+            tracing::error!(
+                destination = %destination.display(),
+                "the restore failed; the destination was left as it was"
+            );
+            return Err(e);
+        }
+    };
+
+    // Move the old tree aside rather than deleting it first, so that a failure
+    // here can put it back.
+    let had_previous = destination.exists();
+    if had_previous {
+        std::fs::rename(destination, &previous)?;
+    }
+
+    if let Err(e) = std::fs::rename(&partial, destination) {
+        if had_previous {
+            // Best effort: the old tree is still on disk either way, and saying
+            // where is more use than a second failure.
+            let restored_back = std::fs::rename(&previous, destination);
+            tracing::error!(
+                destination = %destination.display(),
+                previous = %previous.display(),
+                "could not move the restored tree into place ({e}) and \
+                 could not put the previous one back ({restored_back:?})"
+            );
+        }
+        return Err(e);
+    }
+
+    if had_previous {
+        std::fs::remove_dir_all(&previous)?;
+    }
+
+    report_restored(&restored);
+    Ok(())
+}
+
+/// A path beside `path`, named for it and `suffix`.
+fn sibling(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+
+    path.with_file_name(format!("{name}.{suffix}"))
+}
+
+/// Log what a restore put into the destination.
+fn report_restored(restored: &lepatch::command::Restored) {
+    tracing::info!(
+        files = restored.files,
+        dirs = restored.dirs,
+        links = restored.links,
+        chunks = restored.chunks,
+        "restore complete"
+    );
 }
 
 /// Check that a destination is safe to empty, and empty it.
@@ -419,33 +511,6 @@ fn check_clean_destination(
     }
 
     Ok(())
-}
-
-/// Empty a destination that has already been checked.
-///
-/// Separate from the check so the two can sit either side of taking the restore
-/// claim: refuse first, then claim, then destroy. A failure here stops the run
-/// rather than restoring into whatever is left, because at this point the
-/// destination is known to have been emptied and a half-dealt one is worse than
-/// an untouched one.
-fn empty_destination(destination: &std::path::Path) -> std::io::Result<()> {
-    let target = absolutise(destination);
-
-    // A restore does not create the destination itself, so this only fires when
-    // something is already there.
-    match std::fs::read_dir(&target) {
-        Ok(_) => {
-            tracing::warn!(
-                destination = %target.display(),
-                "emptying the destination before restoring"
-            );
-            std::fs::remove_dir_all(&target)?;
-            std::fs::create_dir_all(&target)?;
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 /// Resolve a path to an absolute one, without requiring it to exist.

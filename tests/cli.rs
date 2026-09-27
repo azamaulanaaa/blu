@@ -761,3 +761,129 @@ fn being_asked_to_stop_does_not_leave_a_claim_behind() {
         }
     }
 }
+
+#[test]
+fn clean_restore_leaves_nothing_beside_the_destination() {
+    // The swap works through a sibling directory. It must not survive a
+    // successful run, or every subsequent restore has to clear it first.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(100_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    ok(dir.path(), &["restore", "out", "store", "--clean"]);
+
+    let siblings: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("out."))
+        .collect();
+
+    assert!(
+        siblings.is_empty(),
+        "a finished --clean restore left {siblings:?} beside the destination"
+    );
+}
+
+#[test]
+fn a_failing_clean_restore_leaves_the_destination_alone() {
+    // A damaged store is refused before anything is written, so a `--clean`
+    // restore must not have emptied the destination on its way to finding out.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    let destination = dir.path().join("out");
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("precious.txt"), b"do not lose me").unwrap();
+
+    // Flip a byte in the blob store so the verify gate refuses the run.
+    let blob = dir.path().join("store.bin");
+    let mut bytes = fs::read(&blob).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    fs::write(&blob, &bytes).unwrap();
+
+    let output = lepatch(dir.path(), &["restore", "out", "store", "--clean"]);
+    assert!(
+        !output.status.success(),
+        "a damaged store should be refused"
+    );
+
+    assert_eq!(
+        fs::read(destination.join("precious.txt")).unwrap(),
+        b"do not lose me",
+        "a refused --clean restore emptied the destination anyway"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_clean_restore_is_never_left_partly_written() {
+    // The invariant, stated so it holds whatever the timing: after a `--clean`
+    // restore is killed, the destination is either *entirely* the old contents or
+    // *entirely* the snapshot. Never some prefix of it, which is what a restore
+    // that writes in place leaves.
+    //
+    // Both outcomes are acceptable, so this cannot be flaky in the failing
+    // direction — a partial destination fails it whichever way the race went.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..10 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(2_000_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    let destination = dir.path().join("out");
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("marker.txt"), b"the old contents").unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        .current_dir(dir.path())
+        .args(["restore", "out", "store", "--clean"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start the restore");
+
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -INT {}", child.id()))
+        .status();
+    let _ = child.wait();
+
+    let names: Vec<String> = fs::read_dir(&destination)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_marker = names.iter().any(|n| n == "marker.txt");
+    let restored_files = names.iter().filter(|n| n.starts_with('f')).count();
+
+    assert!(
+        has_marker && restored_files == 0,
+        "the destination was left partly written: {has_marker} marker, \
+         {restored_files} of 10 files"
+    );
+
+    // And no half-written sibling was left to confuse the next run.
+    let leftovers: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("lepatch-restore-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a killed --clean restore left {leftovers:?} behind"
+    );
+}

@@ -210,6 +210,14 @@ fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
 /// Suffix of the file that marks a destination as being restored into.
 const DESTINATION_LOCK: &str = "lepatch-restore.lock";
 
+/// Suffix of the directory a clean restore is assembled in before being swapped
+/// into place.
+pub const PARTIAL_SUFFIX: &str = "lepatch-restore-partial";
+
+/// Suffix of the directory the previous contents are moved aside to during a
+/// swap.
+pub const PREVIOUS_SUFFIX: &str = "lepatch-restore-previous";
+
 /// Held for as long as a destination is being written to.
 ///
 /// A restore creates or overwrites every file in a tree. Two of them at once
@@ -217,15 +225,29 @@ const DESTINATION_LOCK: &str = "lepatch-restore.lock";
 /// writing it — and neither would end up with the tree it meant to produce. The
 /// claim is a file beside the destination rather than inside it, so it does not
 /// turn up in the restored output.
+///
+/// It also owns the scratch directories a `--clean` restore assembles in, so a
+/// run that is *interrupted* rather than failing — Ctrl-C, a `kill` — does not
+/// leave half a tree on disk. The `Drop` that releases the claim runs in that
+/// case precisely because the work future is dropped rather than resumed, which
+/// is what makes it the right place.
 #[derive(Debug)]
 pub struct DestinationLock {
     path: PathBuf,
+    /// Sibling directories this run may have created, removed on the way out.
+    scratch: Vec<PathBuf>,
     /// Held open for the lifetime of the claim; dropping the `Lock` drops this.
     _file: fs::File,
 }
 
 impl Drop for DestinationLock {
     fn drop(&mut self) {
+        for path in &self.scratch {
+            // A successful swap has already renamed both away, so this is a
+            // no-op in the ordinary case and the cleanup in every other one.
+            let _ = fs::remove_dir_all(path);
+        }
+
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -245,17 +267,28 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
     // keep the name it was given, since that is the directory being claimed.
     let resolved = fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf());
 
-    let name = resolved.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} has no directory name to take a restore claim beside",
-                destination.display()
-            ),
-        )
-    })?;
+    let name = resolved
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} has no directory name to take a restore claim beside",
+                    destination.display()
+                ),
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
 
-    let path = resolved.with_file_name(format!("{}.{DESTINATION_LOCK}", name.to_string_lossy()));
+    let path = resolved.with_file_name(format!("{name}.{DESTINATION_LOCK}"));
+
+    // The two scratch siblings a `--clean` restore works through. Registered
+    // before the claim is taken so that nothing can create them without also
+    // being covered by the cleanup.
+    let scratch = [PARTIAL_SUFFIX, PREVIOUS_SUFFIX]
+        .map(|suffix| resolved.with_file_name(format!("{name}.{suffix}")))
+        .into();
 
     // The claim is a sibling of the destination, so it needs the destination's
     // parent to exist. Restoring into `mnt/new/photos` is an ordinary thing to
@@ -297,7 +330,11 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
             }
         })?;
 
-    Ok(DestinationLock { path, _file: file })
+    Ok(DestinationLock {
+        path,
+        scratch,
+        _file: file,
+    })
 }
 
 /// Create every recorded directory, including ones that hold no files.

@@ -35,6 +35,10 @@ snapshot accounts for, and the run says so when it does.
 $ lepatch restore /tmp/docs-restored docs --clean
 ```
 
+It also assembles the tree *beside* the destination and swaps it in, so a
+failure or a Ctrl-C leaves the destination exactly as it was rather than half
+written. The cost is the disk space for two trees at once.
+
 That is the only operation here that destroys data, so it is deliberately hard to
 talk into. It refuses a destination that holds the backup set being restored
 from, your home directory, the working directory, and the filesystem root. A
@@ -106,21 +110,26 @@ rather than leaving the old tail behind. See [Restoring](#restoring) for
 Stated rather than discovered:
 
 - **Memory scales with the tree, not with the file being read.** A snapshot is
-  held whole in memory while it is verified, restored and re-serialised, and a
-  restore holds a second copy of the chunk table so its write tasks can share it.
-  That is tens of megabytes for a tree of a million files and rather more beyond,
-  which is comfortable for photographs and documents and not for a filesystem
-  image. Chunk data itself is never all resident: the pipeline holds a bounded
-  number of chunks, and verify streams each one past a fixed scratch buffer.
-- **A restore is not atomic.** It is interrupted by a full disk or a kill, the
-  destination is left partly written, and there is no journal to resume from. Run
-  it somewhere you can throw away and start again.
-- **Ctrl-C is not handled.** There is no handler and no cleanup: the process dies
-  where it stands. That is survivable rather than dangerous — a killed backup
-  leaves its version unclaimed and its uploaded chunks unreferenced, and a killed
-  restore leaves a partial tree — but nothing is tidied up on the way out.
-- **A lock left by a killed process has to be removed by hand**, for a backup set
-  or a restore destination alike. The error message says so.
+  held whole in memory while it is verified, restored and re-serialised. That is
+  tens of megabytes for a tree of a million files and rather more beyond, which is
+  comfortable for photographs and documents and not for a filesystem image.
+  Chunk *data* is never all resident: the backup pipeline holds a bounded window
+  of chunks and verify streams each one past a fixed scratch buffer, so this is a
+  limit on the tree's shape rather than on its size. Removing it means streaming
+  the snapshot, which is a change to the on-disk format rather than a tuning knob.
+- **A merging restore is not atomic.** It writes in place, so one interrupted by a
+  full disk or a kill leaves the destination partly written, and there is no
+  journal to resume from. `--clean` *is* atomic: it assembles the tree beside the
+  destination and swaps it in, so a failure or a kill leaves the destination
+  exactly as it was. That costs the disk space for two trees at once.
+- **Ctrl-C stops the run and tidies up.** `SIGINT` and `SIGTERM` are both handled,
+  the exit code follows the shell convention (130 and 143), and any claim on a
+  backup set or a destination is released on the way out. What is *not* undone is
+  work already done: a killed backup leaves its version unclaimed and its
+  uploaded chunks unreferenced, which is harmless, and a killed merging restore
+  leaves whatever it had written.
+- **The format limits above are for restore.** A backup holds one bounded window
+  of chunks regardless of tree size, so it streams.
 - **The on-disk format is not stable.** `FORMAT_VERSION` guards it, so a
   mismatched snapshot is reported rather than misread, but versions of this tool
   are not interchangeable and the crate is not published.
