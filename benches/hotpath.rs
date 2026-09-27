@@ -178,11 +178,11 @@ fn serialisation(c: &mut Criterion) {
 
     for chunks in [1usize, 100, 10_000] {
         let snapshot = sample_snapshot(chunks);
-        let encoded = snapshot.to_bytes().expect("encode");
+        let encoded = snapshot.to_bytes();
 
         group.throughput(Throughput::Bytes(u64::try_from(encoded.len()).unwrap_or(0)));
         group.bench_function(format!("encode_{chunks}_chunks"), |b| {
-            b.iter(|| black_box(snapshot.to_bytes().expect("encode")));
+            b.iter(|| black_box(snapshot.to_bytes()));
         });
         group.bench_function(format!("decode_{chunks}_chunks"), |b| {
             b.iter(|| black_box(Snapshot::from_bytes(black_box(&encoded)).expect("decode")));

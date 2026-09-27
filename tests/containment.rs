@@ -65,7 +65,7 @@ impl Forged {
             }
         }
 
-        let encoded = snapshot.to_bytes().unwrap();
+        let encoded = snapshot.to_bytes();
         let len = u64::try_from(encoded.len()).unwrap();
         let key = storage
             .put(Box::new(Cursor::new(encoded)), len)

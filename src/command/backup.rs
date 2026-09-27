@@ -177,9 +177,9 @@ pub async fn backup<
     // against what the walk recorded turns that into a hard failure.
     verify_file_lengths(&snapshot)?;
 
-    let buffer = snapshot
-        .to_bytes()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    // Infallible: every field of a snapshot is a number, a byte string or a
+    // byte array, so there is nothing here that can fail to be represented.
+    let buffer = snapshot.to_bytes();
 
     let len = u64::try_from(buffer.len())
         .map_err(|_| io::Error::other("the snapshot is too large to store"))?;

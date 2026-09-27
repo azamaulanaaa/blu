@@ -1,83 +1,42 @@
 //! On-disk description of a backup.
 //!
 //! A snapshot is serialised into a single blob in the storage backend and is
-//! referenced from an index file by its storage key. Because the blob is
-//! written once and read back arbitrarily far in the future, the encoding is
-//! explicitly framed with a magic prefix and a format version so that a
-//! layout change is reported as such instead of surfacing as a confusing
-//! deserialisation error.
+//! referenced from an index file by its storage key. Because the blob is written
+//! once and read back arbitrarily far in the future, the encoding is explicitly
+//! framed with a magic prefix and a format version so that a layout change is
+//! reported as such instead of surfacing as a confusing deserialisation error.
+//!
+//! The wire format itself is hand-written; see the `codec` submodule for why, and
+//! for the layout.
+
+mod codec;
 
 use std::{fmt, path::PathBuf};
-
-use serde::{Deserialize, Serialize};
-
-/// Serde helpers for [`PathBuf`].
-///
-/// `PathBuf`'s own `Serialize` impl round-trips through `str`, so a single
-/// path that is not valid UTF-8 fails the entire backup with "path contains
-/// invalid UTF-8 characters" — after the storage backend has already been
-/// written to. On unix the raw bytes are preserved instead; on other
-/// platforms paths are already valid Unicode and travel as a string.
-mod path_bytes {
-    use std::path::{Path, PathBuf};
-
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub(super) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-
-            serializer.serialize_bytes(path.as_os_str().as_bytes())
-        }
-
-        #[cfg(not(unix))]
-        {
-            match path.to_str() {
-                Some(path) => serializer.serialize_str(path),
-                None => Err(serde::ser::Error::custom(
-                    "path is not valid Unicode and cannot be stored on this platform",
-                )),
-            }
-        }
-    }
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<PathBuf, D::Error> {
-        #[cfg(unix)]
-        {
-            use std::ffi::OsString;
-            use std::os::unix::ffi::OsStringExt;
-
-            let bytes = <Vec<u8> as Deserialize>::deserialize(deserializer)?;
-            Ok(PathBuf::from(OsString::from_vec(bytes)))
-        }
-
-        #[cfg(not(unix))]
-        {
-            let path = <String as Deserialize>::deserialize(deserializer)?;
-            Ok(PathBuf::from(path))
-        }
-    }
-}
 
 /// Magic prefix identifying a lepatch snapshot blob.
 pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
 
 /// Snapshot layout version understood by this build.
 ///
-/// Bump this whenever the shape of [`Snapshot`] changes in a way that makes
-/// previously written blobs undecodable.
-pub const FORMAT_VERSION: u32 = 1;
+/// Bump this whenever the shape of [`Snapshot`], or the encoding in `codec`,
+/// changes in a way that makes previously written blobs undecodable.
+///
+/// This is 2. Version 1 was bincode, whose encoding was fixed-width little
+/// endian; this one is the hand-written format and the two are not
+/// interchangeable. Snapshots written by an older build are reported as an
+/// unsupported version rather than misread, which is the whole reason the header
+/// exists.
+pub const FORMAT_VERSION: u32 = 2;
 
-/// Reasons a snapshot blob could not be encoded or decoded.
+/// Reasons a snapshot blob could not be decoded.
+///
+/// There is no encode variant: encoding cannot fail. Every field is a number, a
+/// byte string or a byte array, so a `Result` that is always `Ok` is a `Result`
+/// nobody checks.
 #[derive(Debug)]
 pub enum Error {
-    /// The blob could not be serialised.
-    Encode(bincode::Error),
-    /// The blob could not be deserialised.
-    Decode(bincode::Error),
+    /// The body is malformed.
+    Decode(codec::Malformed),
     /// The blob did not start with [`MAGIC`].
     BadMagic([u8; 8]),
     /// The blob was written by a newer or older layout than this build knows.
@@ -94,8 +53,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Encode(e) => write!(f, "failed to encode snapshot: {e}"),
-            Self::Decode(e) => write!(f, "failed to decode snapshot: {e}"),
+            Self::Decode(e) => write!(f, "the snapshot is malformed: {e}"),
             Self::BadMagic(found) => write!(
                 f,
                 "not a lepatch snapshot: expected magic {MAGIC:?}, found {found:?}"
@@ -113,7 +71,7 @@ impl std::error::Error for Error {}
 
 /// A point in time, stored explicitly so that the encoding does not depend on
 /// the platform representation of `SystemTime`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {
     /// Seconds since the Unix epoch.
     pub secs: i64,
@@ -154,7 +112,7 @@ impl From<Timestamp> for std::time::SystemTime {
 
 /// A complete description of one backup: the directory tree, the set of
 /// distinct chunk contents, and how the chunks map back onto the files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Layout version of this snapshot, see [`FORMAT_VERSION`].
     pub version: u32,
@@ -186,19 +144,20 @@ impl Snapshot {
 
     /// Serialise into the framed on-disk representation.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Encode`] if the snapshot contains something the
-    /// encoding cannot represent.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let body = bincode::serialize(self).map_err(Error::Encode)?;
+    /// Infallible: every field of a snapshot is a number, a byte string or a
+    /// byte array, so there is nothing here that can fail to be represented. That
+    /// is also why the error enum has no encode variant -- a `Result` that cannot
+    /// fail is a `Result` nobody checks.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let body = codec::encode_body(self);
 
         let mut out = Vec::with_capacity(MAGIC.len() + 4 + body.len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&body);
 
-        Ok(out)
+        out
     }
 
     /// Parse the framed on-disk representation, reporting a bad magic or an
@@ -234,7 +193,7 @@ impl Snapshot {
             });
         }
 
-        bincode::deserialize(&bytes[header..]).map_err(Error::Decode)
+        codec::decode_body(&bytes[header..]).map_err(Error::Decode)
     }
 }
 
@@ -245,7 +204,7 @@ impl Default for Snapshot {
 }
 
 /// A distinct chunk of file content, addressed by its content hash.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     /// BLAKE3 hash of the chunk contents, used for deduplication and to verify
     /// the chunk on restore.
@@ -255,7 +214,7 @@ pub struct Chunk {
 }
 
 /// Whether a [`Link`] shares an inode with another file or points elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkKind {
     /// Shares its contents with [`Link::target`], which is another path in the
     /// same backup.
@@ -266,24 +225,21 @@ pub enum LinkKind {
 }
 
 /// A symbolic or hard link, recorded but never chunked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     /// Path of the link relative to the backup root.
-    #[serde(with = "path_bytes")]
     pub path: PathBuf,
     /// For a symbolic link, the raw link target; for a hard link, the path of
     /// the file within the backup whose contents are shared.
-    #[serde(with = "path_bytes")]
     pub target: PathBuf,
     /// Which kind of link this is.
     pub kind: LinkKind,
 }
 
 /// A regular file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
     /// Path relative to the backup root.
-    #[serde(with = "path_bytes")]
     pub path: PathBuf,
     /// Length in bytes at the time the tree was walked. Restore asserts that
     /// the reassembled file reaches exactly this size.
@@ -295,10 +251,9 @@ pub struct File {
 }
 
 /// A directory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dir {
     /// Path relative to the backup root.
-    #[serde(with = "path_bytes")]
     pub path: PathBuf,
     /// Platform permission bits, see [`crate::fsattr::mode_of`].
     pub mode: u32,
@@ -310,7 +265,7 @@ pub struct Dir {
 ///
 /// A single content chunk can be split across several files, and a single file
 /// is covered by several chunk slices, so this is a many-to-many join.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChunk {
     /// Index into [`Snapshot::chunks`].
     pub chunk_index: u32,

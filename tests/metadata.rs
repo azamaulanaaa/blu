@@ -26,7 +26,7 @@ fn sample() -> Snapshot {
 
 #[test]
 fn snapshot_round_trips_through_the_framed_encoding() {
-    let encoded = sample().to_bytes().unwrap();
+    let encoded = sample().to_bytes();
 
     assert_eq!(&encoded[..metadata::MAGIC.len()], metadata::MAGIC);
 
@@ -39,7 +39,7 @@ fn snapshot_round_trips_through_the_framed_encoding() {
 
 #[test]
 fn a_blob_without_the_magic_prefix_is_rejected() {
-    let mut encoded = sample().to_bytes().unwrap();
+    let mut encoded = sample().to_bytes();
     encoded[0] = b'X';
 
     match Snapshot::from_bytes(&encoded) {
@@ -50,7 +50,7 @@ fn a_blob_without_the_magic_prefix_is_rejected() {
 
 #[test]
 fn an_unknown_format_version_is_reported_as_such() {
-    let mut encoded = sample().to_bytes().unwrap();
+    let mut encoded = sample().to_bytes();
     let version_at = metadata::MAGIC.len();
     encoded[version_at..version_at + 4].copy_from_slice(&999u32.to_le_bytes());
 
@@ -65,7 +65,7 @@ fn an_unknown_format_version_is_reported_as_such() {
 
 #[test]
 fn a_truncated_blob_is_rejected_rather_than_panicking() {
-    let encoded = sample().to_bytes().unwrap();
+    let encoded = sample().to_bytes();
 
     for len in 0..metadata::MAGIC.len() + 4 {
         match Snapshot::from_bytes(&encoded[..len]) {
@@ -77,7 +77,7 @@ fn a_truncated_blob_is_rejected_rather_than_panicking() {
 
 #[test]
 fn a_corrupt_body_is_reported_as_a_decode_error() {
-    let mut encoded = sample().to_bytes().unwrap();
+    let mut encoded = sample().to_bytes();
     let last = encoded.len() - 1;
     encoded[last] ^= 0xff;
 
@@ -125,5 +125,47 @@ fn an_extreme_timestamp_does_not_wrap_into_the_opposite_of_itself() {
     assert_eq!(
         restored,
         std::time::UNIX_EPOCH - std::time::Duration::new(1_000_000_000, 500)
+    );
+}
+
+/// A blob written by a pre-release build must be reported, not misread.
+///
+/// Version 1 was bincode — fixed-width little endian — and version 2 is the
+/// hand-written format. They share a magic prefix and nothing else, so a decoder
+/// that guessed rather than checked would turn an old backup set into a
+/// plausible-looking and completely wrong one. This is the test that says it
+/// does not.
+#[test]
+fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
+    let mut encoded = sample().to_bytes();
+    let header = lepatch::metadata::MAGIC.len();
+
+    // Claim to be version 1, with a body that is not a version 1 body.
+    encoded[header..header + 4].copy_from_slice(&1u32.to_le_bytes());
+
+    match lepatch::metadata::Snapshot::from_bytes(&encoded) {
+        Err(lepatch::metadata::Error::UnsupportedVersion { found, supported }) => {
+            assert_eq!(found, 1);
+            assert_eq!(supported, lepatch::metadata::FORMAT_VERSION);
+        }
+        other => panic!("expected an unsupported-version error, got {other:?}"),
+    }
+}
+
+/// The encoded form should not have the same size as the old one by accident.
+///
+/// Not a strong property on its own, but a sanity check that the header really
+/// is being written and the body really is variable width.
+#[test]
+fn the_encoding_is_compact_for_small_numbers() {
+    let snapshot = sample();
+    let encoded = snapshot.to_bytes();
+
+    // A path, a count and a handful of small indices should cost tens of bytes,
+    // not the ~150 a fixed-width encoding of the same values would.
+    assert!(
+        encoded.len() < 120,
+        "expected a compact encoding, got {} bytes",
+        encoded.len()
     );
 }

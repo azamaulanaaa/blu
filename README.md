@@ -130,9 +130,13 @@ Stated rather than discovered:
   leaves whatever it had written.
 - **The format limits above are for restore.** A backup holds one bounded window
   of chunks regardless of tree size, so it streams.
-- **The on-disk format is not stable.** `FORMAT_VERSION` guards it, so a
-  mismatched snapshot is reported rather than misread, but versions of this tool
-  are not interchangeable and the crate is not published.
+- **The on-disk format is not stable.** `FORMAT_VERSION` guards it, so a snapshot
+  from an older build is reported as an unsupported version rather than misread,
+  but the versions are not interchangeable and the crate is not published. The
+  encoding is hand-written in `src/metadata/codec.rs` rather than delegated, so
+  there is no upstream whose policy can decide whether your backup set can still
+  be read — which is how `bincode` came to be on an advisory list in the first
+  place.
 
 ## Library
 

@@ -57,21 +57,17 @@ version = 2
 # stricter than a warn default on purpose.
 yanked = "deny"
 
-# RUSTSEC-2025-0141: the bincode team ceased development permanently after a
-# doxxing incident. Version 1.3.3 is considered complete, so there is no fix
-# coming and no vulnerability either — the crate is simply never going to change
-# again.
+# Nothing is ignored.
 #
-# It is depended on for the snapshot encoding, which is the one place a backup
-# cannot afford to be left behind by someone else's policy. The exposure is
-# contained: `Snapshot::to_bytes` and `Snapshot::from_bytes` are the only code
-# that touches bincode, and both sit behind the explicit magic prefix and
-# `FORMAT_VERSION` header, so replacing the encoding — with bincode 2, or with
-# something hand-written — is a change to two functions plus a version bump.
-# Old snapshots stay readable by keeping the old decoder until a migration runs.
-#
-# Remove this entry when that replacement lands.
-ignore = ["RUSTSEC-2025-0141"]
+# RUSTSEC-2025-0141 used to be here: the bincode team ceased development
+# permanently after a doxxing incident, so 1.3.3 was unmaintained with no fix
+# coming. Moving to bincode 2 did not clear it — the advisory covers the whole
+# project, and the 3.0.0 release is a placeholder whose entire source is a
+# `compile_error!`. The snapshot encoding is now hand-written, in
+# `src/metadata/codec.rs`, which is where it belonged: it is the one thing in this
+# tool that has to keep working, and it should not be at the mercy of somebody
+# else's policy. `FORMAT_VERSION` moved to 2 because the encoding changed.
+ignore = []
 
 [sources]
 # Denied rather than warned. The lockfile is what makes a build reproducible, so
