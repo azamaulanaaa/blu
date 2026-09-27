@@ -28,6 +28,7 @@ use std::{
     io::{self, Cursor},
     path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -86,11 +87,30 @@ fn lock_slots(slots: &Slots) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Slot
 /// boundary from the bytes before it, so the stream cannot be split across
 /// threads. What it does overlap is the storing of chunks it has already handed
 /// over.
+/// How long the reader spent waiting for room in the channel, which is how long
+/// the other half was the slower one.
+#[derive(Debug, Default)]
+struct ReaderTimings {
+    /// Time parked in `blocking_send`.
+    blocked: Duration,
+}
+
+/// Read, chunk and hash the tree on a blocking thread, feeding `tx`.
+///
+/// This half is deliberately sequential: content-defined chunking finds each
+/// boundary from the bytes before it, so the stream cannot be split across
+/// threads. What it does overlap is the storing of chunks it has already handed
+/// over.
+///
+/// Returns how long it spent blocked handing chunks over, which the committer
+/// turns into the pipeline's timing line.
 fn produce(
     paths: Vec<PathBuf>,
     config: reader::ChunkerConfig,
     tx: mpsc::Sender<Pending>,
-) -> io::Result<()> {
+) -> io::Result<Duration> {
+    let mut timings = ReaderTimings::default();
+
     // Built here rather than by the caller because this is the thread that
     // blocks on it: stat'ing every file is a syscall apiece.
     let chunker = reader::Chunker::new(paths, config)?;
@@ -108,13 +128,16 @@ fn produce(
         // would otherwise need is exactly what it must not do. It returns an
         // error once every receiver is gone, which is the signal that the run
         // has already failed and there is nothing left to read for.
-        tx.blocking_send(Pending {
+        let sending = Instant::now();
+        let sent = tx.blocking_send(Pending {
             seq,
             hash,
             sources: chunk.sources,
             data: chunk.data,
-        })
-        .map_err(|_| {
+        });
+        timings.blocked += sending.elapsed();
+
+        sent.map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "every upload failed before the tree was read",
@@ -125,7 +148,7 @@ fn produce(
     // Dropping the sender is how the other half learns the tree is finished.
     drop(tx);
 
-    Ok(())
+    Ok(timings.blocked)
 }
 
 /// Everything the storing half of the pipeline needs, gathered so that passing it
@@ -178,25 +201,44 @@ impl<S: storage::StoragePut + storage::StorageGet + 'static> Pipeline<S> {
         // reader rather than letting the tree accumulate in memory.
         let (tx, mut rx) = mpsc::channel::<Pending>(concurrency * 2);
 
-        let producer = tokio::task::spawn_blocking(move || produce(paths, config, tx));
+        let reader = tokio::task::spawn_blocking(move || produce(paths, config, tx));
 
         let committed = commit(Arc::clone(&self), &mut rx, concurrency, snapshot, files).await;
 
-        if let Err(e) = committed {
-            // Dropping the receiver makes the producer's next send fail, so it
-            // stops reading rather than working through a tree nobody wants.
-            drop(rx);
-            let _ = producer.await;
-            return Err(e);
-        }
+        let commit_busy = match committed {
+            Ok(busy) => busy,
+            Err(e) => {
+                // Dropping the receiver makes the reader's next send fail, so it
+                // stops reading rather than working through a tree nobody wants.
+                drop(rx);
+                let _ = reader.await;
+                return Err(e);
+            }
+        };
 
-        // The producer's own outcome is checked before the snapshot is trusted:
-        // it is the one that knows why a file's contents could not be read, and
-        // its error says so far more usefully than the length mismatch one would
+        // The reader's own outcome is checked before the snapshot is trusted: it
+        // is the one that knows why a file's contents could not be read, and its
+        // error says so far more usefully than the length mismatch one would
         // infer further down.
-        producer
+        let reader_blocked = reader
             .await
             .map_err(|join| io::Error::other(format!("the reader thread failed: {join}")))??;
+
+        // Where the run's wall time went, on the two halves that can be the
+        // bottleneck.
+        //
+        // The reader's blocked time is the number worth having: it is how long the
+        // reader spent waiting for room in the channel, which is how long the
+        // other half was the slower one. A reader that is never blocked and a
+        // committer that is never idle cannot both be true — and which of the two
+        // it is has been guessed wrong twice in this codebase's history.
+        // `lepatch backup -v` prints it.
+        tracing::debug!(
+            reader_blocked_ms = millis(reader_blocked),
+            committer_ms = millis(commit_busy),
+            "pipeline timings; a large reader_blocked_ms means the stores were the \
+             bottleneck, a small one means the reader was"
+        );
 
         Ok(())
     }
@@ -213,7 +255,9 @@ async fn commit<S: storage::StoragePut + 'static>(
     concurrency: usize,
     snapshot: &mut metadata::Snapshot,
     files: u64,
-) -> io::Result<()> {
+) -> io::Result<Duration> {
+    let mut commit_busy = Duration::ZERO;
+
     let mut in_flight = JoinSet::new();
 
     // Results that finished before the one they follow, keyed by read order.
@@ -263,6 +307,8 @@ async fn commit<S: storage::StoragePut + 'static>(
         match in_flight.join_next().await {
             Some(Ok(Ok(stored))) => {
                 ready.insert(stored.seq, stored);
+
+                let folding = Instant::now();
                 commit_ready(
                     &pipeline,
                     &mut ready,
@@ -270,6 +316,7 @@ async fn commit<S: storage::StoragePut + 'static>(
                     &mut index_of,
                     snapshot,
                 )?;
+                commit_busy += folding.elapsed();
 
                 // Distinct content is what actually costs storage, so it is the
                 // number worth watching on a tree that deduplicates well.
@@ -296,7 +343,14 @@ async fn commit<S: storage::StoragePut + 'static>(
         )));
     }
 
-    Ok(())
+    // How long this half spent folding results in, which is what lets the caller
+    // say whether it or the reader was the slow one.
+    Ok(commit_busy)
+}
+
+/// Whole milliseconds, for a log field.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Fold in every result whose turn has come, in read order.
