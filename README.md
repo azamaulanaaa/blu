@@ -117,11 +117,23 @@ Stated rather than discovered:
   of chunks and verify streams each one past a fixed scratch buffer, so this is a
   limit on the tree's shape rather than on its size. Removing it means streaming
   the snapshot, which is a change to the on-disk format rather than a tuning knob.
+- **A backup is CPU-bound, and mostly on hashing.** Measured on 160 MB: 1.2s of CPU
+  for 0.48s of wall clock, about half of it in the kernel. Reading and writing that
+  much to a tmpfs costs about 70ms, so the run is not waiting on the disk at all.
+  The reader hashes with blake3 on one thread while it walks the tree, and that
+  thread is the busiest thing in the process. The obvious fix is hashing chunks
+  across a thread pool, which the pipeline's current shape does not allow: the
+  hash is needed to deduplicate, and deduplication is decided in commit order
+  after every store has finished. It is a change to the pipeline rather than a
+  tuning knob.
 - **A merging restore is not atomic.** It writes in place, so one interrupted by a
   full disk or a kill leaves the destination partly written, and there is no
   journal to resume from. `--clean` *is* atomic: it assembles the tree beside the
   destination and swaps it in, so a failure or a kill leaves the destination
-  exactly as it was. That costs the disk space for two trees at once.
+  exactly as it was. That costs the disk space for two trees at once. Making a
+  merge atomic is possible and not worth it: the destination would have to be
+  copied aside first, which for a restore into a large existing tree doubles both
+  the disk and the time to say nothing that `--clean` does not already offer.
 - **Ctrl-C stops the run and tidies up.** `SIGINT` and `SIGTERM` are both handled,
   the exit code follows the shell convention (130 and 143), and any claim on a
   backup set or a destination is released on the way out. What is *not* undone is
