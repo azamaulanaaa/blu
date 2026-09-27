@@ -41,15 +41,35 @@
 //! criterion's stored baseline. `examples/ab.rs` documents why, and includes the
 //! measurements behind it.
 //!
+//! **Its absolute numbers are higher than the real binary's, and that gap is
+//! unexplained.** Measured here on a 50 MiB tree, byte for byte the same, with an
+//! identical `Options::default()` on a four-core box: the binary takes 0.14s and
+//! the harness 0.36s, with about half again as much CPU in the harness. The
+//! fixture, the data, the store's location, the number of trees resident, the
+//! concurrency, the worker count, building the fixture before the runtime exists
+//! and letting writeback settle were each ruled out by measuring. So the
+//! *ratios* this harness reports are sound — it measures every variant the same
+//! way — but the absolute throughput it prints is not the product's. For a number
+//! to quote about how fast a backup is, time the binary.
+//!
 //! Setup is deliberately outside the timed region: the tree is built once, and
 //! each iteration starts from an empty store. A backup that deduped against its
 //! own previous run would report a throughput no user would ever see.
 //!
 //! Backup is measured across a range of `Options::concurrency` rather than at
 //! one value, because the interesting question is not "how fast is this" but
-//! "where does it stop getting faster". On a four-core machine the answer is
-//! two, and the default of eight is chosen for a store on a network rather than
-//! on the same disk.
+//! "where does it stop getting faster".
+//!
+//! That answer was wrong here for a long time, because of a fault in
+//! `examples/ab.rs`'s fixture: its pseudo-random generator was a function of
+//! `position + seed`, so every file in the tree was the same byte stream at a
+//! different offset. Deduplication removed over 90% of it and the curve flattened
+//! at 2.3x. With the fixture repaired — 50 MiB genuinely reaching the store — the
+//! same four-core box gives **3.0x from concurrency 1 to 8, still climbing at the
+//! top of the range**, and CPU time falls as concurrency rises (340 ms to 260 ms)
+//! rather than staying flat, which is what a store that is no longer serialising
+//! uploads looks like. The default of eight remains the right default; it is now
+//! the measured answer rather than an assumption.
 
 use std::{
     hint::black_box,
