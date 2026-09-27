@@ -13,7 +13,7 @@ use tracing::instrument;
 
 use crate::{
     fsattr,
-    metadata::{self, FileChunk, Snapshot},
+    metadata::{self, Snapshot},
     progress::Progress,
     slice,
     storage::{self, StreamReadSeeker},
@@ -75,13 +75,18 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     key: String,
     storage: S,
 ) -> io::Result<Restored> {
-    let snapshot = {
+    // Shared, not copied. Every `Chunk` in a snapshot owns a `String`, so a clone of
+    // the chunk table is one allocation per chunk in the store — paid on top of
+    // the tree, on top of the snapshot, on top of the decoded bytes, for a value
+    // nothing ever writes to. The write tasks need owned data, and sharing is
+    // how they get it without the copy.
+    let snapshot = Arc::new({
         let mut reader: StreamReadSeeker = storage.get(&key).await?;
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
         metadata::Snapshot::from_bytes(buffer.as_slice())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-    };
+    });
 
     let root = root.as_ref();
     let storage = Arc::new(storage);
@@ -102,7 +107,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         .map_err(|e| io::Error::new(e.kind(), format!("refusing to restore {key}: {e}")))?;
 
     restore_directories(root, &snapshot).await?;
-    let written = restore_files(root, &snapshot, Arc::clone(&storage)).await?;
+    let written = restore_files(root, Arc::clone(&snapshot), Arc::clone(&storage)).await?;
     restore_links(root, &snapshot)?;
     restore_attributes(root, &snapshot)?;
 
@@ -311,13 +316,18 @@ async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()>
 /// be observed by another file being written at the same time.
 async fn restore_files<S: storage::StorageGet + 'static>(
     root: &Path,
-    snapshot: &Snapshot,
+    snapshot: Arc<Snapshot>,
     storage: Arc<S>,
 ) -> io::Result<u64> {
-    // Group the chunk slices by the file they belong to so that each
-    // destination is opened once rather than once per slice.
-    let mut slices: Vec<Vec<FileChunk>> = vec![Vec::new(); snapshot.files.len()];
-    for file_chunk in &snapshot.file_chunks {
+    // Grouped by *index* into `snapshot.file_chunks`, not by copying the slices.
+    //
+    // Copying them was the obvious way to get owned data out here and it cost a
+    // second full set of chunk slices on top of the snapshot for no reason. The
+    // snapshot is shared rather than cloned for the same reason, and that one
+    // matters more: every `Chunk` holds a `String`, so cloning the table meant a
+    // fresh allocation per chunk in the store, on top of the tree's own.
+    let mut slices: Vec<Vec<usize>> = vec![Vec::new(); snapshot.files.len()];
+    for (position, file_chunk) in snapshot.file_chunks.iter().enumerate() {
         let index = file_chunk.file_index as usize;
         let bucket = slices.get_mut(index).ok_or_else(|| {
             io::Error::new(
@@ -325,10 +335,9 @@ async fn restore_files<S: storage::StorageGet + 'static>(
                 format!("chunk slice references file {index}, which the snapshot does not contain"),
             )
         })?;
-        bucket.push(file_chunk.clone());
+        bucket.push(position);
     }
 
-    let chunks = Arc::new(snapshot.chunks.clone());
     let concurrency = restore_concurrency();
     let total_files = u64::try_from(snapshot.files.len()).unwrap_or(0);
 
@@ -352,7 +361,7 @@ async fn restore_files<S: storage::StorageGet + 'static>(
                 path: resolve(root, &snapshot.files[next].path, "a file")?,
                 file: snapshot.files[next].clone(),
                 slices: std::mem::take(&mut slices[next]),
-                chunks: Arc::clone(&chunks),
+                snapshot: Arc::clone(&snapshot),
             };
             next += 1;
 
@@ -390,13 +399,18 @@ async fn restore_files<S: storage::StorageGet + 'static>(
     Ok(written)
 }
 
-/// One file's worth of work, owned so it can outlive the snapshot it came from.
+/// One file.s worth of work, owned so it can outlive the loop that queued it.
+///
+/// The snapshot is shared rather than copied: every chunk it holds owns a
+/// `String`, so a copy of the table is a fresh allocation per chunk in the store
+/// on top of the tree being restored.
 struct RestoreJob {
     /// Where the file goes, already joined onto the restore root.
     path: PathBuf,
     file: metadata::File,
-    slices: Vec<FileChunk>,
-    chunks: Arc<Vec<metadata::Chunk>>,
+    /// Positions in `snapshot.file_chunks` belonging to this file.
+    slices: Vec<usize>,
+    snapshot: Arc<Snapshot>,
 }
 
 /// Create one file at its final length and write its chunk slices into it.
@@ -405,7 +419,7 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
         path,
         file,
         slices,
-        chunks,
+        snapshot,
     } = job;
 
     // Created before the content, at its final size, so that a file with no
@@ -435,16 +449,28 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
 
     handle.set_len(file.len).await?;
 
-    for file_chunk in slices {
-        let chunk = chunks.get(file_chunk.chunk_index as usize).ok_or_else(|| {
-            io::Error::new(
+    for position in slices {
+        // Borrowed from the shared snapshot rather than owned, which is the whole
+        // reason the positions were kept instead of copies of the slices.
+        let Some(file_chunk) = snapshot.file_chunks.get(position) else {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "chunk slice references chunk {}, which the snapshot does not contain",
-                    file_chunk.chunk_index
-                ),
-            )
-        })?;
+                format!("chunk slice {position} is not in the snapshot"),
+            ));
+        };
+
+        let chunk = snapshot
+            .chunks
+            .get(file_chunk.chunk_index as usize)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "chunk slice references chunk {}, which the snapshot does not contain",
+                        file_chunk.chunk_index
+                    ),
+                )
+            })?;
 
         let length = u64::from(file_chunk.length);
 
