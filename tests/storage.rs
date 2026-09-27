@@ -187,3 +187,124 @@ async fn a_store_in_a_missing_directory_is_created() {
     let store = BlobFileStorage::<false>::new(&blob).await.unwrap();
     assert_eq!(read_all(&store, &key).await.unwrap(), vec![3u8; 10]);
 }
+
+/// Concurrent uploads must not overlap.
+///
+/// The store claims a range for each blob and then copies into it without
+/// holding anything, which is what lets uploads run in parallel. That is only
+/// sound if every claim is distinct, and the way it goes wrong is quiet: two
+/// writers agree on an offset, one clobbers the other, and both keys look
+/// perfectly valid.
+///
+/// Every payload is filled with its own index, so an overlap shows up as a blob
+/// that reads back with somebody else's number in it. Payloads are large and
+/// uneven, so a writer cannot finish before its neighbours have started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_do_not_overlap() {
+    const BLOBS: usize = 64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store.bin");
+    let store = std::sync::Arc::new(BlobFileStorage::<true>::new(&blob).await.unwrap());
+
+    // Uneven, and big enough that the copies genuinely overlap in time.
+    let payloads: Vec<Vec<u8>> = (0..BLOBS)
+        .map(|i| {
+            let len = 40_000 + (i * 977) % 90_000;
+            vec![u8::try_from(i % 251).expect("in range") + 1; len]
+        })
+        .collect();
+
+    let mut tasks = Vec::new();
+    for (i, payload) in payloads.iter().cloned().enumerate() {
+        let store = std::sync::Arc::clone(&store);
+        tasks.push(tokio::spawn(async move {
+            let key = store
+                .put(reader(payload.clone()), payload.len() as u64)
+                .await?;
+            Ok::<_, std::io::Error>((i, key))
+        }));
+    }
+
+    let mut keys = Vec::new();
+    for task in tasks {
+        keys.push(task.await.unwrap().unwrap());
+    }
+
+    // Reopened, not the same handle: this is what a restore or a verify does.
+    let reader_store = BlobFileStorage::<false>::new(&blob).await.unwrap();
+    for (i, key) in &keys {
+        let read = read_all(&reader_store, key).await.unwrap();
+        assert_eq!(
+            read.len(),
+            payloads[*i].len(),
+            "blob {i} came back the wrong length, so a range was claimed twice"
+        );
+        assert_eq!(
+            read, payloads[*i],
+            "blob {i} came back holding another blob's bytes"
+        );
+    }
+
+    // Every byte written is accounted for: no gaps, so the claims were disjoint
+    // *and* exhaustive.
+    let total: usize = payloads.iter().map(Vec::len).sum();
+    assert_eq!(
+        std::fs::metadata(&blob).unwrap().len(),
+        total as u64,
+        "the store is not exactly the sum of its blobs"
+    );
+}
+
+/// A failed upload must not disturb the ones that follow it.
+///
+/// A failed copy keeps the range it claimed: the bytes are never referenced by
+/// any key, and giving them back would mean truncating the file, which a writer
+/// that has already claimed the space past them has promised not to happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store.bin");
+    let store = std::sync::Arc::new(BlobFileStorage::<true>::new(&blob).await.unwrap());
+
+    // 64 good blobs, and in the middle of them one that lies about its length.
+    let mut tasks = Vec::new();
+    for i in 0..64usize {
+        let store = std::sync::Arc::clone(&store);
+        tasks.push(tokio::spawn(async move {
+            let payload = vec![u8::try_from(i % 251).expect("in range") + 1; 30_000 + i];
+            let declared = if i == 32 {
+                30_000
+            } else {
+                payload.len() as u64
+            };
+            let key = store.put(reader(payload), declared).await?;
+            Ok::<_, std::io::Error>((i, key))
+        }));
+    }
+
+    let mut keys = Vec::new();
+    let mut failures = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok((i, key)) => keys.push((i, key)),
+            Err(_) => failures += 1,
+        }
+    }
+
+    assert_eq!(
+        failures, 1,
+        "the short reader should have been the only failure"
+    );
+    assert_eq!(keys.len(), 63);
+
+    let reader_store = BlobFileStorage::<false>::new(&blob).await.unwrap();
+    for (i, key) in &keys {
+        let read = read_all(&reader_store, key).await.unwrap();
+        assert_eq!(
+            read,
+            vec![u8::try_from(*i % 251).expect("in range") + 1; 30_000 + i],
+            "blob {i} is wrong"
+        );
+    }
+}
