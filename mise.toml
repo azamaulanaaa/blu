@@ -130,6 +130,18 @@ run. Do not trust its change-detection across runs on a shared machine — it
 reports a 0.9% interval around numbers that then move 16% on the next run.
 """
 
+[tasks.bench-store]
+run = "cargo run --release --example putbench"
+description = """
+The store in isolation: put N blobs through it, against the same bytes written
+with one open and a large buffer.
+
+Use this when the end-to-end number will not settle a question. A change can
+halve the time the store takes and barely move the whole backup, because the
+backup is CPU-bound and the store was not what the CPU was doing. This measures
+the store alone, so the two cannot be confused.
+"""
+
 [tasks.bench-ab]
 run = "cargo run --release --example ab -- compare"
 description = """

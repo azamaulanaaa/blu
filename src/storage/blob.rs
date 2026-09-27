@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
 };
 use tracing::instrument;
 
@@ -187,7 +187,8 @@ impl storage::StoragePut for BlobFileStorage<true> {
         // just decided not to use.
         file.seek(SeekFrom::Start(offset)).await?;
 
-        let written = tokio::io::copy(&mut reader.as_mut().take(len), &mut file).await?;
+        let mut source = BufReader::with_capacity(256 * 1024, reader.as_mut().take(len));
+        let written = tokio::io::copy_buf(&mut source, &mut file).await?;
 
         if written != len {
             return Err(io::Error::new(

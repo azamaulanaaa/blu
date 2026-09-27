@@ -227,17 +227,24 @@ impl<S: storage::StoragePut + storage::StorageGet + 'static> Pipeline<S> {
         // Where the run's wall time went, on the two halves that can be the
         // bottleneck.
         //
-        // The reader's blocked time is the number worth having: it is how long the
-        // reader spent waiting for room in the channel, which is how long the
-        // other half was the slower one. A reader that is never blocked and a
-        // committer that is never idle cannot both be true — and which of the two
-        // it is has been guessed wrong twice in this codebase's history.
-        // `lepatch backup -v` prints it.
+        // `reader_blocked_ms` is how long the reader spent waiting for room in the
+        // channel. Read it as "how far ahead the reader got", not as "how slow
+        // the stores were": a reader that is merely faster than the committer
+        // fills a bounded channel immediately and blocks on it repeatedly, so the
+        // number is large even when the stores are keeping up perfectly well. It
+        // fell from 993 ms to 272 ms when the store's write lock was removed and
+        // wall time halved, which is why it is worth having — but the wall clock
+        // is what settles it and this is what suggests where to look.
+        //
+        // Both halves of this pipeline have been blamed incorrectly in this
+        // codebase's history, twice, so the reading is stated rather than assumed.
+        // `lepatch backup -v` prints it, and `mise run bench-store` measures the
+        // store on its own when this is ambiguous.
         tracing::debug!(
             reader_blocked_ms = millis(reader_blocked),
             committer_ms = millis(commit_busy),
-            "pipeline timings; a large reader_blocked_ms means the stores were the \
-             bottleneck, a small one means the reader was"
+            "pipeline timings; a large reader_blocked_ms means the reader ran ahead \
+             of the committer, which is usually but not always the stores being slow"
         );
 
         Ok(())
