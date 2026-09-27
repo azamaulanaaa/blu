@@ -252,6 +252,27 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
 
     let path = resolved.with_file_name(format!("{}.{DESTINATION_LOCK}", name.to_string_lossy()));
 
+    // The claim is a sibling of the destination, so it needs the destination's
+    // parent to exist. Restoring into `mnt/new/photos` is an ordinary thing to
+    // want and the restore itself would have created the missing directories
+    // anyway — without this the claim is the only part that cannot cope with a
+    // path that is not there yet, and the run fails with a bare ENOENT before it
+    // starts.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        fs::create_dir_all(parent).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "could not create {} to hold the restore claim: {e}",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+
     let file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

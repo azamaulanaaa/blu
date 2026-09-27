@@ -642,3 +642,34 @@ fn a_second_restore_into_one_destination_is_refused() {
         "the destination claim was left behind after the restore finished"
     );
 }
+
+#[test]
+fn a_restore_creates_a_destination_whose_parent_is_missing() {
+    // `mnt/new/photos` is an ordinary thing to want, and the restore itself
+    // creates the missing directories. The destination claim is a *sibling* of
+    // the destination, so it was the one part that could not cope with a path
+    // that is not there yet — and it failed the run with a bare ENOENT before
+    // any of that happened.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(50_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    let destination = dir.path().join("brand").join("new").join("nested");
+    assert!(!destination.exists(), "the fixture should not exist yet");
+
+    ok(dir.path(), &["restore", "brand/new/nested", "store"]);
+
+    assert_eq!(
+        fs::read(destination.join("a.bin")).unwrap().len(),
+        50_000,
+        "the file did not land in the nested destination"
+    );
+
+    // And the claim must not be left inside the restored tree.
+    assert!(
+        !destination.join("nested.lepatch-restore.lock").exists(),
+        "the restore claim ended up inside the restored output"
+    );
+}
