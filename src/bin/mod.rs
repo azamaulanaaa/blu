@@ -84,7 +84,14 @@ async fn main() -> ExitCode {
                 cause = error.source();
             }
 
-            ExitCode::FAILURE
+            // `128 + signal` is what a shell expects from a signalled process, and
+            // scripts already understand it: 130 for Ctrl-C, 143 for `kill`.
+            let signal = STOP_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+            if signal == 0 {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::from(128 + signal)
+            }
         }
     }
 }
@@ -105,7 +112,29 @@ fn init_tracing(verbose: bool, quiet: bool) {
     let _ = fmt().with_env_filter(filter).try_init();
 }
 
+/// Number of the signal that asked us to stop, or 0 if none did.
+///
+/// Read by `main` to report `128 + signal`, which is what a shell expects: 130
+/// for Ctrl-C, 143 for `kill`. A static rather than a return value because the
+/// signal is the reason the run was abandoned, not the reason it failed.
+static STOP_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Run a command, abandoning it if the process is asked to stop.
+///
+/// Without this, Ctrl-C left a restore claim behind that had to be removed by
+/// hand before the next restore into the same directory would run, and a backup
+/// left an index reservation that had to be removed by hand the same way. The
+/// claims are released by `Drop`, so all this has to do is stop unwinding — and
+/// letting the work future drop is what does it.
 async fn run(command: Command) -> std::io::Result<()> {
+    tokio::select! {
+        result = dispatch(command) => result,
+        signal = stop_signal() => Err(signal),
+    }
+}
+
+/// The work itself, without the interruption handling.
+async fn dispatch(command: Command) -> std::io::Result<()> {
     match command {
         Command::Backup { source, name } => run_backup(&source, &name).await,
         Command::Restore {
@@ -116,6 +145,64 @@ async fn run(command: Command) -> std::io::Result<()> {
         } => run_restore(&destination, &name, version, clean).await,
         Command::Verify { name, version } => run_verify(&name, version).await,
     }
+}
+
+/// Resolve when the process is asked to stop.
+///
+/// `SIGTERM` is handled as well as Ctrl-C because everything that stops a backup
+/// unattended — a supervisor, a container stop, a laptop closing — uses it, and
+/// it is the one that was leaving claims behind with no way to tell what had
+/// happened.
+///
+/// A second Ctrl-C is left to the default handler, so a user who wants out
+/// immediately can still have it rather than waiting for a run to notice.
+#[cfg(unix)]
+async fn stop_signal() -> std::io::Error {
+    use std::sync::atomic::Ordering;
+
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(_e) => {
+                // No `SIGTERM` on this platform; Ctrl-C is all there is.
+                let _ = tokio::signal::ctrl_c().await;
+                STOP_SIGNAL.store(2, Ordering::Relaxed);
+                return interrupted();
+            }
+        };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            STOP_SIGNAL.store(2, Ordering::Relaxed);
+        }
+        _ = terminate.recv() => {
+            STOP_SIGNAL.store(15, Ordering::Relaxed);
+        }
+    }
+
+    interrupted()
+}
+
+#[cfg(not(unix))]
+async fn stop_signal() -> std::io::Error {
+    use std::sync::atomic::Ordering;
+
+    let _ = tokio::signal::ctrl_c().await;
+    STOP_SIGNAL.store(2, Ordering::Relaxed);
+    interrupted()
+}
+
+/// The error a stopped run reports.
+///
+/// Deliberately not worded as a success or a silent exit: the work was abandoned,
+/// and how much of it landed depends on the command. What is guaranteed is that
+/// nothing was *published* — a backup's index is only filled in on completion,
+/// and a restore's claim is released.
+fn interrupted() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "interrupted; any claim on a backup set or destination has been released",
+    )
 }
 
 /// Resolve which version to operate on, or explain why there is none.

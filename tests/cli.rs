@@ -673,3 +673,91 @@ fn a_restore_creates_a_destination_whose_parent_is_missing() {
         "the restore claim ended up inside the restored output"
     );
 }
+
+/// The claim a restore takes sits beside the destination, named for it.
+fn claim_path(destination: &Path) -> std::path::PathBuf {
+    destination.with_file_name(format!(
+        "{}.lepatch-restore.lock",
+        destination
+            .file_name()
+            .expect("a destination name")
+            .to_string_lossy()
+    ))
+}
+
+#[test]
+fn a_restore_claim_is_released_when_it_goes_out_of_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("out");
+
+    let claim = lepatch::command::lock_destination(&destination).expect("claim");
+    let path = claim_path(&destination);
+    assert!(path.exists(), "the claim file was not created");
+
+    drop(claim);
+    assert!(!path.exists(), "the claim outlived the guard that held it");
+}
+
+#[cfg(unix)]
+#[test]
+fn being_asked_to_stop_does_not_leave_a_claim_behind() {
+    // Ctrl-C used to leave a claim that had to be removed by hand before the next
+    // restore into the same directory would run.
+    //
+    // The signal goes out through a shell rather than a new dependency: this
+    // crate's graph was just fought over to keep it small, and `kill` is a
+    // coreutils builtin on every platform this test is compiled for. Signalled by
+    // pid rather than by command-line pattern — matching the pattern races the
+    // process installing its handler, and a signal arriving first takes the
+    // default action and kills the run outright, which looks exactly like the
+    // bug being tested for.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..12 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(2_000_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "store"]);
+
+    let destination = dir.path().join("out");
+
+    for signal in ["INT", "TERM"] {
+        let _ = fs::remove_dir_all(&destination);
+        let _ = fs::remove_file(claim_path(&destination));
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+            .current_dir(dir.path())
+            .args(["restore", "out", "store"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to start the restore");
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -{signal} {}", child.id()))
+            .status();
+
+        let status = child.wait().expect("failed to wait for the restore");
+        let path = claim_path(&destination);
+
+        // The claim must be gone whether the run was interrupted or finished:
+        // both paths release it, and that is the property worth asserting.
+        assert!(
+            !path.exists(),
+            "SIG{signal} left a claim at {}",
+            path.display()
+        );
+
+        // When it was interrupted at all, it should report the way a shell
+        // expects: 128 + signal.
+        if let Some(code) = status.code()
+            && code != 0
+        {
+            let expected = if signal == "INT" { 130 } else { 143 };
+            assert_eq!(code, expected, "SIG{signal} produced exit code {code}");
+        }
+    }
+}
