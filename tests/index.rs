@@ -74,8 +74,61 @@ fn derived_paths_honour_a_directory_component() {
         set.blob_path(3),
         std::path::Path::new("backups/photos.0003.bin")
     );
+    assert_eq!(
+        set.index_path(3),
+        std::path::Path::new("backups/photos.v0003.idx")
+    );
     assert_eq!(set.lock_path(), std::path::Path::new("backups/photos.lock"));
     assert_eq!(set.directory(), std::path::Path::new("backups"));
+}
+
+/// An index file is named with a `v`, so a glob cannot confuse the two.
+///
+/// Segments are `base.NNNN.bin`, and index files would otherwise be
+/// `base.NNNN.idx` — different things, same digits, same directory. A script
+/// globbing one pattern, or a person clearing out old index files, would hit
+/// both, and deleting a segment is not something `reindex` can undo.
+#[test]
+fn an_index_file_is_never_confusable_with_a_segment() {
+    let set = IndexSet::new("photos");
+
+    for version in [1u32, 12, 123] {
+        assert_eq!(
+            set.index_path(version),
+            std::path::Path::new(&format!("photos.v{version:04}.idx"))
+        );
+        assert_eq!(
+            set.blob_path(version),
+            std::path::Path::new(&format!("photos.{version:04}.bin"))
+        );
+    }
+}
+
+/// Segments and index files are told apart by name, in both directions.
+///
+/// Including the unprefixed spelling, which is exactly the trap the `v` avoids:
+/// a file that looks like an index and is not one is ignored rather than adopted.
+#[test]
+fn segments_and_index_files_are_told_apart_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = IndexSet::new(dir.path().join("photos"));
+
+    std::fs::write(set.blob_path(0), b"x").unwrap();
+    std::fs::write(set.blob_path(1), b"x").unwrap();
+    std::fs::write(set.index_path(1), b"x").unwrap();
+    std::fs::write(set.index_path(2), b"x").unwrap();
+    std::fs::write(dir.path().join("photos.0003.idx"), b"x").unwrap();
+
+    assert_eq!(
+        set.segments().unwrap(),
+        vec![set.blob_path(0), set.blob_path(1)],
+        "an index file must not be listed as a segment"
+    );
+    assert_eq!(
+        set.indexed_versions().unwrap(),
+        vec![1, 2],
+        "a segment must not be listed as an index, and an unprefixed name is not ours"
+    );
 }
 
 #[test]

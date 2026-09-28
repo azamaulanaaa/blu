@@ -334,6 +334,16 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
+/// Read one segment's records, and keep only the commit records among them.
+///
+/// This is what a scan-free lookup costs instead of scanning the whole set: one
+/// segment's worth of headers, and no payloads. The per-version index file says
+/// which segment a version is in, so a caller that wants version 7 reads one
+/// small file and walks one segment rather than all of them.
+pub(super) fn commits_in(file: &mut std::fs::File, segment: u32) -> io::Result<Vec<[u8; HASH]>> {
+    Ok(scan(file, segment)?.commits)
+}
+
 /// Read one segment's records, stopping at the first one that is not valid.
 ///
 /// `file` must be positioned anywhere; the scan seeks for itself. It never reads

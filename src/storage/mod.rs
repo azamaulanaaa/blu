@@ -21,12 +21,16 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use blob::BlobStore;
+pub use locate::{Resolved, resolve};
 pub use plan::{Plan, Planned, Range};
 pub use record::Kind;
+pub use version_index::VersionIndex;
 
 mod blob;
+mod locate;
 mod plan;
 mod record;
+mod version_index;
 
 /// Where a blob's payload sits in a store.
 ///

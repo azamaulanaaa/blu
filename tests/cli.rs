@@ -148,6 +148,28 @@ fn count_entries(dir: &std::path::Path, set: &str) -> usize {
     out.lines().filter(|line| !line.trim().is_empty()).count()
 }
 
+/// The index files of the set named `set` in `dir`.
+///
+/// Spelled out here rather than reached for through the library, because a test
+/// that deletes the cache should be deleting it the way a person would: by
+/// whatever matches the name.
+fn index_files(dir: &std::path::Path, set: &str) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "idx")
+                && path
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|stem| stem.starts_with(&format!("{set}.v")))
+        })
+        .collect();
+
+    found.sort();
+    found
+}
+
 #[test]
 fn a_second_backup_of_an_unchanged_tree_uploads_only_its_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -392,6 +414,54 @@ fn an_unfinished_run_leaves_the_previous_version_intact() {
     );
 
     ok(dir.path(), &["restore", "out2", "snap"]);
+    assert_eq!(
+        common::describe(&dir.path().join("src")),
+        common::describe(&dir.path().join("out2"))
+    );
+}
+
+/// `lepatch versions` answers from the index files, and reindex puts them back.
+///
+/// The files exist so listing a set costs a file name per version rather than a
+/// scan of every record in it. What matters for a user is that deleting them costs
+/// nothing: the versions are still there, and one command brings the listing back.
+#[test]
+fn the_version_index_can_be_rebuilt_from_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    for _ in 0..3 {
+        ok(dir.path(), &["backup", "src", "snap"]);
+    }
+    assert_eq!(count_entries(dir.path(), "snap"), 3);
+
+    // Gone.
+    for path in index_files(dir.path(), "snap") {
+        fs::remove_file(path).unwrap();
+    }
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        0,
+        "with every index file removed there is nothing to list from"
+    );
+
+    // But the versions are still restorable, which is the whole claim.
+    ok(dir.path(), &["restore", "out", "snap", "--version", "2"]);
+    assert_eq!(
+        common::describe(&dir.path().join("src")),
+        common::describe(&dir.path().join("out"))
+    );
+
+    // And one command brings the listing back.
+    ok(dir.path(), &["reindex", "snap"]);
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        3,
+        "reindex should have written an index file for every version"
+    );
+
+    // Which resolve, not merely exist.
+    ok(dir.path(), &["restore", "out2", "snap", "--version", "1"]);
     assert_eq!(
         common::describe(&dir.path().join("src")),
         common::describe(&dir.path().join("out2"))

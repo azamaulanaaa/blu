@@ -17,6 +17,7 @@ $ lepatch backup ~/Documents docs      # version 2, reusing chunks
 $ lepatch versions docs                # list the versions
 $ lepatch verify docs                  # check the stored chunks
 $ lepatch restore /tmp/docs-restored docs
+$ lepatch reindex docs                 # rebuild the per-version index files
 ```
 
 `--version N` selects a specific version; without it, restore and verify use the
@@ -62,6 +63,7 @@ A backup set is named after a base path, which is treated as an opaque prefix:
 docs.0000.bin     segment 0: the first 4 GiB of records
 docs.0001.bin     segment 1
 ...
+docs.v0001.idx    where version 1's snapshot is, so a listing need not scan
 docs.lock         held while a backup is writing
 ```
 
@@ -98,15 +100,36 @@ Segments accumulate. Nothing is removed, because chunks are shared across
 versions and so a segment cannot be dropped without breaking some other version's
 manifest.
 
-There is no index file. Versions used to be recorded in one small index file each,
-which made publishing a version a cross-file commit: an index named an offset
-inside the store, and nothing could make the two land together. A power cut could
-leave the index durable and the bytes it named unwritten, or the index's own
-directory entry missing while its contents were on the device. Now the store
-records its own versions, so publishing one is a single append to a single file
-and there is no ordering between two files to get right. Losing an index used to
-mean losing a backup whose bytes were still in the file, with no way to find them;
-losing nothing now loses nothing.
+### Index files
+
+One small file per version, saying which segment that version's snapshot is in:
+
+```text
+games.v0001.idx     version, segment, commit record within it, snapshot hash
+```
+
+They exist for one reason: without them, answering "what versions does this set
+have" means reading the header of every record in every segment, which is felt on
+the command line before a restore has written anything. With them it is a file
+name per version.
+
+**They are a cache, not a second source of truth.** The store's commit records are
+the record of what versions exist; an index file is derived from them and can be
+lost, stale, or wrong without the store disagreeing about anything. Delete them all
+and the versions still restore — `lepatch reindex` puts the files back. That is the
+inversion from the old layout, where an index file *was* the only place a version
+existed, so losing one lost the backup and a power cut could leave the index
+durable and the bytes it named unwritten.
+
+An index that disagrees with the store is never used. It must name a version the
+set holds, a segment that exists, and a commit record in that segment whose hash is
+the one the file claims; anything else falls back to the store's own answer. So a
+stale file costs a scan and a copied one costs an error, and neither can make a set
+report a version it does not have.
+
+`lepatch versions` reads the files, so its count is a **lower** bound: a version
+whose index write was abandoned still exists and still restores. It never
+over-reports.
 
 ## What is preserved
 

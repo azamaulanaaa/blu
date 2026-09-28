@@ -79,7 +79,7 @@ use super::record::{self, Kind, Placement, STORE_HEADER};
 use crate::{
     index::IndexSet,
     slice::SliceAsyncReader,
-    storage::{self, BlobId, SegmentLimit, StreamReadSeeker},
+    storage::{self, BlobId, SegmentLimit, StreamReadSeeker, VersionIndex},
 };
 
 /// Copy buffer for a payload.
@@ -97,6 +97,14 @@ struct Contents {
     blobs: HashMap<BlobId, Placement>,
     /// The snapshot hash of each committed version, oldest first.
     commits: Vec<BlobId>,
+    /// How many commit records each segment holds, by segment number.
+    ///
+    /// Seeded by the scan, so it is right for a set that was already there, and
+    /// grown by each commit, so a run that rolls over into a new segment starts it
+    /// at the right place. This is what an index file's ordinal is counted
+    /// against, and it has to be right or every index written after a rollover
+    /// would name the wrong commit record.
+    commits_per_segment: HashMap<u32, u32>,
 }
 
 impl Contents {
@@ -195,6 +203,12 @@ impl<const WRITE: bool> BlobStore<WRITE> {
 
     /// Every version this store holds, oldest first.
     ///
+    /// The commit records are the answer. The index files can only be as long as
+    /// this is, and are not consulted: a version whose index is missing still
+    /// exists, so counting the files would under-report a set whose index writes
+    /// were abandoned. [`crate::index::IndexSet::indexed_versions`] is the
+    /// file-name count, and it is a lower bound on this.
+    ///
     /// # Errors
     ///
     /// Returns an error only if the version count does not fit in a `u32`, which
@@ -247,7 +261,45 @@ impl<const WRITE: bool> BlobStore<WRITE> {
             })
     }
 
+    /// The snapshot a specific version names, using the per-version index file
+    /// when it can be trusted.
+    ///
+    /// The file is **checked, not believed**: it must name a version this set
+    /// holds, a segment that exists, and a commit record in that segment whose
+    /// hash is the one the file claims. Anything else falls back to
+    /// [`BlobStore::snapshot`], so the answer is the store's either way — which is
+    /// what makes a file that is stale, edited, or copied from another set cost a
+    /// little time rather than correctness.
+    ///
+    /// **This is not the fast path for a restore, and it is worth being honest
+    /// about why.** A restore needs every chunk a snapshot names, and locating
+    /// those is the blob index, which only a scan builds. So a caller that wants
+    /// one version still pays for the scan. What the index file does remove is the
+    /// scan for the *version list*: `lepatch versions` on a set of ten thousand
+    /// reads ten thousand file names instead of every record header in the set, and
+    /// a caller that only wants to know how far a set has got does not have to
+    /// open it at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store has no such version, the same one
+    /// [`BlobStore::snapshot`] would give, so a caller cannot tell which path
+    /// answered — which is the point.
+    pub fn snapshot_via_index(&self, version: u32) -> io::Result<BlobId> {
+        let versions = u32::try_from(Contents::lock(&self.contents).commits.len()).unwrap_or(0);
+
+        if let Some((_, snapshot)) = storage::resolve(&self.set, version, versions).confirmed() {
+            return Ok(snapshot);
+        }
+
+        self.snapshot(version)
+    }
+
     /// The snapshot a specific version names.
+    ///
+    /// Answered from the in-memory index, which the open's scan built. That
+    /// index is not the per-version file: it is in memory, and it is always
+    /// complete, because it is derived from the store's own commit records.
     ///
     /// # Errors
     ///
@@ -315,6 +367,7 @@ impl BlobStore<true> {
             contents: Mutex::new(Contents {
                 blobs: scanned.blobs,
                 commits: scanned.commits,
+                commits_per_segment: scanned.commits_per_segment,
             }),
             reserved: Mutex::new(Reservation {
                 segment: scanned.write_into,
@@ -358,6 +411,7 @@ impl BlobStore<false> {
             contents: Mutex::new(Contents {
                 blobs: scanned.blobs,
                 commits: scanned.commits,
+                commits_per_segment: scanned.commits_per_segment,
             }),
             reserved: Mutex::new(Reservation {
                 segment: scanned.write_into,
@@ -633,13 +687,64 @@ impl storage::StoragePut for BlobStore<true> {
         // The second sync, and the one that makes the run real.
         file.sync_data().await?;
 
-        let mut contents = Contents::lock(&self.contents);
-        let version = u32::try_from(contents.commits.len() + 1)
-            .map_err(|_| io::Error::other("a store cannot hold more than u32::MAX versions"))?;
-        contents.commits.push(*snapshot);
+        // The version, and which commit record within this segment it is.
+        //
+        // The ordinal is counted here rather than read back, because the run knows
+        // it: this is the n-th commit written to this segment. It is what lets a
+        // reader confirm an index file from this segment alone.
+        let (version, ordinal) = {
+            let mut contents = Contents::lock(&self.contents);
+
+            let version = u32::try_from(contents.commits.len() + 1)
+                .map_err(|_| io::Error::other("a store cannot hold more than u32::MAX versions"))?;
+            contents.commits.push(*snapshot);
+
+            let count = contents
+                .commits_per_segment
+                .entry(reservation.segment)
+                .or_insert(0);
+            let ordinal = *count;
+            *count = count.saturating_add(1);
+
+            (version, ordinal)
+        };
+
+        // The index file, written after the commit and never allowed to fail the
+        // run.
+        //
+        // A version whose index write is lost still exists and still restores; it
+        // costs a scan to find. That asymmetry is what makes the file a cache
+        // rather than a second source of truth, and it is why this cannot be an
+        // error: a run that reported failure here would have published a version
+        // and told the caller it had not.
+        if let Err(e) = write_index(
+            &self.set,
+            VersionIndex {
+                version,
+                segment: reservation.segment,
+                ordinal,
+                snapshot: *snapshot,
+            },
+        ) {
+            tracing::debug!(
+                version,
+                error = %e,
+                "published a version but could not write its index file; a scan will \
+                 find it instead"
+            );
+        }
 
         Ok(version)
     }
+}
+
+/// Write a version's index file, best-effort.
+///
+/// Never called on a path where its failure matters, which is the point: the
+/// store's commit record is the version's existence, and this is a faster way to
+/// find it.
+fn write_index(set: &IndexSet, index: VersionIndex) -> io::Result<()> {
+    index.write_atomic(&set.index_path(index.version))
 }
 
 impl BlobStore<true> {
@@ -726,6 +831,75 @@ impl BlobStore<true> {
 }
 
 impl BlobStore<true> {
+    /// Write an index file for every version this store holds.
+    ///
+    /// The operation that makes the index files disposable: everything here is
+    /// derived from the commit records, so a set with no index files at all is
+    /// still a complete set, and this brings the cache back up to date without
+    /// the store losing anything by having lost it.
+    ///
+    /// A file that cannot be written is counted as not written rather than failing
+    /// the whole run, for the same reason a backup's index write cannot fail a
+    /// backup: the version exists either way, and the file is only a faster way
+    /// to find it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the version list cannot be read, which is the
+    /// store's own in-memory index and so cannot really fail.
+    pub fn write_index_files(&self) -> io::Result<usize> {
+        let mut written = 0;
+
+        for version in self.versions()? {
+            let Some(snapshot) = self.snapshot(version).ok() else {
+                continue;
+            };
+
+            let Some((segment, ordinal)) = self.commit_position(version) else {
+                continue;
+            };
+
+            if write_index(
+                &self.set,
+                VersionIndex {
+                    version,
+                    segment,
+                    ordinal,
+                    snapshot,
+                },
+            )
+            .is_ok()
+            {
+                written += 1;
+            }
+        }
+
+        Ok(written)
+    }
+
+    /// Which segment, and which commit record within it, a version was published
+    /// by.
+    ///
+    /// Derived from the per-segment commit counts the scan built, so it is the
+    /// same arithmetic the writer used when it recorded the ordinal — and it
+    /// costs nothing.
+    fn commit_position(&self, version: u32) -> Option<(u32, u32)> {
+        let counts = Contents::lock(&self.contents);
+
+        let mut remaining = version.checked_sub(1)?;
+        let mut segments: Vec<(&u32, &u32)> = counts.commits_per_segment.iter().collect();
+        segments.sort_by_key(|(segment, _)| **segment);
+
+        for (segment, count) in segments {
+            if remaining < *count {
+                return Some((*segment, remaining));
+            }
+            remaining -= *count;
+        }
+
+        None
+    }
+
     /// The segments this run has written to, in order.
     fn dirty_segments(&self) -> io::Result<Vec<PathBuf>> {
         let dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
@@ -742,6 +916,8 @@ struct Scanned {
     blobs: HashMap<BlobId, Placement>,
     /// The snapshot hash of each committed version, in log order.
     commits: Vec<BlobId>,
+    /// How many commit records each segment holds, by segment number.
+    commits_per_segment: HashMap<u32, u32>,
     /// The segment a run writes into: the last one, which is the only one not
     /// sealed.
     ///
@@ -777,6 +953,7 @@ fn recover(set: &IndexSet) -> io::Result<Scanned> {
         segments: segments.clone(),
         blobs: HashMap::new(),
         commits: Vec::new(),
+        commits_per_segment: HashMap::new(),
         write_into: u32::MAX,
         end: 0,
     };
@@ -835,6 +1012,10 @@ fn recover(set: &IndexSet) -> io::Result<Scanned> {
         }
 
         out.blobs.extend(scan.blobs);
+        out.commits_per_segment.insert(
+            segment,
+            u32::try_from(scan.commits.len()).unwrap_or(u32::MAX),
+        );
         out.commits.extend(scan.commits);
 
         if is_last {
@@ -863,6 +1044,7 @@ fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
         segments: segments.clone(),
         blobs: HashMap::new(),
         commits: Vec::new(),
+        commits_per_segment: HashMap::new(),
         write_into: u32::MAX,
         end: 0,
     };
@@ -901,6 +1083,10 @@ fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
         }
 
         out.blobs.extend(scan.blobs);
+        out.commits_per_segment.insert(
+            segment,
+            u32::try_from(scan.commits.len()).unwrap_or(u32::MAX),
+        );
         out.commits.extend(scan.commits);
     }
 

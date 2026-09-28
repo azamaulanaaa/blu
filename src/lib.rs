@@ -9,10 +9,16 @@
 //!
 //! # Layout
 //!
-//! A backup set is a sequence of numbered segment files and a lock; see
-//! [`index::IndexSet`]. A segment is *sealed* once it is full and is never written
-//! to again, which is what makes a torn write possible only in the last one and
-//! corruption in the rest permanent and detectable.
+//! A backup set is a sequence of numbered segment files, a per-version index file
+//! for each version, and a lock; see [`index::IndexSet`]. A segment is *sealed*
+//! once it is full and is never written to again, which is what makes a torn write
+//! possible only in the last one and corruption in the rest permanent and
+//! detectable.
+//!
+//! The index files are a cache: they say which segment a version's snapshot is in,
+//! so listing a set costs a file name per version rather than a scan of every
+//! record in it. They are derived from the store's commit records, and deleting
+//! every one of them loses nothing — `lepatch reindex` rebuilds them.
 //!
 //! The store records its own versions, so publishing one is a single append to a
 //! single file and there is no second file whose contents have to be kept in step

@@ -7,6 +7,7 @@
 //! photos.000.bin      segment 0: the first N bytes of records
 //! photos.001.bin      segment 1, sealed once full and never written again
 //! ...
+//! photos.v001.idx     where version 1's snapshot is, so a restore need not scan
 //! photos.lock         held for the duration of a write
 //! ```
 //!
@@ -31,18 +32,30 @@
 //! missing a segment in the middle cannot be read as though the missing chunk
 //! data were simply not there.
 //!
-//! ## Why no index file
+//! ## Index files
 //!
-//! Versions used to be recorded in one small index file each, and that was a
-//! cross-file commit: an index named an offset inside the store, and nothing
-//! could make the two land together. A power cut could leave the index durable
-//! and the bytes it named unwritten, or the index's own directory entry missing
-//! while its contents were on the device. Now the store records its own
-//! versions, so publishing one is a single append to a single file and there is
-//! no ordering between two files to get right.
+//! One small file per version, saying which segment that version's snapshot is
+//! in. They exist for one reason: without them, answering "where is version 7's
+//! snapshot" means reading the headers of every record in every segment, and that
+//! scan is on the critical path of every restore and every verify.
 //!
-//! Losing an index used to mean losing a backup whose bytes were still in the
-//! file, with no way to find them. Losing nothing now loses nothing.
+//! **They are a cache, not a second source of truth.** The store's commit records
+//! are the record of what versions exist; an index file is derived from them and
+//! can be lost, stale, or wrong without the store disagreeing about anything. If
+//! the two conflict, the store wins and the index is rebuilt. That is the
+//! inversion from the previous design, where an index file *was* the only place a
+//! version existed and publishing it was the commit — a cross-file commit, since
+//! nothing could make an index and the bytes it named land together. Now the
+//! commit record is the commit, a single append to a single file, and the index
+//! can be written after it, best-effort, and losing it costs a scan rather than a
+//! backup.
+//!
+//! `lepatch reindex` rebuilds them from the store, which is the operation the
+//! previous design had no equivalent of.
+//!
+//! The `v` in `photos.v001.idx` is deliberate. Without it, `photos.001.idx` and
+//! `photos.001.bin` would name different things in the same directory, and a glob
+//! or a person clearing out old index files would hit both.
 //!
 //! The base path is treated as an opaque prefix rather than a stem, so a base
 //! of `photos.tar` yields `photos.tar.000.bin` instead of silently losing the
@@ -55,6 +68,8 @@ use std::{
 
 /// Extension of a store segment.
 pub const BLOB_EXTENSION: &str = "bin";
+/// Extension of a per-version index file.
+pub const INDEX_EXTENSION: &str = "idx";
 /// Extension of the write lock.
 pub const LOCK_EXTENSION: &str = "lock";
 
@@ -156,13 +171,55 @@ impl IndexSet {
         Ok(found.into_iter().map(|(_, path)| path).collect())
     }
 
+    /// Path of the index file for `version`.
+    #[must_use]
+    pub fn index_path(&self, version: u32) -> PathBuf {
+        self.suffixed(&format!("v{version:0SEGMENT_DIGITS$}.{INDEX_EXTENSION}"))
+    }
+
+    /// Every version that has an index file, in order.
+    ///
+    /// The names, not the contents: reading them is the cheap half, and the count
+    /// of them is what lets an open know how far a set has got without scanning
+    /// it. Which of them are *current* is the store's business, not this
+    /// function's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory exists but cannot be read.
+    pub fn indexed_versions(&self) -> io::Result<Vec<u32>> {
+        let prefix = self.index_prefix();
+        let directory = self.directory();
+
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+
+        let mut found: Vec<u32> = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.parent() != Some(directory) {
+                continue;
+            }
+
+            if let Some(version) = Self::indexed_version(&path, &prefix) {
+                found.push(version);
+            }
+        }
+
+        found.sort_unstable();
+        Ok(found)
+    }
+
     /// Path of the write lock.
     #[must_use]
     pub fn lock_path(&self) -> PathBuf {
         self.suffixed(LOCK_EXTENSION)
     }
 
-    /// The `base.NNNN` part every segment of this set shares.
+    /// The `base.` part every file of this set shares.
     fn segment_prefix(&self) -> String {
         let base = self
             .base
@@ -171,6 +228,21 @@ impl IndexSet {
             .unwrap_or_default();
 
         format!("{base}.")
+    }
+
+    /// The `base.v` part every index file of this set shares.
+    ///
+    /// The `v` is what keeps an index file from ever being mistaken for a
+    /// segment: both are `base.` plus digits plus an extension, and they live in
+    /// the same directory.
+    fn index_prefix(&self) -> String {
+        let base = self
+            .base
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        format!("{base}.v")
     }
 
     /// Directory the set's files live in.
@@ -190,6 +262,27 @@ impl IndexSet {
     /// because a parent is a regular file or the caller lacks permission.
     pub fn ensure_directory(&self) -> io::Result<()> {
         fs::create_dir_all(self.directory())
+    }
+
+    /// The version in `path`'s file name, if it is one of this set's index files.
+    ///
+    /// `None` for anything that is not exactly `base.vNNNN.idx`.
+    fn indexed_version(path: &Path, prefix: &str) -> Option<u32> {
+        let name = path.file_name()?.to_str()?;
+
+        if path.extension().is_none_or(|ext| ext != INDEX_EXTENSION) {
+            return None;
+        }
+
+        let digits = name
+            .strip_prefix(prefix)?
+            .strip_suffix(&format!(".{INDEX_EXTENSION}"))?;
+
+        if digits.len() != SEGMENT_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+
+        digits.parse().ok()
     }
 
     /// The segment number in `path`'s file name, if it is one of this set's.

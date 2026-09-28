@@ -45,7 +45,24 @@ enum Command {
         #[arg(long, value_name = "SIZE", value_parser = parse_size)]
         segment_size: Option<u64>,
     },
+    /// Rebuild the per-version index files from the store's commit records.
+    ///
+    /// The index files are a cache: they make listing a set cost a file name per
+    /// version rather than a scan of every record in it. Nothing is lost if they
+    /// are missing or wrong, and this puts them back. It is the operation the
+    /// previous layout had no equivalent of, because there the index files were
+    /// the only record of which versions existed and could not be derived from
+    /// anything.
+    Reindex {
+        /// Base path of the backup set to rebuild.
+        name: std::path::PathBuf,
+    },
     /// List the versions a backup set holds, oldest first.
+    ///
+    /// Reads the per-version index files, so it costs a file name per version
+    /// rather than a scan of the whole set. The count is a lower bound: a version
+    /// whose index was never written still exists and still restores, so this can
+    /// under-report and never over-reports.
     Versions {
         /// Base path of the backup set to inspect.
         name: std::path::PathBuf,
@@ -204,6 +221,7 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             clean,
         } => run_restore(&destination, &name, version, clean).await,
         Command::Verify { name, version } => run_verify(&name, version).await,
+        Command::Reindex { name } => run_reindex(&name).await,
         Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
     }
 }
@@ -291,17 +309,55 @@ fn select_version(
     }
 }
 
+/// Rebuild every per-version index file from the store's commit records.
+///
+/// The store is opened for writing, which is what makes this a repair: it scans
+/// every segment, so a torn tail in the last one is reclaimed on the way, and the
+/// lock is taken so a run cannot be appending while the records are being read.
+async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
+    let set = IndexSet::new(name);
+    let _lock = set.lock()?;
+
+    let store =
+        storage::BlobStore::<true>::open(set.base(), storage::SegmentLimit::default()).await?;
+    let versions = store.versions()?;
+
+    let written = store.write_index_files()?;
+
+    tracing::info!(
+        name = %set.base().display(),
+        versions = versions.len(),
+        written,
+        "rebuilt the version index"
+    );
+
+    Ok(())
+}
+
 /// List the versions a backup set holds, oldest first.
+///
+/// Reads the index files, which is the point of them: this answers in proportion
+/// to the number of versions rather than to the number of records in the set. Ten
+/// thousand versions is ten thousand small files, not every chunk header in every
+/// gigabyte.
+///
+/// The count printed is a **lower bound**, deliberately. A version whose index
+/// write was abandoned still exists and still restores — the commit record is what
+/// makes a version — so this may report fewer than the set holds. It never reports
+/// more, because a file cannot invent one. A set with no index files lists nothing
+/// rather than failing, and `lepatch reindex` brings it up to date.
 ///
 /// A set with no versions is not an error. "There are none" is the answer to the
 /// question that was asked, and a script iterating over a location that has not
 /// been backed up yet should see an empty list rather than a failure.
 async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Result<()> {
     let set = IndexSet::new(name);
+    let versions = set.indexed_versions()?;
 
-    // Opened read-only: a store cannot be recovered and then left alone, because
-    // recovery truncates. Listing what is there must not be the thing that
-    // discards an unfinished run.
+    // The hashes, which the file names cannot supply. Opened once, read-only: a
+    // store cannot be recovered and then left alone, because recovery truncates,
+    // and listing what is there must not be the thing that discards an unfinished
+    // run.
     let store =
         match storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await
         {
@@ -310,13 +366,22 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
             Err(e) => return Err(e),
         };
 
-    for version in store.versions()? {
+    for version in versions {
+        // Through the store, which checks the file rather than trusting it. One
+        // that does not verify is skipped, not reported: it is a cache, and the
+        // store answers the same question when asked.
         if numbers_only {
-            println!("{version}");
+            let path = set.index_path(version);
+            if storage::VersionIndex::read(&path).is_some() {
+                println!("{version}");
+            }
             continue;
         }
 
-        let snapshot = store.snapshot(version)?;
+        let Ok(snapshot) = store.snapshot_via_index(version) else {
+            continue;
+        };
+
         println!("{version}  {}", storage::hex(&snapshot));
     }
 
