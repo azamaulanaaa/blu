@@ -1,16 +1,11 @@
 //! Integrity checking of a snapshot's stored chunks.
 //!
-//! A restore runs this over the whole snapshot before it writes anything, so it
-//! is on the critical path of every restore and worth being fast: chunks are
-//! checked several at a time, and each is hashed as it streams past rather than
-//! being read into a buffer first.
+//! Run over the whole snapshot before a restore writes anything, and deliberately
+//! a separate pass from the writing: folding the hash into the copy would mean
+//! writing the first file before finding out the chunk for the last is corrupt.
 //!
-//! The pass is deliberately separate from the writing. Folding the hash into the
-//! copy that fills each file would halve the bytes read, but it would also mean
-//! writing the first file before finding out that the chunk for the last one is
-//! corrupt — turning "refuses to restore a damaged store" into "leaves a
-//! half-restored tree". Two passes is the price of that guarantee, and it is
-//! worth paying.
+//! Chunks are checked several at a time, each hashed as it streams rather than
+//! buffered whole.
 
 use std::{io, sync::Arc};
 
@@ -23,18 +18,12 @@ use crate::{
     storage::{self, StorageGet},
 };
 
-/// Chunks to check at once.
-///
-/// Reading a chunk is a round trip to the store and a hash, with nothing to
-/// overlap inside it, so several at a time is the only way to keep the store
-/// busy.
+/// Chunks to check at once. Reading one is a round trip and a hash with nothing to
+/// overlap inside it, so this is all that keeps the store busy.
 const VERIFY_CONCURRENCY: usize = 8;
 
-/// Scratch size for hashing a chunk as it streams.
-///
-/// Not the whole chunk: chunks are capped at the chunker's maximum size, but
-/// nothing here needs to hold one, and streaming means an unexpectedly large
-/// blob costs a couple more reads rather than an unexpectedly large allocation.
+/// Scratch size for hashing a chunk as it streams, so nothing here ever holds a
+/// whole chunk and an unexpectedly large blob costs reads rather than allocation.
 const SCRATCH: usize = 32 * 1024;
 
 /// How many chunks to check at once.
@@ -112,8 +101,8 @@ impl Report {
 /// is addressed by.
 ///
 /// Every failure is collected rather than stopping at the first, so a damaged
-/// store can be assessed in one pass. An unreadable store is reported as a
-/// failure of the chunks it holds rather than aborting the run.
+/// store can be assessed in one pass. An unreadable store is reported as failures
+/// of the chunks it holds rather than aborting the run.
 ///
 /// # Errors
 ///
@@ -158,9 +147,8 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
     let mut running = JoinSet::new();
     let mut next = 0usize;
 
-    // Checking a large store is a long silent wait otherwise, and it is the one
-    // place a user is told "nothing is being written yet" — so it is exactly
-    // where silence is most likely to be read as a hang.
+    // The one long silent wait, and the one place a user is told nothing is being
+    // written yet — so silence here is most likely to be read as a hang.
     let mut progress = Progress::new("verify");
     progress.set("chunks", u64::try_from(snapshot.chunks.len()).unwrap_or(0));
     progress.report();
@@ -215,8 +203,8 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
 
 /// Read one chunk back and check it against its recorded hash.
 ///
-/// Owns its scratch buffer rather than sharing one, so there is one buffer per
-/// chunk in flight rather than one per chunk checked.
+/// Owns its scratch buffer, so there is one per chunk in flight rather than one
+/// per chunk checked.
 async fn check_chunk<S: StorageGet>(
     index: usize,
     chunk: storage::BlobId,
@@ -241,10 +229,8 @@ async fn check_chunk<S: StorageGet>(
         }
     };
 
-    // Hashed as it streams rather than read into a buffer first: the whole
-    // chunk never needs to be resident, and a store that hands back more than
-    // was written costs extra reads instead of an allocation the size of the
-    // lie.
+    // Hashed as it streams, so a chunk is never resident and a store that hands
+    // back more than it stored costs reads rather than an allocation.
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0u64;
 
@@ -271,11 +257,9 @@ async fn check_chunk<S: StorageGet>(
 
     checked.bytes = bytes;
 
-    // A chunk is addressed by the hash of its contents and is stored under that
-    // hash, so the address *is* the expected value: a mismatch means the bytes
-    // stored under this name are not the bytes that were named. The name is
-    // therefore printed once, as the thing to look up, rather than twice as
-    // "expected" and something else.
+    // A chunk is stored under the hash of its contents, so the address *is* the
+    // expected value: a mismatch means the bytes under this name are not the bytes
+    // that were named.
     let actual = hasher.finalize();
     if actual.as_bytes() != &chunk {
         checked.failure = Some(Failure {
