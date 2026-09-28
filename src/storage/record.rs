@@ -7,35 +7,27 @@
 //!          | hash (32) | check (8) | payload
 //! ```
 //!
-//! The two lengths are different numbers, and keeping them apart is most of what
-//! the codec byte is for. A record's length lives in its own header, so a payload
-//! has to be compressed *before* the header is written — there is no going back
-//! to fill it in. The stored length is what a scan skips over, the raw length is
-//! what a reader is handed, and the hash is always of the raw content so that two
-//! stores which compressed the same bytes differently still agree on its name.
-//!
-//! Three properties make the rest of the design possible.
+//! The two lengths are different numbers, which is most of what the codec byte is
+//! for. A record's length lives in its own header, so a payload is compressed
+//! *before* the header is written. The stored length is what a scan skips, the
+//! raw length is what a reader is handed, and the hash is always of the raw
+//! content, so two stores which compressed the same bytes differently still agree
+//! on its name.
 //!
 //! **Every record is self-synchronising.** The scanner stops at the first header
-//! whose magic or check does not verify, and never guesses past it, so a torn
-//! write at the tail cannot make it read a record boundary that is not one.
+//! whose magic or check does not verify and never guesses past it, so a torn write
+//! at the tail cannot make it read a record boundary that is not one.
 //!
-//! **The header is small and the payload needs no checksum of its own.** The hash
-//! in the header is the BLAKE3 of the payload *as it was read* — for a chunk that
-//! hash is already computed for deduplication, so verifying stored content costs
-//! nothing extra, and the `check` field only has to cover the few dozen bytes of
-//! header ahead of it. Compression does not change that: the hash is of the
-//! content, never of the compressed bytes, so it is still the one hash a reader
-//! already has.
-//!
-//! The check is a truncated BLAKE3 rather than a CRC. CRC32C would be the
-//! textbook choice for 45 bytes and is far cheaper, but the cost is invisible
-//! next to the seek and read each record already needs, and a cryptographic
-//! digest rejects *garbage* — a region of zeroes left by an abandoned write, a
-//! length field from another format — with probability 2^-64 rather than 2^-32.
-//! Rejecting garbage well is the whole job here; the checksum is not defending
-//! against an adversary who can write to the file, since such an adversary can
-//! compute a valid check for anything they like.
+//! **The payload needs no checksum of its own.** The header's hash is the BLAKE3
+//! of the payload as it was read — for a chunk, the hash deduplication is keyed
+//! on, so verifying stored content costs nothing extra — which leaves `check` to
+//! cover only the few dozen bytes of header ahead of it. The check is a truncated
+//! BLAKE3 rather than a CRC: cheaper to compute is invisible next to the seek and
+//! read each record already needs, and a cryptographic digest rejects *garbage*
+//! — a run of zeroes left by an abandoned write, a length field from another
+//! format — with probability 2^-64 rather than 2^-32. It is not defending against
+//! an adversary who can write to the file, who can compute a valid check for
+//! anything they like.
 
 use std::{
     collections::HashMap,
@@ -44,9 +36,8 @@ use std::{
 
 /// Magic at the start of a store file.
 ///
-/// A file that does not begin with this is not a store and is never written to.
-/// That is what stops a recovery scan from deciding that some other file is a
-/// store full of garbage and truncating it away.
+/// A file that does not begin with this is not a store and is never written to,
+/// so a recovery scan cannot decide some other file is a store and truncate it.
 pub(super) const STORE_MAGIC: [u8; 4] = *b"LPST";
 
 /// Magic at the start of every record.
@@ -60,7 +51,7 @@ pub(super) const RECORD_MAGIC: [u8; 4] = *b"LPB1";
 /// shape, and the only way to tell them apart is this number.
 pub(super) const FORMAT_VERSION: u32 = 2;
 
-/// Bytes of store header: magic, version, and this segment's own index.
+/// Bytes of store header: magic, version, and this segment's own number.
 pub(super) const STORE_HEADER: usize = 12;
 
 /// Bytes of record header before the first length: magic, kind and codec.
@@ -81,10 +72,10 @@ const MAX_VARINT: usize = 10;
 /// Bytes read at a time while scanning.
 ///
 /// A record is skipped with a seek rather than read, so the scan is proportional
-/// to the number of records and not to the size of the store. What it is
-/// proportional to in *reads* is set here: the buffer is refilled only when the
-/// next header would not fit in what is left, so a store of small records costs
-/// one read per this many bytes.
+/// to the number of records and not to the size of the store. This sets what it
+/// is proportional to in *reads*: the buffer is refilled only when the next
+/// header would not fit in what is left, and always holds at least
+/// [`MIN_HEADER`].
 const SCAN_BUFFER: usize = 1024 * 1024;
 
 /// What a record holds.
@@ -126,9 +117,8 @@ impl Kind {
 pub enum Codec {
     /// Stored as it was hashed, byte for byte.
     ///
-    /// The default, and what a payload falls back to when compressing it did not
-    /// make it smaller — which is the normal outcome for content that is already
-    /// compressed, and zstd adds a few bytes of frame header to anything at all.
+    /// The default, and the fallback whenever a zstd frame did not come out
+    /// smaller than its input.
     #[default]
     Raw,
     /// A zstd frame, decompressed on the way out.
@@ -161,10 +151,9 @@ pub(super) struct Header {
     pub codec: Codec,
     /// BLAKE3 of the payload **as it was read**, before any compression.
     ///
-    /// The hash is always of the content, never of the stored bytes. A chunk is
-    /// addressed by what it contains, and two stores that compressed the same
-    /// content differently — or not at all — must agree on its name, or
-    /// deduplication would stop working the moment a compression level changed.
+    /// Always of the content, never of the stored bytes: a chunk is addressed by
+    /// what it contains, so two stores that compressed the same content
+    /// differently must still agree on its name.
     pub hash: [u8; HASH],
     /// Bytes the payload occupies in the file, which is what a scan skips.
     ///
@@ -181,27 +170,23 @@ pub(super) struct Header {
 
 /// Where a blob's payload sits in the store.
 ///
-/// A [`Placement`] names a *segment* and an offset within it. The two cannot be
-/// one number, because a store is several files: an offset is only meaningful
-/// relative to the file it is in, and a set that is a single 40 GB file is a set
-/// that will hit a filesystem limit sooner than it hits anything else.
+/// A [`Placement`] names a *segment* and an offset within it, because a store is
+/// several files and an offset is only meaningful relative to the one it is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     /// Which segment of the store the payload is in, counting from zero.
     pub segment: u32,
     /// Byte offset of the payload within that segment.
     pub offset: u64,
-    /// Bytes the payload occupies in the file.
-    ///
-    /// This is the length a reader must skip and the length that bounds the bytes
-    /// it reads from disk. For a compressed blob it is *not* the length of the
-    /// content — [`Placement::raw_len`] is that.
+    /// Bytes the payload occupies in the file, which is what a reader must skip
+    /// and what bounds the bytes it reads. Not the content length for a compressed
+    /// blob — that is [`Placement::raw_len`].
     pub len: u64,
     /// Bytes the payload is once decompressed.
     ///
-    /// A caller comparing this against a length the snapshot recorded must use
-    /// this one. A snapshot's lengths are in content bytes, because a snapshot
-    /// describes files rather than storage.
+    /// The one to compare against a length a snapshot recorded: a snapshot's
+    /// lengths are in content bytes, because it describes files rather than
+    /// storage.
     pub raw_len: u64,
     /// How the payload is stored.
     pub codec: Codec,
@@ -212,10 +197,8 @@ pub struct Placement {
 pub(super) struct Scan {
     /// Every blob the store holds, by content hash.
     ///
-    /// Populated from record headers only: the scan never reads a payload, so it
-    /// is proportional to the number of records rather than to the bytes. A blob
-    /// whose payload is damaged is still listed here and is caught when it is
-    /// read, which is what `lepatch verify` is for.
+    /// From record headers only: the scan never reads a payload, so a blob with a
+    /// damaged payload is still listed here and fails when it is read.
     pub blobs: HashMap<[u8; HASH], Placement>,
     /// The snapshot hash of each committed version, oldest first.
     ///
@@ -228,15 +211,9 @@ pub(super) struct Scan {
 
 /// Bytes a record header occupies, given the two lengths it carries.
 ///
-/// A writer needs this before it writes anything, because the header goes in
-/// front of the payload and the payload is a stream.
-///
-/// Both lengths are in the header, and both cost bytes: the stored length so a
-/// scan can skip a record it has no interest in, and the raw length so a reader
-/// knows how much to expect without decompressing first. For a raw record the two
-/// are equal, but the field is written anyway rather than inferred from the codec
-/// byte — a header that means two different things depending on a byte is one
-/// more thing to get right, and the cost is a couple of bytes per record.
+/// A writer needs this before writing anything, since the header precedes a
+/// payload that is a stream. `raw_len` is written even for a raw record, where it
+/// equals `stored_len`, rather than inferred from the codec byte.
 pub(super) fn header_len(stored_len: u64, raw_len: u64) -> u64 {
     (PREFIX + varint_len(stored_len) + varint_len(raw_len) + HASH + CHECK) as u64
 }
@@ -254,8 +231,7 @@ pub(super) fn encode_store_header(segment: u32) -> [u8; STORE_HEADER] {
 /// Why a segment header is not one this build reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum HeaderFault {
-    /// The bytes do not begin with the store magic, so this is not a store file at
-    /// all — somebody's data that this build does not understand.
+    /// The bytes do not begin with the store magic, so this is not a store file.
     NotAStore,
     /// A store, of a layout version this build does not read.
     UnsupportedVersion,
@@ -263,10 +239,10 @@ pub(super) enum HeaderFault {
 
 /// Read a segment header, and say which segment it claims to be.
 ///
-/// The segment index is in the header so that a file which has been renamed or
-/// moved into another set is *detected* rather than being read as though it
-/// belonged. Without it, swapping two segment files would produce a store that
-/// scans cleanly and holds the wrong records in the wrong order.
+/// The segment's number is in the header so a file that does not belong is
+/// detected rather than read as though it did: without it, two swapped segment
+/// files would produce a store that scans cleanly and holds the wrong records in
+/// the wrong order.
 pub(super) fn decode_store_header(bytes: &[u8]) -> Result<u32, HeaderFault> {
     if bytes.len() < STORE_HEADER || bytes[..4] != STORE_MAGIC {
         return Err(HeaderFault::NotAStore);
@@ -295,10 +271,8 @@ fn varint_len(mut value: u64) -> usize {
 /// Append the header for a record to `out`.
 ///
 /// `stored_len` is what the payload occupies in the file and `raw_len` what it is
-/// once decompressed; for a raw record they are equal. Both must be known before
-/// the header is written, which they are: a payload is compressed before it is
-/// reserved a place in the file, because a record's length is in its header and a
-/// header cannot be written twice. Nothing reaches the store until then.
+/// once decompressed; for a raw record they are equal. Both must be known first,
+/// because a header cannot be written twice.
 pub(super) fn encode_header(
     out: &mut Vec<u8>,
     kind: Kind,
@@ -347,10 +321,9 @@ fn check(header_without_check: &[u8]) -> [u8; CHECK] {
 /// absolute offset and is only used to work out where the payload lands.
 ///
 /// `None` means the bytes here are not the start of a valid record: the buffer
-/// ran out, the magic is wrong, the kind is unknown, or the check does not
-/// verify. All four mean the same thing to a scanner — stop here — and none of
-/// them is distinguishable from a tail torn by a power cut, which is the case
-/// this has to get right.
+/// ran out, the magic is wrong, the kind or codec is unknown, or the check does
+/// not verify. All of them mean the same thing to a scanner — stop here — and
+/// none is distinguishable from a tail torn by a power cut.
 fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
     if buffer.len() < MIN_HEADER {
         return None;
@@ -367,9 +340,8 @@ fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
     let (raw_len, raw_bytes) = read_varint(&buffer[PREFIX + stored_bytes..])?;
     let total = header_len(stored_len, raw_len);
 
-    // A header that does not fit in the buffer is a header that was never
-    // written, not one this scanner is too small to read: the buffer always
-    // holds at least MIN_HEADER, and any longer header was fully read.
+    // A header that does not fit in the buffer was never written, not merely
+    // unreadable: the buffer always holds at least MIN_HEADER.
     let total = usize::try_from(total).ok()?;
     if total > buffer.len() {
         return None;
@@ -380,8 +352,8 @@ fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
 
     // The check covers every byte of the header ahead of itself, so it is
     // verified before the hash is believed. A record whose two lengths do not
-    // account for the header it is standing in is not a record this scanner can
-    // safely skip past, and is treated the same as one that was never written.
+    // account for the header it stands in cannot be safely skipped, and is
+    // treated the same as one that was never written.
     if buffer[check_at..total] != check(&buffer[..check_at]) {
         return None;
     }
@@ -395,11 +367,9 @@ fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
         hash,
         stored_len,
         raw_len,
-        // The payload follows the header, so it starts one header-length past
-        // the record. Deriving it any other way — by subtracting the payload
-        // length, say — borrows from a length that has nothing to do with where
-        // the header ends, and underflows for every record bigger than the bytes
-        // in front of it.
+        // The payload starts one header-length past the record. Deriving that any
+        // other way borrows from a length with nothing to do with where the
+        // header ends, and underflows for any record bigger than what precedes it.
         payload_offset: at.saturating_add(total as u64),
         total_len: total as u64,
     })
@@ -431,23 +401,18 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 
 /// Read one segment's records, and keep only the commit records among them.
 ///
-/// This is what a scan-free lookup costs instead of scanning the whole set: one
-/// segment's worth of headers, and no payloads. The per-version index file says
-/// which segment a version is in, so a caller that wants version 7 reads one
-/// small file and walks one segment rather than all of them.
+/// One segment's worth of headers and no payloads: what a lookup that would
+/// otherwise scan the whole set costs instead.
 pub(super) fn commits_in(file: &mut std::fs::File, segment: u32) -> io::Result<Vec<[u8; HASH]>> {
     Ok(scan(file, segment)?.commits)
 }
 
 /// Read one segment's records, stopping at the first one that is not valid.
 ///
-/// `file` must be positioned anywhere; the scan seeks for itself. It never reads
-/// a payload except for a commit record, which holds 32 bytes.
-///
-/// Every [`Placement`] this produces is tagged with `segment`, so a scan of the
-/// whole set is a scan of each segment in turn rather than a scan of a
-/// concatenation — the records are in separate files and the gaps between them
-/// are other files' business.
+/// `file` may be positioned anywhere; the scan seeks for itself, and never reads a
+/// payload except a commit's 32 bytes. Every [`Placement`] is tagged with
+/// `segment`, so a set is scanned one segment at a time and never as a
+/// concatenation.
 ///
 /// # Errors
 ///
@@ -489,11 +454,10 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
             }
         }
 
-        // `buffer` begins at `base`, which is the record's position only when the
-        // buffer was refilled just now. On any later iteration of the run it
-        // still holds several records, so the header is given the slice that
-        // actually starts at this record and told where that is in the file, so
-        // it can report an absolute payload offset.
+        // `buffer` begins at `base`, which is this record's position only when the
+        // buffer was just refilled. Give the header the slice that actually
+        // starts at this record, and where that is in the file, so it can report
+        // an absolute payload offset.
         let at = usize::try_from(position - base).ok();
         let Some(at) = at.filter(|a| *a < buffer.len()) else {
             break;
@@ -526,11 +490,10 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
                 );
             }
             Kind::Commit => {
-                // A commit record with a payload that is not exactly a hash is
-                // not a commit record this build wrote, and treating it as one
-                // would publish a version pointing at nothing. The raw length is
-                // the one that decides this: a commit record is 32 bytes of
-                // content, whatever it happens to occupy on disk.
+                // A commit record whose payload is not exactly a hash is not one
+                // this build wrote, and treating it as one would publish a
+                // version pointing at nothing. The raw length decides: a commit
+                // is 32 bytes of content whatever it occupies on disk.
                 if header.raw_len == HASH as u64 && header.codec == Codec::Raw {
                     let start = usize::try_from(header.payload_offset - base).ok();
                     let start = start.filter(|s| *s + HASH <= buffer.len());
@@ -542,10 +505,9 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
                     }) {
                         scan.commits.push(snapshot);
                     } else {
-                        // The payload is in the file but not in the buffer that
-                        // was read for the header, which happens when a commit
-                        // record straddles a buffer boundary. Read it directly
-                        // rather than treating a real version as damaged.
+                        // A commit straddling a buffer boundary has its payload in
+                        // the file but not in the buffer read for the header; read
+                        // it directly rather than call a real version damaged.
                         let mut hash = [0u8; HASH];
                         file.seek(SeekFrom::Start(header.payload_offset))?;
                         if read_exact_or_eof(file, &mut hash)? {
