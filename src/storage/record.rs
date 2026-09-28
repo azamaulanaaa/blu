@@ -119,7 +119,7 @@ pub(super) struct Header {
 
 /// Where a blob's payload sits in the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Placement {
+pub struct Placement {
     /// Byte offset of the payload.
     pub offset: u64,
     /// Length of the payload.

@@ -153,6 +153,33 @@ impl<const WRITE: bool> BlobStore<WRITE> {
             .map(|snapshot| (version, snapshot))
     }
 
+    /// Where the blob hashing to `id` sits in this store.
+    ///
+    /// The index a scan builds, answered directly. This is what
+    /// [`crate::storage::Plan`] resolves a snapshot against, and it is public
+    /// because anything that walks a version — a pack writer, a differ, a
+    /// uploader — needs locations and has no other way to get them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::NotFound`] if the store does not hold that blob,
+    /// naming the hash it was asked for.
+    pub fn locate(&self, id: &BlobId) -> io::Result<Placement> {
+        Contents::lock(&self.contents)
+            .blobs
+            .get(id)
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "this store does not hold a blob hashing to {}",
+                        storage::hex(id)
+                    ),
+                )
+            })
+    }
+
     /// The snapshot a specific version names.
     ///
     /// # Errors
@@ -264,19 +291,7 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
     /// read past it into its neighbour.
     #[instrument(skip_all, err)]
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
-        let placement = Contents::lock(&self.contents)
-            .blobs
-            .get(id)
-            .copied()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "this store does not hold a blob hashing to {}",
-                        storage::hex(id)
-                    ),
-                )
-            })?;
+        let placement = self.locate(id)?;
 
         let file = fs::File::open(&self.file_path).await?;
         let len = file.metadata().await?.len();

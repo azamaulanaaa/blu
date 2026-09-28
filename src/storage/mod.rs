@@ -21,10 +21,19 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use blob::BlobStore;
+pub use plan::{Plan, Planned, Range};
 pub use record::Kind;
 
 mod blob;
+mod plan;
 mod record;
+
+/// Where a blob's payload sits in a store.
+///
+/// A blob's offset and length are an implementation detail of the store holding
+/// it — a location in this file, an object key there — so a plan resolves a
+/// snapshot against a store and speaks in terms a pack writer can use.
+pub use record::Placement;
 
 /// Address of a blob: the BLAKE3 hash of its contents.
 ///
