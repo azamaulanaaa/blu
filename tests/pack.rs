@@ -625,6 +625,35 @@ fn a_file_that_is_not_a_pack_is_refused() {
     assert!(Pack::open(&path).is_err());
 }
 
+/// A version with no file content still has a pack, and it still opens.
+///
+/// The counts are two one-byte varints and the payload is nothing, so only two
+/// bytes lie between the header's fixed part and the trailer. A reader that asks
+/// for a fixed 20 there gets a read error on a pack this crate just wrote.
+#[tokio::test]
+async fn a_pack_of_an_empty_version_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    let blob = dir.path().join("store");
+    common::run_backup(&source, &blob).await;
+
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let plan = plan_of(&blob).await;
+    assert!(plan.is_empty(), "an empty tree should plan to no chunks");
+
+    let path = dir.path().join("v1.pack");
+    Pack::write(&store, &plan, &snapshot_id(&blob).await, &path)
+        .await
+        .unwrap();
+
+    let pack = Pack::open(&path).expect("a pack this crate wrote should open");
+    assert!(pack.is_empty());
+    assert_eq!(pack.payload_len(), 0);
+    assert_eq!(pack.len(), 0);
+}
+
 /// The snapshot a pack names is the one it was built from.
 #[tokio::test]
 async fn a_pack_names_its_snapshot() {

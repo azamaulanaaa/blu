@@ -89,6 +89,11 @@ const HEADER: usize = 4 + 4 + 32;
 /// Bytes of trailer: the index length and the trailing magic.
 const TRAILER: usize = 8 + 4;
 
+/// Longest the header's two varint counts can be: a [`read_varint`] accepts at
+/// most ten bytes, so the pair is at most twenty and the fixed part is never the
+/// whole of it.
+const COUNTS_MAX: usize = 20;
+
 /// Where a chunk sits in a pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Located {
@@ -177,9 +182,9 @@ impl Pack {
         let mut chunks = Vec::with_capacity(plan.len());
         let mut offset = 0u64;
 
-        // The header is the same length whatever the counts are: two varints, both
-        // of which fit in a single byte for any count or size a single version can
-        // reach. Computing it up front is what lets the payload stream.
+        // The header's length depends on the counts — each varint runs until its
+        // high bit clears, so a version over 127 chunks needs a second byte — which
+        // is why it is built before the payload starts rather than reserved.
         let header = encode_header(planned_count, planned_bytes, *snapshot);
         let payload_start = u64::try_from(header.len()).unwrap_or(u64::MAX);
 
@@ -236,7 +241,10 @@ impl Pack {
     /// # Errors
     ///
     /// Returns an error if the file is too short to hold a trailer, does not end
-    /// with the pack magic, or its index does not decode.
+    /// with the pack magic, does not begin with one, is a format version this
+    /// build does not read, or if its index does not decode. A header that
+    /// disagrees with its own index — on the chunk count, or on where the
+    /// payload ends — is refused rather than believed.
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut file = fs::File::open(path)?;
         let len = file.metadata()?.len();
@@ -293,10 +301,16 @@ impl Pack {
         // The two varints. Reading the header's fixed part alone would leave the
         // payload starting at the wrong offset — the counts are part of it, and
         // getting this wrong shifts every chunk by a couple of bytes rather than
-        // failing.
-        let mut head = [0u8; 20];
+        // failing. Only what lies between the fixed part and the index is read:
+        // two varints need at most 20 bytes, but a pack of an empty plan has
+        // just the two one-byte counts there, and asking for 20 regardless turns
+        // a readable pack into a read error.
+        let mut head = [0u8; COUNTS_MAX];
+        let available = index_start.saturating_sub(u64::try_from(HEADER).unwrap_or(u64::MAX));
+        let to_read = usize::try_from(available.min(u64::try_from(COUNTS_MAX).unwrap_or(u64::MAX)))
+            .unwrap_or(0);
         file.seek(SeekFrom::Start(u64::try_from(HEADER).unwrap_or(u64::MAX)))?;
-        file.read_exact(&mut head)?;
+        file.read_exact(&mut head[..to_read])?;
 
         let (count, count_len) = read_varint(&head, 0)?;
         let (payload_len, payload_len_len) = read_varint(&head, count_len)?;
@@ -441,7 +455,7 @@ impl Pack {
 
 /// The header's fixed part plus its two varint counts.
 fn encode_header(chunks: u64, payload_len: u64, snapshot: BlobId) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER + 20);
+    let mut out = Vec::with_capacity(HEADER + COUNTS_MAX);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&snapshot);
