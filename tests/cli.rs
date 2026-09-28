@@ -19,6 +19,7 @@ use std::{
 };
 
 use common::noisy;
+use lepatch::command::PARTIAL_SUFFIX;
 
 /// Run the binary in `dir` and return its output.
 fn lepatch(dir: &Path, args: &[&str]) -> Output {
@@ -1061,11 +1062,23 @@ fn a_failing_clean_restore_leaves_the_destination_alone() {
 fn a_clean_restore_is_never_left_partly_written() {
     // The invariant, stated so it holds whatever the timing: after a `--clean`
     // restore is killed, the destination is either *entirely* the old contents or
-    // *entirely* the snapshot. Never some prefix of it, which is what a restore
-    // that writes in place leaves.
+    // *entirely* the snapshot. Never some mixture of the two, which is what a
+    // restore that wrote in place would leave.
     //
-    // Both outcomes are acceptable, so this cannot be flaky in the failing
-    // direction — a partial destination fails it whichever way the race went.
+    // This test previously slept a fixed 120 ms and then killed, which is a race
+    // it cannot reliably win: on a machine where the restore of 20 MB finished
+    // inside that window, the kill arrived *after* the swap and the destination
+    // held the finished snapshot — a correct outcome the assertion rejected. The
+    // comment claimed "both outcomes are acceptable, so this cannot be flaky in
+    // the failing direction", and that was false: the assertion accepted one of
+    // them. A test whose stated invariant is wider than what it checks is worse
+    // than a tight assertion, because the comment is what a reader trusts.
+    //
+    // So two things are fixed rather than one. The kill is aimed by *waiting* for
+    // the staging directory a `--clean` restore assembles into, which is the
+    // window the atomicity claim is actually about, instead of guessing a duration
+    // the machine decides. And the assertion states the invariant, so either side
+    // of the race passes and only a genuinely mixed destination fails.
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
@@ -1086,11 +1099,28 @@ fn a_clean_restore_is_never_left_partly_written() {
         .spawn()
         .expect("failed to start the restore");
 
-    std::thread::sleep(std::time::Duration::from_millis(120));
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("kill -INT {}", child.id()))
-        .status();
+    // Wait for the restore to be *assembling*, rather than assuming how long that
+    // takes. A `--clean` restore builds the whole tree in a sibling directory and
+    // swaps it in, so the presence of that directory is the signal that the
+    // destination has not been touched yet — the only state in which a kill says
+    // anything about atomicity, and a fact about the restore rather than a
+    // duration the machine gets to choose.
+    let staging = dir.path().join(format!("out.{PARTIAL_SUFFIX}"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !staging.exists() && std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let killed_while_assembling = staging.exists();
+
+    if killed_while_assembling {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -INT {}", child.id()))
+            .status();
+    }
     let _ = child.wait();
 
     let names: Vec<String> = fs::read_dir(&destination)
@@ -1104,10 +1134,18 @@ fn a_clean_restore_is_never_left_partly_written() {
     let has_marker = names.iter().any(|n| n == "marker.txt");
     let restored_files = names.iter().filter(|n| n.starts_with('f')).count();
 
+    // The invariant, not one side of it. Either exactly what it was — the marker,
+    // and none of the restored files — or exactly the snapshot: every restored
+    // file, and no marker. Anything else means the destination was written into,
+    // which is the failure.
+    let untouched = has_marker && restored_files == 0;
+    let swapped = !has_marker && restored_files == 10;
+
     assert!(
-        has_marker && restored_files == 0,
+        untouched || swapped,
         "the destination was left partly written: {has_marker} marker, \
-         {restored_files} of 10 files"
+         {restored_files} of 10 files (killed while assembling: \
+         {killed_while_assembling})"
     );
 
     // And no half-written sibling was left to confuse the next run.
