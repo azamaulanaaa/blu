@@ -1,26 +1,15 @@
 //! Saying how a run is going while it is going.
 //!
-//! A backup of a real dataset takes minutes to hours, and until this existed the
-//! only output was one line at the end. A user watching a silent terminal cannot
-//! tell a working backup from a hung one, and the first thing they do about that
-//! is kill it.
-//!
-//! There is no percentage to report, and that is worth being honest about: the
-//! number of chunks a tree divides into is not known until it has been read,
-//! because content-defined chunking finds each boundary from the bytes before it.
-//! So this reports what *is* known — how much has been read or written, how many
-//! files, and how long it has taken — and a rate derived from those.
-//!
-//! Reporting is on a timer rather than on a count, so a fast run stays quiet and
-//! a slow one is not left silent for minutes at a stretch. [`Progress::report`]
-//! decides whether a line is due.
+//! There is no percentage to report: content-defined chunking finds each boundary
+//! from the bytes before it, so a tree's chunk count is unknown until it is read.
+//! What is reported instead is bytes read or written, counts, elapsed time, and a
+//! rate derived from those, on a timer that [`Progress::report`] checks — so a
+//! fast run stays quiet and a slow one is not left silent for minutes.
 
 use std::time::{Duration, Instant};
 
-/// How often a run says something.
-///
-/// Short enough that a slow run does not leave the terminal silent for long
-/// while staring, long enough that a fast one does not fill it.
+/// How often a run says something: short enough that a slow run is not left
+/// silent for long, long enough that a fast one does not fill the terminal.
 const INTERVAL: Duration = Duration::from_millis(300);
 
 /// Accumulates what a run has done and decides when to say so.
@@ -29,9 +18,8 @@ pub struct Progress {
     /// What is being reported on, e.g. `"backup"`.
     what: &'static str,
     started: Instant,
-    /// When a line was last emitted. `None` until one has been, so that the
-    /// first tick always reports: a run that takes four seconds should still say
-    /// something, and a run that takes four hours should say it has started.
+    /// When a line was last emitted. `None` until one has been, so the first
+    /// tick always reports.
     last_reported: Option<Instant>,
     /// Running totals, in the order they are reported.
     counters: Vec<(&'static str, u64)>,
@@ -51,10 +39,8 @@ impl Progress {
 
     /// Add to a running total, which is only read when a line is emitted.
     ///
-    /// Counters are kept by name rather than as fields so a caller can add to one
-    /// without this type having to know what every command measures. A name that
-    /// is not already present is created, so a caller that never reports
-    /// something simply has no line for it.
+    /// Kept by name, and created on first use, so a caller that never reports
+    /// something has no line for it.
     pub fn add(&mut self, counter: &'static str, amount: u64) {
         if let Some((_, total)) = self.counters.iter_mut().find(|(name, _)| *name == counter) {
             *total = total.saturating_add(amount);
@@ -74,9 +60,7 @@ impl Progress {
 
     /// Whether enough time has passed to report.
     ///
-    /// Always true for the first call, and false immediately after a report, so
-    /// a run always announces itself and then goes quiet until it is worth
-    /// speaking again.
+    /// Always true for the first call, and false immediately after a report.
     pub fn due(&mut self) -> bool {
         let now = Instant::now();
         let due = self
@@ -139,13 +123,11 @@ fn describe(counters: &[(&'static str, u64)], elapsed: Duration) -> String {
     out
 }
 
-/// Bytes per second as tenths of a mebibyte per second, split into whole and
-/// tenths so it can be printed without a float.
+/// Bytes per second in tenths of a MiB/s, split into whole and tenths so it
+/// prints without a float.
 ///
-/// Integer arithmetic throughout. The crate denies clippy's float-cast lints and
-/// they are right to: a byte count is exactly the kind of value that has no
-/// business losing precision on the way to a string, and the `u128` intermediate
-/// means the multiplication cannot overflow for any run that fits on a disk.
+/// Integer throughout, with a `u128` intermediate so the multiply cannot
+/// overflow.
 fn mib_per_second_tenths(bytes: u64, elapsed: Duration) -> (u64, u64) {
     let millis = elapsed.as_millis();
     if millis == 0 {
@@ -213,11 +195,9 @@ mod tests {
 
     #[test]
     fn the_first_tick_always_reports() {
-        // A run that finishes quickly should still say something, and a run that
-        // takes a long time should say it has started.
         let mut progress = Progress::new("test");
         assert!(progress.due());
-        // And then it goes quiet, however many times it is asked.
+        // And then it goes quiet.
         assert!(!progress.due());
         assert!(!progress.due());
     }

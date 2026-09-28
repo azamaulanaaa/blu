@@ -33,20 +33,15 @@ pub struct Chunk {
     /// The file slices this chunk covers, in stream order. More than one entry
     /// means the chunk spans a file boundary.
     pub sources: Vec<ChunkSource>,
-    /// The chunk's contents.
-    ///
-    /// Held directly rather than behind a reader: the chunker has already
-    /// materialised these bytes to find the boundary, so wrapping them in a
-    /// `Cursor` and reading them straight back out again was a copy of every
-    /// byte of the tree for no benefit.
+    /// The chunk's contents, owned rather than behind a reader: the chunker has
+    /// already materialised them to find the boundary.
     pub data: Vec<u8>,
 }
 
 impl Debug for Chunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The contents are left out on purpose: a `Debug` that dumped every
-        // chunk of a backup would be a way to print the user's data, and its
-        // length says everything useful anyway.
+        // Contents omitted: a `Debug` that dumped a backup would be a way to
+        // print the user's data, and the length says everything useful anyway.
         f.debug_struct("Chunk")
             .field("sources", &self.sources)
             .field("len", &self.data.len())
@@ -122,11 +117,9 @@ impl FileRegistry {
             let overlap_start_global = std::cmp::max(global_start, entry.global_offset);
             let overlap_end_global = std::cmp::min(global_end, file_end_global);
 
-            // Both endpoints lie within `[global_start, global_end]`, so the
-            // difference cannot exceed `global_end - global_start`, which is
-            // `length` and already a `u32`. Clamping to `length` keeps that true
-            // even if a future change breaks the invariant, instead of wrapping
-            // to a plausible-looking wrong length.
+            // Both endpoints lie in `[global_start, global_end]`, so the
+            // difference cannot exceed `length`; clamping keeps that true rather
+            // than wrapping to a plausible-looking wrong length.
             let overlap = overlap_end_global.saturating_sub(overlap_start_global);
 
             let overlap_len = u32::try_from(overlap).unwrap_or(length);
@@ -194,10 +187,8 @@ impl Read for GlobalStream {
 
 /// Content-defined chunking parameters.
 ///
-/// Boundaries are chosen from the content itself rather than at fixed offsets,
-/// so inserting or removing bytes shifts only the chunks around the change
-/// instead of every chunk after it. That is what makes deduplication work
-/// across revisions of a file.
+/// Boundaries come from the content, so inserting or removing bytes shifts only
+/// the chunks around the change rather than every chunk after it.
 #[derive(Debug, Clone)]
 pub struct ChunkerConfig {
     /// No boundary is taken before this many bytes.
@@ -234,11 +225,9 @@ impl Chunker {
     pub fn new(paths: Vec<PathBuf>, config: ChunkerConfig) -> io::Result<Self> {
         let registry = Arc::new(FileRegistry::new(paths.iter())?);
 
-        // The chunker takes its bounds as `usize`, where the snapshot format
-        // stores chunk lengths as `u32`. Widening is exact in this direction on
-        // every platform that can hold a `u32`, and the reverse — a chunk longer
-        // than `u32::MAX` — is caught in `next`, where it can still be reported
-        // against the chunk that caused it.
+        // Bounds arrive as `u32` and are widened; a chunk longer than `u32::MAX` is
+        // caught in `next`, where it can be reported against the chunk that
+        // caused it.
         let widen = |value: u32| usize::try_from(value).unwrap_or(usize::MAX);
 
         let stream = GlobalStream::new(paths.iter());
@@ -259,8 +248,6 @@ impl Chunker {
 impl Iterator for Chunker {
     type Item = io::Result<Chunk>;
 
-    /// One chunk per call, so this is the natural place to trace how the
-    /// stream was split up.
     #[instrument(level = "debug", skip_all)]
     fn next(&mut self) -> Option<Self::Item> {
         let cdc_chunk = self.cdc_iter.next()?;
@@ -269,10 +256,8 @@ impl Iterator for Chunker {
             Err(e) => return Some(Err(io::Error::other(e))),
         };
 
-        // The chunker is configured with a `u32` `max_size`, so a chunk cannot
-        // exceed `u32::MAX`. Narrowing it anyway is a configuration error worth
-        // reporting rather than truncating into a length that maps the chunk to
-        // the wrong files.
+        // A configuration error, reported rather than narrowed: truncating would
+        // map the chunk to the wrong files.
         let Ok(length) = u32::try_from(cdc_chunk.length) else {
             return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -36,8 +36,7 @@ pub fn mtime_of(meta: &fs::Metadata) -> Option<Timestamp> {
 
         Some(Timestamp {
             secs: meta.mtime(),
-            // Sub-second precision is below one second by definition, so this
-            // always fits; the fallback only covers a platform that disagrees.
+            // The `max(0)` and `try_from` only cover a disagreeing platform.
             nanos: u32::try_from(meta.mtime_nsec().max(0)).unwrap_or(0),
         })
     }
@@ -50,8 +49,9 @@ pub fn mtime_of(meta: &fs::Metadata) -> Option<Timestamp> {
 
 /// Apply permission bits captured by [`mode_of`].
 ///
-/// A no-op where the platform has no equivalent, and where `mode` carries no
-/// information.
+/// A no-op where the platform has no equivalent, and where `mode` is `0` — which
+/// is what `mode_of` returns on such a platform, and what a non-unix snapshot
+/// records.
 ///
 /// # Errors
 ///
@@ -86,8 +86,8 @@ pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
     let time = filetime::FileTime::from_unix_time(mtime.secs, mtime.nanos);
 
-    // A symlink's own timestamp is not meaningful, and updating it would
-    // follow the link and touch the target instead.
+    // A symlink's own mtime is not meaningful, and setting it would follow the
+    // link and touch the target.
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Ok(());
     }
