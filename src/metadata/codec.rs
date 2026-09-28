@@ -1,15 +1,6 @@
-//! The snapshot wire format.
-//!
-//! Hand-written rather than delegated, and that is the whole point of it. The
-//! reason `bincode` ended up on an advisory list is that a project's policy
-//! decision became this tool's problem: the encoding of a user's backup set is
-//! the one thing that has to keep working, and it was at the mercy of a crate
-//! whose maintainers had walked away. Moving to a different third party lowers
-//! the probability and repeats the exposure. Owning the format removes it.
-//!
-//! The format is small enough to own. A snapshot is six flat structs of numbers,
-//! byte strings and byte arrays — no polymorphism, no generics, no maps — so
-//! the codec is a couple of hundred lines with nothing to get subtly wrong.
+//! The snapshot wire format. Hand-written rather than delegated: the encoding of
+//! a user's backup set is the one thing that has to keep working, and the
+//! reasoning behind that decision is in the README.
 //!
 //! ```text
 //! magic     8 bytes,  b"LEPATCH\0"
@@ -28,34 +19,26 @@
 //!     per link:   path, path, u8 kind
 //! ```
 //!
-//! A `varint` is LEB128. Lengths and indices are variable width because most are
-//! small; byte counts, modes and file lengths are fixed width because they are
-//! not.
+//! A `varint` is LEB128. Lengths and indices are variable width; byte counts,
+//! modes and file lengths are fixed width. An optional timestamp is a `u8` tag
+//! (`0` absent, `1` present) then `i64` secs and `u32` nanos, and a link's `u8`
+//! kind is `0` hard or `1` symbolic — any other value is refused.
 //!
 //! # Decoding is the security-relevant half
 //!
 //! A snapshot is untrusted input: it comes out of a file that gets synced,
-//! shared and backed up like anything else, and a tampered one should not be
-//! able to do anything but fail. So every length is checked against the bytes
-//! actually remaining *before* anything is allocated for it, which is what stops
-//! a four-byte count from asking for four gigabytes. A count can never exceed the
-//! input it describes, so no allocation is ever larger than the blob.
-//!
-//! Trailing bytes after the body are refused. The snapshot's own length is
-//! recorded in the store's record header, so a blob with anything after the
-//! snapshot in it is damaged, and quietly ignoring the difference would hide
-//! exactly the kind of corruption this whole check exists to catch.
+//! shared and backed up like anything else, and a tampered one should do nothing
+//! but fail. Every length is checked against the bytes remaining *before*
+//! anything is allocated for it, so a count can never request more than the blob
+//! holds, and trailing bytes after the body are refused.
 
 use std::path::{Path, PathBuf};
 
 use super::{Dir, File, FileChunk, Link, LinkKind, Snapshot, Timestamp};
 
-/// Refuse a count that cannot possibly fit in the remaining input.
-///
-/// Each entry of every collection needs at least one byte on the wire, so a count
-/// larger than the bytes left is malformed however it came to be. This is the
-/// check that makes a hostile count harmless rather than merely unlikely to
-/// cause trouble.
+/// Refuse a count that cannot fit in the bytes left: every collection entry costs
+/// at least one byte on the wire, so a count above the remaining input is
+/// malformed.
 fn plausible(count: u64, remaining: usize) -> bool {
     count <= remaining as u64
 }
@@ -99,8 +82,8 @@ impl<'a> Reader<'a> {
 
     /// Take `count` bytes, or fail if there are not that many left.
     ///
-    /// The bounds check is here, before the slice, so nothing is ever read past
-    /// the end and nothing is allocated for a length the input cannot support.
+    /// The bounds check is before the slice, so nothing is read past the end and
+    /// nothing is allocated for a length the input cannot support.
     fn take(&mut self, count: usize) -> Result<&'a [u8]> {
         let end = self
             .at
@@ -133,10 +116,8 @@ impl<'a> Reader<'a> {
         self.u64().map(|v| i64::from_le_bytes(v.to_le_bytes()))
     }
 
-    /// An LEB128 unsigned integer.
-    ///
-    /// At most ten bytes: a `u64` needs at most that many, and continuing past
-    /// it would mean either an overflow or a number no length could describe.
+    /// An LEB128 unsigned integer: at most ten bytes, and the tenth may contribute
+    /// only the last bit of a `u64`.
     fn varint(&mut self) -> Result<u64> {
         let mut out: u64 = 0;
         let mut shift: u32 = 0;
@@ -144,8 +125,7 @@ impl<'a> Reader<'a> {
         for index in 0..10 {
             let byte = self.u8()?;
 
-            // The tenth byte can only contribute the single remaining bit of a
-            // u64; anything more is an overlong encoding of something shorter.
+            // The tenth byte can contribute only the last bit of a u64.
             if index == 9 && byte > 1 {
                 return Err(Malformed("a length in the snapshot is too large"));
             }
@@ -178,12 +158,8 @@ impl<'a> Reader<'a> {
         Ok(count)
     }
 
-    /// A path, as raw bytes.
-    ///
-    /// Not as a string, because a path is not required to be valid UTF-8 and
-    /// refusing to store one loses a file. This is the one place the old serde
-    /// helper existed, and doing it directly means no wrapper type and no
-    /// per-field attribute.
+    /// A path, as a varint byte length then the raw bytes: a path need not be
+    /// valid UTF-8, and refusing one would lose a file.
     fn path(&mut self) -> Result<PathBuf> {
         let len =
             usize::try_from(self.varint()?).map_err(|_| Malformed("a path length is too large"))?;
@@ -199,8 +175,6 @@ impl<'a> Reader<'a> {
 
         #[cfg(not(unix))]
         {
-            // Elsewhere a path is already text, so a byte sequence that is not
-            // UTF-8 cannot have come from a real filesystem.
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| Malformed("a path is not valid Unicode on this platform"))?;
             Ok(PathBuf::from(text))
@@ -338,8 +312,6 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Vec<u8> {
     for link in &snapshot.links {
         out.path(&link.path);
         out.path(&link.target);
-        // One byte, and an unknown value is refused on the way back in rather
-        // than being mapped onto some other kind of link.
         out.u8(match link.kind {
             LinkKind::Hard => 0,
             LinkKind::Symbolic => 1,
@@ -414,9 +386,7 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Anything after the snapshot is damage, not padding: the snapshot's length
-    // is recorded in the store's record header, so a mismatch means the two
-    // disagree about what this blob is, which is what the verify pass catches.
+    // Anything after the snapshot is damage, not padding.
     if !reader.is_done() {
         return Err(Malformed("the snapshot has trailing bytes"));
     }
@@ -505,8 +475,7 @@ mod tests {
 
     #[test]
     fn an_absurd_count_cannot_allocate() {
-        // The first count claims 2^40 files in a body nine bytes long. Nothing
-        // should be allocated for it, and nothing should succeed.
+        // 2^40 files claimed in a nine-byte body.
         let mut body = Vec::new();
         Writer::new().varint(0);
         body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
