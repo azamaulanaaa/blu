@@ -6,7 +6,10 @@ name = "lepatch"
 # third benchmark and fail to link. Every target this package has is listed
 # explicitly, so nothing is lost by saying so.
 autobenches = false
-version = "0.1.0"
+# 0.2.0 introduced zstd compression, which changed the record format:
+# `FORMAT_VERSION` is 2, and a store written by 0.1 is refused rather than
+# misparsed. Anyone with an existing backup set re-takes it.
+version = "0.2.0"
 edition = "2024"
 # Minimum supported Rust version.
 #
