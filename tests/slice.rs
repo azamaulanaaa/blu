@@ -11,9 +11,7 @@
 //! handed on short — a short read that looked like end-of-file would leave a
 //! restored file quietly incomplete.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; the helpers below are
-// plain functions that tests call, so they need the exemption spelled out.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
 use std::io::SeekFrom;
 
@@ -93,18 +91,15 @@ async fn it_seeks_where_it_says_from_every_origin() {
     let raw = payload(60_000);
     let mut reader = DecompressReader::new(frame_of(&raw), 60_000).await.unwrap();
 
-    // From the start.
     reader.seek(SeekFrom::Start(10_000)).await.unwrap();
     assert_eq!(reader.stream_position().await.unwrap(), 10_000);
     let mut window = [0u8; 16];
     reader.read_exact(&mut window).await.unwrap();
     assert_eq!(&window, &raw[10_000..10_016]);
 
-    // Relative to where it is now.
     reader.seek(SeekFrom::Current(5)).await.unwrap();
     assert_eq!(reader.stream_position().await.unwrap(), 10_005 + 16);
 
-    // From the end, forwards and backwards.
     reader.seek(SeekFrom::End(-100)).await.unwrap();
     assert_eq!(reader.stream_position().await.unwrap(), 60_000 - 100);
     let mut tail = Vec::new();

@@ -1,7 +1,5 @@
 //! Content round-tripping through backup and restore.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; `build_tree` below is
-// a plain helper called from one, so it needs the exemption spelled out.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

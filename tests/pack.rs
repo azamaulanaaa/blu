@@ -12,9 +12,7 @@
 //!   merge, which is the entire point of packing;
 //! * a truncated or corrupt pack is refused rather than read as a shorter one.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; the helpers below are
-// plain functions that tests call, so they need the exemption spelled out.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
 mod common;
 

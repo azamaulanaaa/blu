@@ -6,8 +6,6 @@
 //! message the user sees were all untested. These tests go through the real
 //! binary so those paths are exercised as a user would meet them.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; the `lepatch` helper
-// below is a plain fn called from many.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

@@ -6,9 +6,6 @@
 //! content it already has writes nothing — so these tests are about the
 //! property a caller gets for free rather than about a knob it sets.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; the `snapshot`
-// helper below is a plain async fn called from one, so it needs the exemption
-// spelled out.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

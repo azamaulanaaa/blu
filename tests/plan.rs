@@ -6,8 +6,6 @@
 //! plan — a pack, a diff, a delta download — differs between runs, and the
 //! snapshot's determinism buys nothing.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; the helper below is a
-// plain async fn called from one, so it needs the exemption spelled out.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;

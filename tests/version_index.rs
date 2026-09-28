@@ -17,9 +17,7 @@
 //! So the tests below are about safety, not speed, and the one that matters most
 //! is `an_index_cannot_invent_a_version`.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; the helpers below are
-// plain functions that tests call, so they need the exemption spelled out.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
 mod common;
 

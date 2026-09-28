@@ -1,9 +1,7 @@
 //! The blob store: content addressing, length enforcement, deduplication, and
 //! refusing to read anything the store does not hold.
 
-// `.clippy.toml` exempts code inside a `#[test]` function; the helpers below are
-// plain functions that tests call, so they need the exemption spelled out.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
 mod common;
 
