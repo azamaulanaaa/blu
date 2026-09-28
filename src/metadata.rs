@@ -1,14 +1,9 @@
 //! On-disk description of a backup.
 //!
-//! A snapshot is serialised into a single blob in the storage backend, and the
-//! store's commit record names it by the BLAKE3 hash of those bytes. Because the
-//! blob is written once and read back arbitrarily far in the future, the
-//! encoding is explicitly framed with a magic prefix and a format version so
-//! that a layout change is reported as such instead of surfacing as a confusing
-//! deserialisation error.
-//!
-//! The wire format itself is hand-written; see the `codec` submodule for why, and
-//! for the layout.
+//! A snapshot is serialised into a single blob in the storage backend, named by
+//! the BLAKE3 hash of its bytes, and framed with a magic prefix and a format
+//! version so a layout change is reported as such rather than as a confusing
+//! deserialisation error. The wire format is in the `codec` submodule.
 
 mod codec;
 
@@ -24,19 +19,13 @@ pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
 /// Bump this whenever the shape of [`Snapshot`], or the encoding in `codec`,
 /// changes in a way that makes previously written blobs undecodable.
 ///
-/// This is 3. Version 2 recorded, for each chunk, both its content hash and a
-/// storage key naming a byte offset — the hash to deduplicate by, the offset to
-/// read from. The store's own index answers "where is this content" now, so the
-/// key is gone and a chunk is a bare hash. A snapshot is smaller for it, and it
-/// is the reason a store can be read back without trusting anything outside it.
-/// Version 1 was bincode, whose encoding was fixed-width little endian.
+/// This is 3. Version 2 recorded, per chunk, both its content hash and a storage
+/// key naming a byte offset; the store's own index answers "where is this
+/// content" now, so a chunk is a bare hash.
 pub const FORMAT_VERSION: u32 = 3;
 
-/// Reasons a snapshot blob could not be decoded.
-///
-/// There is no encode variant: encoding cannot fail. Every field is a number, a
-/// byte string or a byte array, so a `Result` that is always `Ok` is a `Result`
-/// nobody checks.
+/// Reasons a snapshot blob could not be decoded. No encode variant, because
+/// encoding cannot fail: every field is a number, a byte string or a byte array.
 #[derive(Debug)]
 pub enum Error {
     /// The body is malformed.
@@ -87,9 +76,8 @@ impl From<std::time::SystemTime> for Timestamp {
     fn from(time: std::time::SystemTime) -> Self {
         match time.duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => Self {
-                // Saturate rather than wrap: a timestamp beyond `i64::MAX`
-                // seconds is far outside anything a filesystem reports, and a
-                // wrapped negative value would be a worse answer than a clamp.
+                // Saturate rather than wrap: a wrapped negative would be a worse
+                // answer than a clamp.
                 secs: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
                 nanos: d.subsec_nanos(),
             },
@@ -124,14 +112,8 @@ pub struct Snapshot {
     pub files: Vec<File>,
     /// Directories, including ones that contain no files.
     pub dirs: Vec<Dir>,
-    /// Distinct chunk contents, referenced by `FileChunk::chunk_index`.
-    ///
-    /// Each entry is the BLAKE3 hash of a chunk's contents, and that hash is
-    /// also how the store finds the bytes. A snapshot used to carry a second
-    /// copy of where each chunk lived, as a string of JSON naming an offset and
-    /// a length; the store keeps that mapping in its own index now, so a
-    /// snapshot is a description of the tree and nothing about the file it
-    /// happens to be in.
+    /// Distinct chunk contents, referenced by `FileChunk::chunk_index`. Each
+    /// entry is the BLAKE3 hash of the contents, and the store's index maps it.
     pub chunks: Vec<storage::BlobId>,
     /// Placement of each chunk slice within each file.
     pub file_chunks: Vec<FileChunk>,
@@ -153,12 +135,8 @@ impl Snapshot {
         }
     }
 
-    /// Serialise into the framed on-disk representation.
-    ///
-    /// Infallible: every field of a snapshot is a number, a byte string or a
-    /// byte array, so there is nothing here that can fail to be represented. That
-    /// is also why the error enum has no encode variant -- a `Result` that cannot
-    /// fail is a `Result` nobody checks.
+    /// Serialise into the framed on-disk representation: [`MAGIC`], the version
+    /// as a little-endian `u32`, then the body.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let body = codec::encode_body(self);
@@ -171,8 +149,7 @@ impl Snapshot {
         out
     }
 
-    /// Parse the framed on-disk representation, reporting a bad magic or an
-    /// unsupported version as a distinct, actionable error.
+    /// Parse the framed on-disk representation.
     ///
     /// # Errors
     ///
@@ -208,9 +185,7 @@ impl Snapshot {
     }
 }
 
-/// Empty, which is a snapshot of a tree with nothing in it. Not a convenience so
-/// much as a consequence: `new` is the only way to build one, and clippy is right
-/// that a type with a `new` that returns nothing should also say so.
+/// A snapshot of a tree with nothing in it.
 impl Default for Snapshot {
     fn default() -> Self {
         Self::new()
@@ -267,10 +242,8 @@ pub struct Dir {
     pub mtime: Option<Timestamp>,
 }
 
-/// The placement of one chunk slice within one file.
-///
-/// A single content chunk can be split across several files, and a single file
-/// is covered by several chunk slices, so this is a many-to-many join.
+/// The placement of one chunk slice within one file: a chunk can be split across
+/// several files, and a file is covered by several slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileChunk {
     /// Index into [`Snapshot::chunks`].
