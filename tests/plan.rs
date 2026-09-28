@@ -16,13 +16,15 @@ use std::fs;
 
 use lepatch::{
     metadata::Snapshot,
-    storage::{BlobStore, Plan, StorageGet},
+    storage::{BlobStore, Plan, SegmentLimit, StorageGet},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Resolve a store's latest version into a plan.
 async fn plan_of_latest(path: &std::path::Path) -> Plan {
-    let store = BlobStore::<false>::open(path).await.unwrap();
+    let store = BlobStore::<false>::open(path, SegmentLimit::default())
+        .await
+        .unwrap();
     let snapshot = latest_snapshot(&store).await;
     Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap()
 }
@@ -50,7 +52,9 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
     let blob = dir.path().join("store.bin");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
+        .await
+        .unwrap();
     let snapshot = latest_snapshot(&store).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 
@@ -98,7 +102,9 @@ async fn the_ranges_of_a_plan_cover_every_byte_it_needs() {
     let blob = dir.path().join("store.bin");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
+        .await
+        .unwrap();
     let snapshot = latest_snapshot(&store).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 
@@ -136,7 +142,7 @@ async fn the_ranges_of_a_plan_cover_every_byte_it_needs() {
 
     // And no range reaches into a record header, which would mean reading framing
     // as if it were chunk data.
-    let store_len = fs::metadata(&blob).unwrap().len();
+    let store_len = common::set_size(&blob);
     for range in &ranges {
         assert!(
             range.end <= store_len,
@@ -206,7 +212,9 @@ async fn a_plans_payloads_concatenate_into_the_files_it_describes() {
     let blob = dir.path().join("store.bin");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
+        .await
+        .unwrap();
     let snapshot = latest_snapshot(&store).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 

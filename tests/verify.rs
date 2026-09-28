@@ -7,7 +7,8 @@ use std::fs;
 use common::noisy;
 use lepatch::{
     command::{Report, restore, verify},
-    storage::BlobStore,
+    index::IndexSet,
+    storage::{BlobStore, SegmentLimit},
 };
 
 /// Non-uniform content, so the chunker finds real boundaries and the chunks
@@ -27,7 +28,9 @@ async fn an_intact_snapshot_verifies_clean() {
     let blob = dir.path().join("store.bin");
     let committed = common::run_backup(&source, &blob).await;
 
-    let storage = BlobStore::<false>::open(&blob).await.unwrap();
+    let storage = BlobStore::<false>::open(&blob, SegmentLimit::default())
+        .await
+        .unwrap();
     let report = verify(committed.snapshot, storage).await.unwrap();
 
     assert!(report.is_ok(), "unexpected failures: {:?}", report.failures);
@@ -42,16 +45,19 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("a.bin"), varied(200_000)).unwrap();
 
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
 
-    // Corrupt a byte in the middle of the chunk data.
-    let offset = fs::metadata(&blob).unwrap().len() / 2;
-    let mut bytes = fs::read(&blob).unwrap();
+    // Corrupt a byte in the middle of the chunk data, in the segment it is in.
+    let segment = IndexSet::new(&blob).blob_path(0);
+    let offset = fs::metadata(&segment).unwrap().len() / 2;
+    let mut bytes = fs::read(&segment).unwrap();
     bytes[offset as usize] ^= 0xff;
-    fs::write(&blob, &bytes).unwrap();
+    fs::write(&segment, &bytes).unwrap();
 
-    let storage = BlobStore::<false>::open(&blob).await.unwrap();
+    let storage = BlobStore::<false>::open(&blob, SegmentLimit::default())
+        .await
+        .unwrap();
     let report = verify(committed.snapshot, storage).await.unwrap();
 
     assert!(!report.is_ok(), "corruption went undetected");
@@ -62,30 +68,35 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     );
 }
 
-/// A store cut short leaves a version that cannot be read back.
+/// A store cut short is reported as damaged, not read as a shorter store.
 ///
-/// The snapshot blob is written last, so lopping off the tail of the store
-/// destroys it. The commit record naming it is gone with it, so the version
-/// simply is not there — which is the correct report, and quite different from
-/// the old behaviour of handing back a version whose bytes were missing.
+/// The single-file design had a version here: lopping off the tail destroyed the
+/// commit record, so the set held no version and a restore said so. Segments make
+/// that quieter rather than clearer -- the scan stops at the first record that does
+/// not verify and the bytes after it are simply not there -- so the refusal moved
+/// earlier, to the open. A set that cannot be read whole is refused whole.
 #[tokio::test]
-async fn a_store_truncated_before_its_snapshot_has_no_such_version() {
+async fn a_store_truncated_before_its_snapshot_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("a.bin"), varied(200_000)).unwrap();
 
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;
 
-    let bytes = fs::read(&blob).unwrap();
-    fs::write(&blob, &bytes[..bytes.len() - 50_000]).unwrap();
+    let segment = IndexSet::new(&blob).blob_path(0);
+    let bytes = fs::read(&segment).unwrap();
+    fs::write(&segment, &bytes[..bytes.len() - 50_000]).unwrap();
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let error = BlobStore::<false>::open(&blob, SegmentLimit::default())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(
-        store.latest().is_none(),
-        "a store with no commit record holds no version, even though its snapshot \\
-         record may still be partly there"
+        error.to_string().contains("damaged"),
+        "the error should say the set is damaged, got: {error}"
     );
 }
 
@@ -96,16 +107,19 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("a.bin"), varied(200_000)).unwrap();
 
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
 
-    let offset = fs::metadata(&blob).unwrap().len() / 2;
-    let mut bytes = fs::read(&blob).unwrap();
+    let segment = IndexSet::new(&blob).blob_path(0);
+    let offset = fs::metadata(&segment).unwrap().len() / 2;
+    let mut bytes = fs::read(&segment).unwrap();
     bytes[offset as usize] ^= 0xff;
-    fs::write(&blob, &bytes).unwrap();
+    fs::write(&segment, &bytes).unwrap();
 
     let destination = dir.path().join("restored");
-    let storage = BlobStore::<false>::open(&blob).await.unwrap();
+    let storage = BlobStore::<false>::open(&blob, SegmentLimit::default())
+        .await
+        .unwrap();
     let error = restore(&destination, committed.snapshot, storage)
         .await
         .unwrap_err();

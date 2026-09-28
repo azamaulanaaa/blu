@@ -12,7 +12,7 @@ single backup and across every version that follows it.
 ## Usage
 
 ```console
-$ lepatch backup ~/Documents docs      # creates docs.bin, version 1
+$ lepatch backup ~/Documents docs      # creates docs.0000.bin, version 1
 $ lepatch backup ~/Documents docs      # version 2, reusing chunks
 $ lepatch versions docs                # list the versions
 $ lepatch verify docs                  # check the stored chunks
@@ -59,17 +59,49 @@ verbatim and resolved by whoever follows it: a tree containing a link to
 A backup set is named after a base path, which is treated as an opaque prefix:
 
 ```text
-docs.bin          the store: every chunk, every snapshot, and a commit record per version
+docs.0000.bin     segment 0: the first 4 GiB of records
+docs.0001.bin     segment 1
+...
 docs.lock         held while a backup is writing
 ```
 
 The base name is a prefix, not a stem, so a set called `docs.tar` produces
-`docs.tar.bin` — no part of the name is silently reinterpreted.
+`docs.tar.0000.bin` — no part of the name is silently reinterpreted.
 
-There is no second file. Versions used to be recorded in one small index file
-each, which made publishing a version a cross-file commit: an index named an
-offset inside the store, and nothing could make the two land together. A power cut
-could leave the index durable and the bytes it named unwritten, or the index's own
+### Segments
+
+A set is capped per file rather than being one file that grows without bound, so
+it does not meet a limit that is somebody else's decision: a filesystem's maximum
+file size, a tool that cannot read it, a transfer that has to succeed in one piece.
+`lepatch backup --segment-size 1GiB` sets the cap; the default is 4 GiB, chosen to
+sit under what other tools and formats will handle.
+
+**A full segment is sealed and never written to again.** That is what makes this
+safe rather than merely possible: a torn write — which the commit protocol already
+anticipated as a tail that fails to verify — can only ever be in the *last*
+segment. So damage anywhere else is permanent and reported, rather than something
+the next run quietly trims away, and recovery only ever repairs one file.
+
+Each segment's header records which segment it is, so a file renamed or moved
+into another set is refused rather than read as though it belonged. A set missing a
+segment in the middle is refused too: the segments are the only place the data is,
+and a gap read as "those chunks were never stored" is a backup that lost data
+without saying so.
+
+The cap is a write policy, not part of the format, and is not recorded in the
+header. Changing it mid-life is safe and never rewrites what is already there —
+no record depends on where a boundary fell. A record larger than the whole cap is
+an error naming the cap, not a segment that quietly grows past it; note that a
+snapshot is a single record, so the cap has to exceed a snapshot's size.
+
+Segments accumulate. Nothing is removed, because chunks are shared across
+versions and so a segment cannot be dropped without breaking some other version's
+manifest.
+
+There is no index file. Versions used to be recorded in one small index file each,
+which made publishing a version a cross-file commit: an index named an offset
+inside the store, and nothing could make the two land together. A power cut could
+leave the index durable and the bytes it named unwritten, or the index's own
 directory entry missing while its contents were on the device. Now the store
 records its own versions, so publishing one is a single append to a single file
 and there is no ordering between two files to get right. Losing an index used to
@@ -98,9 +130,14 @@ The parts that matter when a backup runs unattended:
   particular order: with a single sync the page holding the commit record can
   arrive while an earlier data page has not, and then the store holds a version
   whose data is not there. A run that stops before the commit leaves nothing
-  published, and the next run's recovery scan discards the tail it left behind.
-  A killed run leaves no skipped version numbers to reason about, because a
-  version number is a position in the store's own log.
+  published, and the next run's recovery discards the tail it left behind — from
+  the last segment only, since a sealed one is never written to again. A killed
+  run leaves no skipped version numbers to reason about, because a version number
+  is a position in the store's own log.
+- **A set that cannot be read whole is refused whole.** A segment with a tail that
+  does not verify is reported as damaged rather than read up to the damage. Reading
+  past it would mean a restore that quietly omits whatever those bytes held and
+  reports success. Only a *run* repairs, and only the last segment.
 - **Nothing is written from a corrupt store.** Every chunk is checked against
   the hash it is addressed by before restore writes a single byte. A chunk's
   address *is* the hash of its contents, so this is one check rather than two.
@@ -179,24 +216,31 @@ Stated rather than discovered:
 The crate is usable directly:
 
 ```rust
-use lepatch::{command::{Options, backup, restore}, storage::BlobStore};
+use lepatch::{
+    command::{Options, backup, restore},
+    storage::{BlobStore, SegmentLimit},
+};
 
-let store = BlobStore::<true>::open("docs.bin").await?;
+let store = BlobStore::<true>::open("docs", SegmentLimit::default()).await?;
 let first = backup("~/Documents", Options::default(), store).await?;
 
 // Later backups need nothing passed to deduplicate: the store holds every
 // version it has ever been given, so a chunk it already has is not written
 // again however far back it was last seen.
-let store = BlobStore::<true>::open("docs.bin").await?;
+let store = BlobStore::<true>::open("docs", SegmentLimit::default()).await?;
 backup("~/Documents", Options::default(), store).await?;
 
-let store = BlobStore::<false>::open("docs.bin").await?;
+let store = BlobStore::<false>::open("docs", SegmentLimit::default()).await?;
 restore("~/Documents-restored", first.snapshot, store).await?;
 ```
 
 `backup` returns a `Committed`: the version number the run was given and the hash
 of the snapshot it published. A version is a position in the store's commit
 records, so `store.versions()` and `store.snapshot(n)` address them directly.
+
+`SegmentLimit` caps one file of the set; the default is 4 GiB and it can be changed
+between runs without rewriting anything. A set is `base.0000.bin`,
+`base.0001.bin` and so on, and `BlobStore::segments()` names them.
 
 The `WRITE` const generic on `BlobStore` is what stops a read-only restore from
 being handed something that can append to the store.

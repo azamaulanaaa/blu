@@ -82,7 +82,8 @@ use std::{fmt::Write as _, time::Instant};
 
 use lepatch::{
     command::{Options, backup},
-    storage::BlobStore,
+    index::IndexSet,
+    storage::{BlobStore, SegmentLimit},
 };
 
 /// Files in the tree. Enough for per-file costs to show, small enough that a
@@ -255,9 +256,13 @@ impl Samples {
 async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Options) -> Timed {
     // A fresh store each time, or the run would deduplicate against itself and
     // report a throughput nothing else would ever see.
-    let _ = std::fs::remove_file(blob);
+    for segment in 0..64 {
+        let _ = std::fs::remove_file(store_segment(blob, segment));
+    }
 
-    let storage = BlobStore::<true>::open(blob).await.expect("store");
+    let storage = BlobStore::<true>::open(blob, SegmentLimit::default())
+        .await
+        .expect("store");
     let cpu_before = cpu_seconds();
     let started = Instant::now();
     backup(src, options, storage).await.expect("backup");
@@ -268,6 +273,14 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
         wall_ms: wall * 1000.0,
         cpu_ms: cpu * 1000.0,
     }
+}
+
+/// The path of segment `segment` of the set at `base`.
+///
+/// A set is several files, and a benchmark that measures one backup wants a clean
+/// one every round — so it has to remove all of them, not just the first.
+fn store_segment(base: &std::path::Path, segment: u32) -> std::path::PathBuf {
+    IndexSet::new(base).blob_path(segment)
 }
 
 /// One measurement, in both clocks.
@@ -303,7 +316,7 @@ async fn curve(stores: &std::path::Path, src: &std::path::Path, shared: usize) {
 
     for _ in 0..ROUNDS {
         for (index, concurrency) in settings.iter().enumerate() {
-            let blob = stores.join(format!("store{concurrency}.bin"));
+            let blob = stores.join(format!("store{concurrency}"));
             let ms = time_backup(
                 src,
                 &blob,
@@ -373,7 +386,7 @@ async fn curve(stores: &std::path::Path, src: &std::path::Path, shared: usize) {
 /// Measure one configuration and print a single number, for external
 /// interleaving of two builds of the source.
 async fn report(stores: &std::path::Path, src: &std::path::Path, label: &str, rounds: usize) {
-    let blob = stores.join("store.bin");
+    let blob = stores.join("store");
     let mut samples = Samples::new(label);
     samples.times.reserve(rounds);
 

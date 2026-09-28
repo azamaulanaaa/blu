@@ -17,14 +17,16 @@ use std::fs;
 
 use lepatch::{
     command::Options,
-    storage::{BlobId, BlobStore, StorageGet},
+    storage::{BlobId, BlobStore, SegmentLimit, StorageGet},
 };
 
 /// Read a snapshot back out of a store.
 async fn snapshot(blob: &std::path::Path, id: &BlobId) -> lepatch::metadata::Snapshot {
     use tokio::io::AsyncReadExt;
 
-    let storage = BlobStore::<false>::open(blob).await.unwrap();
+    let storage = BlobStore::<false>::open(blob, SegmentLimit::default())
+        .await
+        .unwrap();
     let mut reader = storage.get(id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
@@ -45,7 +47,7 @@ async fn repeated_content_within_one_run_is_stored_once() {
         fs::write(source.join(name), &block).unwrap();
     }
 
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
     let snapshot = snapshot(&blob, &committed.snapshot).await;
 
@@ -59,7 +61,7 @@ async fn repeated_content_within_one_run_is_stored_once() {
     // 192 KiB of input must not have grown the store by 192 KiB. The store file
     // carries record headers and the snapshot on top of the chunk data, so this
     // is a loose bound rather than an exact one.
-    let stored = fs::metadata(&blob).unwrap().len();
+    let stored = common::set_size(&blob);
     assert!(
         stored < 128 * 1024,
         "store grew to {stored} bytes, deduplication did not happen"
@@ -81,13 +83,13 @@ async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("stable.bin"), vec![0x11u8; 100_000]).unwrap();
 
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
 
     let first = common::run_backup(&source, &blob).await;
-    let after_first = fs::metadata(&blob).unwrap().len();
+    let after_first = common::set_size(&blob);
 
     let second = common::run_backup(&source, &blob).await;
-    let after_second = fs::metadata(&blob).unwrap().len();
+    let after_second = common::set_size(&blob);
 
     assert_ne!(
         first.version, second.version,
@@ -131,7 +133,7 @@ async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
 
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let stable = common::noisy(100_000);
     let changing = common::noisy(40_000);
 
@@ -139,14 +141,14 @@ async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
     let cold = {
         fs::write(source.join("stable.bin"), &stable).unwrap();
         fs::write(source.join("changing.bin"), &changing).unwrap();
-        let path = dir.path().join("cold.bin");
+        let path = dir.path().join("cold");
         common::run_backup(&source, &path).await;
-        std::fs::metadata(&path).unwrap().len()
+        common::set_size(&path)
     };
 
     // Version 1, and the baseline it is compared against.
     common::run_backup(&source, &blob).await;
-    let after_first = fs::metadata(&blob).unwrap().len();
+    let after_first = common::set_size(&blob);
     assert_eq!(
         after_first, cold,
         "the first backup should match the cold store"
@@ -156,13 +158,13 @@ async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
     let other = common::noisy(40_000);
     fs::write(source.join("changing.bin"), &other).unwrap();
     common::run_backup(&source, &blob).await;
-    let after_second = fs::metadata(&blob).unwrap().len();
+    let after_second = common::set_size(&blob);
 
     // Version 3 puts the first file's content back. It is in the store — it has
     // been there since version 1 — and it is not in the version that came before.
     fs::write(source.join("changing.bin"), &changing).unwrap();
     let third = common::run_backup(&source, &blob).await;
-    let after_third = fs::metadata(&blob).unwrap().len();
+    let after_third = common::set_size(&blob);
 
     // Version 3 costs what publishing a version costs — a snapshot blob and a
     // commit record — and none of the chunk data, because every chunk it names
@@ -196,7 +198,7 @@ async fn deduplication_does_not_change_the_restored_tree() {
     }
     fs::write(source.join("unique.txt"), b"not shared").unwrap();
 
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
     let destination = dir.path().join("restored");
     common::run_restore(&blob, committed.snapshot, &destination).await;

@@ -34,9 +34,16 @@ enum Command {
     Backup {
         /// Directory to back up.
         source: std::path::PathBuf,
-        /// Base path of the backup set, e.g. `photos` creates `photos.bin` and
-        /// `photos.lock`.
+        /// Base path of the backup set, e.g. `photos` creates `photos.000.bin`
+        /// and `photos.lock`.
         name: std::path::PathBuf,
+        /// How large a segment may get before a new one is started, e.g. `4GiB`.
+        ///
+        /// Only affects segments written from now on. No record depends on where
+        /// a boundary fell, so changing it mid-life is safe and never rewrites
+        /// what is already there.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        segment_size: Option<u64>,
     },
     /// List the versions a backup set holds, oldest first.
     Versions {
@@ -146,10 +153,50 @@ async fn run(command: Command) -> std::io::Result<()> {
     }
 }
 
+/// Parse a human size like `4GiB`, `512MiB`, `1G`, or a plain byte count.
+///
+/// Deliberately small rather than a general parser: the units people reach for are
+/// the powers of 1024 and an `iB`/`B` distinction, and a size that is ambiguous is
+/// better refused than guessed at. A byte count with no unit is taken literally,
+/// which is what a script passing `4294967296` means.
+fn parse_size(raw: &str) -> std::result::Result<u64, String> {
+    let text = raw.trim();
+
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{raw}` does not start with a number of bytes"))?;
+
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024_u64 * 1024 * 1024 * 1024,
+        other => {
+            return Err(format!(
+                "`{other}` is not a size lepatch knows; use B, KiB, MiB, GiB or TiB"
+            ));
+        }
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("`{raw}` is larger than can be addressed"))
+}
+
 /// The work itself, without the interruption handling.
 async fn dispatch(command: Command) -> std::io::Result<()> {
     match command {
-        Command::Backup { source, name } => run_backup(&source, &name).await,
+        Command::Backup {
+            source,
+            name,
+            segment_size,
+        } => run_backup(&source, &name, segment_size).await,
         Command::Restore {
             destination,
             name,
@@ -236,7 +283,7 @@ fn select_version(
                 std::io::ErrorKind::NotFound,
                 format!(
                     "no committed version found in {} (looked in {})",
-                    set.blob_path().display(),
+                    set.base().display(),
                     set.directory().display()
                 ),
             )
@@ -255,11 +302,13 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     // Opened read-only: a store cannot be recovered and then left alone, because
     // recovery truncates. Listing what is there must not be the thing that
     // discards an unfinished run.
-    let store = match storage::BlobStore::<false>::open(set.blob_path()).await {
-        Ok(store) => store,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    let store =
+        match storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await
+        {
+            Ok(store) => store,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
     for version in store.versions()? {
         if numbers_only {
@@ -274,27 +323,53 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     Ok(())
 }
 
-async fn run_backup(source: &std::path::Path, name: &std::path::Path) -> std::io::Result<()> {
+async fn run_backup(
+    source: &std::path::Path,
+    name: &std::path::Path,
+    segment_size: Option<u64>,
+) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
     // Refuse to run against a backup set another process is writing to. The
-    // store is a single append-only file and the run holds one commit point at
-    // its end, so two runs interleaving would publish versions over each other.
+    // store is append-only and the run holds one commit point at its end, so two
+    // runs interleaving would publish versions over each other.
     let _lock = set.lock()?;
 
-    let blob_path = set.blob_path();
+    let limit = match segment_size {
+        Some(bytes) => storage::SegmentLimit::new(bytes),
+        None => storage::SegmentLimit::default(),
+    };
     let lock_path = set.lock_path();
 
-    // The store and the lock live next to the tree being read and grow while it
-    // is being read, so they must not be swept into the backup.
+    // The store's segments and the lock live next to the tree being read and grow
+    // while it is being read, so they must not be swept into the backup. Every
+    // segment, not just segment 0: a set that has rolled over has more than one,
+    // and a segment left out of this list would be backed up while being written.
+    let mut exclude = vec![lock_path];
+    for segment in set.segments()? {
+        exclude.push(segment);
+    }
+    // Segments written by this run may not exist yet — segment 0 of a fresh set,
+    // and the one a roll-over creates during the run. A handful of names past the
+    // last one on disk covers both: a run that rolls over more than once already
+    // has more than a handful of segments, and those are on disk by the time the
+    // exclusion is built.
+    for segment in 0..u32::try_from(set.segments()?.len())
+        .unwrap_or(0)
+        .saturating_add(4)
+    {
+        exclude.push(set.blob_path(segment));
+    }
+
     let options = Options {
-        exclude: vec![blob_path.clone(), lock_path.clone()],
+        exclude,
         ..Options::default()
     };
 
-    // Opening recovers the store: anything past the last valid record is a run
-    // that did not finish, and is discarded here rather than being read as data.
-    let store = storage::BlobStore::<true>::open(&blob_path).await?;
+    // Opening recovers the store: a tail past the last valid record in the last
+    // segment is a run that did not finish, and is discarded here rather than
+    // being read as data.
+    let store = storage::BlobStore::<true>::open(set.base(), limit).await?;
 
     if let Some(previous) = store.versions()?.last() {
         tracing::debug!(previous, name = %set.base().display(), "deduplicating against the store");
@@ -305,13 +380,15 @@ async fn run_backup(source: &std::path::Path, name: &std::path::Path) -> std::io
         );
     }
 
+    let segments = store.segment_count();
     let committed = backup(source, options, store).await?;
 
     tracing::info!(
         name = %set.base().display(),
         version = committed.version,
         snapshot = %storage::hex(&committed.snapshot),
-        store = %blob_path.display(),
+        store = %set.base().display(),
+        segments,
         "backup complete"
     );
 
@@ -325,7 +402,8 @@ async fn run_restore(
     clean: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::<false>::open(set.blob_path()).await?;
+    let store =
+        storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(
@@ -340,7 +418,7 @@ async fn run_restore(
     // be cleaned reports why before anything is created for it. The removal
     // itself happens after, so two runs cannot both decide to empty it.
     if clean {
-        check_clean_destination(destination, &set.blob_path())?;
+        check_clean_destination(destination, &set)?;
     }
 
     // Held for the whole run, so two restores into one destination cannot
@@ -479,10 +557,7 @@ fn report_restored(restored: &lepatch::command::Restored) {
 /// blob path never "starts with" a relative destination and the check would
 /// silently never fire; and the handful of directories nobody means to empty are
 /// refused outright.
-fn check_clean_destination(
-    destination: &std::path::Path,
-    blob: &std::path::Path,
-) -> std::io::Result<()> {
+fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std::io::Result<()> {
     if destination.as_os_str().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -493,15 +568,40 @@ fn check_clean_destination(
     // Both sides absolute, or the comparison below is comparing two different
     // ways of naming the same place and quietly answering the wrong question.
     let target = absolutise(destination);
-    let store = absolutise(blob);
 
-    if store.starts_with(&target) {
+    // Every segment, not just the first. A set that has rolled over holds the rest
+    // of the backup in files the caller has probably never heard of, and a clean
+    // restore would delete them while leaving segment 0 behind — which looks like
+    // a successful restore of a set that is now two-thirds gone.
+    let segments = set.segments()?;
+    for segment in &segments {
+        let segment = absolutise(segment);
+        if !segment.starts_with(&target) {
+            continue;
+        }
+
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "refusing to clean {}: it holds the backup set being restored from ({})",
                 target.display(),
-                store.display()
+                segment.display()
+            ),
+        ));
+    }
+
+    // The segment a run would write next, which may not exist yet but is still
+    // part of the set and would be created inside the destination.
+    if absolutise(&set.blob_path(u32::try_from(segments.len()).unwrap_or(u32::MAX)))
+        .starts_with(&target)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to clean {}: the backup set being restored from is written there \
+                 ({} and following)",
+                target.display(),
+                set.base().display()
             ),
         ));
     }
@@ -566,7 +666,8 @@ fn absolutise(path: &std::path::Path) -> std::path::PathBuf {
 }
 async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::<false>::open(set.blob_path()).await?;
+    let store =
+        storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(name = %set.base().display(), version, "verifying");

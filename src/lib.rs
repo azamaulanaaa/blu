@@ -9,27 +9,34 @@
 //!
 //! # Layout
 //!
-//! A backup set is a store file and a lock; see [`index::IndexSet`]. The store
-//! records its own versions, so publishing one is a single append to a single
-//! file and there is no second file whose contents have to be kept in step with
-//! it.
+//! A backup set is a sequence of numbered segment files and a lock; see
+//! [`index::IndexSet`]. A segment is *sealed* once it is full and is never written
+//! to again, which is what makes a torn write possible only in the last one and
+//! corruption in the rest permanent and detectable.
+//!
+//! The store records its own versions, so publishing one is a single append to a
+//! single file and there is no second file whose contents have to be kept in step
+//! with it.
 //!
 //! # Example
 //!
 //! ```no_run
 //! # async fn example() -> std::io::Result<()> {
-//! use lepatch::{command::{backup, restore, Options}, storage::BlobStore};
+//! use lepatch::{
+//!     command::{Options, backup, restore},
+//!     storage::{BlobStore, SegmentLimit},
+//! };
 //!
-//! // First backup.
-//! let store = BlobStore::<true>::open("photos.bin").await?;
+//! // First backup. Four gibibytes per segment, the default.
+//! let store = BlobStore::<true>::open("photos", SegmentLimit::default()).await?;
 //! let first = backup("~/Pictures", Options::default(), store).await?;
 //!
 //! // Later backup. Nothing new to store means nothing is written.
-//! let store = BlobStore::<true>::open("photos.bin").await?;
+//! let store = BlobStore::<true>::open("photos", SegmentLimit::default()).await?;
 //! backup("~/Pictures", Options::default(), store).await?;
 //!
 //! // Restore.
-//! let store = BlobStore::<false>::open("photos.bin").await?;
+//! let store = BlobStore::<false>::open("photos", SegmentLimit::default()).await?;
 //! restore("~/Pictures-restored", first.snapshot, store).await?;
 //! # Ok(())
 //! # }

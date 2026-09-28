@@ -111,7 +111,7 @@ fn each_backup_claims_the_next_version() {
     // The versions are commit records inside the one store file, so three
     // backups leave one file and not three index files. Each version is
     // individually addressable, which is what proves they were all recorded.
-    assert!(dir.path().join("snap.bin").is_file());
+    assert!(dir.path().join("snap.0000.bin").is_file());
     assert_eq!(
         count_entries(dir.path(), "snap"),
         3,
@@ -154,10 +154,14 @@ fn a_second_backup_of_an_unchanged_tree_uploads_only_its_snapshot() {
     build_tree(dir.path());
 
     ok(dir.path(), &["backup", "src", "snap"]);
-    let after_first = fs::metadata(dir.path().join("snap.bin")).unwrap().len();
+    let after_first = fs::metadata(dir.path().join("snap.0000.bin"))
+        .unwrap()
+        .len();
 
     ok(dir.path(), &["backup", "src", "snap"]);
-    let after_second = fs::metadata(dir.path().join("snap.bin")).unwrap().len();
+    let after_second = fs::metadata(dir.path().join("snap.0000.bin"))
+        .unwrap()
+        .len();
 
     let growth = after_second - after_first;
     assert!(
@@ -210,7 +214,17 @@ fn the_backup_set_is_excluded_from_its_own_backup() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
-    assert!(listing.contains(&"self.bin".to_string()));
+    // A set is several files, and the exclusion has to cover all of them — a
+    // segment left out of the list would be backed up while being written, which
+    // is the failure this test exists for.
+    assert!(
+        listing.contains(&"self.0000.bin".to_string()),
+        "the set should be there and excluded, got {listing:?}"
+    );
+    assert!(
+        !listing.contains(&"self.lock".to_string()),
+        "the lock is not content and must not be in the backup: {listing:?}"
+    );
 
     // The store grew while it was being read, so if it had been chunked the
     // offsets would have shifted and the restore would not match.
@@ -242,7 +256,7 @@ fn verify_fails_and_restore_refuses_on_a_damaged_store() {
     ok(dir.path(), &["backup", "src", "snap"]);
 
     // Flip a byte well inside the chunk data.
-    let store = dir.path().join("snap.bin");
+    let store = dir.path().join("snap.0000.bin");
     let mut bytes = fs::read(&store).unwrap();
     let target = bytes.len() / 2;
     bytes[target] ^= 0xff;
@@ -348,32 +362,28 @@ fn an_unfinished_run_leaves_the_previous_version_intact() {
     build_tree(dir.path());
 
     ok(dir.path(), &["backup", "src", "snap"]);
-    assert_eq!(count_entries(dir.path(), "snap.bin"), 1);
+    assert_eq!(count_entries(dir.path(), "snap"), 1);
 
     // Append a blob record that is then cut short, which is what a torn write at
     // the tail of an interrupted run looks like: the header is there and the
     // payload is not all of it. No commit record follows it, because the run
     // never reached one.
-    let mut bytes = fs::read(dir.path().join("snap.bin")).unwrap();
+    let mut bytes = fs::read(dir.path().join("snap.0000.bin")).unwrap();
     bytes.extend_from_slice(b"LPB1\x00\x80\x01");
     bytes.extend_from_slice(&[0u8; 16]);
     bytes.extend_from_slice(b"half a record");
-    fs::write(dir.path().join("snap.bin"), &bytes).unwrap();
+    fs::write(dir.path().join("snap.0000.bin"), &bytes).unwrap();
 
-    // The half-written record is not a version, and the one before it still is.
-    ok(dir.path(), &["restore", "out", "snap"]);
-    assert_eq!(
-        common::describe(&dir.path().join("src")),
-        common::describe(&dir.path().join("out")),
-        "the version before the torn record should still restore"
-    );
-    assert_eq!(
-        count_entries(dir.path(), "snap"),
-        1,
-        "a torn record at the tail must not be counted as a version"
+    // A read refuses rather than repairing: the bytes are there and unreadable,
+    // and silently ignoring them would mean a restore that quietly omits whatever
+    // they held. The next *run* is what repairs it, below.
+    let refused = fails(dir.path(), &["restore", "out", "snap"]);
+    assert!(
+        refused.contains("damaged") && refused.contains("does not repair"),
+        "a damaged segment should be reported rather than repaired, got: {refused}"
     );
 
-    // And the next run reclaims the space and publishes over the top of it.
+    // The next run truncates the torn tail and the version is back.
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(
         count_entries(dir.path(), "snap"),
@@ -388,46 +398,36 @@ fn an_unfinished_run_leaves_the_previous_version_intact() {
     );
 }
 
-/// A blob the store is missing is a damaged store, not a missing version.
+/// A store with a tail that does not parse is reported, not repaired or ignored.
+///
+/// The scan stops at the first record that does not verify, so bytes past that
+/// point are unreadable. Silently ignoring them would mean a restore that
+/// quietly omits whatever they held and reports success — so a read refuses, and
+/// a write truncates only the last segment. This is the test for the read half.
 #[test]
-fn a_truncated_store_reports_a_damaged_store() {
+fn a_store_with_a_damaged_tail_is_reported_not_ignored() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
-
     ok(dir.path(), &["backup", "src", "snap"]);
 
     // Cut the store inside the records, so the last version's snapshot is not
-    // wholly present. The version is still committed, so the report has to be
-    // about damage rather than about the version being absent.
-    let bytes = fs::read(dir.path().join("snap.bin")).unwrap();
-    fs::write(dir.path().join("snap.bin"), &bytes[..bytes.len() - 40_000]).unwrap();
-
-    let error = fails(dir.path(), &["restore", "out", "snap"]);
-    assert!(
-        error.contains("no committed version"),
-        "the version's commit record is in the chopped-off tail, so the right \
-         report is that the store holds no version: {error}"
-    );
-
-    // Cutting less off leaves the commit record in place and destroys the data it
-    // names. That is the case the store has to detect itself.
-    let dir = tempfile::tempdir().unwrap();
-    build_tree(dir.path());
-    ok(dir.path(), &["backup", "src", "snap"]);
-
-    // Lop off the last chunk's worth of payload without reaching the commit
-    // record, which is written after all of the data.
-    let store = dir.path().join("snap.bin");
+    // wholly present.
+    let store = dir.path().join("snap.0000.bin");
     let bytes = fs::read(&store).unwrap();
-    let keep = bytes.len() - 20_000;
-    fs::write(&store, &bytes[..keep]).unwrap();
+    fs::write(&store, &bytes[..bytes.len() - 40_000]).unwrap();
 
-    let listed = ok(dir.path(), &["versions", "snap", "--numbers-only"]);
-    assert_eq!(
-        listed.trim(),
-        "",
-        "a commit record whose payload is not all there must not be counted: {listed}"
-    );
+    for (args, what) in [
+        (vec!["restore", "out", "snap"], "a restore"),
+        (vec!["verify", "snap"], "a verify"),
+        (vec!["versions", "snap"], "a listing"),
+    ] {
+        let error = fails(dir.path(), &args);
+        assert!(
+            error.contains("damaged"),
+            "{what} should say the store is damaged rather than reporting a \
+             partial answer: {error}"
+        );
+    }
 }
 
 #[test]
@@ -450,7 +450,7 @@ fn restoring_a_name_with_no_snapshots_explains_itself() {
 
     let error = fails(dir.path(), &["restore", "out", "ghost"]);
     assert!(
-        error.contains("no backup store at ghost.bin"),
+        error.contains("no backup store at ghost"),
         "the error should name what it looked for and where: {error}"
     );
 }
@@ -493,9 +493,9 @@ fn a_backup_set_named_with_an_extension_keeps_it() {
 
     ok(dir.path(), &["backup", "src", "photos.tar"]);
 
-    assert!(dir.path().join("photos.tar.bin").is_file());
+    assert!(dir.path().join("photos.tar.0000.bin").is_file());
     assert!(
-        !dir.path().join("photos.bin").exists(),
+        !dir.path().join("photos.0000.bin").exists(),
         "the base name's extension should not be replaced"
     );
 }
@@ -509,7 +509,7 @@ fn a_backup_set_can_live_in_a_subdirectory() {
     ok(dir.path(), &["backup", "src", "data/deep/snap"]);
     ok(dir.path(), &["restore", "out", "data/deep/snap"]);
 
-    assert!(dir.path().join("data/deep/snap.bin").is_file());
+    assert!(dir.path().join("data/deep/snap.0000.bin").is_file());
     assert_eq!(count_entries(dir.path(), "data/deep/snap"), 2);
     assert_eq!(
         common::describe(&dir.path().join("src")),
@@ -734,7 +734,7 @@ fn clean_refuses_a_destination_holding_the_backup_set() {
         stderr(&output)
     );
     assert!(
-        dir.path().join("store.bin").exists(),
+        dir.path().join("store.0000.bin").exists(),
         "the store was deleted"
     );
 }
@@ -949,7 +949,7 @@ fn a_failing_clean_restore_leaves_the_destination_alone() {
     fs::write(destination.join("precious.txt"), b"do not lose me").unwrap();
 
     // Flip a byte in the blob store so the verify gate refuses the run.
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store.0000.bin");
     let mut bytes = fs::read(&blob).unwrap();
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0xff;

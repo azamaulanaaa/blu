@@ -42,6 +42,47 @@ pub use record::Placement;
 /// in the store.
 pub type BlobId = [u8; 32];
 
+/// How large a store segment may get before a new one is started.
+///
+/// A write policy, not part of the format, and deliberately so: a set written
+/// under one limit reads back under any other, because no record depends on where
+/// a segment boundary fell. A reader is given a limit only so that one value can
+/// be passed to both constructors, and ignores it.
+///
+/// The default is 4 GiB, which is chosen for the limits other tools impose
+/// rather than for lepatch's own: it is under the 4 GiB that FAT32 and several
+/// older archive formats refuse, and small enough that no single file needs 64-bit
+/// offsets to be handled by anything that moves data around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SegmentLimit(u64);
+
+impl SegmentLimit {
+    /// A limit of `bytes`.
+    ///
+    /// Clamped to a floor of one store header plus one record, because a segment
+    /// that cannot hold its own header cannot be a segment.
+    #[must_use]
+    pub fn new(bytes: u64) -> Self {
+        let floor = u64::try_from(record::STORE_HEADER).unwrap_or(u64::MAX) + MIN_RECORD;
+        Self(bytes.max(floor))
+    }
+
+    /// The limit in bytes.
+    #[must_use]
+    pub fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for SegmentLimit {
+    fn default() -> Self {
+        Self(4 * 1024 * 1024 * 1024)
+    }
+}
+
+/// The smallest record that can be written: a header and an empty payload.
+const MIN_RECORD: u64 = 46;
+
 /// A [`BlobId`] in lowercase hex, for messages a person can read off a screen
 /// and compare against a `blake3` sum they ran themselves.
 #[must_use]

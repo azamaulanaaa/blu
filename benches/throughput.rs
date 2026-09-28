@@ -80,7 +80,8 @@ use std::{
 use criterion::{Criterion, Throughput};
 use lepatch::{
     command::{Options, backup, restore},
-    storage::BlobStore,
+    index::IndexSet,
+    storage::{BlobStore, SegmentLimit},
 };
 use tempfile::TempDir;
 
@@ -138,7 +139,7 @@ fn total_bytes() -> u64 {
 fn bench_backup(c: &mut Criterion) {
     let dir = TempDir::new().expect("tempdir");
     let src = tree(&dir);
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let rt = runtime();
 
     let mut group = c.benchmark_group("backup");
@@ -157,9 +158,13 @@ fn bench_backup(c: &mut Criterion) {
                         // A fresh store each time, or the run would deduplicate
                         // against itself and report a throughput nothing else
                         // would ever see.
-                        let _ = std::fs::remove_file(&blob);
+                        for segment in 0..64 {
+                            let _ = std::fs::remove_file(IndexSet::new(&blob).blob_path(segment));
+                        }
 
-                        let storage = BlobStore::<true>::open(&blob).await.expect("store");
+                        let storage = BlobStore::<true>::open(&blob, SegmentLimit::default())
+                            .await
+                            .expect("store");
                         let options = Options {
                             concurrency,
                             ..Options::default()
@@ -185,11 +190,13 @@ fn bench_backup(c: &mut Criterion) {
 fn bench_restore(c: &mut Criterion) {
     let dir = TempDir::new().expect("tempdir");
     let src = tree(&dir);
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let rt = runtime();
 
     let committed = rt.block_on(async {
-        let storage = BlobStore::<true>::open(&blob).await.expect("store");
+        let storage = BlobStore::<true>::open(&blob, SegmentLimit::default())
+            .await
+            .expect("store");
         backup(&src, Options::default(), storage)
             .await
             .expect("backup")
@@ -207,7 +214,9 @@ fn bench_restore(c: &mut Criterion) {
                     let destination = dir.path().join("out");
                     let _ = std::fs::remove_dir_all(&destination);
 
-                    let storage = BlobStore::<false>::open(&blob).await.expect("store");
+                    let storage = BlobStore::<false>::open(&blob, SegmentLimit::default())
+                        .await
+                        .expect("store");
 
                     let started = Instant::now();
                     restore(&destination, committed.snapshot, storage)
@@ -232,19 +241,23 @@ fn bench_restore(c: &mut Criterion) {
 fn the_throughput_benchmark_restores_what_it_backed_up() {
     let dir = TempDir::new().expect("tempdir");
     let src = tree(&dir);
-    let blob = dir.path().join("store.bin");
+    let blob = dir.path().join("store");
     let out = dir.path().join("out");
     let rt = runtime();
 
     let committed = rt.block_on(async {
-        let storage = BlobStore::<true>::open(&blob).await.expect("store");
+        let storage = BlobStore::<true>::open(&blob, SegmentLimit::default())
+            .await
+            .expect("store");
         backup(&src, Options::default(), storage)
             .await
             .expect("backup")
     });
 
     rt.block_on(async {
-        let storage = BlobStore::<false>::open(&blob).await.expect("store");
+        let storage = BlobStore::<false>::open(&blob, SegmentLimit::default())
+            .await
+            .expect("store");
         restore(&out, committed.snapshot, storage)
             .await
             .expect("restore");

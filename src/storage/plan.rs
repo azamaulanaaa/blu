@@ -153,25 +153,29 @@ impl Plan {
 
     /// The plan's byte ranges, coalesced.
     ///
-    /// Neighbouring ranges are merged, so the result is the fewest ranges that
-    /// cover the whole plan. That is the property a range list is for: one range
-    /// per chunk turns a delta download into a request per chunk, which is the
-    /// thing packing exists to avoid.
+    /// Neighbouring ranges *in the same segment* are merged, so the result is the
+    /// fewest ranges that cover the whole plan. That is the property a range list
+    /// is for: one range per chunk turns a delta download into a request per
+    /// chunk, which is the thing packing exists to avoid.
     ///
-    /// **Against a store this merging almost never fires.** A store puts a record
-    /// header in front of every payload, so two chunks a restore reads back to
-    /// back are separated by framing and are not contiguous. The ranges it
-    /// returns are therefore one per chunk, and that is correct rather than a
-    /// limitation of the plan — a range here is a range *in the store*, and it
-    /// must not reach over a header. It is the reason a delta download cannot be
-    /// served straight out of the store, and the reason a pack is a separate
-    /// artifact: it is the same list of chunks with the framing left out, and
-    /// there the merging has something to do.
+    /// Ranges never cross a segment. Two chunks that touch in the plan can be in
+    /// different files, and a range spanning them would name bytes in a segment it
+    /// does not belong to — which is how a reader ends up fetching one file's
+    /// header as though it were another one's data.
+    ///
+    /// **Against a store this merging rarely fires even within a segment.** A
+    /// store puts a record header in front of every payload, so two chunks a
+    /// restore reads back to back are separated by framing and are not contiguous.
+    /// That is correct rather than a limitation of the plan: a range here is a
+    /// range in a *store*, and it must not reach over a header. It is the reason
+    /// a delta download cannot be served straight out of a store, and the reason a
+    /// pack is a separate artifact — the same list of chunks with the framing left
+    /// out, and there the merging has something to do.
     ///
     /// # Errors
     ///
-    /// Returns an error if a chunk's range overflows the file, which a store
-    /// whose index disagrees with its length can produce.
+    /// Returns an error if a chunk's range overflows, which a store whose index
+    /// disagrees with its length can produce.
     pub fn ranges(&self) -> io::Result<Vec<Range>> {
         let mut ranges: Vec<Range> = Vec::with_capacity(self.chunks.len());
 
@@ -182,11 +186,18 @@ impl Plan {
             })?;
 
             match ranges.last_mut() {
-                // Only merged when they touch exactly. Chunks can be out of
-                // order in a store, and a gap is not a range: fetching it would
-                // read a record header as if it were chunk data.
-                Some(last) if last.end == start => last.end = end,
-                _ => ranges.push(Range { start, end }),
+                // Only merged when they touch exactly, and only within one
+                // segment. Chunks can be out of order within a segment, and a gap
+                // is not a range: fetching it would read a record header as if it
+                // were chunk data.
+                Some(last) if last.segment == chunk.placement.segment && last.end == start => {
+                    last.end = end;
+                }
+                _ => ranges.push(Range {
+                    segment: chunk.placement.segment,
+                    start,
+                    end,
+                }),
             }
         }
 
@@ -220,12 +231,18 @@ fn bad_index(snapshot: &Snapshot, slice: &FileChunk) -> io::Error {
     )
 }
 
-/// A half-open byte range of a store: `start` to `end`, not including `end`.
+/// A half-open byte range within one segment: `start` to `end`, not including
+/// `end`.
+///
+/// The segment is part of the range rather than implied, because a store is
+/// several files and an offset alone does not say which one it is an offset in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
-    /// First byte.
+    /// Which segment the range is in.
+    pub segment: u32,
+    /// First byte within that segment.
     pub start: u64,
-    /// One past the last byte.
+    /// One past the last byte within that segment.
     pub end: u64,
 }
 
@@ -254,7 +271,19 @@ mod tests {
     }
 
     fn at(offset: u64, len: u64) -> Placement {
-        Placement { offset, len }
+        Placement {
+            segment: 0,
+            offset,
+            len,
+        }
+    }
+
+    fn at_in(segment: u32, offset: u64, len: u64) -> Placement {
+        Placement {
+            segment,
+            offset,
+            len,
+        }
     }
 
     /// A snapshot of one file of 100 bytes made of two 50-byte chunks.
@@ -364,8 +393,47 @@ mod tests {
 
         assert_eq!(
             plan.ranges().unwrap(),
-            vec![Range { start: 0, end: 100 }],
+            vec![Range {
+                segment: 0,
+                start: 0,
+                end: 100
+            }],
             "adjacent ranges should coalesce, or a download is a request per chunk"
+        );
+    }
+
+    /// Touching ranges in *different* segments must not merge.
+    ///
+    /// They look adjacent — the same offsets, back to back — and merging them
+    /// would produce a range that means "bytes 50 to 100 of a file", naming two
+    /// files at once. A reader following one would fetch a second segment's header
+    /// as though it were chunk data.
+    #[test]
+    fn touching_chunks_in_different_segments_do_not_merge() {
+        let plan = Plan::from_snapshot(&two_chunks(), |id| {
+            Ok(if *id == chunk() {
+                at_in(0, 0, 50)
+            } else {
+                at_in(1, 50, 50)
+            })
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan.ranges().unwrap(),
+            vec![
+                Range {
+                    segment: 0,
+                    start: 0,
+                    end: 50
+                },
+                Range {
+                    segment: 1,
+                    start: 50,
+                    end: 100
+                },
+            ],
+            "a range must not span two segments, however exactly they line up"
         );
     }
 
@@ -391,11 +459,16 @@ mod tests {
         assert_eq!(
             plan.ranges().unwrap(),
             vec![
-                Range { start: 0, end: 50 },
                 Range {
+                    segment: 0,
+                    start: 0,
+                    end: 50
+                },
+                Range {
+                    segment: 0,
                     start: 98,
                     end: 148
-                }
+                },
             ],
             "a gap must be respected, or the download reads a header as chunk data"
         );
@@ -415,11 +488,16 @@ mod tests {
         assert_eq!(
             plan.ranges().unwrap(),
             vec![
-                Range { start: 0, end: 50 },
                 Range {
+                    segment: 0,
+                    start: 0,
+                    end: 50
+                },
+                Range {
+                    segment: 0,
                     start: 500,
                     end: 550
-                }
+                },
             ],
             "a gap must not be merged over: it holds another chunk's bytes"
         );

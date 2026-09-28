@@ -46,8 +46,8 @@ pub(super) const RECORD_MAGIC: [u8; 4] = *b"LPB1";
 /// reported as such rather than misparsed.
 pub(super) const FORMAT_VERSION: u32 = 1;
 
-/// Bytes of store header: magic and version.
-pub(super) const STORE_HEADER: usize = 8;
+/// Bytes of store header: magic, version, and this segment's own index.
+pub(super) const STORE_HEADER: usize = 12;
 
 /// Bytes of record header before the length: magic and kind.
 const PREFIX: usize = 5;
@@ -118,9 +118,16 @@ pub(super) struct Header {
 }
 
 /// Where a blob's payload sits in the store.
+///
+/// A [`Placement`] names a *segment* and an offset within it. The two cannot be
+/// one number, because a store is several files: an offset is only meaningful
+/// relative to the file it is in, and a set that is a single 40 GB file is a set
+/// that will hit a filesystem limit sooner than it hits anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
-    /// Byte offset of the payload.
+    /// Which segment of the store the payload is in, counting from zero.
+    pub segment: u32,
+    /// Byte offset of the payload within that segment.
     pub offset: u64,
     /// Length of the payload.
     pub len: u64,
@@ -151,6 +158,47 @@ pub(super) struct Scan {
 /// front of the payload and the payload is a stream.
 pub(super) fn header_len(payload_len: u64) -> u64 {
     (PREFIX + varint_len(payload_len) + HASH + CHECK) as u64
+}
+
+/// The header of a segment file.
+pub(super) fn encode_store_header(segment: u32) -> [u8; STORE_HEADER] {
+    let mut out = [0u8; STORE_HEADER];
+    out[..4].copy_from_slice(&STORE_MAGIC);
+    out[4..8].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out[8..].copy_from_slice(&segment.to_le_bytes());
+
+    out
+}
+
+/// Why a segment header is not one this build reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HeaderFault {
+    /// The bytes do not begin with the store magic, so this is not a store file at
+    /// all — somebody's data that this build does not understand.
+    NotAStore,
+    /// A store, of a layout version this build does not read.
+    UnsupportedVersion,
+}
+
+/// Read a segment header, and say which segment it claims to be.
+///
+/// The segment index is in the header so that a file which has been renamed or
+/// moved into another set is *detected* rather than being read as though it
+/// belonged. Without it, swapping two segment files would produce a store that
+/// scans cleanly and holds the wrong records in the wrong order.
+pub(super) fn decode_store_header(bytes: &[u8]) -> Result<u32, HeaderFault> {
+    if bytes.len() < STORE_HEADER || bytes[..4] != STORE_MAGIC {
+        return Err(HeaderFault::NotAStore);
+    }
+
+    let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if version != FORMAT_VERSION {
+        return Err(HeaderFault::UnsupportedVersion);
+    }
+
+    Ok(u32::from_le_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11],
+    ]))
 }
 
 /// Bytes `value` takes as a LEB128 integer.
@@ -286,17 +334,22 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-/// Read a store's records, stopping at the first one that is not valid.
+/// Read one segment's records, stopping at the first one that is not valid.
 ///
 /// `file` must be positioned anywhere; the scan seeks for itself. It never reads
 /// a payload except for a commit record, which holds 32 bytes.
+///
+/// Every [`Placement`] this produces is tagged with `segment`, so a scan of the
+/// whole set is a scan of each segment in turn rather than a scan of a
+/// concatenation — the records are in separate files and the gaps between them
+/// are other files' business.
 ///
 /// # Errors
 ///
 /// Returns an error if the seek or read fails. A file whose contents are not a
 /// store is not an error here — that is [`crate::storage::blob`]'s business,
 /// because only it can tell a truncated tail from a file that was never a store.
-pub(super) fn scan(file: &mut std::fs::File) -> io::Result<Scan> {
+pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
     let file_len = file.metadata()?.len();
     let mut scan = Scan::default();
 
@@ -359,6 +412,7 @@ pub(super) fn scan(file: &mut std::fs::File) -> io::Result<Scan> {
                 scan.blobs.insert(
                     header.hash,
                     Placement {
+                        segment,
                         offset: header.payload_offset,
                         len: header.payload_len,
                     },

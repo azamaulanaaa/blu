@@ -1,10 +1,30 @@
-//! A store of content-addressed blobs, in one append-only file.
+//! A store of content-addressed blobs, in a sequence of append-only segments.
 //!
-//! The file is the journal. It begins with a store header and is then a
-//! sequence of records (see [`super::record`]); a version of the backup set is a
-//! *commit record* naming a snapshot, and version numbers are positions in that
-//! sequence. Nothing outside the file is needed to read it, and nothing outside
-//! the file is trusted to say what is in it.
+//! Each segment is the journal for its own stretch of the log: a store header and
+//! then records (see [`super::record`]). A version of the backup set is a *commit
+//! record* naming a snapshot, and version numbers are positions in the sequence
+//! across all segments. Nothing outside the segments is needed to read a set, and
+//! nothing outside them is trusted to say what is in it.
+//!
+//! # Why segments, and what it costs
+//!
+//! A single file that grows without bound eventually meets a limit that is
+//! somebody else's decision: a filesystem's maximum file size, a tool that
+//! cannot read it, a transfer that has to succeed in one piece. Segments under a
+//! fixed limit avoid all three, and a numbered segment can be moved, verified or
+//! replaced on its own.
+//!
+//! The property that makes it safe is that **a full segment is sealed**. Nothing
+//! writes to a sealed segment again, so a torn write can only ever be in the last
+//! one. A segment that is not last and has a tail which does not verify is
+//! therefore *corruption*, not an unfinished run, and is refused rather than
+//! truncated — the previous design had no way to tell those apart, and treating
+//! corruption as an unfinished run is how a damaged backup gets quietly trimmed
+//! down to whatever still parses.
+//!
+//! Records are never split across a boundary. A segment is sealed when the next
+//! record would not fit in it, so every record is whole within one file and a
+//! segment can be verified on its own.
 //!
 //! # Commit protocol
 //!
@@ -29,26 +49,23 @@
 //!
 //! # Recovery
 //!
-//! Opening for writing scans the records and truncates the file back to the end
-//! of the last valid one. That reclaims the space a failed run left behind —
-//! which the previous design could not do, because it had no way to tell a
-//! committed byte from an abandoned one — and it is why a run may abandon a
+//! Opening for writing scans every segment, and truncates the *last* one back to
+//! the end of its last valid record. That reclaims the space a failed run left
+//! behind — which the previous design could not do, because it had no way to tell
+//! a committed byte from an abandoned one — and it is why a run may abandon a
 //! record in the middle: nothing was committed, so the scan stops at the hole
 //! and everything after it goes with it.
 //!
-//! A file that does not begin with the store magic is *not* truncated. It is
-//! refused, because a store from an older build is a backup somebody cares
-//! about and a recovery scan that decides it is garbage would destroy it.
+//! A segment that does not begin with the store magic is *not* truncated. It is
+//! refused, because a store from another build is a backup somebody cares about
+//! and a recovery scan that decides it is garbage would destroy it.
 
 use std::{
     collections::HashMap,
     fmt::Debug,
     io::{self, SeekFrom},
     path::{Path, PathBuf},
-    sync::{
-        Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Mutex, PoisonError},
 };
 
 use async_trait::async_trait;
@@ -58,10 +75,11 @@ use tokio::{
 };
 use tracing::instrument;
 
-use super::record::{self, FORMAT_VERSION, Kind, Placement, STORE_HEADER, STORE_MAGIC};
+use super::record::{self, Kind, Placement, STORE_HEADER};
 use crate::{
+    index::IndexSet,
     slice::SliceAsyncReader,
-    storage::{self, BlobId, StreamReadSeeker},
+    storage::{self, BlobId, SegmentLimit, StreamReadSeeker},
 };
 
 /// Copy buffer for a payload.
@@ -86,11 +104,30 @@ impl Contents {
     ///
     /// A panic while the lock was held would leave a half-updated index, but
     /// unwinding through a backup aborts the run and the recovery scan on the
-    /// next open rebuilds the index from the file. The poison carries no
+    /// next open rebuilds the index from the files. The poison carries no
     /// information worth propagating.
     fn lock(contents: &Mutex<Contents>) -> std::sync::MutexGuard<'_, Contents> {
         contents.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Where the next record goes.
+///
+/// A reservation is a `(segment, offset)` rather than a bare offset, because the
+/// log spans several files. Taking one is a short critical section — a couple of
+/// comparisons and an addition — and the copy that follows happens outside it,
+/// which is what keeps uploads running in parallel. A lock held across the copy
+/// would serialise them, and that is the mistake the single-file design avoided
+/// by using one `fetch_add`; a rollover decision is not expressible as one
+/// atomic, so it takes a lock and that is the cost of segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reservation {
+    /// Which segment the record goes in.
+    segment: u32,
+    /// Byte offset within that segment.
+    offset: u64,
+    /// Bytes the record occupies, header included.
+    len: u64,
 }
 
 /// A store of content-addressed blobs.
@@ -100,30 +137,60 @@ impl Contents {
 /// path that only needs to read cannot accidentally append to the store.
 #[derive(Debug)]
 pub struct BlobStore<const WRITE: bool> {
-    file_path: PathBuf,
+    /// The set this store is, which is how its segments are named and found.
+    set: IndexSet,
+    /// Every segment on disk, in order. Fixed at open: the set only grows by
+    /// appending a segment, and a reader holds this list for its lifetime.
+    segments: Vec<PathBuf>,
     /// What the store holds, rebuilt by the scan that every open begins with.
     contents: Mutex<Contents>,
-    /// First byte of the store not yet handed out to a record.
+    /// Where the next record goes, and how full the last segment is.
     ///
-    /// A reservation counter rather than the file's length, so a writer claims
-    /// its range and then copies into it while other writers claim theirs. Were
-    /// the end taken from the file instead, two writers would both read the same
-    /// length while the first was still writing and would pick the same offset.
+    /// Seeded from the end of the last valid record. A failed record keeps the
+    /// range it claimed: reclaiming it would mean truncating past a writer that
+    /// has already been promised that space, and the recovery scan on the next
+    /// open reclaims the lot of them anyway.
+    reserved: Mutex<Reservation>,
+    /// How large a segment may get. A write policy, not a format property, which
+    /// is why it is not recorded in the header: a set written under one limit
+    /// reads back under any other, because no record depends on where a boundary
+    /// fell.
+    limit: SegmentLimit,
+    /// Segments this run has written to, so `sync_data` knows which files to sync.
     ///
-    /// It is seeded from the end of the last valid record, and a failed record
-    /// keeps the range it claimed: reclaiming it would mean truncating past a
-    /// writer that has already been promised that space, and the recovery scan
-    /// on the next open reclaims the lot of them anyway.
-    reserved: AtomicU64,
-    /// Handle the run's records are written through. Only when `WRITE` is set.
-    writer: Option<fs::File>,
+    /// Empty until the first record, and not persisted: a run that wrote nothing
+    /// has nothing to sync, and a run that did has already synced by the time it
+    /// commits.
+    dirty: Mutex<Vec<u32>>,
 }
 
 impl<const WRITE: bool> BlobStore<WRITE> {
-    /// The path this store lives at.
+    /// The path of segment `segment`.
+    ///
+    /// The last segment is the only one a run writes to; everything before it is
+    /// sealed. This is what a caller should name when it needs one file of a set
+    /// rather than the whole of it.
     #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.file_path
+    pub fn segment_path(&self, segment: u32) -> PathBuf {
+        self.set.blob_path(segment)
+    }
+
+    /// How many segments this store has, counting from zero.
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// The paths of every segment, in order.
+    #[must_use]
+    pub fn segments(&self) -> &[PathBuf] {
+        &self.segments
+    }
+
+    /// How large a segment may get before a new one is started.
+    #[must_use]
+    pub fn limit(&self) -> SegmentLimit {
+        self.limit
     }
 
     /// Every version this store holds, oldest first.
@@ -204,7 +271,7 @@ impl<const WRITE: bool> BlobStore<WRITE> {
                     io::ErrorKind::NotFound,
                     format!(
                         "version {version} does not exist in {}; it holds {} version(s)",
-                        self.file_path.display(),
+                        self.set.base().display(),
                         contents.commits.len()
                     ),
                 )
@@ -213,72 +280,92 @@ impl<const WRITE: bool> BlobStore<WRITE> {
 }
 
 impl BlobStore<true> {
-    /// Open a store for writing, creating it and recovering it if necessary.
+    /// Open a set for writing, creating its first segment and recovering it if
+    /// necessary.
     ///
     /// Runs the recovery scan on a blocking thread: it is proportional to the
-    /// number of records in the store, which on a large set is long enough that
+    /// number of records in the set, which on a large one is long enough that
     /// holding up the async pool while it happens would be visible.
     ///
     /// # Errors
     ///
-    /// Returns an error if the containing directory or the store cannot be
+    /// Returns an error if the containing directory or a segment cannot be
     /// created, for instance because the path is a directory or the caller lacks
-    /// permission, or if the file exists but is not a store this build
-    /// understands — which is reported rather than repaired, because a store
-    /// written by another version is a backup and not a broken file.
+    /// permission; if a segment exists but is not a store this build understands,
+    /// which is reported rather than repaired, because a store written by another
+    /// version is a backup and not a broken file; if the set is missing a segment
+    /// in the middle; or if a *sealed* segment has a tail that does not verify,
+    /// which is corruption rather than an unfinished run and is never truncated.
     #[instrument(skip_all, err)]
-    pub async fn open<P: Into<PathBuf> + Debug>(path: P) -> io::Result<Self> {
-        let file_path = path.into();
+    pub async fn open<P: Into<PathBuf> + Debug>(path: P, limit: SegmentLimit) -> io::Result<Self> {
+        let set = IndexSet::new(path.into());
 
-        if let Some(parent) = file_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(parent) = set.base().parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).await?;
         }
 
-        let scan_path = file_path.clone();
-        let (scan, writer) = tokio::task::spawn_blocking(move || recover(&scan_path))
+        let scan_set = set.clone();
+        let scanned = tokio::task::spawn_blocking(move || recover(&scan_set))
             .await
             .map_err(|join| io::Error::other(format!("the store scan failed: {join}")))??;
 
         Ok(Self {
-            file_path,
+            set,
+            segments: scanned.segments,
             contents: Mutex::new(Contents {
-                blobs: scan.blobs,
-                commits: scan.commits,
+                blobs: scanned.blobs,
+                commits: scanned.commits,
             }),
-            reserved: AtomicU64::new(scan.end),
-            writer: Some(writer),
+            reserved: Mutex::new(Reservation {
+                segment: scanned.write_into,
+                offset: scanned.end,
+                len: 0,
+            }),
+            limit,
+            dirty: Mutex::new(Vec::new()),
         })
     }
 }
 
 impl BlobStore<false> {
-    /// Open a store for reading.
+    /// Open a set for reading.
     ///
-    /// The file must already exist and must be a store: reading a path that is
-    /// not one is an error rather than an empty backup set, so a mistyped name
-    /// cannot come back as "no versions".
+    /// The set must already exist and must be a store: reading a path that is not
+    /// one is an error rather than an empty backup set, so a mistyped name cannot
+    /// come back as "no versions".
+    ///
+    /// `limit` is accepted and ignored. A read does not roll over, and no record
+    /// depends on where a segment boundary fell, so the value a writer used is
+    /// not needed to read what it wrote. Taking it keeps the two constructors
+    /// interchangeable, which is what lets a caller pass one value to both.
     ///
     /// # Errors
     ///
-    /// Returns an error if the store does not exist, cannot be read, or was
-    /// written by an incompatible build.
+    /// Returns an error if the set does not exist, cannot be read, is missing a
+    /// segment, or was written by an incompatible build.
     #[instrument(skip_all, err)]
-    pub async fn open<P: Into<PathBuf> + Debug>(path: P) -> io::Result<Self> {
-        let file_path = path.into();
+    pub async fn open<P: Into<PathBuf> + Debug>(path: P, limit: SegmentLimit) -> io::Result<Self> {
+        let set = IndexSet::new(path.into());
 
-        let scan_path = file_path.clone();
-        let scan = tokio::task::spawn_blocking(move || read_only_scan(&scan_path))
+        let scan_set = set.clone();
+        let scanned = tokio::task::spawn_blocking(move || read_only_scan(&scan_set))
             .await
             .map_err(|join| io::Error::other(format!("the store scan failed: {join}")))??;
 
         Ok(Self {
-            file_path,
+            set,
+            segments: scanned.segments,
             contents: Mutex::new(Contents {
-                blobs: scan.blobs,
-                commits: scan.commits,
+                blobs: scanned.blobs,
+                commits: scanned.commits,
             }),
-            reserved: AtomicU64::new(scan.end),
-            writer: None,
+            reserved: Mutex::new(Reservation {
+                segment: scanned.write_into,
+                offset: scanned.end,
+                len: 0,
+            }),
+            limit,
+            dirty: Mutex::new(Vec::new()),
         })
     }
 }
@@ -293,10 +380,22 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
         let placement = self.locate(id)?;
 
-        let file = fs::File::open(&self.file_path).await?;
+        let segment = self.segments.get(usize::try_from(placement.segment).unwrap_or(usize::MAX))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "this store's index names segment {} for a blob, but it holds {} segment(s)",
+                    placement.segment,
+                    self.segments.len()
+                ),
+            )
+        })?;
+
+        let file = fs::File::open(segment).await?;
         let len = file.metadata().await?.len();
 
-        // The index is built by a scan and cannot be wrong unless the file has
+        // The index is built by a scan and cannot be wrong unless a segment has
         // shrunk since, which only a hand-edited store can arrange. Checked
         // rather than trusted, so the answer is a short read reported here
         // instead of a silent hole in a restored file.
@@ -308,8 +407,10 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "blob at {} needs bytes {}..{end} but the store is only {len} bytes long",
-                    self.file_path.display(),
+                    "blob at {} in segment {} needs bytes {}..{end} but that segment is \
+                     only {len} bytes long",
+                    segment.display(),
+                    placement.segment,
                     placement.offset
                 ),
             ));
@@ -348,12 +449,11 @@ impl storage::StoragePut for BlobStore<true> {
         let mut header = Vec::with_capacity(usize::try_from(record::header_len(len)).unwrap_or(0));
         record::encode_header(&mut header, Kind::Blob, id, len);
 
-        let offset = self.reserved.fetch_add(
-            u64::try_from(header.len()).unwrap_or(u64::MAX) + len,
-            Ordering::Relaxed,
-        );
+        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + len;
+        let reservation = self.reserve(total)?;
+        let offset = reservation.offset;
 
-        // A handle of its own, not a clone of the shared one.
+        // A handle of its own, not a clone of a shared one.
         //
         // `dup` — which is what `try_clone` is — shares the file offset between
         // the original and the copy, so every concurrent `put` would seek the
@@ -366,7 +466,7 @@ impl storage::StoragePut for BlobStore<true> {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&self.file_path)
+            .open(self.segment_path(reservation.segment))
             .await?;
 
         // Positional, never append: `append` would redirect every write to
@@ -451,12 +551,18 @@ impl storage::StoragePut for BlobStore<true> {
         Contents::lock(&self.contents).blobs.insert(
             *id,
             Placement {
+                segment: reservation.segment,
                 offset: payload_offset,
                 len,
             },
         );
 
-        tracing::trace!(offset, length = len, "stored blob");
+        tracing::trace!(
+            segment = reservation.segment,
+            offset,
+            length = len,
+            "stored blob"
+        );
 
         Ok(())
     }
@@ -466,12 +572,24 @@ impl storage::StoragePut for BlobStore<true> {
     /// Called once per run, after the last of its data records and before the
     /// commit record. See the module docs for why the commit is a second sync
     /// rather than a continuation of this one.
+    ///
+    /// Every segment this run wrote to is synced, not just the last one. A run
+    /// that crossed a boundary has records in two files, and syncing only the
+    /// newer one would leave the older one's pages unordered against it — which is
+    /// the failure the two syncs exist to prevent, one level up.
     async fn sync_data(&self) -> io::Result<()> {
-        self.writer
-            .as_ref()
-            .ok_or_else(|| io::Error::other("a read-only store cannot be synced"))?
-            .sync_data()
-            .await
+        let dirty = self.dirty_segments()?;
+
+        for segment in dirty {
+            // A handle of its own per segment for the same reason `put` takes one
+            // per record: this is a standalone sync, not a write, and nothing is
+            // seeking.
+            let file = fs::OpenOptions::new().write(true).open(segment).await?;
+
+            file.sync_data().await?;
+        }
+
+        Ok(())
     }
 
     /// Publish `snapshot` as the next version, durably.
@@ -490,11 +608,10 @@ impl storage::StoragePut for BlobStore<true> {
             u64::try_from(snapshot.len()).unwrap_or(u64::MAX),
         );
 
-        let offset = self.reserved.fetch_add(
-            u64::try_from(header.len()).unwrap_or(u64::MAX)
-                + u64::try_from(snapshot.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        let total = u64::try_from(header.len()).unwrap_or(u64::MAX)
+            + u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
+        let reservation = self.reserve(total)?;
+        let offset = reservation.offset;
 
         // Its own handle, for the same reason `put` takes one: a clone shares its
         // offset with the original, and the offset is what this write is aimed
@@ -505,7 +622,7 @@ impl storage::StoragePut for BlobStore<true> {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&self.file_path)
+            .open(self.segment_path(reservation.segment))
             .await?;
 
         file.seek(SeekFrom::Start(offset)).await?;
@@ -525,89 +642,301 @@ impl storage::StoragePut for BlobStore<true> {
     }
 }
 
-/// Open a store for writing, scanning it and discarding anything past the last
-/// valid record.
+impl BlobStore<true> {
+    /// Claim `total` bytes for a record, rolling into a new segment if it will not
+    /// fit in the last one.
+    ///
+    /// The lock is held only for the decision. A record is never split across a
+    /// boundary, so this either returns a range inside the current segment or
+    /// starts the next one — and only the first of those is the common case.
+    ///
+    /// A record that is larger than the whole limit is an error rather than a
+    /// segment that quietly grows past the cap. "No file over 4 GiB" is the
+    /// reason segments exist; silently breaking it would defeat that, and the
+    /// error names the cap so the caller can raise it deliberately.
+    fn reserve(&self, total: u64) -> io::Result<Reservation> {
+        let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let limit = self.limit.bytes();
+        let header = u64::try_from(STORE_HEADER).unwrap_or(u64::MAX);
+
+        // `offset` starts past the store header, so it already counts those bytes
+        // against the file's size; adding them again here would roll over early.
+        let end = reserved.offset.saturating_add(total);
+
+        if end <= limit {
+            let reservation = Reservation {
+                segment: reserved.segment,
+                offset: reserved.offset,
+                len: total,
+            };
+
+            reserved.offset = end;
+            reserved.len = 0;
+            self.note_segment(reservation.segment);
+
+            return Ok(reservation);
+        }
+
+        // Rolled only if something has been written to this segment. An empty
+        // segment that cannot hold the record is a record bigger than the limit,
+        // which is reported rather than retried forever against a fresh segment.
+        if reserved.offset <= header {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "a record of {total} bytes does not fit in a segment of {limit}, which is \
+                     the limit this store was opened with; raise it to store this blob"
+                ),
+            ));
+        }
+
+        let next = reserved
+            .segment
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("a store cannot hold more than u32::MAX segments"))?;
+
+        // The file is created here, before any writer is told it may use it, so a
+        // rollover cannot hand out an offset in a file that does not exist yet.
+        create_segment(&self.segment_path(next), next)?;
+
+        let reservation = Reservation {
+            segment: next,
+            offset: header,
+            len: total,
+        };
+
+        reserved.segment = next;
+        reserved.offset = header + total;
+        reserved.len = 0;
+        self.note_segment(next);
+
+        Ok(reservation)
+    }
+
+    /// Record that `segment` was written to by this run, so `sync_data` knows
+    /// which files to sync.
+    fn note_segment(&self, segment: u32) {
+        let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+
+        if !dirty.contains(&segment) {
+            dirty.push(segment);
+        }
+    }
+}
+
+impl BlobStore<true> {
+    /// The segments this run has written to, in order.
+    fn dirty_segments(&self) -> io::Result<Vec<PathBuf>> {
+        let dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+
+        dirty.iter().map(|s| Ok(self.segment_path(*s))).collect()
+    }
+}
+
+/// What scanning a whole set found, and where the log should carry on from.
+struct Scanned {
+    /// Every segment of the set, in order.
+    segments: Vec<PathBuf>,
+    /// Every blob across every segment, by content hash.
+    blobs: HashMap<BlobId, Placement>,
+    /// The snapshot hash of each committed version, in log order.
+    commits: Vec<BlobId>,
+    /// The segment a run writes into: the last one, which is the only one not
+    /// sealed.
+    ///
+    /// Always a real index — segment 0 for a fresh set — so the reservation
+    /// arithmetic is the same for a store with one segment and one with a
+    /// thousand. A reader leaves it at `u32::MAX` and never uses it, because a
+    /// reader has nowhere to write.
+    write_into: u32,
+    /// First byte past the last valid record in `write_into`.
+    end: u64,
+}
+
+/// Open a set for writing: create the first segment if there is none, scan every
+/// segment, and discard an unfinished tail from the last one.
 ///
-/// Returns the scan and an open handle to write through.
-fn recover(path: &Path) -> io::Result<(record::Scan, fs::File)> {
+/// Only the last segment is ever truncated. A segment before it was sealed, and a
+/// sealed segment is never written again, so a tail that does not verify there is
+/// damage rather than a run that stopped — and damage that this pass quietly
+/// shortened away would be damage nobody ever heard about.
+fn recover(set: &IndexSet) -> io::Result<Scanned> {
+    let mut segments = set.segments()?;
+
+    let created = segments.is_empty();
+    if created {
+        let first = set.blob_path(0);
+        create_segment(&first, 0)?;
+        sync_parent(&first)?;
+        segments.push(first);
+    }
+
+    let last = u32::try_from(segments.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    let mut out = Scanned {
+        segments: segments.clone(),
+        blobs: HashMap::new(),
+        commits: Vec::new(),
+        write_into: u32::MAX,
+        end: 0,
+    };
+
+    for (index, path) in segments.iter().enumerate() {
+        let segment = u32::try_from(index).unwrap_or(u32::MAX);
+        let is_last = index == segments.len() - 1;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(is_last)
+            .truncate(false)
+            .open(path)?;
+
+        let claimed = check_store_header(&mut file, path)?;
+        if claimed != segment {
+            return Err(not_a_store(
+                path,
+                &format!(
+                    "its header says it is segment {claimed}, but it is named as segment {segment}, \
+                     so the set's segments have been moved around or renamed"
+                ),
+            ));
+        }
+
+        let scan = record::scan(&mut file, segment)?;
+        let len = file.metadata()?.len();
+
+        if scan.end < len {
+            if !is_last {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} is a sealed segment and has {} bytes that are not a valid record, so it \
+                         is damaged rather than unfinished; nothing here was truncated",
+                        path.display(),
+                        len - scan.end
+                    ),
+                ));
+            }
+
+            // A run that did not finish. The bytes past the last valid record
+            // were never published, so they are not data anybody can lose, and the
+            // file is shortened back over them. Synced, because the truncation has
+            // to be durable before anything is written over the space: a crash
+            // that brought the old tail back would put the scan and the append
+            // pointer out of step with each other.
+            file.set_len(scan.end)?;
+            file.sync_data()?;
+
+            tracing::info!(
+                path = %path.display(),
+                reclaimed = len - scan.end,
+                "discarded the tail of an unfinished run"
+            );
+        }
+
+        out.blobs.extend(scan.blobs);
+        out.commits.extend(scan.commits);
+
+        if is_last {
+            // The last segment is the one a run writes into. Recording it rather
+            // than "how many are sealed" is what makes a fresh set — one segment,
+            // nothing sealed — use the same arithmetic as a set of a thousand.
+            out.write_into = last;
+            out.end = scan.end;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Open a set for reading, without writing to it.
+fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
+    let segments = set.segments()?;
+    if segments.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no backup store at {}", set.base().display()),
+        ));
+    }
+
+    let mut out = Scanned {
+        segments: segments.clone(),
+        blobs: HashMap::new(),
+        commits: Vec::new(),
+        write_into: u32::MAX,
+        end: 0,
+    };
+
+    for (index, path) in segments.iter().enumerate() {
+        let segment = u32::try_from(index).unwrap_or(u32::MAX);
+        let mut file = std::fs::File::open(path)?;
+        let claimed = check_store_header(&mut file, path)?;
+
+        if claimed != segment {
+            return Err(not_a_store(
+                path,
+                &format!(
+                    "its header says it is segment {claimed}, but it is named as segment {segment}"
+                ),
+            ));
+        }
+
+        // A read does not repair, so a segment with a tail that does not verify is
+        // reported the same way the writing open reports damage in a sealed one:
+        // the bytes are there, they are not readable, and pretending otherwise
+        // would mean a restore that quietly omits whatever they held.
+        let scan = record::scan(&mut file, segment)?;
+        let len = file.metadata()?.len();
+
+        if scan.end < len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} has {} bytes past its last valid record, so it is damaged; a read does \
+                     not repair a store",
+                    path.display(),
+                    len - scan.end
+                ),
+            ));
+        }
+
+        out.blobs.extend(scan.blobs);
+        out.commits.extend(scan.commits);
+    }
+
+    // A reader never writes, so it has no segment to write into and no end to
+    // carry on from. Both are left saying so rather than pretending to be a
+    // one-segment set.
+    out.write_into = u32::MAX;
+    out.end = 0;
+
+    Ok(out)
+}
+
+/// Create segment `segment` and write its header.
+///
+/// `create_new` rather than `create`, so a segment that already exists is an error
+/// instead of a header written over the top of records that are already there.
+fn create_segment(path: &Path, segment: u32) -> io::Result<()> {
+    use std::io::Write as _;
+
     let mut file = std::fs::OpenOptions::new()
-        .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .open(path)?;
 
-    let created = file.metadata()?.len() == 0;
+    file.write_all(&record::encode_store_header(segment))?;
+    file.sync_data()?;
 
-    if created {
-        // A store with no header is not a store yet, and a zero-length file is
-        // not an empty backup set. Writing it before anything else means every
-        // later open can tell the two apart.
-        use std::io::Write as _;
-
-        let mut header = [0u8; STORE_HEADER];
-        header[..4].copy_from_slice(&STORE_MAGIC);
-        header[4..].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-
-        file.write_all(&header)?;
-        file.sync_data()?;
-    }
-
-    check_store_header(&mut file, path)?;
-
-    let scan = record::scan(&mut file)?;
-    let len = file.metadata()?.len();
-
-    if scan.end < len {
-        // A run that did not finish. The bytes past the last valid record were
-        // never published, so they are not data anybody can lose, and the file is
-        // shortened back over them. Synced, because the truncation has to be
-        // durable before anything is written over the space: a crash that
-        // brought the old tail back would put the scan and the append pointer
-        // out of step with each other.
-        file.set_len(scan.end)?;
-        file.sync_data()?;
-
-        tracing::info!(
-            path = %path.display(),
-            reclaimed = len - scan.end,
-            "discarded the tail of an unfinished run"
-        );
-    }
-
-    if created {
-        // The file itself has to be in the directory, not just its contents, or
-        // a power cut can leave a durable store that no longer exists.
-        sync_parent(path)?;
-    }
-
-    let handle = fs::File::from_std(file);
-    Ok((scan, handle))
+    Ok(())
 }
 
-/// Open a store for reading, without writing to it.
-fn read_only_scan(path: &Path) -> io::Result<record::Scan> {
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no backup store at {}", path.display()),
-            )
-        } else {
-            e
-        }
-    })?;
-
-    check_store_header(&mut file, path)?;
-    record::scan(&mut file)
-}
-
-/// Refuse a file that is not a store this build can read.
+/// Check that `path` is a store segment, and return the number its header claims.
 ///
 /// Never repairs and never truncates: a file that does not start with the store
 /// magic is somebody's data that this build does not understand, and the one
 /// thing a recovery pass must not do is decide otherwise on its own.
-fn check_store_header(file: &mut std::fs::File, path: &Path) -> io::Result<()> {
+fn check_store_header(file: &mut std::fs::File, path: &Path) -> io::Result<u32> {
     use std::io::{Read as _, Seek as _};
 
     let len = file.metadata()?.len();
@@ -617,29 +946,25 @@ fn check_store_header(file: &mut std::fs::File, path: &Path) -> io::Result<()> {
 
     let mut header = [0u8; STORE_HEADER];
 
-    // From the start, whatever the handle happens to be positioned at. The
-    // caller that just created the store has written the header and left the
-    // cursor at the end of the file, and reading from there would be a read past
-    // the end of an 8-byte file rather than a read of its header.
+    // From the start, whatever the handle happens to be positioned at. A handle
+    // that has just written the header is left at the end of the file, and
+    // reading from there would be a read past the end of a 12-byte file rather
+    // than a read of its header.
     file.seek(io::SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
 
-    if header[..4] != STORE_MAGIC {
-        return Err(not_a_store(
-            path,
-            "it does not begin with a lepatch store header, so it was not written by this format",
-        ));
-    }
+    record::decode_store_header(&header).map_err(|fault| {
+        let why = match fault {
+            record::HeaderFault::NotAStore => {
+                "it does not begin with a lepatch store header, so it was not written by this format"
+            }
+            record::HeaderFault::UnsupportedVersion => {
+                "it is a store format this build does not read"
+            }
+        };
 
-    let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    if version != FORMAT_VERSION {
-        return Err(not_a_store(
-            path,
-            &format!("it is store format {version}, but this build reads {FORMAT_VERSION}"),
-        ));
-    }
-
-    Ok(())
+        not_a_store(path, why)
+    })
 }
 
 fn not_a_store(path: &Path, why: &str) -> io::Error {

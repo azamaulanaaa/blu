@@ -15,7 +15,8 @@ use std::{
 
 use lepatch::{
     command::{Committed, Options, backup, restore},
-    storage::{BlobId, BlobStore},
+    index::IndexSet,
+    storage::{BlobId, BlobStore, SegmentLimit},
 };
 
 /// Default chunker configuration, mirroring the CLI defaults.
@@ -124,6 +125,21 @@ pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
     out
 }
 
+/// Total bytes of the set at `base`, across every segment.
+///
+/// A set is several files, so a test that wants to know how much a run added has
+/// to add them up. Deliberately sums the whole set rather than one segment: a
+/// backup that rolled over grew by more than a segment, and a test measuring only
+/// the last one would call that no growth at all.
+pub(crate) fn set_size(base: &Path) -> u64 {
+    IndexSet::new(base)
+        .segments()
+        .expect("the set should be readable")
+        .iter()
+        .map(|segment| fs::metadata(segment).map_or(0, |meta| meta.len()))
+        .sum()
+}
+
 /// Back up `source` into a fresh store and return what was committed.
 ///
 /// There is no base snapshot to pass: deduplication is the store's own business,
@@ -135,13 +151,31 @@ pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
 /// Back up `source` with specific options, for tests that need to pin a knob the
 /// defaults would otherwise choose.
 pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
-    let storage = BlobStore::<true>::open(blob).await.unwrap();
+    let storage = BlobStore::<true>::open(blob, SegmentLimit::default())
+        .await
+        .unwrap();
     backup(source, opts, storage).await.unwrap()
+}
+
+/// Back up `source` into a store with a given segment limit.
+///
+/// The limit belongs to the store rather than to the run — it is a property of
+/// the files on disk — so a test that wants a small one has to open the store
+/// itself, which is what this does.
+pub(crate) async fn run_backup_limited(
+    source: &Path,
+    blob: &Path,
+    limit: SegmentLimit,
+) -> Committed {
+    let storage = BlobStore::<true>::open(blob, limit).await.unwrap();
+    backup(source, Options::default(), storage).await.unwrap()
 }
 
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
 pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Path) {
-    let storage = BlobStore::<false>::open(blob).await.unwrap();
+    let storage = BlobStore::<false>::open(blob, SegmentLimit::default())
+        .await
+        .unwrap();
     restore(destination, snapshot, storage).await.unwrap();
 }
 

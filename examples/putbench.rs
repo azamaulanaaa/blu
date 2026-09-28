@@ -13,7 +13,10 @@
 use std::io::Cursor;
 use std::time::Instant;
 
-use lepatch::storage::{BlobStore, StoragePut};
+use lepatch::{
+    index::IndexSet,
+    storage::{BlobStore, SegmentLimit, StoragePut},
+};
 
 const CHUNK: usize = 64 * 1024;
 const CHUNKS: usize = 1500;
@@ -100,8 +103,14 @@ async fn main() {
     // Warm up, so the first run is not paying for page cache and allocator
     // growth that every later run gets for free.
     for _ in 0..2 {
-        let _ = std::fs::remove_file(&store_path);
-        let store = std::sync::Arc::new(BlobStore::<true>::open(&store_path).await.expect("store"));
+        for segment in 0..64 {
+            let _ = std::fs::remove_file(IndexSet::new(&store_path).blob_path(segment));
+        }
+        let store = std::sync::Arc::new(
+            BlobStore::<true>::open(&store_path, SegmentLimit::default())
+                .await
+                .expect("store"),
+        );
         put_all(store.clone()).await;
     }
     let _ = write_all_blocking(&plain_path);
@@ -110,8 +119,14 @@ async fn main() {
     let mut plain_times = Vec::new();
 
     for _ in 0..5 {
-        let _ = std::fs::remove_file(&store_path);
-        let store = std::sync::Arc::new(BlobStore::<true>::open(&store_path).await.expect("store"));
+        for segment in 0..64 {
+            let _ = std::fs::remove_file(IndexSet::new(&store_path).blob_path(segment));
+        }
+        let store = std::sync::Arc::new(
+            BlobStore::<true>::open(&store_path, SegmentLimit::default())
+                .await
+                .expect("store"),
+        );
         store_times.push(put_all(store.clone()).await);
         plain_times.push(write_all_blocking(&plain_path));
     }
