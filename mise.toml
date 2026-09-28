@@ -59,11 +59,19 @@ description = "Wildcard dependencies, duplicate versions and unused crates"
 depends = ["licenses", "advisories", "bans"]
 
 # Fails if the real floor has drifted above `rust-version` in Cargo.toml. Needs
-# the toolchain once: rustup toolchain install 1.85
+# the toolchain once, at whatever the manifest currently says:
+#
+#   rustup toolchain install "$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+#
 # The floor is read out of the manifest rather than written here, because the two
 # drifting apart is the one failure this task cannot detect: a stale pin would
 # keep testing a toolchain nobody claims to support while `rust-version` said
-# something else.
+# something else. So this comment deliberately carries no version of its own.
+#
+# An interrupted install leaves a toolchain directory that has `cargo` but no
+# `rustc`, and the symptom is confusing: `cargo +1.98 --version` works while
+# `rustc +1.98 -vV` reports a missing manifest. `rustup toolchain install` again
+# repairs it, and says "recovering from a partially installed toolchain".
 [tasks.msrv]
 run = '''
 floor=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
