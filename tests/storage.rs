@@ -7,26 +7,11 @@
 
 mod common;
 
-use std::io::Cursor;
-
 use lepatch::{
     index::IndexSet,
     storage::{BlobId, BlobStore, SegmentLimit, StorageGet, StoragePut},
 };
 use tokio::io::AsyncReadExt;
-
-fn reader(bytes: Vec<u8>) -> lepatch::storage::StreamReadSeeker {
-    Box::new(Cursor::new(bytes))
-}
-
-/// The address a payload is stored under: the BLAKE3 of its contents.
-fn id_of(bytes: &[u8]) -> BlobId {
-    *blake3::hash(bytes).as_bytes()
-}
-
-fn len_of(bytes: &[u8]) -> u64 {
-    u64::try_from(bytes.len()).unwrap()
-}
 
 /// `StreamReadSeeker` is not `Debug`, so `unwrap_err` is not available on
 /// `StorageGet::get`.
@@ -58,14 +43,21 @@ async fn a_stored_blob_reads_back_byte_for_byte() {
         .await
         .unwrap();
     store
-        .put(&id_of(&payload), reader(payload.clone()), len_of(&payload))
+        .put(
+            &common::id_of(&payload),
+            common::reader(payload.clone()),
+            common::len_of(&payload),
+        )
         .await
         .unwrap();
 
     let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
         .await
         .unwrap();
-    assert_eq!(read_all(&store, &id_of(&payload)).await.unwrap(), payload);
+    assert_eq!(
+        read_all(&store, &common::id_of(&payload)).await.unwrap(),
+        payload
+    );
 }
 
 #[tokio::test]
@@ -81,10 +73,14 @@ async fn blobs_appended_in_sequence_do_not_overlap() {
     for i in 0..8u8 {
         let payload = vec![i; 1_000 + usize::from(i)];
         store
-            .put(&id_of(&payload), reader(payload.clone()), len_of(&payload))
+            .put(
+                &common::id_of(&payload),
+                common::reader(payload.clone()),
+                common::len_of(&payload),
+            )
             .await
             .unwrap();
-        ids.push(id_of(&payload));
+        ids.push(common::id_of(&payload));
     }
 
     let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
@@ -109,12 +105,20 @@ async fn an_empty_blob_round_trips() {
     let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
         .await
         .unwrap();
-    store.put(&id_of(&[]), reader(Vec::new()), 0).await.unwrap();
+    store
+        .put(&common::id_of(&[]), common::reader(Vec::new()), 0)
+        .await
+        .unwrap();
 
     let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
         .await
         .unwrap();
-    assert!(read_all(&store, &id_of(&[])).await.unwrap().is_empty());
+    assert!(
+        read_all(&store, &common::id_of(&[]))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -128,7 +132,7 @@ async fn a_reader_shorter_than_the_declared_length_is_rejected() {
 
     // Claimed 1000 bytes, only 10 available.
     let error = store
-        .put(&id_of(&[]), reader(vec![1u8; 10]), 1000)
+        .put(&common::id_of(&[]), common::reader(vec![1u8; 10]), 1000)
         .await
         .unwrap_err();
 
@@ -151,7 +155,11 @@ async fn a_reader_longer_than_the_declared_length_is_rejected() {
     // Claimed 10 bytes, 1000 available. Accepting this would leave the extra
     // 990 bytes in the store, past the end of the record that claims them.
     let error = store
-        .put(&id_of(&[1u8; 10]), reader(vec![1u8; 1000]), 10)
+        .put(
+            &common::id_of(&[1u8; 10]),
+            common::reader(vec![1u8; 1000]),
+            10,
+        )
         .await
         .unwrap_err();
 
@@ -181,10 +189,14 @@ async fn content_that_does_not_hash_to_its_address_is_rejected() {
 
     let payload = vec![1u8; 100];
     // The address of something else entirely.
-    let wrong = id_of(b"a different payload");
+    let wrong = common::id_of(b"a different payload");
 
     let error = store
-        .put(&wrong, reader(payload.clone()), len_of(&payload))
+        .put(
+            &wrong,
+            common::reader(payload.clone()),
+            common::len_of(&payload),
+        )
         .await
         .unwrap_err();
 
@@ -226,7 +238,7 @@ async fn a_blob_the_store_does_not_hold_is_rejected() {
         .await
         .unwrap();
 
-    let absent = id_of(b"never stored");
+    let absent = common::id_of(b"never stored");
     let error = expect_get_error(store.get(&absent).await);
 
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -250,13 +262,13 @@ async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
     let blob = dir.path().join("store");
 
     let payload = vec![7u8; 100];
-    let id = id_of(&payload);
-    let len = len_of(&payload);
+    let id = common::id_of(&payload);
+    let len = common::len_of(&payload);
 
     let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
         .await
         .unwrap();
-    store.put(&id, reader(payload), len).await.unwrap();
+    store.put(&id, common::reader(payload), len).await.unwrap();
 
     // Chop the last segment in half, which lands inside the one record it holds.
     let segment = IndexSet::new(&blob).blob_path(0);
@@ -352,7 +364,11 @@ async fn a_store_in_a_missing_directory_is_created() {
         .await
         .unwrap();
     store
-        .put(&id_of(&payload), reader(payload.clone()), len_of(&payload))
+        .put(
+            &common::id_of(&payload),
+            common::reader(payload.clone()),
+            common::len_of(&payload),
+        )
         .await
         .unwrap();
 
@@ -364,7 +380,10 @@ async fn a_store_in_a_missing_directory_is_created() {
     let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
         .await
         .unwrap();
-    assert_eq!(read_all(&store, &id_of(&payload)).await.unwrap(), payload);
+    assert_eq!(
+        read_all(&store, &common::id_of(&payload)).await.unwrap(),
+        payload
+    );
 }
 
 /// Content already in the store is not written again.
@@ -378,13 +397,17 @@ async fn content_the_store_already_holds_is_not_written_again() {
     let blob = dir.path().join("store");
 
     let payload = common::noisy(64 * 1024);
-    let id = id_of(&payload);
+    let id = common::id_of(&payload);
 
     let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
         .await
         .unwrap();
     store
-        .put(&id, reader(payload.clone()), len_of(&payload))
+        .put(
+            &id,
+            common::reader(payload.clone()),
+            common::len_of(&payload),
+        )
         .await
         .unwrap();
     store.sync_data().await.unwrap();
@@ -397,7 +420,11 @@ async fn content_the_store_already_holds_is_not_written_again() {
         .await
         .unwrap();
     store
-        .put(&id, reader(payload.clone()), len_of(&payload))
+        .put(
+            &id,
+            common::reader(payload.clone()),
+            common::len_of(&payload),
+        )
         .await
         .unwrap();
     store.sync_data().await.unwrap();
@@ -431,18 +458,26 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
         .await
         .unwrap();
     store
-        .put(&id_of(&first), reader(first.clone()), len_of(&first))
+        .put(
+            &common::id_of(&first),
+            common::reader(first.clone()),
+            common::len_of(&first),
+        )
         .await
         .unwrap();
     store.sync_data().await.unwrap();
-    store.commit(&id_of(&first)).await.unwrap();
+    store.commit(&common::id_of(&first)).await.unwrap();
 
     // Reopen, as a second run does, so the index is rebuilt from the file.
     let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
         .await
         .unwrap();
     store
-        .put(&id_of(&second), reader(second.clone()), len_of(&second))
+        .put(
+            &common::id_of(&second),
+            common::reader(second.clone()),
+            common::len_of(&second),
+        )
         .await
         .unwrap();
     store.sync_data().await.unwrap();
@@ -451,12 +486,16 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
         .await
         .unwrap();
     assert_eq!(
-        read_all(&reader_store, &id_of(&first)).await.unwrap(),
+        read_all(&reader_store, &common::id_of(&first))
+            .await
+            .unwrap(),
         first,
         "a blob from an earlier run should still be readable"
     );
     assert_eq!(
-        read_all(&reader_store, &id_of(&second)).await.unwrap(),
+        read_all(&reader_store, &common::id_of(&second))
+            .await
+            .unwrap(),
         second
     );
 }
@@ -495,10 +534,10 @@ async fn concurrent_uploads_do_not_overlap() {
     let mut tasks = Vec::new();
     for (i, payload) in payloads.iter().cloned().enumerate() {
         let store = std::sync::Arc::clone(&store);
-        let id = id_of(&payload);
-        let len = len_of(&payload);
+        let id = common::id_of(&payload);
+        let len = common::len_of(&payload);
         tasks.push(tokio::spawn(async move {
-            store.put(&id, reader(payload), len).await?;
+            store.put(&id, common::reader(payload), len).await?;
             Ok::<_, std::io::Error>((i, id))
         }));
     }
@@ -562,9 +601,13 @@ async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
         let store = std::sync::Arc::clone(&store);
         tasks.push(tokio::spawn(async move {
             let payload = vec![u8::try_from(i % 251).expect("in range") + 1; 30_000 + i];
-            let id = id_of(&payload);
-            let declared = if i == 32 { 30_000 } else { len_of(&payload) };
-            store.put(&id, reader(payload), declared).await?;
+            let id = common::id_of(&payload);
+            let declared = if i == 32 {
+                30_000
+            } else {
+                common::len_of(&payload)
+            };
+            store.put(&id, common::reader(payload), declared).await?;
             Ok::<_, std::io::Error>((i, id))
         }));
     }

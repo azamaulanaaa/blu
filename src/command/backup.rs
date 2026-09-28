@@ -77,8 +77,7 @@ pub struct Committed {
 
 /// Uploads to run at once when the caller has not asked for a specific number.
 fn default_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map_or(DEFAULT_CONCURRENCY, |n| n.get().min(DEFAULT_CONCURRENCY))
+    super::concurrency(DEFAULT_CONCURRENCY)
 }
 
 /// Clamp a requested concurrency to something that can only help.

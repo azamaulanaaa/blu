@@ -206,14 +206,6 @@ mod tests {
         }
     }
 
-    fn at_in(segment: u32, offset: u64, len: u64) -> Placement {
-        Placement {
-            segment,
-            offset,
-            len,
-        }
-    }
-
     /// A snapshot of one file of 100 bytes made of two 50-byte chunks.
     fn two_chunks() -> Snapshot {
         let mut s = Snapshot::new();

@@ -87,20 +87,6 @@ fn lock_slots(slots: &Slots) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Slot
 /// boundary from the bytes before it, so the stream cannot be split across
 /// threads. What it does overlap is the storing of chunks it has already handed
 /// over.
-/// How long the reader spent waiting for room in the channel, which is how long
-/// the other half was the slower one.
-#[derive(Debug, Default)]
-struct ReaderTimings {
-    /// Time parked in `blocking_send`.
-    blocked: Duration,
-}
-
-/// Read, chunk and hash the tree on a blocking thread, feeding `tx`.
-///
-/// This half is deliberately sequential: content-defined chunking finds each
-/// boundary from the bytes before it, so the stream cannot be split across
-/// threads. What it does overlap is the storing of chunks it has already handed
-/// over.
 ///
 /// Returns how long it spent blocked handing chunks over, which the committer
 /// turns into the pipeline's timing line.
@@ -109,7 +95,7 @@ fn produce(
     config: reader::ChunkerConfig,
     tx: mpsc::Sender<Pending>,
 ) -> io::Result<Duration> {
-    let mut timings = ReaderTimings::default();
+    let mut blocked = Duration::ZERO;
 
     // Built here rather than by the caller because this is the thread that
     // blocks on it: stat'ing every file is a syscall apiece.
@@ -135,7 +121,7 @@ fn produce(
             sources: chunk.sources,
             data: chunk.data,
         });
-        timings.blocked += sending.elapsed();
+        blocked += sending.elapsed();
 
         sent.map_err(|_| {
             io::Error::new(
@@ -148,7 +134,7 @@ fn produce(
     // Dropping the sender is how the other half learns the tree is finished.
     drop(tx);
 
-    Ok(timings.blocked)
+    Ok(blocked)
 }
 
 /// Everything the storing half of the pipeline needs, gathered so that passing it

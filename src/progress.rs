@@ -111,12 +111,6 @@ impl Progress {
 
         true
     }
-
-    /// Seconds elapsed, for a final line.
-    #[must_use]
-    pub fn elapsed_secs(&self) -> u64 {
-        self.started.elapsed().as_secs()
-    }
 }
 
 /// Counters whose totals are byte counts, and so are worth showing as a human

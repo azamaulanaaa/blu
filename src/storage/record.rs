@@ -75,7 +75,7 @@ const SCAN_BUFFER: usize = 1024 * 1024;
 
 /// What a record holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
+pub(super) enum Kind {
     /// Content, addressed by the BLAKE3 of its payload. Chunks and snapshots are
     /// both this, and are told apart only by what refers to them.
     Blob,
@@ -245,11 +245,8 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
-/// The header's own checksum: the first [`CHECK`] bytes of its hash.
 fn check(header_without_check: &[u8]) -> [u8; CHECK] {
-    let mut out = [0u8; CHECK];
-    out.copy_from_slice(&blake3::hash(header_without_check).as_bytes()[..CHECK]);
-    out
+    super::truncated_hash(header_without_check)
 }
 
 /// Decode the header of the record starting at `at` in the store.

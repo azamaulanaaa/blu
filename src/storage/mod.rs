@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncSeek};
 pub use blob::BlobStore;
 pub use locate::{Resolved, resolve};
 pub use plan::{Plan, Planned};
-pub use record::Kind;
+
 pub use version_index::VersionIndex;
 
 mod blob;
@@ -31,6 +31,17 @@ mod locate;
 mod plan;
 mod record;
 mod version_index;
+
+/// The first `N` bytes of a BLAKE3 hash, for a checksum over fixed-size bytes.
+///
+/// Both on-disk formats here — a record header and a version index file — are
+/// small, fixed-size, and carry a truncated digest to catch a torn or foreign
+/// write. They are the same computation and had it written out twice.
+pub(super) fn truncated_hash<const N: usize>(bytes: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    out.copy_from_slice(&blake3::hash(bytes).as_bytes()[..N]);
+    out
+}
 
 /// Where a blob's payload sits in a store.
 ///

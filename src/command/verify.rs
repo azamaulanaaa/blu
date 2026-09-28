@@ -20,7 +20,7 @@ use tracing::instrument;
 use crate::{
     metadata::Snapshot,
     progress::Progress,
-    storage::{self, StorageGet, StreamReadSeeker},
+    storage::{self, StorageGet},
 };
 
 /// Chunks to check at once.
@@ -39,8 +39,7 @@ const SCRATCH: usize = 32 * 1024;
 
 /// How many chunks to check at once.
 fn verify_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map_or(VERIFY_CONCURRENCY, |n| n.get().clamp(1, VERIFY_CONCURRENCY))
+    super::concurrency(VERIFY_CONCURRENCY)
 }
 
 /// A chunk that could not be read back, or whose contents did not match the
@@ -126,13 +125,7 @@ pub async fn verify<S: storage::StorageGet + 'static>(
     snapshot_id: storage::BlobId,
     storage: S,
 ) -> io::Result<Report> {
-    let snapshot = {
-        let mut reader: StreamReadSeeker = storage.get(&snapshot_id).await?;
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await?;
-        Snapshot::from_bytes(buffer.as_slice())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-    };
+    let snapshot = super::load_snapshot(&storage, snapshot_id).await?;
 
     Ok(check(&snapshot, Arc::new(storage)).await)
 }

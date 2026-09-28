@@ -608,20 +608,13 @@ fn report_restored(restored: &lepatch::command::Restored) {
     );
 }
 
-/// Check that a destination is safe to empty, and empty it.
-///
-/// This is the only operation here that destroys data, so it is deliberately
-/// hard to talk into it: the paths are compared absolute, because a relative
-/// blob path never "starts with" a relative destination and the check would
-/// silently never fire; and the handful of directories nobody means to empty are
-/// refused outright.
 /// Check that a destination is safe to empty, without touching it.
 ///
-/// This is the only operation here that destroys data, so it is deliberately
-/// hard to talk into it: the paths are compared absolute, because a relative
-/// blob path never "starts with" a relative destination and the check would
-/// silently never fire; and the handful of directories nobody means to empty are
-/// refused outright.
+/// `--clean` is the only operation here that destroys data, so it is deliberately
+/// hard to talk into: the paths are compared absolute, because a relative blob
+/// path never "starts with" a relative destination and the check would silently
+/// never fire; and the handful of directories nobody means to empty are refused
+/// outright.
 fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std::io::Result<()> {
     if destination.as_os_str().is_empty() {
         return Err(std::io::Error::new(

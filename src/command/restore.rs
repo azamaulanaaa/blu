@@ -4,11 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use tokio::{
-    fs as fs_async,
-    io::{AsyncReadExt, AsyncSeekExt},
-    task::JoinSet,
-};
+use tokio::{fs as fs_async, io::AsyncSeekExt, task::JoinSet};
 use tracing::instrument;
 
 use crate::{
@@ -29,9 +25,7 @@ const RESTORE_CONCURRENCY: usize = 8;
 
 /// How many files to write at once.
 fn restore_concurrency() -> usize {
-    std::thread::available_parallelism().map_or(RESTORE_CONCURRENCY, |n| {
-        n.get().clamp(1, RESTORE_CONCURRENCY)
-    })
+    super::concurrency(RESTORE_CONCURRENCY)
 }
 
 /// What a restore put into the destination.
@@ -79,13 +73,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     // in the store — paid on top of the tree, on top of the snapshot, on top of
     // the decoded bytes, for a value nothing ever writes to. The write tasks need
     // owned data, and sharing is how they get it without the copy.
-    let snapshot = Arc::new({
-        let mut reader: StreamReadSeeker = storage.get(&snapshot_id).await?;
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await?;
-        metadata::Snapshot::from_bytes(buffer.as_slice())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-    });
+    let snapshot = Arc::new(super::load_snapshot(&storage, snapshot_id).await?);
 
     let root = root.as_ref();
     let storage = Arc::new(storage);

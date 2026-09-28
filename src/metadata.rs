@@ -208,6 +208,9 @@ impl Snapshot {
     }
 }
 
+/// Empty, which is a snapshot of a tree with nothing in it. Not a convenience so
+/// much as a consequence: `new` is the only way to build one, and clippy is right
+/// that a type with a `new` that returns nothing should also say so.
 impl Default for Snapshot {
     fn default() -> Self {
         Self::new()

@@ -10,14 +10,30 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Cursor,
     path::{Path, PathBuf},
 };
 
 use lepatch::{
     command::{Committed, Options, backup, restore},
     index::IndexSet,
-    storage::{BlobId, BlobStore, SegmentLimit},
+    storage::{BlobId, BlobStore, SegmentLimit, StreamReadSeeker},
 };
+
+/// A reader over `bytes`, for handing a store something to put.
+pub(crate) fn reader(bytes: Vec<u8>) -> StreamReadSeeker {
+    Box::new(Cursor::new(bytes))
+}
+
+/// The address a payload is stored under: the BLAKE3 of its contents.
+pub(crate) fn id_of(bytes: &[u8]) -> BlobId {
+    *blake3::hash(bytes).as_bytes()
+}
+
+/// A length as the store's `u64`, from a slice the test already has in hand.
+pub(crate) fn len_of(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).unwrap()
+}
 
 /// Default chunker configuration, mirroring the CLI defaults.
 pub(crate) fn options() -> Options {

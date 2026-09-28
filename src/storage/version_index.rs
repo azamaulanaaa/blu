@@ -32,7 +32,7 @@
 
 use std::{
     fs,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Write},
     path::Path,
 };
 
@@ -44,16 +44,8 @@ const LEN: usize = 4 + 4 + 4 + 32 + 8;
 /// Bytes the checksum covers: everything ahead of itself.
 const UNCHECKED: usize = LEN - 8;
 
-/// The truncated BLAKE3 that guards the rest of the file.
-///
-/// A checksum rather than a copy of the payload hash, because the payload hash is
-/// already in the file and is verified separately against the snapshot itself.
-/// This only has to notice that the two counts were torn or written by something
-/// else, which a 64-bit digest is more than enough for on a 40-byte file.
 fn check(head: &[u8]) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out.copy_from_slice(&blake3::hash(head).as_bytes()[..8]);
-    out
+    super::truncated_hash(head)
 }
 
 /// Where a version's snapshot is.
@@ -195,16 +187,4 @@ fn temporary_for(path: &Path) -> std::path::PathBuf {
     name.push(".tmp");
 
     path.with_file_name(name)
-}
-
-/// Read an index file, leaving the file position alone.
-///
-/// Used by tests and by anything that already holds a handle.
-#[allow(dead_code)]
-pub(super) fn read_from(file: &mut fs::File) -> io::Result<VersionIndex> {
-    let mut bytes = [0u8; LEN];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut bytes)?;
-
-    VersionIndex::from_bytes(&bytes)
 }

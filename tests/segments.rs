@@ -16,7 +16,7 @@
 
 mod common;
 
-use std::{fs, io::Cursor, path::Path};
+use std::{fs, path::Path};
 
 use lepatch::{
     index::IndexSet,
@@ -34,18 +34,6 @@ fn small() -> SegmentLimit {
     SegmentLimit::new(64 * 1024)
 }
 
-fn reader(bytes: Vec<u8>) -> lepatch::storage::StreamReadSeeker {
-    Box::new(Cursor::new(bytes))
-}
-
-fn id_of(bytes: &[u8]) -> BlobId {
-    *blake3::hash(bytes).as_bytes()
-}
-
-fn len_of(bytes: &[u8]) -> u64 {
-    u64::try_from(bytes.len()).unwrap()
-}
-
 /// Store `payloads` one at a time, returning the ids in the order stored.
 async fn put_all(blob: &Path, limit: SegmentLimit, payloads: &[Vec<u8>]) -> Vec<BlobId> {
     let store = BlobStore::<true>::open(blob, limit).await.unwrap();
@@ -53,10 +41,14 @@ async fn put_all(blob: &Path, limit: SegmentLimit, payloads: &[Vec<u8>]) -> Vec<
     let mut ids = Vec::new();
     for payload in payloads {
         store
-            .put(&id_of(payload), reader(payload.clone()), len_of(payload))
+            .put(
+                &common::id_of(payload),
+                common::reader(payload.clone()),
+                common::len_of(payload),
+            )
             .await
             .unwrap();
-        ids.push(id_of(payload));
+        ids.push(common::id_of(payload));
     }
 
     store.sync_data().await.unwrap();
@@ -141,7 +133,11 @@ async fn a_record_larger_than_the_limit_is_refused() {
     let store = BlobStore::<true>::open(&blob, limit).await.unwrap();
 
     let error = store
-        .put(&id_of(&big), reader(big.clone()), len_of(&big))
+        .put(
+            &common::id_of(&big),
+            common::reader(big.clone()),
+            common::len_of(&big),
+        )
         .await
         .unwrap_err();
 
@@ -251,7 +247,7 @@ async fn a_sealed_segment_with_a_damaged_tail_is_refused_not_truncated() {
     // A sealed one: anything but the last.
     let sealed = &segments[0];
     let sealed_claim = BlobStore::<false>::open(&blob, tiny()).await.unwrap();
-    let first_placement = sealed_claim.locate(&id_of(&payloads[0])).unwrap();
+    let first_placement = sealed_claim.locate(&common::id_of(&payloads[0])).unwrap();
     assert_eq!(
         first_placement.segment, 0,
         "the first payload should be in segment 0, which is the sealed one"
@@ -395,10 +391,10 @@ async fn concurrent_writes_across_a_rollover_do_not_overlap() {
     let mut tasks = Vec::new();
     for payload in payloads.iter().cloned() {
         let store = std::sync::Arc::clone(&store);
-        let id = id_of(&payload);
-        let len = len_of(&payload);
+        let id = common::id_of(&payload);
+        let len = common::len_of(&payload);
         tasks.push(tokio::spawn(async move {
-            store.put(&id, reader(payload), len).await?;
+            store.put(&id, common::reader(payload), len).await?;
             Ok::<_, std::io::Error>(id)
         }));
     }

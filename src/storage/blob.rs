@@ -134,8 +134,6 @@ struct Reservation {
     segment: u32,
     /// Byte offset within that segment.
     offset: u64,
-    /// Bytes the record occupies, header included.
-    len: u64,
 }
 
 /// A store of content-addressed blobs.
@@ -187,18 +185,6 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     #[must_use]
     pub fn segment_count(&self) -> usize {
         self.segments.len()
-    }
-
-    /// The paths of every segment, in order.
-    #[must_use]
-    pub fn segments(&self) -> &[PathBuf] {
-        &self.segments
-    }
-
-    /// How large a segment may get before a new one is started.
-    #[must_use]
-    pub fn limit(&self) -> SegmentLimit {
-        self.limit
     }
 
     /// Every version this store holds, oldest first.
@@ -390,7 +376,6 @@ impl BlobStore<true> {
             reserved: Mutex::new(Reservation {
                 segment: scanned.write_into,
                 offset: scanned.end,
-                len: 0,
             }),
             limit,
             dirty: Mutex::new(Vec::new()),
@@ -434,7 +419,6 @@ impl BlobStore<false> {
             reserved: Mutex::new(Reservation {
                 segment: scanned.write_into,
                 offset: scanned.end,
-                len: 0,
             }),
             limit,
             dirty: Mutex::new(Vec::new()),
@@ -791,11 +775,9 @@ impl BlobStore<true> {
             let reservation = Reservation {
                 segment: reserved.segment,
                 offset: reserved.offset,
-                len: total,
             };
 
             reserved.offset = end;
-            reserved.len = 0;
             self.note_segment(reservation.segment);
 
             return Ok(reservation);
@@ -826,12 +808,10 @@ impl BlobStore<true> {
         let reservation = Reservation {
             segment: next,
             offset: header,
-            len: total,
         };
 
         reserved.segment = next;
         reserved.offset = header + total;
-        reserved.len = 0;
         self.note_segment(next);
 
         Ok(reservation)
