@@ -4,24 +4,17 @@
 //! version (4) | segment (4) | ordinal in segment (4) | snapshot hash (32) | check (8)
 //! ```
 //!
-//! The whole of the file is a few dozen bytes and it exists to answer one
-//! question without a scan. Without it, "where is version 7's snapshot" means
-//! reading the header of every record in every segment of the set, and that scan
-//! is on the critical path of every restore and every verify.
+//! It answers "where is version 7's snapshot" without a scan of every record
+//! header in the set.
 //!
 //! ## This is a cache
 //!
 //! The store's commit records are the record of which versions exist. An index
 //! file is derived from them, and a wrong or missing one costs a scan rather than
-//! a backup. Nothing in this module is trusted without being checked against the
-//! store, and nothing here can make a store report a version it does not hold —
-//! see [`resolve`](super::resolve).
-//!
-//! That is the inversion from the previous layout, where an index file *was* the
-//! only place a version existed. There, publishing the index was the commit, and
-//! it was a cross-file commit: the index named an offset in the store and nothing
-//! could make the two land together. Here the commit record is the commit — one
-//! append to one file — and this file is written afterwards, best-effort.
+//! a backup. The commit record is the commit, one append to one file; this is
+//! written afterwards, best-effort. Nothing here is trusted without being checked
+//! against the store, and nothing here can make a store report a version it does
+//! not hold — see [`resolve`](super::resolve).
 //!
 //! ## Why the hash is in here at all
 //!
@@ -57,12 +50,9 @@ pub struct VersionIndex {
     pub segment: u32,
     /// Which commit record *within that segment* the version is.
     ///
-    /// This is what makes the file checkable from one segment. The versions a
-    /// set holds are the concatenation of its segments' commit records, so a
-    /// segment on its own cannot say which global version one of its commits is —
-    /// that would need the segments before it scanned too, which is the work the
-    /// file exists to avoid. A position *within* the segment is self-contained:
-    /// read that one segment, take that commit, and the snapshot is the answer.
+    /// A global version number would need every earlier segment scanned to
+    /// resolve, which is the work this file exists to avoid. A position within
+    /// the segment is self-contained: read that one segment, take that commit.
     pub ordinal: u32,
     /// The snapshot's content hash, and the check on everything above.
     pub snapshot: BlobId,
@@ -126,14 +116,9 @@ impl VersionIndex {
 
     /// Write this index to `path`, durably.
     ///
-    /// The file is created with a temporary name and renamed into place, so a
-    /// reader never sees a half-written index. That matters less than it would
-    /// for the store — a torn index is simply ignored and the scan answers — but
-    /// `rename` is free and the alternative is a window where a version's index
-    /// exists and is wrong.
-    ///
-    /// The parent directory is synced afterwards, so the rename itself is durable
-    /// and not just the bytes.
+    /// Written to a sibling temporary file and renamed into place, so a reader
+    /// never sees a half-written index. The parent directory is then synced, so
+    /// the rename itself survives a crash and not just the bytes.
     ///
     /// # Errors
     ///
@@ -159,11 +144,9 @@ impl VersionIndex {
 
     /// Read the index at `path`, or `None` if it is not there or not readable.
     ///
-    /// Never an error. Every way this can go wrong — absent, truncated, wrong
-    /// checksum, unreadable directory — is the same thing to a caller that treats
-    /// this as a cache: no usable index, so fall back to the scan. The only thing
-    /// deliberately not swallowed is a directory that cannot be read at all, which
-    /// is a problem with the set rather than with the cache.
+    /// Never an error: absent, truncated, wrong checksum and unreadable are all
+    /// "no usable index" to a caller treating this as a cache. A directory that
+    /// cannot be read at all is not swallowed — that is a problem with the set.
     #[must_use]
     pub fn read(path: &Path) -> Option<Self> {
         let bytes = fs::read(path).ok()?;
@@ -173,9 +156,7 @@ impl VersionIndex {
 
 /// A sibling path to write an index to first, before renaming it.
 ///
-/// Deliberately in the same directory, because `rename` is only atomic within one
-/// filesystem, and a temporary file in `/tmp` would be a copy rather than a move
-/// on the wrong side of that boundary.
+/// In the same directory, because `rename` is only atomic within one filesystem.
 #[must_use]
 fn temporary_for(path: &Path) -> std::path::PathBuf {
     let mut name = path

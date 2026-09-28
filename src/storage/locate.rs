@@ -1,30 +1,26 @@
 //! Answering "where is version N's snapshot" without scanning the whole set.
 //!
 //! Every open scans, and the scan is proportional to the number of records in the
-//! set. On a large one that is felt: a restore of the newest version pays for the
-//! entire history's worth of record headers before it writes anything. The
-//! per-version index files exist to avoid that, and this is the path that uses
-//! them.
+//! set. The per-version index files exist to avoid that, and this is the path that
+//! uses them.
 //!
 //! # The rule: an index file is checked, never believed
 //!
 //! Three things can be wrong with one, and each is caught differently:
 //!
 //! * *stale* — the set has run since it was written, so a version has no index.
-//!   That is not a failure. It is a version that takes the slow path, which is
-//!   correct and merely slower.
+//!   That is not a failure, only the slow path.
 //! * *from another set* — it names more versions than this set holds, or a
-//!   segment that is not here. Refused, because an over-reaching index is the one
-//!   kind of wrong answer that would otherwise be used to answer about a version
-//!   that does not exist.
-//! * *edited* — it names a version, a segment and a hash that do not go
-//!   together. The hash is the check: the commit records in the segment it named
-//!   are read, and the version it claims must be among them with that hash.
+//!   segment that is not here. Refused, because an over-reaching index would
+//!   otherwise answer about a version that does not exist.
+//! * *edited* — it names a version, a segment and a hash that do not go together.
+//!   The hash is the check: the commit records of the segment it named are read,
+//!   and the version it claims must be among them with that hash.
 //!
-//! So a wrong index costs a scan, and a forged one costs an error. Neither can
-//! make a set report a version it does not hold, which is the property that
-//! matters: **the store's commit records decide what versions exist, and this
-//! module only decides how much work it takes to find out.**
+//! So a wrong index costs a scan and a forged one costs an error. Neither can
+//! make a set report a version it does not hold: **the store's commit records
+//! decide what versions exist, and this module only decides how much work it
+//! takes to find out.**
 
 use std::{
     fs,
@@ -70,13 +66,12 @@ impl Resolved {
 
 /// Read the index for `version` and check it against the segments on disk.
 ///
-/// `versions` is the number of versions the set is known to hold. It is what
-/// makes an over-reaching index safe to refuse: an index naming version 40 of a
-/// three-version set is describing something else, and the fastest correct answer
-/// is to say so rather than scan for a version that is not there.
+/// `versions` is the number of versions the set is known to hold: an index naming
+/// version 40 of a three-version set is describing something else, and refusing it
+/// is faster than scanning for a version that is not there.
 ///
-/// This does no I/O proportional to the size of the set: one small file, and the
-/// commit records of the one segment it named.
+/// No I/O proportional to the size of the set: one small file, and the commit
+/// records of the one segment it named.
 #[must_use]
 pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
     // Absent, truncated, wrong checksum and unreadable are all the same to a
@@ -98,10 +93,9 @@ pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
         return Resolved::Disagrees;
     };
 
-    // The check. The segment must hold the snapshot at the position claimed, and
-    // the position is *within the segment* — which is why the file records it
-    // rather than a global version number. An index copied from another set names
-    // a different snapshot, so it fails here even when the segment exists.
+    // The check. The position is *within* the segment, which is why the file
+    // records one. An index copied from another set names a different snapshot, so
+    // it fails here even when the segment exists.
     let held = usize::try_from(index.ordinal)
         .ok()
         .and_then(|ordinal| commits.get(ordinal));
@@ -116,10 +110,8 @@ pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
     }
 }
 
-/// Read one segment's commit records.
-///
-/// The scan is per segment and reads headers only, so this is proportional to the
-/// records in *one* segment rather than the whole set.
+/// Read one segment's commit records: headers only, so proportional to the
+/// records in one segment rather than the whole set.
 fn read_commits(path: &Path, segment: u32) -> std::io::Result<Vec<BlobId>> {
     let mut file = fs::File::open(path)?;
 

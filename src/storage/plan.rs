@@ -1,33 +1,22 @@
 //! Turning a snapshot into an ordered list of chunks in a store.
 //!
 //! A [`crate::metadata::Snapshot`] is a location-free recipe: which chunks exist,
-//! which file each slice of each chunk belongs in, and where in that file. It
-//! says nothing about where the bytes are. This module is the step that asks the
-//! store and produces the answer — the one thing a pack writer needs and cannot
-//! get for itself.
+//! which file each slice of each chunk belongs in, and where in that file. This
+//! module is the step that asks the store and produces the answer.
 //!
-//! The order is the point, and it is not incidental. Chunks are appended to a
-//! store in whatever order concurrent uploads happen to finish, which is
-//! dedup-driven and arbitrary: two backups of the same tree land their chunks in
-//! different places. So a list taken from the store directly would differ between
-//! runs, and anything built from it — a pack, a diff, a delta download — would
-//! differ too. [`Plan::from_snapshot`] therefore orders by the snapshot's own
-//! chunk table, which is a function of read order and nothing else. Two backups
-//! of one tree produce the same plan.
+//! **The order is the point.** Chunks reach a store in whatever order concurrent
+//! uploads finish, so a list taken from the store directly differs between runs
+//! and anything built from it would differ too. [`Plan::from_snapshot`] therefore
+//! orders by the snapshot's own chunk table, a function of read order and nothing
+//! else: two backups of one tree produce the same plan.
 //!
-//! That determinism is what makes a plan the right input to a pack, and it is why
-//! a plan is a list of *chunks* and not a list of ranges. A range in a store has
-//! to stop at every record header, because the header of one chunk is not part of
-//! the next, so a range list taken against a store coalesces almost never and
-//! cannot be used to serve a delta download. A pack has no framing between its
-//! payloads, so the same chunks laid end to end *are* contiguous — which is the
-//! argument for packing being a separate artifact rather than a flag. See
-//! [`crate::pack`].
+//! That determinism is why a plan is a list of *chunks* and not a list of ranges.
+//! A store range has to stop at every record header, so a range list taken against
+//! a store coalesces almost never. A pack has no framing between its payloads, so
+//! the same chunks end to end *are* contiguous — see [`crate::pack`].
 //!
-//! [`Plan::total_bytes`] is the size a concatenation of every distinct chunk
-//! would occupy. It is a property of the plan alone, and is what makes the plan
-//! worth computing before reading a byte: a caller can size a download, or decide
-//! a transport, from it.
+//! [`Plan::total_bytes`] is therefore the size of a pack, not of a store byte
+//! range, and is computable before reading a byte.
 
 use std::io;
 
@@ -36,10 +25,9 @@ use crate::storage::{BlobId, Placement};
 
 /// Where one distinct chunk lives, and how much of it a version actually uses.
 ///
-/// `length` is the number of bytes a restore reads for this chunk, which is not
-/// the chunk's whole length. A chunk that runs past the end of one file and into
-/// the next is stored whole but only partly used, and a chunk entirely spanned by
-/// repeated content may be used at several offsets and no more than once.
+/// `length` is what a restore reads for this chunk, not the chunk's whole length:
+/// one spanning two files is stored whole and used in part, and one spanned by
+/// repeated content may be used at several offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Planned {
     /// The chunk's content hash, and its identity.
@@ -59,17 +47,15 @@ pub struct Plan {
 impl Plan {
     /// Resolve `snapshot` against the placements `locate` reports.
     ///
-    /// `locate` is given a chunk hash and returns where that chunk is, or
-    /// [`io::ErrorKind::NotFound`] if the store does not hold it. It is a
-    /// callback rather than a store so this works for any backend, including one
-    /// that is not a single local file.
+    /// `locate` is given a chunk hash and returns where it is, or
+    /// [`io::ErrorKind::NotFound`] if the store does not hold it. A callback
+    /// rather than a store, so this works for any backend.
     ///
     /// # Errors
     ///
-    /// Returns an error if `locate` fails for any chunk the snapshot names, or
-    /// if the snapshot's own tables disagree — a slice naming a chunk index or a
-    /// file index that does not exist. Both mean the snapshot and the store
-    /// disagree about what this version is, and there is nothing to resolve.
+    /// Returns an error if `locate` fails for any chunk the snapshot names, or if
+    /// the snapshot's tables disagree — a slice naming a chunk or file index that
+    /// does not exist.
     pub fn from_snapshot<F>(snapshot: &Snapshot, mut locate: F) -> io::Result<Self>
     where
         F: FnMut(&BlobId) -> io::Result<Placement>,
@@ -93,20 +79,16 @@ impl Plan {
         for (index, id) in snapshot.chunks.iter().enumerate() {
             let length = extent[index];
             if length == 0 {
-                // Listed but never read: a chunk the snapshot carries and no file
-                // slice refers to. Keeping it would put a zero-length range in a
-                // range list, and there is nothing to read.
+                // Listed but never read, so there is nothing to read it for.
                 continue;
             }
 
             let placement = locate(id)?;
 
-            // Against the *raw* length, not the stored one. A snapshot describes
-            // files and records its slices in content bytes, while a compressed
-            // placement's `len` is how many bytes the frame occupies on disk —
-            // which is a different, usually smaller, number. Comparing content to
-            // storage would either accept a chunk that is genuinely too short or
-            // reject a perfectly good one.
+            // Against the *raw* length: a snapshot records its slices in content
+            // bytes, while a compressed placement's `len` is the frame's size on
+            // disk. Comparing content to storage would accept a chunk that is
+            // genuinely too short, or reject a good one.
             let held = placement.raw_len;
 
             if length > held {
@@ -148,18 +130,11 @@ impl Plan {
         self.chunks.is_empty()
     }
 
-    /// Bytes a concatenation of every distinct chunk would occupy.
+    /// Bytes a concatenation of every distinct chunk would occupy, counting each
+    /// chunk once — the size of a *pack*, not of the tree.
     ///
-    /// This counts each chunk once, so it is the size of a *pack*, not of the
-    /// tree. It is less than the sum of the files' lengths whenever a chunk is
-    /// used by more than one of them, which is the deduplication showing up as
-    /// an arithmetic fact rather than as a time saving.
-    ///
-    /// A caller fetching out of a store cannot use this number, because the
-    /// chunks are separated by the store's own record headers and are not
-    /// contiguous: a range has to stop at every header. The same chunks laid end
-    /// to end with the framing left out are contiguous, and that is a pack — see
-    /// [`crate::pack`].
+    /// Not a store byte range: a caller fetching from a store cannot use this
+    /// number, because the chunks are separated by record headers.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.chunks
