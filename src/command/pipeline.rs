@@ -1,27 +1,15 @@
 //! Getting a walked tree's chunks stored, concurrently.
 //!
-//! Backup is two kinds of work wearing the same function. Reading the tree,
-//! cutting it into chunks and hashing them all block or burn CPU, and only one
-//! of them can happen at a time: content-defined chunking finds each boundary
-//! from the bytes before it, so the stream cannot be split across threads.
-//! Storing a chunk is the opposite — it does nothing but wait on the store —
-//! and is worth doing several at once.
+//! Reading, chunking and hashing must be sequential: a content-defined boundary
+//! depends on the bytes before it, so the reader cannot be split across threads.
+//! Storing waits on the store and overlaps freely, so the reading half runs on a
+//! blocking thread, the storing half on the async pool, and a bounded channel
+//! joins them — which is what makes a slow store throttle the reader instead of
+//! buffering a whole tree in memory.
 //!
-//! So the reading half runs on a blocking thread, the storing half runs on the
-//! async pool, and a bounded channel joins them. The bound matters: it means a
-//! slow store throttles the reader rather than letting a whole tree accumulate
-//! in memory waiting to be written.
-//!
-//! Deduplication has to stay exact while chunks are in flight together, which a
-//! plain map lookup cannot manage on its own. Each hash gets a [`Slot`] holding
-//! a `OnceCell`, and every chunk with that content fills the same one: the first
-//! to arrive stores it, the rest wait and reuse the result. Nothing is stored
-//! twice, however many stores happen to be running.
-//!
-//! What comes out does not depend on how the stores interleaved. Results are
-//! committed in the order chunks were *read*, so a snapshot is a function of the
-//! tree rather than of scheduling — which is what makes the concurrency a tuning
-//! knob rather than a source of run-to-run differences.
+//! Each distinct hash gets a [`Slot`] filled once, so nothing is stored twice
+//! however many stores are in flight. Results are committed in the order chunks
+//! were *read*, so a snapshot is a function of the tree and not of scheduling.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -55,38 +43,27 @@ struct Stored {
     sources: Vec<reader::ChunkSource>,
 }
 
-/// One hash's cell in the run's deduplication map, filled exactly once.
+/// One hash's cell in the deduplication map, filled exactly once.
 ///
-/// Every chunk with the same content fills the same cell: the first to arrive
-/// stores it, the rest wait and reuse the result. Nothing is stored twice,
-/// however many stores happen to be running.
-///
-/// The store deduplicates too — it will not write a blob it already holds — so
-/// this is not what makes deduplication correct. It is what keeps a run from
-/// handing the store the same content once per copy of it: the store's index is
-/// only updated once a blob is written, so concurrent duplicates would each miss
-/// it and each write.
+/// Every chunk of the same content fills the same cell: the first to arrive stores
+/// it, the rest wait and reuse it. The store deduplicates too, but its index is
+/// only updated once a blob is written, so without this a run hands it the same
+/// content once per copy.
 type Slot = Arc<OnceCell<()>>;
 
 /// Deduplication state shared by every store in flight.
 type Slots = Arc<Mutex<HashMap<[u8; 32], Slot>>>;
 
-/// Lock the deduplication map, ignoring poisoning.
-///
-/// A panic while the lock is held would leave a half-built map, but the only code
-/// that runs under it is a hash insert, which cannot panic. Unwinding through
-/// this function would abort the run anyway, so the poison carries no
-/// information worth propagating.
+/// Lock the deduplication map, ignoring poisoning: the only code under it is a
+/// hash insert, which cannot panic.
 fn lock_slots(slots: &Slots) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Slot>> {
     slots.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Read, chunk and hash the tree on a blocking thread, feeding `tx`.
 ///
-/// This half is deliberately sequential: content-defined chunking finds each
-/// boundary from the bytes before it, so the stream cannot be split across
-/// threads. What it does overlap is the storing of chunks it has already handed
-/// over.
+/// Sequential, because a content-defined boundary depends on the bytes before it.
+/// What it does overlap is the storing of chunks it has already handed over.
 ///
 /// Returns how long it spent blocked handing chunks over, which the committer
 /// turns into the pipeline's timing line.
@@ -110,10 +87,8 @@ fn produce(
         // the async pool to itself.
         let hash = *blake3::hash(&chunk.data).as_bytes();
 
-        // `blocking_send`, because this is a blocking thread and the await it
-        // would otherwise need is exactly what it must not do. It returns an
-        // error once every receiver is gone, which is the signal that the run
-        // has already failed and there is nothing left to read for.
+        // `blocking_send`, because this is a blocking thread. An error means every
+        // receiver is gone, so the run has already failed.
         let sending = Instant::now();
         let sent = tx.blocking_send(Pending {
             seq,
@@ -137,8 +112,7 @@ fn produce(
     Ok(blocked)
 }
 
-/// Everything the storing half of the pipeline needs, gathered so that passing it
-/// around does not turn into a longer and longer argument list.
+/// Everything the storing half of the pipeline needs.
 pub(super) struct Pipeline<S> {
     /// Root the tree was walked from, to turn a chunk source's path back into the
     /// relative one the file index is keyed by.
@@ -194,30 +168,16 @@ impl<S: storage::StoragePut + 'static> Pipeline<S> {
             }
         };
 
-        // The reader's own outcome is checked before the snapshot is trusted: it
-        // is the one that knows why a file's contents could not be read, and its
-        // error says so far more usefully than the length mismatch one would
-        // infer further down.
+        // The reader's own error, checked before the snapshot is trusted: it knows
+        // why a file's contents could not be read, and says so better than the
+        // length mismatch one would infer from it.
         let reader_blocked = reader
             .await
             .map_err(|join| io::Error::other(format!("the reader thread failed: {join}")))??;
 
-        // Where the run's wall time went, on the two halves that can be the
-        // bottleneck.
-        //
-        // `reader_blocked_ms` is how long the reader spent waiting for room in the
-        // channel. Read it as "how far ahead the reader got", not as "how slow
-        // the stores were": a reader that is merely faster than the committer
-        // fills a bounded channel immediately and blocks on it repeatedly, so the
-        // number is large even when the stores are keeping up perfectly well. It
-        // fell from 993 ms to 272 ms when the store's write lock was removed and
-        // wall time halved, which is why it is worth having — but the wall clock
-        // is what settles it and this is what suggests where to look.
-        //
-        // Both halves of this pipeline have been blamed incorrectly in this
-        // codebase's history, twice, so the reading is stated rather than assumed.
-        // `lepatch backup -v` prints it, and `mise run bench-store` measures the
-        // store on its own when this is ambiguous.
+        // `reader_blocked_ms` is how far ahead the reader got, not how slow the
+        // stores were: a reader faster than the committer fills a bounded channel
+        // and blocks on it repeatedly. The wall clock settles which it was.
         tracing::debug!(
             reader_blocked_ms = millis(reader_blocked),
             committer_ms = millis(commit_busy),
@@ -256,12 +216,10 @@ async fn commit<S: storage::StoragePut + 'static>(
     // the same content reuses it instead of being stored again.
     let mut index_of: HashMap<[u8; 32], u32> = HashMap::new();
 
-    // What the run has done so far. The committer sees every chunk exactly
-    // once, so it is the one place that can count them all.
-    //
-    // The file count comes from the walk and is the only thing known before any
-    // content has been read // so it is what the opening line says. A first line
-    // reporting one chunk and nineteen kilobytes would be true and useless.
+    // The committer sees every chunk exactly once, so it is the one place that
+    // can count them. The file count comes from the walk and is the only thing
+    // known before any content has been read, so it is what the opening line
+    // says.
     let mut progress = Progress::new("backup");
     progress.set("files", files);
     progress.report();
@@ -304,8 +262,8 @@ async fn commit<S: storage::StoragePut + 'static>(
                 )?;
                 commit_busy += folding.elapsed();
 
-                // Distinct content is what actually costs storage, so it is the
-                // number worth watching on a tree that deduplicates well.
+                // Distinct content is what costs storage, so it is the number
+                // worth watching on a tree that deduplicates well.
                 progress.set(
                     "distinct",
                     u64::try_from(snapshot.chunks.len()).unwrap_or(0),
@@ -321,16 +279,14 @@ async fn commit<S: storage::StoragePut + 'static>(
         }
     }
 
-    // Everything the producer sent has been committed: a result left over would
-    // mean a chunk was stored but never referenced, silently wasting space.
+    // A result left over would mean a chunk was stored but never referenced.
     if let Some(&seq) = ready.keys().next() {
         return Err(io::Error::other(format!(
             "chunk {seq} was stored but never committed"
         )));
     }
 
-    // How long this half spent folding results in, which is what lets the caller
-    // say whether it or the reader was the slow one.
+    // How long this half spent folding results in, for the timing line.
     Ok(commit_busy)
 }
 
@@ -348,21 +304,11 @@ fn commit_ready<S>(
     snapshot: &mut metadata::Snapshot,
 ) -> io::Result<()> {
     while let Some(stored) = ready.remove(next_seq) {
-        // Uniqueness is decided here, by read order, and nowhere else.
-        //
-        // An earlier attempt recorded which chunk had reached a hash's cell
-        // first, on the assumption that the earliest-read chunk of some content
-        // would be the first to arrive. That does not hold: stores finish out of
-        // order, so a later-read duplicate can claim the cell before the
-        // earlier-read one does, and the committer would then look for a chunk
-        // index that had not been handed out yet. It surfaced as a backup that
-        // failed outright at high concurrency, under load.
-        //
-        // Deciding by the order results are committed in removes the assumption
-        // entirely. Every chunk of the same content carries the same hash, so
-        // whichever reaches this point first allocates the index and the rest
-        // reuse it — which is the same answer a purely sequential run gives,
-        // and the same one every time.
+        // Uniqueness is decided here, by read order, and nowhere else. Stores
+        // finish out of order, so a first-arrival claim is not good enough: every
+        // chunk of the same content carries the same hash, so whichever result
+        // reaches this point first allocates the index and the rest reuse it —
+        // the same answer a sequential run gives, and the same one every time.
         let chunk_index = if let Some(&existing) = index_of.get(&stored.hash) {
             existing
         } else {
@@ -426,9 +372,8 @@ async fn store_chunk<S: storage::StoragePut + 'static>(
         Arc::clone(map.entry(hash).or_insert_with(|| Arc::new(OnceCell::new())))
     };
 
-    // The store decides whether this content is already held. A chunk the store
-    // has seen in *any* earlier version costs nothing here, which is what
-    // incremental backup is: not "the same tree again" but "nothing new to
+    // The store decides whether this content is already held, so a chunk seen in
+    // *any* earlier version costs nothing: incremental backup is "nothing new to
     // store", however far back the content was last seen.
     slot.get_or_try_init(|| async {
         let len = u64::try_from(data.len()).map_err(|_| {
