@@ -39,13 +39,8 @@ jobs:
     name: Lint (fmt & clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy
@@ -62,26 +57,26 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # rustfmt and clippy are not needed to run tests, and leaving them out means
+      # a test failure on one OS is not a formatting failure on another.
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
       - run: cargo test --all-targets --all-features --locked
 
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # 0.9.1 pinned, and the same version `mise install` puts on a developer's
+      # machine, so a coverage number that differs between the two is a bug here
+      # rather than a surprise there.
+      - uses: ./.github/actions/setup-rust
         with:
           components: llvm-tools-preview
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --locked
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
+          install: cargo-llvm-cov@0.9.1
       # llvm-cov instruments the test binary rather than sampling, so the number
       # is exact and does not drift between runs of the same commit.
       #
@@ -99,7 +94,7 @@ jobs:
       - name: Measure coverage
         run: cargo llvm-cov --all-features --html --locked --output-dir target/llvm-cov
       - name: Upload report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-html
           path: target/llvm-cov/html
@@ -109,7 +104,7 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Pinned to an exact version rather than `stable`, so a new release
       # breaking the build is caught here rather than being blamed on the floor.
       #
@@ -122,25 +117,24 @@ jobs:
       - name: Read the declared floor
         id: floor
         run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
-      - name: Install the declared floor
-        uses: dtolnay/rust-toolchain@master
+      # The one job that needs a toolchain installed, and it installs exactly the
+      # version the manifest declares. rustup is already on the image, so this is
+      # a `rustup toolchain install` and nothing else — no action in the middle
+      # holding the token.
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: ${{ steps.floor.outputs.version }}
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: msrv
+          components: ''
       - run: cargo check --all-targets --all-features --locked
 
   doc:
     name: Docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
       - name: Check rustdoc
         run: cargo doc --no-deps --all-features
         env:
@@ -150,11 +144,15 @@ jobs:
     name: Release config
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-dist
-        run: cargo install cargo-dist --locked
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The version pinned in dist-workspace.toml, spelled out here as well. Two
+      # places to update when it moves, deliberately: the config is what dist
+      # itself reads at release time, and this job exists to prove the config
+      # resolves with the tool that will act on it.
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+          install: cargo-dist@0.32.0
 
       # `.github/workflows/release.yml` is generated by dist and then hand-edited
       # to gate publishing on this workflow, so its bytes cannot be compared
@@ -187,47 +185,47 @@ jobs:
       - name: The release plan resolves
         run: dist plan --output-format=human > /dev/null
 
+  # Three cargo-deny jobs rather than one running all its checks. They fail
+  # independently on purpose: a new dependency with an unknown licence and one
+  # with a known vulnerability are different conversations, and lumping them means
+  # a licence bump is reported as "a deny check failed".
+  #
+  # cargo-deny is installed from crates.io with --locked rather than through
+  # EmbarkStudios/cargo-deny-action, which is the third-party action this workflow
+  # otherwise avoids. Same project, same checks, one fewer `uses:` line holding
+  # this repository's token.
   licenses:
     name: Licences (cargo deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: Check dependency licences
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
         with:
-          command: check
-          command-arguments: licenses
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check dependency licences
+        run: cargo deny check licenses
 
   advisories:
     name: Advisories (cargo deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: Check advisories (vulns / yanks)
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
         with:
-          command: check
-          command-arguments: advisories
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check advisories (vulns / yanks)
+        run: cargo deny check advisories
 
   bans:
     name: Bans (cargo deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache build artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: Check wildcards and duplicate versions
-        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
         with:
-          command: check
-          command-arguments: bans
+          components: ''
+          install: cargo-deny@0.20.2
+      - name: Check wildcards and duplicate versions
+        run: cargo deny check bans

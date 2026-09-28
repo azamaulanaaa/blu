@@ -432,11 +432,29 @@ them:
   and coverage jobs from running with write access to the repository every time a
   release is cut.
 
-Actions are referenced by tag rather than by commit SHA. That is the usual
-weakness in a workflow like this one — tags are mutable, so whoever controls the
-tag controls the code that runs with this repository's token — and pinning is
-worth doing, but it needs the real SHAs resolved rather than guessed, plus
-something to keep them current.
+Actions are referenced by commit SHA rather than by tag, and only two of the three
+are external: `actions/checkout` and `actions/upload-artifact`, both official and
+both pinned. Everything else is in `.github/actions/setup-rust`, a composite
+action in this repository that can be read in one sitting.
+
+It follows two rules, which is the whole supply-chain argument:
+
+- **Rust comes from the image.** The official GitHub-hosted runner images already
+  ship Rust, Cargo and rustup, so there is no toolchain-fetching action here at
+  all. The image has rustfmt but not clippy or llvm-tools, and those are
+  `rustup component add` from `static.rust-lang.org`. The MSRV job installs
+  exactly the version `Cargo.toml` declares.
+- **Every other CLI comes from `cargo install --locked`.** `cargo-deny`,
+  `cargo-llvm-cov` and `cargo-dist` are not on the image, so they are installed
+  from crates.io at a pinned version — an unpinned install is a different tool the
+  day someone cuts a release, which is the same weakness as a mutable action tag
+  but slower to notice.
+
+`release.yml` is the exception and is left unpinned deliberately: it is written by
+`dist generate`, and `allow-dirty` in `dist-workspace.toml` scopes hand-edits to
+the CI gate alone. Pinning it there would be undone by the next regeneration. It
+does use only official `actions/*` entries, so it is not a third-party
+dependency — just a tag rather than a SHA.
 
 ## License
 

@@ -1,0 +1,157 @@
+# The Rust toolchain and the CLIs CI needs, from the two sources there are.
+#
+# Two rules, and everything below follows from them:
+#
+#   * **Rust comes from the image.** The official GitHub-hosted runner images
+#     already ship Rust, Cargo and rustup — the "Rust Tools" section of the image
+#     README. So nothing is downloaded for the common case, and there is no
+#     toolchain-fetching action in this repository at all. The image has rustfmt
+#     but not clippy or llvm-tools, and those are `rustup component add` from
+#     static.rust-lang.org. MSRV is the one job that needs a different compiler,
+#     and it is a `rustup toolchain install` of exactly the version the manifest
+#     declares.
+#
+#   * **Every other CLI comes from `cargo install --locked`.** cargo-deny,
+#     cargo-llvm-cov and cargo-dist are not on the image, and the way to get one
+#     is its crates.io package with the lock file it ships, not an action that
+#     happens to wrap it. The version is pinned as `name@version`, because an
+#     unpinned install is a different tool the day someone cuts a release — the
+#     same weakness as a mutable action tag, only slower to notice.
+#
+# The result is that ci.yml names no third-party action. What remains is the
+# official `actions/*` set pinned to commit SHAs rather than mutable tags, and
+# this file, which lives in this repository and can be read in one sitting. That
+# removes the class of risk where whoever can move a tag decides what runs with
+# this repository's token.
+#
+# A composite action rather than a reusable workflow, so the audit trail for "what
+# does this run" is one file here instead of a `uses:` line pointing elsewhere.
+
+name: Setup Rust
+description: >-
+  Add the toolchain components a job needs, cache the build, and install any
+  cargo CLIs it uses. Uses only actions/* pinned to a SHA.
+
+inputs:
+  # A toolchain to install and make default, e.g. "1.98". Empty means use the
+  # one the image already has, which is what every job but MSRV wants.
+  toolchain:
+    description: Toolchain version to install, or empty for the image's own.
+    required: false
+    default: ""
+
+  # Components to ensure present on the toolchain in use.
+  components:
+    description: Comma-separated rustup components to add.
+    required: false
+    default: "rustfmt,clippy"
+
+  # cargo CLIs to install, each `name` or `name@version`, comma-separated.
+  # A version is pinned deliberately: an unpinned install is a different tool on
+  # the day someone publishes a release, which is the same weakness as a mutable
+  # action tag, just slower to notice.
+  install:
+    description: Comma-separated cargo CLIs to install, as name or name@version.
+    required: false
+    default: ""
+
+  # Bumped by hand to throw away every cached target directory, for when a stale
+  # artefact produces a confusing failure rather than a clean one. The toolchain is
+  # already part of the key, so this is not needed for a compiler change.
+  cache-suffix:
+    description: Extra text appended to the build cache key.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # Deliberately the official cache, by SHA. Swatinem/rust-cache is a third
+    # party action and this file's whole reason for existing is to not use one.
+    #
+    # The registry and the git checkouts are cached separately from the build
+    # directory, because they are keyed on Cargo.lock and so survive a source
+    # change, while the build directory is keyed on the lock file *and* the
+    # toolchain. Caching them together would throw away a good registry hit every
+    # time a dependency version moved.
+    - name: Cache the cargo registry and git checkouts
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          cargo-${{ runner.os }}-
+
+    - name: Install the toolchain
+      if: inputs.toolchain != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        # --profile minimal because the default profile installs documentation
+        # and extra targets, and this job only ever runs `cargo check`.
+        rustup toolchain install "${{ inputs.toolchain }}" --profile minimal --no-self-update
+        rustup override set "${{ inputs.toolchain }}"
+
+    - name: Add the components
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        set -euo pipefail
+        # The image has rustfmt but not clippy or llvm-tools, and this is a
+        # download of a component from static.rust-lang.org rather than an
+        # action fetching a toolchain.
+        IFS=',' read -ra wanted <<< "$COMPONENTS"
+        for component in "${wanted[@]}"; do
+          [ -n "$component" ] || continue
+          rustup component add "$component"
+        done
+        rustc --version
+        cargo --version
+
+    - name: Cache the build directory
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: target
+        # The toolchain is part of the key because a `target/` built by one
+        # compiler is not reusable by another, and a stale artefact is a
+        # confusing failure rather than a clean one. `image` is the toolchain the
+        # runner image ships, which is every job but MSRV.
+        key: >-
+          target-${{ runner.os }}-${{ inputs.toolchain || 'image' }}-${{ hashFiles('**/Cargo.lock') }}-${{ inputs.cache-suffix }}
+        restore-keys: |
+          target-${{ runner.os }}-${{ inputs.toolchain || 'image' }}-${{ inputs.cache-suffix }}-
+
+    - name: Install the cargo CLIs
+      if: inputs.install != ''
+      shell: bash
+      env:
+        INSTALL: ${{ inputs.install }}
+      run: |
+        set -euo pipefail
+        IFS=',' read -ra tools <<< "$INSTALL"
+        for tool in "${tools[@]}"; do
+          [ -n "$tool" ] || continue
+          # --locked so the CLI's own dependency graph is the one its Cargo.lock
+          # pins, rather than whatever resolves today.
+          echo "installing $tool"
+          cargo install "$tool" --locked
+        done
+
+    - name: Report what is installed
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Worth the two lines: a CI failure that turns out to be the wrong version
+        # of a tool is otherwise a mystery, and the versions below are the ones
+        # a developer would need to reproduce it.
+        echo "toolchain: $(rustc --version)"
+        rustup component list --installed || true
+        for tool in cargo-llvm-cov cargo-deny cargo-dist; do
+          if command -v "$tool" > /dev/null; then
+            echo "$tool: $("$tool" --version 2>/dev/null || echo present)"
+          fi
+        done
