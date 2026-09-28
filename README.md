@@ -61,6 +61,14 @@ as untrusted input. A symbolic link's *target* is exempt, because it is stored
 verbatim and resolved by whoever follows it: a tree containing a link to
 `/etc/passwd` is an ordinary tree.
 
+The write itself runs in four phases, and the order is not incidental: directories
+first, so every parent exists; regular files next, each created at its final length
+before any content is written, which is what makes empty files and hard-link
+targets exist; then links, which may only be created once their targets do; and
+attributes last, because writing into a directory updates its modification time.
+Files are removed rather than truncated in place, so a `link -> /etc` left by an
+earlier restore into the same directory is not written through.
+
 ### Layout
 
 A backup set is named after a base path, which is treated as an opaque prefix:
@@ -105,6 +113,29 @@ snapshot is a single record, so the cap has to exceed a snapshot's size.
 Segments accumulate. Nothing is removed, because chunks are shared across
 versions and so a segment cannot be dropped without breaking some other version's
 manifest.
+
+Inside a segment, each record is self-delimiting and self-checking:
+
+```text
+magic (4) | kind (1) | codec (1) | stored length (varint) | raw length (varint)
+         | hash (32) | check (8) | payload
+```
+
+A scan stops at the first header whose magic or check does not verify and never
+guesses past it, so a torn tail cannot make it read a record boundary that is not
+one. The two lengths differ because a compressed payload is not as long as its
+content: `stored` is what a scan skips, `raw` is what a reader is handed, and
+`hash` is always the BLAKE3 of the *uncompressed* content — so two sets that
+compressed the same bytes differently still agree on a chunk's name, and
+deduplication survives a change of compression level.
+
+The header's checksum is a truncated BLAKE3 rather than a CRC. CRC32C would be
+cheaper, and the cost is invisible next to the seek and read each record already
+does, but a cryptographic digest rejects *garbage* — a run of zeroes left by an
+abandoned write, a length field from another format — with probability 2^-64
+rather than 2^-32. It is not defending against an adversary who can write to the
+file, who can compute a valid check for anything they like; it is against damage
+and coincidence.
 
 ### Index files
 
@@ -299,6 +330,19 @@ The parts that matter when a backup runs unattended:
   does not verify is reported as damaged rather than read up to the damage. Reading
   past it would mean a restore that quietly omits whatever those bytes held and
   reports success. Only a *run* repairs, and only the last segment.
+- **A snapshot is untrusted input, and is decoded as such.** A snapshot is a blob
+  in a file that gets synced, shared and backed up like anything else, so the
+  decoder checks every length against the bytes actually remaining *before*
+  allocating for it, refuses trailing bytes, and bounds every varint. A count can
+  therefore never request more than the blob holds. A compressed record's declared
+  size is checked against the length its record header claims before anything is
+  allocated, because that header is covered by a truncated hash rather than a MAC:
+  a tampered length must not become a multi-gigabyte allocation.
+- **A restore writes nothing until the whole snapshot is checked.** Every chunk
+  is verified against its hash and every recorded path is checked to land inside
+  the destination, *before* the first byte is written. Both because a snapshot is
+  untrusted, and because finding out at entry 900,001 of a million that a path
+  escapes would leave a tree that is neither the old one nor the new one.
 - **Nothing is written from a corrupt store.** Every chunk is checked against
   the hash it is addressed by before restore writes a single byte. A chunk's
   address *is* the hash of its contents, so this is one check rather than two.
@@ -367,15 +411,15 @@ Stated rather than discovered:
   sets.** `FORMAT_VERSION` guards the snapshot encoding and a store carries its
   own version in its header, so a store from an older build is *reported* as
   unreadable rather than misread — but it is not converted, and the old bytes
-  stay where they are. Two layouts exist so far: version 1, whose record headers
-  had no codec and one length, and the current version 2. A version 1 store is
-  refused, and there is nothing in it that would let it be walked anyway. Treat a
-  format change as a reason to re-take your backups. The crate is not published,
-  and the
-  encoding is hand-written in `src/metadata/codec.rs` rather than delegated, so
-  there is no upstream whose policy can decide whether your backup set can still
-  be read — which is how `bincode` came to be on an advisory list in the first
-  place.
+  stay where they are. The store has had one layout so far: version 1, whose record
+  headers had no codec and one length, is refused, and there is nothing in it that
+  would let it be walked anyway. The snapshot encoding is at version 3; version 2
+  recorded a per-chunk storage key alongside the content hash, and the store's own
+  index replaced it, so a chunk is a bare hash. Treat a format change as a reason
+  to re-take your backups. The crate is not published, and the encoding is
+  hand-written in `src/metadata/codec.rs` rather than delegated, so there is no
+  upstream whose policy can decide whether your backup set can still be read —
+  which is how `bincode` came to be on an advisory list in the first place.
 
 ## Library
 
