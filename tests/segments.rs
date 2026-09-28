@@ -72,7 +72,7 @@ async fn a_set_that_outgrows_its_limit_rolls_over() {
     let payloads: Vec<Vec<u8>> = (0..8).map(|i| payload(i, 900)).collect();
     let ids = put_all(&blob, tiny(), &payloads).await;
 
-    let store = BlobStore::<false>::open(&blob, tiny()).await.unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     assert!(
         store.segment_count() > 1,
         "8 payloads of 900 bytes under a 4 KiB limit should have needed \
@@ -178,7 +178,7 @@ async fn a_set_built_across_several_segments_restores() {
     let blob = dir.path().join("store");
     let committed = common::run_backup_limited(&source, &blob, small()).await;
 
-    let store = BlobStore::<false>::open(&blob, small()).await.unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     assert!(
         store.segment_count() > 1,
         "a ~500 KB tree under a 4 KiB limit should have produced many segments"
@@ -214,7 +214,7 @@ async fn a_version_committed_in_a_later_segment_is_reachable() {
         versions.push(common::run_backup_limited(&source, &blob, small()).await);
     }
 
-    let store = BlobStore::<false>::open(&blob, small()).await.unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     assert!(store.segment_count() > 1, "the set should have rolled over");
 
     // Every version, each in whichever segment holds its commit record.
@@ -246,7 +246,7 @@ async fn a_sealed_segment_with_a_damaged_tail_is_refused_not_truncated() {
 
     // A sealed one: anything but the last.
     let sealed = &segments[0];
-    let sealed_claim = BlobStore::<false>::open(&blob, tiny()).await.unwrap();
+    let sealed_claim = BlobStore::<false>::open(&blob).await.unwrap();
     let first_placement = sealed_claim.locate(&common::id_of(&payloads[0])).unwrap();
     assert_eq!(
         first_placement.segment, 0,
@@ -303,7 +303,7 @@ async fn the_last_segments_torn_tail_is_reclaimed_by_a_run() {
     fs::write(&last, &bytes).unwrap();
 
     // A read refuses, and does not repair.
-    assert!(BlobStore::<false>::open(&blob, small()).await.is_err());
+    assert!(BlobStore::<false>::open(&blob).await.is_err());
 
     // A run truncates and carries on, publishing a second version over the first.
     let committed = common::run_backup_limited(&source, &blob, small()).await;
@@ -325,7 +325,7 @@ async fn the_last_segments_torn_tail_is_reclaimed_by_a_run() {
 
     // And both versions still restore, which is the part that matters: a repair
     // that cost a version would not be a repair.
-    let store = BlobStore::<false>::open(&blob, small()).await.unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     for version in 1..=2 {
         let destination = dir.path().join(format!("out{version}"));
         common::run_restore(&blob, store.snapshot(version).unwrap(), &destination).await;
@@ -361,7 +361,7 @@ async fn a_segment_renamed_into_another_position_is_refused() {
     fs::write(a, &second).unwrap();
     fs::write(b, &first).unwrap();
 
-    let error = BlobStore::<false>::open(&blob, tiny()).await.unwrap_err();
+    let error = BlobStore::<false>::open(&blob).await.unwrap_err();
     assert!(
         error.to_string().contains("header says it is segment"),
         "a segment in the wrong position should be refused by name, got: {error}"
@@ -404,7 +404,7 @@ async fn concurrent_writes_across_a_rollover_do_not_overlap() {
         stored.push(task.await.unwrap().unwrap());
     }
 
-    let reader_store = BlobStore::<false>::open(&blob, limit).await.unwrap();
+    let reader_store = BlobStore::<false>::open(&blob).await.unwrap();
     assert!(
         reader_store.segment_count() > 1,
         "the set should have rolled over"
@@ -440,7 +440,7 @@ async fn a_set_written_under_one_limit_reads_under_another() {
 
     // Opened with a limit a hundred times bigger, and one a hundred times smaller.
     for limit in [SegmentLimit::new(1 << 20), SegmentLimit::new(512)] {
-        let store = BlobStore::<false>::open(&blob, limit).await.unwrap();
+        let store = BlobStore::<false>::open(&blob).await.unwrap();
 
         for (payload, id) in payloads.iter().zip(&ids) {
             let mut reader = store.get(id).await.unwrap();

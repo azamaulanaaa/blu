@@ -42,7 +42,7 @@
 //! backup("~/Pictures", Options::default(), store).await?;
 //!
 //! // Restore.
-//! let store = BlobStore::<false>::open("photos", SegmentLimit::default()).await?;
+//! let store = BlobStore::<false>::open("photos").await?;
 //! restore("~/Pictures-restored", first.snapshot, store).await?;
 //! # Ok(())
 //! # }

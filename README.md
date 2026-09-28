@@ -317,7 +317,7 @@ let first = backup("~/Documents", Options::default(), store).await?;
 let store = BlobStore::<true>::open("docs", SegmentLimit::default()).await?;
 backup("~/Documents", Options::default(), store).await?;
 
-let store = BlobStore::<false>::open("docs", SegmentLimit::default()).await?;
+let store = BlobStore::<false>::open("docs").await?;
 restore("~/Documents-restored", first.snapshot, store).await?;
 ```
 
@@ -327,7 +327,11 @@ records, so `store.versions()` and `store.snapshot(n)` address them directly.
 
 `SegmentLimit` caps one file of the set; the default is 4 GiB and it can be changed
 between runs without rewriting anything. A set is `base.0000.bin`,
-`base.0001.bin` and so on, and `BlobStore::segments()` names them.
+`base.0001.bin` and so on, and `IndexSet::segments()` names them.
+
+A read-only store takes no `SegmentLimit`, because a read never rolls over: the
+value a writer used is not needed to read what it wrote, and a parameter the
+function ignores is worse than an asymmetry between the two constructors.
 
 A pack is written from a `Plan`, which resolves a snapshot into an ordered list of
 chunks with their locations, and asks `Pack` what a client holding some of them
@@ -338,11 +342,11 @@ use std::collections::BTreeSet;
 use lepatch::{
     metadata::Snapshot,
     pack::{Pack, chunks_covering},
-    storage::{BlobStore, Plan, SegmentLimit, StorageGet},
+    storage::{BlobStore, Plan, StorageGet},
 };
 
 // The plan is a function of the snapshot, so it is the same every run.
-let store = BlobStore::<false>::open("docs", SegmentLimit::default()).await?;
+let store = BlobStore::<false>::open("docs").await?;
 let snapshot = read_snapshot(&store).await;
 let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 

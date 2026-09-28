@@ -390,17 +390,20 @@ impl BlobStore<false> {
     /// one is an error rather than an empty backup set, so a mistyped name cannot
     /// come back as "no versions".
     ///
-    /// `limit` is accepted and ignored. A read does not roll over, and no record
-    /// depends on where a segment boundary fell, so the value a writer used is
-    /// not needed to read what it wrote. Taking it keeps the two constructors
-    /// interchangeable, which is what lets a caller pass one value to both.
+    /// No `SegmentLimit`, unlike the writing constructor. A read does not roll
+    /// over and no record depends on where a segment boundary fell, so the value
+    /// a writer used is not needed to read what it wrote — and accepting a
+    /// parameter the function ignores is worse than an asymmetry. It was taken
+    /// only so the two constructors looked interchangeable, which is a property of
+    /// the signature rather than of the store, and it cost every reader a
+    /// `SegmentLimit::default()` that said nothing about the set being read.
     ///
     /// # Errors
     ///
     /// Returns an error if the set does not exist, cannot be read, is missing a
     /// segment, or was written by an incompatible build.
     #[instrument(skip_all, err)]
-    pub async fn open<P: Into<PathBuf> + Debug>(path: P, limit: SegmentLimit) -> io::Result<Self> {
+    pub async fn open<P: Into<PathBuf> + Debug>(path: P) -> io::Result<Self> {
         let set = IndexSet::new(path.into());
 
         let scan_set = set.clone();
@@ -420,7 +423,10 @@ impl BlobStore<false> {
                 segment: scanned.write_into,
                 offset: scanned.end,
             }),
-            limit,
+            // The field is shared with the writing constructor, and only the
+            // writing one consults it. There is no value to record here: a read
+            // never rolls over, so there is no limit in force to record.
+            limit: SegmentLimit::default(),
             dirty: Mutex::new(Vec::new()),
         })
     }

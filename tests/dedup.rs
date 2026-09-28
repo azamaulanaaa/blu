@@ -17,16 +17,14 @@ use std::fs;
 
 use lepatch::{
     command::Options,
-    storage::{BlobId, BlobStore, SegmentLimit, StorageGet},
+    storage::{BlobId, BlobStore, StorageGet},
 };
 
 /// Read a snapshot back out of a store.
 async fn snapshot(blob: &std::path::Path, id: &BlobId) -> lepatch::metadata::Snapshot {
     use tokio::io::AsyncReadExt;
 
-    let storage = BlobStore::<false>::open(blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let storage = BlobStore::<false>::open(blob).await.unwrap();
     let mut reader = storage.get(id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();

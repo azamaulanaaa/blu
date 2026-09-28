@@ -199,7 +199,7 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
     // The store enforces the same rule on the way in, and names both numbers. Two
     // layers refusing the same file is the point: the index check is not the only
     // thing standing between a misfiled segment and a wrong snapshot.
-    let err = BlobStore::<false>::open(&blob, SegmentLimit::default())
+    let err = BlobStore::<false>::open(&blob)
         .await
         .expect_err("a set with a misfiled segment must not open");
     let why = err.to_string();
@@ -314,9 +314,7 @@ async fn a_destroyed_index_costs_a_scan_and_no_answer() {
     for (i, version) in (1..=3u32).enumerate() {
         assert_eq!(resolve(&set, version, 3), Resolved::Absent);
 
-        let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
-            .await
-            .unwrap();
+        let store = BlobStore::<false>::open(&blob).await.unwrap();
         assert_eq!(
             store.snapshot(version).unwrap(),
             expected[i],

@@ -44,9 +44,7 @@ async fn set_with_versions(
         common::run_backup(&source, &blob).await;
     }
 
-    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     (blob, store)
 }
 
@@ -204,9 +202,7 @@ async fn a_missing_index_is_absent_rather_than_an_error() {
 
     // The version is still there, which is the whole point of the file being a
     // cache.
-    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     assert!(store.snapshot(2).is_ok());
 }
 
@@ -338,7 +334,7 @@ async fn an_index_names_the_segment_the_snapshot_is_in() {
         common::run_backup_limited(&source2, &rolled, small).await;
     }
 
-    let store = BlobStore::<false>::open(&rolled, small).await.unwrap();
+    let store = BlobStore::<false>::open(&rolled).await.unwrap();
     assert!(store.segment_count() > 1, "the set should have rolled over");
 
     let rolled_set = IndexSet::new(&rolled);
@@ -389,9 +385,7 @@ async fn the_index_files_can_all_be_deleted_and_rebuilt() {
 
     // Versions still exist. Nothing was lost, because the store never depended on
     // these files.
-    let reopened = BlobStore::<false>::open(&blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let reopened = BlobStore::<false>::open(&blob).await.unwrap();
     for (i, version) in (1..=4u32).enumerate() {
         assert_eq!(reopened.snapshot(version).unwrap(), before[i]);
     }

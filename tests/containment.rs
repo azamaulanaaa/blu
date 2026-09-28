@@ -83,9 +83,7 @@ impl Forged {
 
     /// Restore into `dest`, and report the error if it refused.
     async fn restore_into(&self, dest: &Path) -> Result<(), String> {
-        let storage = BlobStore::<false>::open(&self.blob, SegmentLimit::default())
-            .await
-            .unwrap();
+        let storage = BlobStore::<false>::open(&self.blob).await.unwrap();
         match restore(dest, self.snapshot, storage).await {
             Ok(_) => Ok(()),
             Err(e) => Err(e.to_string()),

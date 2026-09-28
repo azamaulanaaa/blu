@@ -189,9 +189,7 @@ pub(crate) async fn run_backup_limited(
 
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
 pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Path) {
-    let storage = BlobStore::<false>::open(blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let storage = BlobStore::<false>::open(blob).await.unwrap();
     restore(destination, snapshot, storage).await.unwrap();
 }
 

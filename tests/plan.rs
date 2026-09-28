@@ -16,15 +16,13 @@ use std::fs;
 
 use lepatch::{
     metadata::Snapshot,
-    storage::{BlobStore, Plan, SegmentLimit, StorageGet},
+    storage::{BlobStore, Plan, StorageGet},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Resolve a store's latest version into a plan.
 async fn plan_of_latest(path: &std::path::Path) -> Plan {
-    let store = BlobStore::<false>::open(path, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(path).await.unwrap();
     let snapshot = latest_snapshot(&store).await;
     Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap()
 }
@@ -52,9 +50,7 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
     let blob = dir.path().join("store.bin");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     let snapshot = latest_snapshot(&store).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 
@@ -111,9 +107,7 @@ async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
     let blob = dir.path().join("store.bin");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     let snapshot = latest_snapshot(&store).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 
@@ -207,9 +201,7 @@ async fn a_plans_payloads_concatenate_into_the_files_it_describes() {
     let blob = dir.path().join("store.bin");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     let snapshot = latest_snapshot(&store).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 

@@ -391,13 +391,11 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     // store cannot be recovered and then left alone, because recovery truncates,
     // and listing what is there must not be the thing that discards an unfinished
     // run.
-    let store =
-        match storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await
-        {
-            Ok(store) => store,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
+    let store = match storage::BlobStore::<false>::open(set.base()).await {
+        Ok(store) => store,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
 
     for version in versions {
         // Through the store, which checks the file rather than trusting it. One
@@ -500,8 +498,7 @@ async fn run_restore(
     clean: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store =
-        storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await?;
+    let store = storage::BlobStore::<false>::open(set.base()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(
@@ -757,8 +754,7 @@ fn absolutise(path: &std::path::Path) -> std::path::PathBuf {
 }
 async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store =
-        storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await?;
+    let store = storage::BlobStore::<false>::open(set.base()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(name = %set.base().display(), version, "verifying");
@@ -795,8 +791,7 @@ async fn run_pack(
     version: Option<u32>,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store =
-        storage::BlobStore::<false>::open(set.base(), storage::SegmentLimit::default()).await?;
+    let store = storage::BlobStore::<false>::open(set.base()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(

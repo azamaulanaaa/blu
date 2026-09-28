@@ -23,16 +23,14 @@ use std::{collections::BTreeSet, fs, path::Path};
 use lepatch::{
     metadata::Snapshot,
     pack::{Pack, chunks_covering, hash_file},
-    storage::{BlobStore, Plan, SegmentLimit, StorageGet},
+    storage::{BlobStore, Plan, StorageGet},
 };
 use std::io::{Read, Seek, SeekFrom};
 use tokio::io::AsyncReadExt;
 
 /// The BLAKE3 of a set's latest snapshot — what a pack of that version names.
 async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
-    let store = BlobStore::<false>::open(blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(blob).await.unwrap();
 
     let id = store.latest().unwrap().1;
     let mut reader = store.get(&id).await.unwrap();
@@ -44,9 +42,7 @@ async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
 
 /// The plan for a set's latest version, and the chunk hashes it names.
 async fn plan_of(blob: &Path) -> Plan {
-    let store = BlobStore::<false>::open(blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(blob).await.unwrap();
 
     let id = store.latest().unwrap().1;
     let mut reader = store.get(&id).await.unwrap();
@@ -72,9 +68,7 @@ struct Built {
 impl Built {
     /// Write a pack of this version to `at`, and return it.
     async fn pack(&self, at: &Path) -> Pack {
-        let store = BlobStore::<false>::open(&self.blob, SegmentLimit::default())
-            .await
-            .unwrap();
+        let store = BlobStore::<false>::open(&self.blob).await.unwrap();
         let snapshot = snapshot_id(&self.blob).await;
 
         Pack::write(&store, &self.plan, &snapshot, at)
@@ -85,9 +79,7 @@ impl Built {
 
 /// Pack a set's latest version to `at`.
 async fn pack(blob: &Path, at: &Path) -> Pack {
-    let store = BlobStore::<false>::open(blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(blob).await.unwrap();
     let plan = plan_of(blob).await;
     let snapshot = snapshot_id(blob).await;
 
@@ -129,9 +121,7 @@ async fn a_pack_holds_its_versions_chunks() {
     );
 
     // And the bytes are the chunks, in order, byte for byte.
-    let store = BlobStore::<false>::open(&built.blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(&built.blob).await.unwrap();
     let mut file = fs::File::open(&path).unwrap();
 
     for (i, chunk) in built.plan.chunks().iter().enumerate() {
@@ -242,9 +232,7 @@ async fn a_patch_is_usually_one_range() {
 
     let v2 = plan_of(&blob).await;
 
-    let store = BlobStore::<false>::open(&blob, SegmentLimit::default())
-        .await
-        .unwrap();
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     let snapshot = snapshot_id(&blob).await;
     let pack = Pack::write(&store, &v2, &snapshot, &dir.path().join("v2.pack"))
         .await

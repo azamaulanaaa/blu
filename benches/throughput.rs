@@ -214,9 +214,7 @@ fn bench_restore(c: &mut Criterion) {
                     let destination = dir.path().join("out");
                     let _ = std::fs::remove_dir_all(&destination);
 
-                    let storage = BlobStore::<false>::open(&blob, SegmentLimit::default())
-                        .await
-                        .expect("store");
+                    let storage = BlobStore::<false>::open(&blob).await.expect("store");
 
                     let started = Instant::now();
                     restore(&destination, committed.snapshot, storage)
@@ -255,9 +253,7 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
     });
 
     rt.block_on(async {
-        let storage = BlobStore::<false>::open(&blob, SegmentLimit::default())
-            .await
-            .expect("store");
+        let storage = BlobStore::<false>::open(&blob).await.expect("store");
         restore(&out, committed.snapshot, storage)
             .await
             .expect("restore");
