@@ -215,24 +215,32 @@ out ranges covering the wrong bytes.
 Record payloads are stored as **zstd frames** by default, at level 1:
 
 ```console
-$ lepatch backup ~/Documents docs                        # zstd level 1
+$ lepatch backup ~/Documents docs                        # zstd level 1 (default)
 $ lepatch backup ~/Documents docs --compression-level 9   # smaller, much slower
-$ lepatch backup ~/Documents docs --no-compression        # stored as-is
+$ lepatch backup ~/Documents docs --compression-level 0   # stored as they are
 ```
+
+One flag, counting 0 to 9, where **0 stores payloads as they are** and 1 to 9 are
+zstd levels. There is deliberately no `--no-compression`: it would be a second
+spelling of `--compression-level 0`, and two ways to say the same thing is two ways
+to forget which one is in force. A value outside 0–9 is a usage error rather than
+something silently corrected, so the store on disk always matches the command that
+made it.
 
 Measured on a mixed game tree — an executable, a texture, mesh JSON and config
 text, 7.5 MB in total:
 
 | | size | vs uncompressed |
 |---|---|---|
-| `--no-compression` | 7,519,423 | — |
+| `--compression-level 0` | 7,519,423 | — |
 | **level 1 (default)** | **4,358,018** | **42% smaller** |
 | level 9 | 4,177,469 | 44% smaller |
 
 **Level 1 is the default because the levels are not close.** On a 4 MB executable:
-level 1 is 2.7x smaller at 468 MB/s, level 3 gains three more percent for half the
-speed, and level 19 — a hundred times slower than level 1 — gains four percent more.
-A backup runs once and is read many times, so write speed is the cost that matters.
+level 1 is 2.7x smaller at 468 MB/s and level 9 is 3.3x at 65 MB/s. zstd's own
+levels run to 22, and the last thirteen of them are not offered: they buy a few
+percent for a hundred times the time. A backup runs once and is read many times, so
+write speed is the cost that matters.
 
 **Already-compressed content gains nothing, and does not cost anything either.**
 Textures, audio and video are entropy-coded, so zstd produces something no smaller

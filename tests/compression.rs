@@ -176,7 +176,7 @@ async fn deduplication_holds_across_different_codecs() {
     // Same hash, different policy. Nothing should be written: the store already
     // holds this content, and *how* it holds it is not the store's business.
     drop(store);
-    let store = writable(&blob, Compression::zstd(19)).await;
+    let store = writable(&blob, Compression::zstd(9)).await;
     store
         .put(
             &id,
@@ -232,7 +232,7 @@ async fn a_store_written_at_one_level_reads_at_another() {
         assert_eq!(
             &read(&reader, id).await,
             payload,
-            "content written at level 1 did not read back at level 19"
+            "content written at level 1 did not read back at level 9"
         );
     }
 }
@@ -252,11 +252,7 @@ async fn a_store_may_hold_records_written_under_several_policies() {
     let blob = dir.path().join("store");
 
     // One backup per policy, each of a tree that has grown since the last.
-    let policies = [
-        Compression::Off,
-        Compression::zstd(19),
-        Compression::zstd(1),
-    ];
+    let policies = [Compression::Off, Compression::zstd(9), Compression::zstd(1)];
 
     for (i, compression) in policies.iter().enumerate() {
         let n = u8::try_from(i).unwrap();
@@ -408,4 +404,47 @@ async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
         on_disk < content,
         "the store should hold less than the content, and holds {on_disk} of {content}"
     );
+}
+
+/// The level the user types is the policy that gets applied.
+///
+/// `--compression-level` counts 0 to 9 and there is no separate switch, so the
+/// mapping from what a user writes to what the store does is the whole interface.
+/// Two mistakes are possible and both are worth pinning: `0` has to mean "as-is"
+/// rather than falling into zstd's own idea of level 0, and a number outside the
+/// range has to be clamped by the library while the command line rejects it
+/// before the library is ever reached.
+#[test]
+fn the_level_a_user_types_is_the_policy_applied() {
+    use lepatch::storage::MAX_COMPRESSION_LEVEL;
+
+    // 0 is not zstd level 0, which zstd itself treats as "use the default". It is
+    // "do not compress", which is the only reading that makes it worth having.
+    assert_eq!(Compression::from_level(0), Compression::Off);
+    assert_eq!(Compression::from_level(0).level(), None);
+
+    // 1 is the default and the fastest level that still compresses.
+    assert_eq!(Compression::from_level(1), Compression::default());
+    assert_eq!(Compression::from_level(1).level(), Some(1));
+
+    // The top of the range.
+    assert_eq!(Compression::from_level(9).level(), Some(9));
+    assert_eq!(
+        Compression::from_level(MAX_COMPRESSION_LEVEL),
+        Compression::zstd(9)
+    );
+
+    // Past the top, the library clamps rather than panicking: a library caller
+    // with a bad number gets a working policy, where a user gets an error.
+    assert_eq!(Compression::from_level(200).level(), Some(9));
+    assert_eq!(Compression::zstd(0).level(), Some(1));
+
+    // And the two entry points agree about every level in range.
+    for level in 1..=9 {
+        assert_eq!(
+            Compression::from_level(level),
+            Compression::zstd(level),
+            "level {level} is spelled differently by the two constructors"
+        );
+    }
 }

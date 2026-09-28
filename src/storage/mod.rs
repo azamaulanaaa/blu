@@ -105,24 +105,31 @@ impl Default for SegmentLimit {
 /// compression off entirely — reads back correctly, and a chunk deduplicates
 /// against the same content no matter which run stored it first.
 ///
-/// The default is [`Compression::zstd`] at level 1, chosen from measurement rather
-/// than from habit. On a 4 MB executable, level 1 is 2.7x smaller at 468 MB/s;
-/// level 3 gains three more percent for half the speed, and level 19 — 100x slower
-/// than level 1 — gains four percent more. On content that is already
-/// entropy-coded, which is most of what a game ships as textures, audio and
-/// video, every level produces something no smaller than the input, and a payload
-/// that does not shrink is stored raw rather than as a frame a few bytes larger
-/// than the bytes it replaced.
+/// The default is [`Compression::Zstd`] at level 1, chosen from measurement
+/// rather than from habit. On a 4 MB executable, level 1 is 2.7x smaller at
+/// 468 MB/s and level 9 is 3.3x at 65 MB/s. zstd's own levels run to 22, and the
+/// last thirteen of them are not worth offering: they buy a few percent for a
+/// hundred times the time. On content that is already entropy-coded, which is most
+/// of what a game ships as textures, audio and video, every level produces
+/// something no smaller than the input, and a payload that does not shrink is
+/// stored raw rather than as a frame a few bytes larger than the bytes it
+/// replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     /// Store payloads as they are.
+    ///
+    /// What [`Compression::from_level`] returns for 0, and the reason there is one
+    /// flag rather than a level and a switch.
     Off,
     /// Compress payloads as zstd frames at `level`.
     Zstd {
-        /// The zstd compression level, 1 (fastest, default) to 22 (slowest).
+        /// The zstd compression level, 1 (fastest, default) to 9 (smallest).
         level: u8,
     },
 }
+
+/// The highest level offered. zstd goes further; see [`Compression`].
+pub const MAX_COMPRESSION_LEVEL: u8 = 9;
 
 impl Default for Compression {
     fn default() -> Self {
@@ -131,11 +138,28 @@ impl Default for Compression {
 }
 
 impl Compression {
-    /// zstd at `level`, clamped to zstd's own range.
+    /// The policy for a level the way a user counts them: 0 stores payloads as they
+    /// are, and 1 to 9 are zstd levels.
+    ///
+    /// Out-of-range values are clamped rather than rejected, because this is a
+    /// library entry point and a caller with a bad number should get a working
+    /// policy rather than a panic. A command line rejects them instead, at the
+    /// point where the user can be told.
+    #[must_use]
+    pub fn from_level(level: u8) -> Self {
+        match level {
+            0 => Self::Off,
+            _ => Self::Zstd {
+                level: level.clamp(1, MAX_COMPRESSION_LEVEL),
+            },
+        }
+    }
+
+    /// zstd at `level`, clamped to 1..=[`MAX_COMPRESSION_LEVEL`].
     #[must_use]
     pub fn zstd(level: u8) -> Self {
         Self::Zstd {
-            level: level.clamp(1, 22),
+            level: level.clamp(1, MAX_COMPRESSION_LEVEL),
         }
     }
 

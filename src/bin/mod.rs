@@ -45,22 +45,22 @@ enum Command {
         /// what is already there.
         #[arg(long, value_name = "SIZE", value_parser = parse_size)]
         segment_size: Option<u64>,
-        /// zstd level for compressing record payloads, 1 (fast) to 22 (small).
+        /// How hard to compress record payloads: 0 stores them as they are, 1 is
+        /// fastest, 9 is smallest.
         ///
         /// Only affects records written from now on. Every record names the codec
         /// it was written with, so a set written at one level reads back correctly
-        /// whatever level it is read or written at later, and changing it never
+        /// whatever level it is read or written at later, and changing this never
         /// rewrites what is already there. A payload that does not compress —
         /// most already-compressed assets — is stored raw at any level.
-        #[arg(long, value_name = "LEVEL")]
-        compression_level: Option<u8>,
-        /// Store record payloads uncompressed.
         ///
-        /// Larger on disk and faster to write. What a set written this way loses
-        /// is nothing that affects reading it, so this and `--compression-level`
-        /// can be mixed within one set.
-        #[arg(long, conflicts_with = "compression_level")]
-        no_compression: bool,
+        /// 1 is the default, and the levels are not close to each other: on a 4 MB
+        /// executable level 1 is 2.7x smaller at 468 MB/s and level 9 is 3.3x at
+        /// 65 MB/s. A backup runs once and is read many times, so write speed is
+        /// the cost that matters. zstd's own levels go to 22, and the last
+        /// thirteen of them buy a few percent for a hundred times the time.
+        #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(u8).range(0..=9))]
+        compression_level: Option<u8>,
     },
     /// Rebuild the per-version index files from the store's commit records.
     ///
@@ -296,9 +296,8 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             name,
             segment_size,
             compression_level,
-            no_compression,
         } => {
-            let compression = compression_policy(compression_level, no_compression);
+            let compression = compression_policy(compression_level);
             run_backup(&source, &name, segment_size, compression).await
         }
         Command::Restore {
@@ -513,20 +512,21 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     Ok(())
 }
 
-/// The compression policy from the two flags, which cannot both be given.
+/// The compression policy from `--compression-level`, where 0 means "as-is".
 ///
-/// `--no-compression` is a flag and `--compression-level` takes a value, so the
-/// level is the one that has to be interpreted: a bare `--compression-level`
-/// without a number is a usage error clap catches, and the value is clamped to
-/// zstd's range rather than rejected, because a knob out of range is a tuning
-/// mistake, not a correctness one.
-fn compression_policy(level: Option<u8>, off: bool) -> storage::Compression {
-    if off {
-        return storage::Compression::Off;
-    }
-
+/// One flag rather than a level and a switch, because the switch was a second
+/// spelling of a value the flag already takes: `--no-compression` and
+/// `--compression-level 0` mean the same thing, and two ways to say it is two ways
+/// to forget which one is in force.
+///
+/// The range is checked by clap rather than clamped here, so a value outside 0–9 is
+/// a usage error the user is shown rather than something silently corrected. That
+/// is the difference between a tuning mistake and a mystery: asking for level 20
+/// and quietly getting 9 would be a store on disk that does not match the command
+/// that made it.
+fn compression_policy(level: Option<u8>) -> storage::Compression {
     match level {
-        Some(level) => storage::Compression::zstd(level),
+        Some(level) => storage::Compression::from_level(level),
         None => storage::Compression::default(),
     }
 }

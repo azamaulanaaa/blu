@@ -19,7 +19,10 @@ use std::{
 };
 
 use common::noisy;
-use lepatch::command::PARTIAL_SUFFIX;
+use lepatch::{
+    command::PARTIAL_SUFFIX,
+    storage::{BlobStore, Codec},
+};
 
 /// Run the binary in `dir` and return its output.
 fn lepatch(dir: &Path, args: &[&str]) -> Output {
@@ -676,6 +679,57 @@ fn an_unknown_subcommand_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let output = lepatch(dir.path(), &["frobnicate"]);
     assert!(!output.status.success());
+}
+
+/// `--compression-level` counts 0 to 9, and says so rather than guessing.
+///
+/// The library clamps an out-of-range level so a caller with a bad number gets a
+/// working policy. A person typing a number should be told, not corrected: a
+/// store quietly written at a level other than the one they asked for is a thing
+/// they cannot see from the directory listing, and the whole point of the flag
+/// being a write policy is that it is legible.
+#[tokio::test]
+async fn a_compression_level_outside_zero_to_nine_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.bin"), noisy(30_000)).unwrap();
+
+    for level in ["10", "22", "255"] {
+        let output = lepatch(
+            dir.path(),
+            &["backup", ".", "store", "--compression-level", level],
+        );
+        assert!(
+            !output.status.success(),
+            "--compression-level {level} should be refused"
+        );
+        assert!(
+            stderr(&output).contains("0..=9") || stderr(&output).contains('0'),
+            "the error should say the range, got: {}",
+            stderr(&output)
+        );
+    }
+
+    // And both ends of the range are accepted, 0 included.
+    for level in ["0", "1", "9"] {
+        ok(
+            dir.path(),
+            &[
+                "backup",
+                ".",
+                &format!("store{level}"),
+                "--compression-level",
+                level,
+            ],
+        );
+    }
+
+    // 0 stored the payload raw, which is what it claims to mean.
+    let store = BlobStore::<false>::open(dir.path().join("store0"))
+        .await
+        .unwrap();
+    let id = store.latest().unwrap().1;
+    let placement = store.locate(&id).unwrap();
+    assert_eq!(placement.codec, Codec::Raw);
 }
 
 #[test]
