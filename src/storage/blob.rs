@@ -280,6 +280,14 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     /// a caller that only wants to know how far a set has got does not have to
     /// open it at all.
     ///
+    /// The fallback is *reported*, because a caller asking this is trying to avoid
+    /// a scan and needs to know it did not get one. A version with no index file is
+    /// the ordinary case — the set has run since it was written — so that is a
+    /// debug line. An index that disagrees with the store is not ordinary, and
+    /// means a file is stale, edited, or copied from another set, so that is a
+    /// warning. Without this the two are indistinguishable from a version that does
+    /// not exist, and `lepatch versions` under-reports for reasons nobody can see.
+    ///
     /// # Errors
     ///
     /// Returns an error if the store has no such version, the same one
@@ -288,8 +296,18 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     pub fn snapshot_via_index(&self, version: u32) -> io::Result<BlobId> {
         let versions = u32::try_from(Contents::lock(&self.contents).commits.len()).unwrap_or(0);
 
-        if let Some((_, snapshot)) = storage::resolve(&self.set, version, versions).confirmed() {
+        let resolved = storage::resolve(&self.set, version, versions);
+        if let Some((_, snapshot)) = resolved.confirmed() {
             return Ok(snapshot);
+        }
+
+        // `reason` is the one place that says in a sentence why the file was not
+        // used, so it is the message rather than a second wording of it here.
+        let why = resolved.reason(version, &self.set);
+        match resolved {
+            storage::Resolved::Absent => tracing::debug!(version, reason = %why),
+            storage::Resolved::Disagrees => tracing::warn!(version, reason = %why),
+            storage::Resolved::Confirmed { .. } => unreachable!("confirmed returns early"),
         }
 
         self.snapshot(version)

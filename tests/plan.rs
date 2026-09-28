@@ -1,4 +1,4 @@
-//! A plan resolves a snapshot against a store and yields byte ranges.
+//! A plan resolves a snapshot against a store and yields an ordered chunk list.
 //!
 //! The property that matters is determinism: a plan is ordered by the snapshot's
 //! own chunk table, not by the order chunks happened to be written, so two
@@ -86,8 +86,17 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
     }
 }
 
+/// A store's framing keeps two chunks a restore reads back to back apart.
+///
+/// This used to be asserted through `Plan::ranges`, which merged adjacent ranges
+/// and was asked to produce one range per chunk. It is worth keeping, because it
+/// is the reason a delta download cannot be served straight out of a store and
+/// the reason a pack is a separate artifact — but the property belongs to the
+/// *store*, not to a method that has been deleted, so it is now stated directly:
+/// there is a gap between consecutive chunks in a segment, and that gap is a
+/// record header.
 #[tokio::test]
-async fn the_ranges_of_a_plan_cover_every_byte_it_needs() {
+async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
@@ -108,55 +117,41 @@ async fn the_ranges_of_a_plan_cover_every_byte_it_needs() {
     let snapshot = latest_snapshot(&store).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 
-    let ranges = plan.ranges().unwrap();
-
-    // A framed store keeps a record header between every payload, so two chunks
-    // a restore reads back to back are never *contiguous* here and no two ranges
-    // merge. That is worth asserting rather than discovering: it is the reason a
-    // delta download cannot be served out of the store directly, and the reason
-    // a pack — payloads laid end to end with no framing between them — is worth
-    // building at all.
-    assert_eq!(
-        ranges.len(),
-        plan.len(),
-        "a framed store should not produce adjacent ranges, so {} ranges for {} \
-         chunks means the framing is not where it was expected",
-        ranges.len(),
-        plan.len()
+    let chunks = plan.chunks();
+    assert!(
+        chunks.len() > 1,
+        "the fixture needs several chunks or there is nothing to be separated from"
     );
 
-    // Each range is exactly the part of the chunk the version reads, and the
-    // covered total matches the plan.
-    let covered: u64 = ranges.iter().map(lepatch::storage::Range::len).sum();
-    assert_eq!(covered, plan.total_bytes());
+    // The whole payload, and the store is bigger than that: the difference is the
+    // framing plus the snapshot record.
+    assert_eq!(
+        plan.total_bytes(),
+        chunks.iter().map(|c| c.length).sum::<u64>()
+    );
+    assert!(
+        common::set_size(&blob) > plan.total_bytes(),
+        "a store holding one version's chunks should be larger than the chunks, \
+         or the framing is not where it was expected"
+    );
 
-    // Ranges are ordered and disjoint, so a concatenation of them is the plan.
-    for pair in ranges.windows(2) {
-        assert!(
-            pair[0].end <= pair[1].start,
-            "ranges overlap or are out of order: {:?} then {:?}",
-            pair[0],
-            pair[1]
-        );
-    }
-
-    // And no range reaches into a record header, which would mean reading framing
-    // as if it were chunk data.
-    let store_len = common::set_size(&blob);
-    for range in &ranges {
-        assert!(
-            range.end <= store_len,
-            "a range runs past the end of the store"
-        );
-        for chunk in plan.chunks() {
-            if chunk.placement.offset == range.start {
-                assert!(
-                    range.end <= chunk.placement.offset + chunk.placement.len,
-                    "a range reads past the chunk it starts at"
-                );
-            }
+    // No two chunks the plan needs are adjacent in a segment. If any pair were,
+    // a restore could have fetched them in one read, and the argument for packing
+    // would be weaker than this crate says it is.
+    let mut touching = 0;
+    for pair in chunks.windows(2) {
+        let (before, after) = (&pair[0], &pair[1]);
+        if before.placement.segment == after.placement.segment
+            && before.placement.offset + before.placement.len == after.placement.offset
+        {
+            touching += 1;
         }
     }
+    assert_eq!(
+        touching, 0,
+        "two chunks are contiguous in a store, so they could have been fetched \
+         together"
+    );
 }
 
 /// The determinism the plan exists for.

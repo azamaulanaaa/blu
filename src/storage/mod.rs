@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use blob::BlobStore;
 pub use locate::{Resolved, resolve};
-pub use plan::{Plan, Planned, Range};
+pub use plan::{Plan, Planned};
 pub use record::Kind;
 pub use version_index::VersionIndex;
 
