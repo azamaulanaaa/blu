@@ -20,6 +20,15 @@
 //! packing, and it is not a small one: the same delta served out of the store is
 //! 25,325 requests.
 //!
+//! **The 1.9% is a best case and the request count is the result.** That fixture
+//! comes from a generator that is a function of position only, so every file in it
+//! is a prefix of the next and rewriting one truncates the original stream — the
+//! most favourable case content-defined chunking can be given. On a tree with no
+//! such relationship the same patch is 6.1% of the pack, still in one request.
+//! `a_patch_is_one_range_on_a_tree_that_is_not_a_special_case` asserts the
+//! request count on content that is not degenerate, which is the claim that
+//! generalises.
+//!
 //! ## Determinism
 //!
 //! A pack is a function of its [`crate::storage::Plan`], and a plan is ordered by
@@ -394,8 +403,8 @@ impl Pack {
     ///
     /// Adjacent ranges are merged, which is the entire value of packing — the
     /// payload is laid end to end with no framing, so chunks a client needs are
-    /// contiguous and the merged count is small. The measured case is one request
-    /// for a 1.9% patch.
+    /// contiguous and the merged count is small. The measured case is one request,
+    /// for a patch of between 2% and 6% of the pack depending on the tree.
     #[must_use]
     pub fn needed(&self, have: &BTreeSet<BlobId>) -> Vec<Range> {
         let mut ranges: Vec<Range> = Vec::new();

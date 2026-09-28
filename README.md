@@ -164,6 +164,15 @@ store is 25,325 requests. That is the whole argument for packing, and it is why 
 8 KiB average chunk size is not a problem: the concern about thousands of tiny
 ranges was a property of the store's framing, which a pack does not have.
 
+**The 1.9% is a best case; the one request is the real result.** That fixture is
+built from a generator that is a function of position only, so every file in it is
+a *prefix* of the next, and "rewriting" one leaves the original byte stream
+truncated — the most favourable thing that can happen to content-defined chunking.
+On a tree with no such relationship, the same one-file patch measures **6.1% of the
+pack, still in a single request**. The request count is the property that holds; the
+fraction is fixture-dependent, and `tests/pack.rs` asserts the robust one on
+content that is not a special case.
+
 ```text
 magic | version | snapshot hash | chunk count | payload bytes
 ...payloads, end to end, in plan order...

@@ -203,22 +203,44 @@ async fn a_client_holding_nothing_needs_one_range() {
     assert_eq!(pack.needed_bytes(&BTreeSet::new()), pack.payload_len());
 }
 
-/// A client holding a version's chunks needs only the rest, and usually in one
-/// range too.
+/// A client holding a version's chunks needs only the rest, in one range.
 ///
-/// The measured case that justifies packing: patch one binary in a tree, and the
-/// bytes that changed are contiguous, so the delta is one request.
+/// This is the measured case that justifies packing, and it is asserted on a tree
+/// built from `common::untagged_stream` rather than `common::noisy`.
+///
+/// That matters more than it looks. `noisy` is a function of position only, so
+/// `noisy(n)` is a prefix of `noisy(m)`: a tree of them is one long byte stream cut
+/// at various points, deduplicates far more than real data would, and "rewriting"
+/// a file by asking for a shorter `noisy` leaves the original stream truncated —
+/// the best possible case for content-defined chunking. A test on that fixture
+/// shows the property is *achievable*, not that it *holds*.
+///
+/// On this fixture the delta is a single range and about 6% of the pack, against
+/// 1.9% on the degenerate one. So the robust claim is the request count, and the
+/// fraction is fixture-dependent.
 #[tokio::test]
-async fn a_patch_is_usually_one_range() {
+async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
     let blob = dir.path().join("store");
 
-    for i in 0..8 {
+    for (i, size) in [
+        500_000usize,
+        540_000,
+        580_000,
+        620_000,
+        660_000,
+        700_000,
+        740_000,
+        780_000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         fs::write(
             source.join(format!("f{i}.bin")),
-            common::noisy(300_000 + i * 20_000),
+            common::untagged_stream(i as u8, size),
         )
         .unwrap();
     }
@@ -226,8 +248,9 @@ async fn a_patch_is_usually_one_range() {
 
     let v1 = hashes_of(&blob).await;
 
-    // Change one file.
-    fs::write(source.join("f3.bin"), common::noisy(310_000)).unwrap();
+    // One binary genuinely rewritten, with new content rather than a truncation of
+    // the old.
+    fs::write(source.join("f3.bin"), common::untagged_stream(200, 640_000)).unwrap();
     common::run_backup(&source, &blob).await;
 
     let v2 = plan_of(&blob).await;
@@ -240,21 +263,19 @@ async fn a_patch_is_usually_one_range() {
 
     let needed = pack.needed(&v1);
 
-    assert!(
-        needed.len() <= 2,
-        "a one-file patch produced {} ranges; packing is supposed to keep this \
-         near one",
+    assert_eq!(
+        needed.len(),
+        1,
+        "a one-file patch on ordinary content should be one range, got {}",
         needed.len()
-    );
-    assert!(
-        pack.needed_bytes(&v1) < pack.payload_len() / 10,
-        "a one-file patch should need well under a tenth of the pack, needed {} of {}",
-        pack.needed_bytes(&v1),
-        pack.payload_len()
     );
     assert!(
         pack.needed_bytes(&v1) > 0,
         "the patch should need something"
+    );
+    assert!(
+        pack.needed_bytes(&v1) < pack.payload_len(),
+        "the patch should need less than the whole pack"
     );
 }
 
