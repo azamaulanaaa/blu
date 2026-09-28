@@ -4,10 +4,10 @@
 //! common base path:
 //!
 //! ```text
-//! photos.000.bin      segment 0: the first N bytes of records
-//! photos.001.bin      segment 1, sealed once full and never written again
+//! photos.0000.bin     segment 0: the first N bytes of records
+//! photos.0001.bin     segment 1, sealed once full and never written again
 //! ...
-//! photos.v001.idx     where version 1's snapshot is, so a restore need not scan
+//! photos.v0001.idx    where version 1's snapshot is, so a restore need not scan
 //! photos.lock         held for the duration of a write
 //! ```
 //!
@@ -26,8 +26,9 @@
 //! means a failure inside one is permanent and detectable rather than something
 //! the next open can quietly paper over by truncating it.
 //!
-//! Every segment carries its own index in its header, so a file renamed or moved
-//! into another set is refused rather than read as though it belonged. Segments
+//! Every segment's header carries its own number, and a file whose header does
+//! not match the number in its name is refused rather than read as though it
+//! belonged — a segment copied in from elsewhere is caught that way. Segments
 //! are numbered from zero with no gaps; a gap is refused too, because a set
 //! missing a segment in the middle cannot be read as though the missing chunk
 //! data were simply not there.
@@ -58,7 +59,7 @@
 //! or a person clearing out old index files would hit both.
 //!
 //! The base path is treated as an opaque prefix rather than a stem, so a base
-//! of `photos.tar` yields `photos.tar.000.bin` instead of silently losing the
+//! of `photos.tar` yields `photos.tar.0000.bin` instead of silently losing the
 //! extension the way `Path::with_extension` would.
 
 use std::{
@@ -75,9 +76,8 @@ pub const LOCK_EXTENSION: &str = "lock";
 
 /// Digits in a segment's number.
 ///
-/// Four is not arbitrary in the useful direction: a set of 10,000 segments at 4
-/// GiB each is 40 TB, and four digits sorts lexically as it sorts numerically, so
-/// a directory listing is already in order.
+/// The width both caps a set at 10,000 segments and makes lexical order over a
+/// directory listing the same as numeric order, so a listing is already in order.
 pub const SEGMENT_DIGITS: usize = 4;
 
 /// A backup set rooted at a base path.
@@ -102,7 +102,7 @@ impl IndexSet {
     ///
     /// Zero-padded to [`SEGMENT_DIGITS`], so that lexical order over the files in
     /// a directory is numeric order over the segments — a listing that reads
-    /// `010` before `002` is a set that restores its records out of order.
+    /// `0010` before `0002` is a set that restores its records out of order.
     #[must_use]
     pub fn blob_path(&self, segment: u32) -> PathBuf {
         self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{BLOB_EXTENSION}"))

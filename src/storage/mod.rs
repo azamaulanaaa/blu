@@ -180,8 +180,8 @@ impl Compression {
     /// would make the store bigger for content zstd could not improve on, which is
     /// the normal case for already-compressed assets.
     ///
-    /// `raw` is not copied when compression is off or unhelpful, so the common
-    /// cases hand the caller's buffer straight back.
+    /// The return type is a [`Vec`], so the fallback paths copy rather than
+    /// borrowing the caller's slice.
     pub(super) fn compress(self, raw: &[u8]) -> (Codec, Vec<u8>) {
         let Some(level) = self.level() else {
             return (Codec::Raw, raw.to_vec());

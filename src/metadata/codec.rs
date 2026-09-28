@@ -41,10 +41,10 @@
 //! a four-byte count from asking for four gigabytes. A count can never exceed the
 //! input it describes, so no allocation is ever larger than the blob.
 //!
-//! Trailing bytes after the body are refused. The blob's length is recorded in
-//! its key, so a blob with anything after the snapshot in it is damaged, and
-//! quietly ignoring the difference would hide exactly the kind of corruption
-//! this whole check exists to catch.
+//! Trailing bytes after the body are refused. The snapshot's own length is
+//! recorded in the store's record header, so a blob with anything after the
+//! snapshot in it is damaged, and quietly ignoring the difference would hide
+//! exactly the kind of corruption this whole check exists to catch.
 
 use std::path::{Path, PathBuf};
 
@@ -414,9 +414,9 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Anything after the snapshot is damage, not padding: the blob's length is
-    // recorded in its key, so a mismatch means the two disagree about what this
-    // blob is, which is the sort of thing the verify pass exists to catch.
+    // Anything after the snapshot is damage, not padding: the snapshot's length
+    // is recorded in the store's record header, so a mismatch means the two
+    // disagree about what this blob is, which is what the verify pass catches.
     if !reader.is_done() {
         return Err(Malformed("the snapshot has trailing bytes"));
     }

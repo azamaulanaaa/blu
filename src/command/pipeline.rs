@@ -233,7 +233,8 @@ impl<S: storage::StoragePut + 'static> Pipeline<S> {
 ///
 /// Results are committed strictly in the order the chunks were read, so the
 /// snapshot a run produces does not depend on how the stores interleaved. That
-/// is what lets [`Options::concurrency`] be tuned freely.
+/// is what lets [`Options::concurrency`](crate::command::Options::concurrency) be
+/// tuned freely.
 async fn commit<S: storage::StoragePut + 'static>(
     pipeline: Arc<Pipeline<S>>,
     rx: &mut mpsc::Receiver<Pending>,

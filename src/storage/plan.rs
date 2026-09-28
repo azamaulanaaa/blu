@@ -181,7 +181,11 @@ fn reach(slice: &FileChunk) -> io::Result<u64> {
         })
 }
 
-/// A slice of the store this version needs, as a half-open byte range.
+/// The error for a slice naming a chunk or a file the snapshot does not have.
+///
+/// Both counts go in the message: a damaged snapshot is the one case where the
+/// indices on the wire and in memory have to be reconciled by a human, and the
+/// numbers are the only thing that makes it possible.
 fn bad_index(snapshot: &Snapshot, slice: &FileChunk) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,

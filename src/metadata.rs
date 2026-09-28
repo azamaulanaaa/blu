@@ -245,8 +245,10 @@ pub struct Link {
 pub struct File {
     /// Path relative to the backup root.
     pub path: PathBuf,
-    /// Length in bytes at the time the tree was walked. Restore asserts that
-    /// the reassembled file reaches exactly this size.
+    /// Length in bytes at the time the tree was walked.
+    ///
+    /// Restore creates the file at this length and truncates back to it at the
+    /// end, so a gap in the recorded slices is zero-filled rather than detected.
     pub len: u64,
     /// Platform permission bits, see [`crate::fsattr::mode_of`].
     pub mode: u32,

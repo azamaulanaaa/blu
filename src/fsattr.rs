@@ -2,8 +2,8 @@
 //!
 //! Unix and Windows expose different attribute sets, so everything that
 //! cannot be expressed portably is funnelled through this module and compiled
-//! per platform. Attributes that a platform does not model are reported as
-//! `None`/no-ops rather than silently recorded as zero, so a restore never
+//! per platform. An attribute a platform does not model is reported as `None`,
+//! as `0`, or as a no-op rather than as a fabricated value, so a restore never
 //! writes a bogus mode or timestamp.
 
 use std::{fs, io, path::Path};

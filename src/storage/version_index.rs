@@ -15,7 +15,7 @@
 //! file is derived from them, and a wrong or missing one costs a scan rather than
 //! a backup. Nothing in this module is trusted without being checked against the
 //! store, and nothing here can make a store report a version it does not hold —
-//! see [`VersionIndex::resolve`].
+//! see [`resolve`](super::resolve).
 //!
 //! That is the inversion from the previous layout, where an index file *was* the
 //! only place a version existed. There, publishing the index was the commit, and
@@ -93,8 +93,8 @@ impl VersionIndex {
     /// Returns an error if the file is the wrong length, which is a file that is
     /// not one of these, or if the checksum does not verify, which is a torn write
     /// or something else entirely. Both are treated as "no index" by
-    /// [`resolve`](super::BlobStore::snapshot): a cache that cannot be read is
-    /// not a cache that can be believed.
+    /// [`resolve`](super::resolve): a cache that cannot be read is not a cache
+    /// that can be believed.
     pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() != LEN {
             return Err(io::Error::new(
