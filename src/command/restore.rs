@@ -16,7 +16,7 @@ use crate::{
     metadata::{self, Snapshot},
     progress::Progress,
     slice,
-    storage::{self, StreamReadSeeker},
+    storage::{self, StreamReadSeeker, hex},
 };
 
 /// Files to write at once.
@@ -72,16 +72,15 @@ pub struct Restored {
 #[instrument(level = "info", skip(storage, root), err)]
 pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     root: P,
-    key: String,
+    snapshot_id: storage::BlobId,
     storage: S,
 ) -> io::Result<Restored> {
-    // Shared, not copied. Every `Chunk` in a snapshot owns a `String`, so a clone of
-    // the chunk table is one allocation per chunk in the store — paid on top of
-    // the tree, on top of the snapshot, on top of the decoded bytes, for a value
-    // nothing ever writes to. The write tasks need owned data, and sharing is
-    // how they get it without the copy.
+    // Shared, not copied. A clone of the chunk table is one allocation per chunk
+    // in the store — paid on top of the tree, on top of the snapshot, on top of
+    // the decoded bytes, for a value nothing ever writes to. The write tasks need
+    // owned data, and sharing is how they get it without the copy.
     let snapshot = Arc::new({
-        let mut reader: StreamReadSeeker = storage.get(&key).await?;
+        let mut reader: StreamReadSeeker = storage.get(&snapshot_id).await?;
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
         metadata::Snapshot::from_bytes(buffer.as_slice())
@@ -93,18 +92,27 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
 
     // Nothing below can detect damaged chunk data on its own — a short read
     // would just leave a file quietly filled with the wrong bytes — so the
-    // whole snapshot is checked against the hashes recorded at backup time
+    // whole snapshot is checked against the hashes its chunks are addressed by
     // before a single byte is written.
     super::verify::check(&snapshot, Arc::clone(&storage))
         .await
         .into_result()
-        .map_err(|e| io::Error::new(e.kind(), format!("refusing to restore {key}: {e}")))?;
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("refusing to restore snapshot {}: {e}", hex(&snapshot_id)),
+            )
+        })?;
 
     // And the paths it would write are checked here, for the same reason and
     // with the same guarantee: a snapshot is untrusted input, and nothing should
     // be created on disk until it is known to be safe to create it.
-    check_paths(&snapshot)
-        .map_err(|e| io::Error::new(e.kind(), format!("refusing to restore {key}: {e}")))?;
+    check_paths(&snapshot).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("refusing to restore snapshot {}: {e}", hex(&snapshot_id)),
+        )
+    })?;
 
     restore_directories(root, &snapshot).await?;
     let written = restore_files(root, Arc::clone(&snapshot), Arc::clone(&storage)).await?;
@@ -438,9 +446,9 @@ async fn restore_files<S: storage::StorageGet + 'static>(
 
 /// One file.s worth of work, owned so it can outlive the loop that queued it.
 ///
-/// The snapshot is shared rather than copied: every chunk it holds owns a
-/// `String`, so a copy of the table is a fresh allocation per chunk in the store
-/// on top of the tree being restored.
+/// The snapshot is shared rather than copied: its chunk table is one allocation
+/// per chunk in the store, and a copy of it would be paid again on top of the
+/// tree being restored.
 struct RestoreJob {
     /// Where the file goes, already joined onto the restore root.
     path: PathBuf,
@@ -515,7 +523,7 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
             .seek(io::SeekFrom::Start(file_chunk.file_offset))
             .await?;
 
-        let mut source: StreamReadSeeker = storage.get(&chunk.location).await?;
+        let mut source: StreamReadSeeker = storage.get(chunk).await?;
         source
             .seek(io::SeekFrom::Start(file_chunk.chunk_offset.into()))
             .await?;
@@ -529,9 +537,8 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "chunk at {} is shorter than the {} bytes recorded for {}",
-                    chunk.location,
-                    length,
+                    "chunk {} is shorter than the {length} bytes recorded for {}",
+                    hex(chunk),
                     file.path.display()
                 ),
             ));

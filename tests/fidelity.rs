@@ -89,14 +89,14 @@ async fn restore_does_not_leave_trailing_bytes_from_a_previous_larger_file() {
     fs::write(source.join("shrunk"), b"short").unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&source, &blob, None).await;
+    let committed = common::run_backup(&source, &blob).await;
 
     // Restore over a file that is much longer than the backed-up one.
     let destination = dir.path().join("restored");
     fs::create_dir_all(&destination).unwrap();
     fs::write(destination.join("shrunk"), vec![0xffu8; 10_000]).unwrap();
 
-    common::run_restore(&blob, &key, &destination).await;
+    common::run_restore(&blob, committed.snapshot, &destination).await;
 
     assert_eq!(fs::read(destination.join("shrunk")).unwrap(), b"short");
 }
@@ -109,13 +109,13 @@ async fn restore_over_an_existing_tree_succeeds() {
     fs::write(source.join("sub/file"), b"fresh").unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&source, &blob, None).await;
+    let committed = common::run_backup(&source, &blob).await;
 
     let destination = dir.path().join("restored");
     fs::create_dir_all(&destination).unwrap();
     fs::write(destination.join("stale"), b"left over").unwrap();
 
-    common::run_restore(&blob, &key, &destination).await;
+    common::run_restore(&blob, committed.snapshot, &destination).await;
 
     assert_eq!(fs::read(destination.join("sub/file")).unwrap(), b"fresh");
 }

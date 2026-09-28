@@ -20,7 +20,7 @@
 //!   varint   count of directories
 //!     per dir:    path, u32 mode, optional timestamp
 //!   varint   count of distinct chunks
-//!     per chunk:  32 raw bytes of hash, string location
+//!     per chunk:  32 raw bytes of hash
 //!   varint   count of chunk slices
 //!     per slice:  varint chunk, varint file, varint chunk offset,
 //!                 varint file offset, varint length
@@ -48,7 +48,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Chunk, Dir, File, FileChunk, Link, LinkKind, Snapshot, Timestamp};
+use super::{Dir, File, FileChunk, Link, LinkKind, Snapshot, Timestamp};
 
 /// Refuse a count that cannot possibly fit in the remaining input.
 ///
@@ -207,14 +207,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn string(&mut self) -> Result<String> {
-        let len = usize::try_from(self.varint()?)
-            .map_err(|_| Malformed("a string length is too large"))?;
-
-        let bytes = self.take(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| Malformed("a string is not valid UTF-8"))
-    }
-
     /// An optional timestamp, as a presence tag then the two numbers.
     fn optional_timestamp(&mut self) -> Result<Option<Timestamp>> {
         match self.u8()? {
@@ -293,11 +285,6 @@ impl Writer {
         self.bytes.extend_from_slice(bytes);
     }
 
-    fn string(&mut self, value: &str) {
-        self.varint(value.len() as u64);
-        self.bytes.extend_from_slice(value.as_bytes());
-    }
-
     fn optional_timestamp(&mut self, mtime: Option<Timestamp>) {
         match mtime {
             None => self.u8(0),
@@ -335,8 +322,7 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Vec<u8> {
 
     out.count(snapshot.chunks.len());
     for chunk in &snapshot.chunks {
-        out.hash(&chunk.hash);
-        out.string(&chunk.location);
+        out.hash(chunk);
     }
 
     out.count(snapshot.file_chunks.len());
@@ -389,12 +375,7 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
         .collect::<Result<Vec<_>>>()?;
 
     let chunks = (0..reader.count()?)
-        .map(|_| {
-            Ok(Chunk {
-                hash: reader.hash()?,
-                location: reader.string()?,
-            })
-        })
+        .map(|_| reader.hash())
         .collect::<Result<Vec<_>>>()?;
 
     let file_chunks = (0..reader.count()?)
@@ -468,10 +449,7 @@ mod tests {
             mode: 0o644,
             mtime: None,
         });
-        snapshot.chunks.push(Chunk {
-            hash: [3u8; 32],
-            location: String::from(r#"{"version":1,"offset":0,"length":3}"#),
-        });
+        snapshot.chunks.push([3u8; 32]);
         snapshot.file_chunks.push(FileChunk {
             chunk_index: 0,
             file_index: 0,

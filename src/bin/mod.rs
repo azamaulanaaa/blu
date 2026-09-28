@@ -34,9 +34,20 @@ enum Command {
     Backup {
         /// Directory to back up.
         source: std::path::PathBuf,
-        /// Base path of the backup set, e.g. `photos` creates `photos.bin`,
-        /// `photos.001.idx` and so on.
+        /// Base path of the backup set, e.g. `photos` creates `photos.bin` and
+        /// `photos.lock`.
         name: std::path::PathBuf,
+    },
+    /// List the versions a backup set holds, oldest first.
+    Versions {
+        /// Base path of the backup set to inspect.
+        name: std::path::PathBuf,
+        /// Print just the version numbers, one per line, and nothing else.
+        ///
+        /// For scripts counting or iterating over versions; the default output is
+        /// for a person reading it.
+        #[arg(long)]
+        numbers_only: bool,
     },
     /// Rebuild a directory from a backup set.
     Restore {
@@ -146,6 +157,7 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             clean,
         } => run_restore(&destination, &name, version, clean).await,
         Command::Verify { name, version } => run_verify(&name, version).await,
+        Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
     }
 }
 
@@ -208,41 +220,67 @@ fn interrupted() -> std::io::Error {
 }
 
 /// Resolve which version to operate on, or explain why there is none.
-fn select_version(set: &IndexSet, requested: Option<u32>) -> std::io::Result<(u32, String)> {
-    let versions = set.versions()?;
-
-    match (requested, versions.latest) {
-        (Some(version), _) => Ok((version, set.read_key(version)?)),
-        (None, Some(found)) => Ok(found),
-        (None, None) => Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "no usable snapshot found for {} (looked in {})",
-                set.base().display(),
-                set.directory().display()
-            ),
-        )),
+///
+/// Reads the store's commit records rather than a separate index, so the answer
+/// cannot disagree with the bytes: a version exists here if and only if the store
+/// holds the record that published it.
+fn select_version(
+    set: &IndexSet,
+    store: &storage::BlobStore<false>,
+    requested: Option<u32>,
+) -> std::io::Result<(u32, storage::BlobId)> {
+    match requested {
+        Some(version) => Ok((version, store.snapshot(version)?)),
+        None => store.latest().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no committed version found in {} (looked in {})",
+                    set.blob_path().display(),
+                    set.directory().display()
+                ),
+            )
+        }),
     }
+}
+
+/// List the versions a backup set holds, oldest first.
+///
+/// A set with no versions is not an error. "There are none" is the answer to the
+/// question that was asked, and a script iterating over a location that has not
+/// been backed up yet should see an empty list rather than a failure.
+async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Result<()> {
+    let set = IndexSet::new(name);
+
+    // Opened read-only: a store cannot be recovered and then left alone, because
+    // recovery truncates. Listing what is there must not be the thing that
+    // discards an unfinished run.
+    let store = match storage::BlobStore::<false>::open(set.blob_path()).await {
+        Ok(store) => store,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    for version in store.versions()? {
+        if numbers_only {
+            println!("{version}");
+            continue;
+        }
+
+        let snapshot = store.snapshot(version)?;
+        println!("{version}  {}", storage::hex(&snapshot));
+    }
+
+    Ok(())
 }
 
 async fn run_backup(source: &std::path::Path, name: &std::path::Path) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
-    // Refuse to run against a backup set another process is writing to: the
-    // blob store is append-only and shared, so interleaved writes from two
-    // processes would corrupt both.
+    // Refuse to run against a backup set another process is writing to. The
+    // store is a single append-only file and the run holds one commit point at
+    // its end, so two runs interleaving would publish versions over each other.
     let _lock = set.lock()?;
-
-    let versions = set.versions()?;
-
-    // Reuse the newest usable snapshot so unchanged chunks are not re-uploaded.
-    let base_key = versions.latest.as_ref().map(|(_, key)| key.clone());
-    if base_key.is_none() {
-        tracing::debug!(name = %set.base().display(), "no earlier version to deduplicate against");
-    }
-
-    let reservation = set.reserve()?;
-    let version = reservation.version();
 
     let blob_path = set.blob_path();
     let lock_path = set.lock_path();
@@ -250,30 +288,29 @@ async fn run_backup(source: &std::path::Path, name: &std::path::Path) -> std::io
     // The store and the lock live next to the tree being read and grow while it
     // is being read, so they must not be swept into the backup.
     let options = Options {
-        base_key,
         exclude: vec![blob_path.clone(), lock_path.clone()],
         ..Options::default()
     };
 
-    let store = storage::BlobFileStorage::<true>::new(&blob_path).await?;
+    // Opening recovers the store: anything past the last valid record is a run
+    // that did not finish, and is discarded here rather than being read as data.
+    let store = storage::BlobStore::<true>::open(&blob_path).await?;
 
-    let key = match backup(source, options, store).await {
-        Ok(key) => key,
-        Err(e) => {
-            tracing::error!(
-                name = %set.base().display(),
-                version,
-                "backup failed; leaving no index behind"
-            );
-            return Err(e);
-        }
-    };
+    if let Some(previous) = store.versions()?.last() {
+        tracing::debug!(previous, name = %set.base().display(), "deduplicating against the store");
+    } else {
+        tracing::debug!(
+            name = %set.base().display(),
+            "no earlier version; this is the first backup of this location"
+        );
+    }
 
-    reservation.commit(&key)?;
+    let committed = backup(source, options, store).await?;
 
     tracing::info!(
         name = %set.base().display(),
-        version,
+        version = committed.version,
+        snapshot = %storage::hex(&committed.snapshot),
         store = %blob_path.display(),
         "backup complete"
     );
@@ -288,7 +325,8 @@ async fn run_restore(
     clean: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let (version, key) = select_version(&set, version)?;
+    let store = storage::BlobStore::<false>::open(set.blob_path()).await?;
+    let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(
         name = %set.base().display(),
@@ -309,16 +347,14 @@ async fn run_restore(
     // interleave writes into the same tree.
     let _claim = lock_destination(destination)?;
 
-    let store = storage::BlobFileStorage::<false>::new(set.blob_path()).await?;
-
     if clean {
         // Restored beside the destination and swapped in, rather than emptied
         // and refilled. A restore that dies part-way through then leaves the
         // destination exactly as it was, instead of holding some prefix of the
         // snapshot.
-        restore_atomically(destination, key, store).await?;
+        restore_atomically(destination, snapshot, store).await?;
     } else {
-        let restored = restore(destination, key, store).await?;
+        let restored = restore(destination, snapshot, store).await?;
         report_restored(&restored);
 
         // A merging restore leaves the destination holding more than the snapshot
@@ -347,7 +383,7 @@ async fn run_restore(
 /// leaving nothing behind.
 async fn restore_atomically<S: storage::StorageGet + 'static>(
     destination: &std::path::Path,
-    key: String,
+    snapshot: storage::BlobId,
     store: S,
 ) -> std::io::Result<()> {
     let partial = sibling(destination, PARTIAL_SUFFIX);
@@ -365,7 +401,7 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
         }
     }
 
-    let restored = match restore(&partial, key, store).await {
+    let restored = match restore(&partial, snapshot, store).await {
         Ok(restored) => restored,
         Err(e) => {
             // The destination has not been touched, so there is nothing to put
@@ -530,12 +566,12 @@ fn absolutise(path: &std::path::Path) -> std::path::PathBuf {
 }
 async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let (version, key) = select_version(&set, version)?;
+    let store = storage::BlobStore::<false>::open(set.blob_path()).await?;
+    let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(name = %set.base().display(), version, "verifying");
 
-    let store = storage::BlobFileStorage::<false>::new(set.blob_path()).await?;
-    let report = verify(key, store).await?;
+    let report = verify(snapshot, store).await?;
 
     for failure in &report.failures {
         eprintln!("error: {}", failure.detail);

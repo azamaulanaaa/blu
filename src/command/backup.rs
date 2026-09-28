@@ -15,7 +15,6 @@ use std::{
     sync::Arc,
 };
 
-use tokio::io::AsyncReadExt;
 use tracing::instrument;
 use walkdir::WalkDir;
 
@@ -35,12 +34,9 @@ const MAX_CONCURRENCY: usize = 32;
 /// Knobs for a single [`backup`] run.
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Key of a previous snapshot whose chunks may be reused instead of being
-    /// uploaded again. Deduplication against this snapshot only.
-    pub base_key: Option<String>,
     /// Paths to leave out of the backup, compared after normalisation. The
-    /// caller should exclude its own output artifacts: backing up a blob store
-    /// that is being appended to while it is read corrupts the chunk offsets.
+    /// caller should exclude its own output artifacts: backing up a store that
+    /// is being appended to while it is read corrupts the run.
     pub exclude: Vec<PathBuf>,
     /// Content-defined chunking parameters.
     pub chunker: reader::ChunkerConfig,
@@ -59,7 +55,6 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            base_key: None,
             exclude: Vec::new(),
             chunker: reader::ChunkerConfig {
                 min_size: 8 * 1024,
@@ -69,6 +64,15 @@ impl Default for Options {
             concurrency: default_concurrency(),
         }
     }
+}
+
+/// A version that has been committed to the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Committed {
+    /// The version number the run was given.
+    pub version: u32,
+    /// Hash of the snapshot blob, which is how the store names this version.
+    pub snapshot: storage::BlobId,
 }
 
 /// Uploads to run at once when the caller has not asked for a specific number.
@@ -93,26 +97,26 @@ struct Walked {
     paths: Vec<PathBuf>,
 }
 
-/// Snapshot a directory tree and return the storage key of the snapshot.
+/// Snapshot a directory tree and commit it to the store as a new version.
 ///
-/// The returned snapshot can be passed back as [`Options::base_key`] on a later
-/// run so that unchanged chunks are not uploaded again.
+/// Deduplication is the store's business: a chunk whose content it already holds
+/// is not written again, so an unchanged file costs nothing after the first time
+/// it is seen, and so does one that was last seen in any version rather than
+/// only the most recent.
 ///
 /// # Errors
 ///
 /// Returns an error if the tree cannot be walked, if a file changes while it is
-/// being read, or if the storage backend rejects a write.
+/// being read, if the store rejects a write, or if the run cannot be committed.
+/// A run that returns an error has written no commit record, so the store is
+/// left exactly as it was — the space is reclaimed by the next run's recovery.
 #[instrument(level = "info", skip(storage, options), err)]
-pub async fn backup<
-    P: AsRef<Path> + Debug,
-    S: storage::StoragePut + storage::StorageGet + 'static,
->(
+pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     root: P,
     options: Options,
     storage: S,
-) -> io::Result<String> {
+) -> io::Result<Committed> {
     let Options {
-        base_key,
         exclude,
         chunker: config,
         concurrency,
@@ -120,25 +124,6 @@ pub async fn backup<
 
     let root = root.as_ref();
     let concurrency = effective_concurrency(concurrency);
-
-    let base_chunks: Arc<HashMap<[u8; 32], metadata::Chunk>> = match base_key {
-        Some(v) => {
-            let mut reader = storage.get(&v).await?;
-            let mut buffer = Vec::new();
-            reader.read_to_end(&mut buffer).await?;
-            let snapshot = metadata::Snapshot::from_bytes(buffer.as_slice())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-            Arc::new(
-                snapshot
-                    .chunks
-                    .into_iter()
-                    .map(|chunk| (chunk.hash, chunk))
-                    .collect(),
-            )
-        }
-        None => Arc::new(HashMap::new()),
-    };
 
     // Walking stats every entry in the tree, which blocks; reading and hashing
     // the contents blocks and burns CPU. Both halves of that are the pipeline's
@@ -165,7 +150,7 @@ pub async fn backup<
     // has been read.
     let files = u64::try_from(file_index.len()).unwrap_or(0);
 
-    let pipeline = pipeline::Pipeline::new(root.to_path_buf(), file_index, base_chunks, storage);
+    let pipeline = pipeline::Pipeline::new(root.to_path_buf(), file_index, storage);
 
     Arc::clone(&pipeline)
         .run(paths, config, concurrency, files, &mut snapshot)
@@ -181,13 +166,30 @@ pub async fn backup<
     // byte array, so there is nothing here that can fail to be represented.
     let buffer = snapshot.to_bytes();
 
+    // The snapshot is a blob like any other, addressed by the hash of its own
+    // bytes — which is what the commit record names.
+    let id = *blake3::hash(&buffer).as_bytes();
+
     let len = u64::try_from(buffer.len())
         .map_err(|_| io::Error::other("the snapshot is too large to store"))?;
 
     pipeline
         .storage
-        .put(Box::new(Cursor::new(buffer)), len)
-        .await
+        .put(&id, Box::new(Cursor::new(buffer)), len)
+        .await?;
+
+    // The run's one data sync. Everything this run wrote — every chunk and the
+    // snapshot — is on the device before the commit record exists, which is what
+    // makes the commit safe to make durable. See `storage::blob` for why the
+    // commit is a second sync rather than part of this one.
+    pipeline.storage.sync_data().await?;
+
+    let version = pipeline.storage.commit(&id).await?;
+
+    Ok(Committed {
+        version,
+        snapshot: id,
+    })
 }
 
 /// Walk the tree, recording everything that is not file content.

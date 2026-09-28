@@ -7,7 +7,7 @@ use std::fs;
 use common::noisy;
 use lepatch::{
     command::{Report, restore, verify},
-    storage::BlobFileStorage,
+    storage::BlobStore,
 };
 
 /// Non-uniform content, so the chunker finds real boundaries and the chunks
@@ -25,10 +25,10 @@ async fn an_intact_snapshot_verifies_clean() {
     fs::write(source.join("a.bin"), varied(200_000)).unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&source, &blob, None).await;
+    let committed = common::run_backup(&source, &blob).await;
 
-    let storage = BlobFileStorage::<false>::new(&blob).await.unwrap();
-    let report = verify(key, storage).await.unwrap();
+    let storage = BlobStore::<false>::open(&blob).await.unwrap();
+    let report = verify(committed.snapshot, storage).await.unwrap();
 
     assert!(report.is_ok(), "unexpected failures: {:?}", report.failures);
     assert!(report.chunks > 1, "expected several distinct chunks");
@@ -43,7 +43,7 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     fs::write(source.join("a.bin"), varied(200_000)).unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&source, &blob, None).await;
+    let committed = common::run_backup(&source, &blob).await;
 
     // Corrupt a byte in the middle of the chunk data.
     let offset = fs::metadata(&blob).unwrap().len() / 2;
@@ -51,41 +51,41 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     bytes[offset as usize] ^= 0xff;
     fs::write(&blob, &bytes).unwrap();
 
-    let storage = BlobFileStorage::<false>::new(&blob).await.unwrap();
-    let report = verify(key, storage).await.unwrap();
+    let storage = BlobStore::<false>::open(&blob).await.unwrap();
+    let report = verify(committed.snapshot, storage).await.unwrap();
 
     assert!(!report.is_ok(), "corruption went undetected");
     assert!(
-        report.failures[0].detail.contains("corrupt"),
-        "failure should say the chunk is corrupt: {}",
+        report.failures[0].detail.contains("actually hash to"),
+        "the failure should say what the bytes really hashed to: {}",
         report.failures[0].detail
     );
-    assert!(report.failures[0].detail.contains("expected hash"));
 }
 
+/// A store cut short leaves a version that cannot be read back.
+///
+/// The snapshot blob is written last, so lopping off the tail of the store
+/// destroys it. The commit record naming it is gone with it, so the version
+/// simply is not there — which is the correct report, and quite different from
+/// the old behaviour of handing back a version whose bytes were missing.
 #[tokio::test]
-async fn a_store_truncated_before_its_snapshot_is_reported() {
+async fn a_store_truncated_before_its_snapshot_has_no_such_version() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
     fs::write(source.join("a.bin"), varied(200_000)).unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&source, &blob, None).await;
+    common::run_backup(&source, &blob).await;
 
-    // The snapshot blob is written last, so lopping off the tail of the store
-    // destroys it. That has to surface as an error, not as a clean report.
     let bytes = fs::read(&blob).unwrap();
     fs::write(&blob, &bytes[..bytes.len() - 50_000]).unwrap();
 
-    let storage = BlobFileStorage::<false>::new(&blob).await.unwrap();
-    let error = verify(key, storage).await.unwrap_err();
-
-    // Caught by the store's bounds check before the snapshot is even decoded.
-    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
     assert!(
-        error.to_string().contains("the store is only"),
-        "the error should explain the store is too short, got: {error}"
+        store.latest().is_none(),
+        "a store with no commit record holds no version, even though its snapshot \\
+         record may still be partly there"
     );
 }
 
@@ -97,7 +97,7 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
     fs::write(source.join("a.bin"), varied(200_000)).unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&source, &blob, None).await;
+    let committed = common::run_backup(&source, &blob).await;
 
     let offset = fs::metadata(&blob).unwrap().len() / 2;
     let mut bytes = fs::read(&blob).unwrap();
@@ -105,8 +105,10 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
     fs::write(&blob, &bytes).unwrap();
 
     let destination = dir.path().join("restored");
-    let storage = BlobFileStorage::<false>::new(&blob).await.unwrap();
-    let error = restore(&destination, key, storage).await.unwrap_err();
+    let storage = BlobStore::<false>::open(&blob).await.unwrap();
+    let error = restore(&destination, committed.snapshot, storage)
+        .await
+        .unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(
@@ -140,8 +142,8 @@ fn a_report_with_failures_summarises_them() {
         bytes: 100,
         failures: (0..7)
             .map(|i| lepatch::command::Failure {
-                location: format!("loc{i}"),
-                detail: format!("chunk loc{i} is corrupt"),
+                location: [u8::try_from(i).unwrap_or(0); 32],
+                detail: format!("chunk {i} is corrupt"),
             })
             .collect(),
     };

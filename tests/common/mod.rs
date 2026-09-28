@@ -14,8 +14,8 @@ use std::{
 };
 
 use lepatch::{
-    command::{Options, backup, restore},
-    storage::BlobFileStorage,
+    command::{Committed, Options, backup, restore},
+    storage::{BlobId, BlobStore},
 };
 
 /// Default chunker configuration, mirroring the CLI defaults.
@@ -124,40 +124,35 @@ pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
     out
 }
 
-/// Back up `source` into a fresh blob store and return the snapshot key.
-pub(crate) async fn run_backup(source: &Path, blob: &Path, base_key: Option<String>) -> String {
-    run_backup_with(source, blob, base_key, Options::default()).await
+/// Back up `source` into a fresh store and return what was committed.
+///
+/// There is no base snapshot to pass: deduplication is the store's own business,
+/// so a run hands it every chunk it read and the store decides what is new.
+pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
+    run_backup_with(source, blob, Options::default()).await
 }
 
 /// Back up `source` with specific options, for tests that need to pin a knob the
 /// defaults would otherwise choose.
-pub(crate) async fn run_backup_with(
-    source: &Path,
-    blob: &Path,
-    base_key: Option<String>,
-    opts: Options,
-) -> String {
-    let storage = BlobFileStorage::<true>::new(blob).await.unwrap();
-    let opts = Options { base_key, ..opts };
+pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
+    let storage = BlobStore::<true>::open(blob).await.unwrap();
     backup(source, opts, storage).await.unwrap()
 }
 
-/// Restore `key` from the blob store at `blob` into `destination`.
-pub(crate) async fn run_restore(blob: &Path, key: &str, destination: &Path) {
-    let storage = BlobFileStorage::<false>::new(blob).await.unwrap();
-    restore(destination, key.to_string(), storage)
-        .await
-        .unwrap();
+/// Restore the snapshot named by `snapshot` from the store at `blob`.
+pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Path) {
+    let storage = BlobStore::<false>::open(blob).await.unwrap();
+    restore(destination, snapshot, storage).await.unwrap();
 }
 
 /// Back up `source`, restore it, and assert the two trees are identical.
 pub(crate) async fn assert_round_trip(source: &Path) {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store.bin");
-    let key = run_backup(source, &blob, None).await;
+    let committed = run_backup(source, &blob).await;
     let destination = dir.path().join("restored");
 
-    run_restore(&blob, &key, &destination).await;
+    run_restore(&blob, committed.snapshot, &destination).await;
 
     let before = describe(source);
     let after = describe(&destination);

@@ -44,11 +44,11 @@ fn verify_concurrency() -> usize {
 }
 
 /// A chunk that could not be read back, or whose contents did not match the
-/// hash recorded when it was written.
+/// hash it is addressed by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
-    /// Storage key of the offending chunk.
-    pub location: String,
+    /// Content hash of the offending chunk.
+    pub location: storage::BlobId,
     /// Why it failed.
     pub detail: String,
 }
@@ -109,8 +109,8 @@ impl Report {
     }
 }
 
-/// Read back every distinct chunk in `snapshot` and check it against the hash
-/// recorded at backup time.
+/// Read back every distinct chunk in `snapshot` and check it against the hash it
+/// is addressed by.
 ///
 /// Every failure is collected rather than stopping at the first, so a damaged
 /// store can be assessed in one pass. An unreadable store is reported as a
@@ -123,11 +123,11 @@ impl Report {
 /// error, so a single call assesses the whole store.
 #[instrument(level = "info", skip(storage), err)]
 pub async fn verify<S: storage::StorageGet + 'static>(
-    key: String,
+    snapshot_id: storage::BlobId,
     storage: S,
 ) -> io::Result<Report> {
     let snapshot = {
-        let mut reader: StreamReadSeeker = storage.get(&key).await?;
+        let mut reader: StreamReadSeeker = storage.get(&snapshot_id).await?;
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer).await?;
         Snapshot::from_bytes(buffer.as_slice())
@@ -179,7 +179,7 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
 
             running.spawn(check_chunk(
                 index,
-                snapshot.chunks[index].clone(),
+                snapshot.chunks[index],
                 Arc::clone(&storage),
             ));
         }
@@ -211,8 +211,8 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
                 }
             }
             None => report.failures.push(Failure {
-                location: chunk.location.clone(),
-                detail: format!("chunk at {} was never checked", chunk.location),
+                location: *chunk,
+                detail: format!("chunk {} was never checked", storage::hex(chunk)),
             }),
         }
     }
@@ -226,7 +226,7 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
 /// chunk in flight rather than one per chunk checked.
 async fn check_chunk<S: StorageGet>(
     index: usize,
-    chunk: crate::metadata::Chunk,
+    chunk: storage::BlobId,
     storage: Arc<S>,
 ) -> Checked {
     let mut scratch = vec![0u8; SCRATCH];
@@ -237,12 +237,12 @@ async fn check_chunk<S: StorageGet>(
         failure: None,
     };
 
-    let mut reader = match storage.get(&chunk.location).await {
+    let mut reader = match storage.get(&chunk).await {
         Ok(reader) => reader,
         Err(e) => {
             checked.failure = Some(Failure {
-                location: chunk.location.clone(),
-                detail: format!("chunk at {} could not be read: {e}", chunk.location),
+                location: chunk,
+                detail: format!("chunk {} could not be read: {e}", storage::hex(&chunk)),
             });
             return checked;
         }
@@ -261,8 +261,8 @@ async fn check_chunk<S: StorageGet>(
             Err(e) => {
                 checked.bytes = bytes;
                 checked.failure = Some(Failure {
-                    location: chunk.location.clone(),
-                    detail: format!("chunk at {} could not be read: {e}", chunk.location),
+                    location: chunk,
+                    detail: format!("chunk {} could not be read: {e}", storage::hex(&chunk)),
                 });
                 return checked;
             }
@@ -278,31 +278,22 @@ async fn check_chunk<S: StorageGet>(
 
     checked.bytes = bytes;
 
+    // A chunk is addressed by the hash of its contents and is stored under that
+    // hash, so the address *is* the expected value: a mismatch means the bytes
+    // stored under this name are not the bytes that were named. The name is
+    // therefore printed once, as the thing to look up, rather than twice as
+    // "expected" and something else.
     let actual = hasher.finalize();
-    if actual.as_bytes() != &chunk.hash {
+    if actual.as_bytes() != &chunk {
         checked.failure = Some(Failure {
-            location: chunk.location.clone(),
+            location: chunk,
             detail: format!(
-                "chunk at {} is corrupt: expected hash {}, found {} ({} bytes)",
-                chunk.location,
-                hex(&chunk.hash),
-                hex(actual.as_bytes()),
-                bytes
+                "the bytes stored as chunk {} actually hash to {} ({bytes} bytes)",
+                storage::hex(&chunk),
+                storage::hex(actual.as_bytes()),
             ),
         });
     }
 
     checked
-}
-
-/// Lowercase hex, for reporting hashes in a form a human can compare.
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
-            let _ = write!(out, "{b:02x}");
-            out
-        })
 }

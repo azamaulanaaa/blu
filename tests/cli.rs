@@ -108,13 +108,44 @@ fn each_backup_claims_the_next_version() {
         ok(dir.path(), &["backup", "src", "snap"]);
     }
 
+    // The versions are commit records inside the one store file, so three
+    // backups leave one file and not three index files. Each version is
+    // individually addressable, which is what proves they were all recorded.
+    assert!(dir.path().join("snap.bin").is_file());
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        3,
+        "each backup should add exactly one commit record to the store"
+    );
+
+    // And the numbering a user asks for with --version resolves to each of
+    // them, oldest first.
     for version in 1..=3 {
-        assert!(
-            dir.path().join(format!("snap.{version:03}.idx")).is_file(),
-            "version {version} index is missing"
+        ok(
+            dir.path(),
+            &[
+                "restore",
+                &format!("out{version}"),
+                "snap",
+                "--version",
+                &version.to_string(),
+            ],
+        );
+        assert_eq!(
+            common::describe(&dir.path().join("src")),
+            common::describe(&dir.path().join(format!("out{version}"))),
+            "version {version} did not restore the tree it recorded"
         );
     }
-    assert!(dir.path().join("snap.bin").is_file());
+}
+
+/// How many commit records the store at `store` holds.
+///
+/// Read through the store itself rather than by counting files, which is the
+/// point: a version is a record, so this is the only count that means anything.
+fn count_entries(dir: &std::path::Path, set: &str) -> usize {
+    let out = ok(dir, &["versions", set, "--numbers-only"]);
+    out.lines().filter(|line| !line.trim().is_empty()).count()
 }
 
 #[test]
@@ -180,7 +211,6 @@ fn the_backup_set_is_excluded_from_its_own_backup() {
         .collect::<Vec<_>>();
 
     assert!(listing.contains(&"self.bin".to_string()));
-    assert!(listing.contains(&"self.001.idx".to_string()));
 
     // The store grew while it was being read, so if it had been chunked the
     // offsets would have shifted and the restore would not match.
@@ -230,9 +260,39 @@ fn verify_fails_and_restore_refuses_on_a_damaged_store() {
     );
 
     let detail = stderr(&verify);
+    // A chunk is named by the hash of what it should contain, and the bytes are
+    // reported as what they actually hash to — so two different hashes, and the
+    // message says which is which.
     assert!(
-        detail.contains("expected hash") && detail.contains("found"),
-        "the detail should name both hashes: {detail}"
+        detail.contains("actually hash to"),
+        "the detail should say what the bytes really hashed to: {detail}"
+    );
+
+    let named = detail
+        .split("actually hash to")
+        .next()
+        .and_then(|line| line.split("stored as chunk ").nth(1))
+        .map(|hash| {
+            hash.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let found = detail
+        .split("actually hash to")
+        .nth(1)
+        .map(|rest| {
+            rest.split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert!(
+        !named.is_empty() && !found.is_empty() && named != found,
+        "the detail should name the chunk and what it really hashed to, \
+         and those must differ: {detail}"
     );
 
     let refused = fails(dir.path(), &["restore", "out", "snap"]);
@@ -246,8 +306,13 @@ fn verify_fails_and_restore_refuses_on_a_damaged_store() {
     );
 }
 
+/// A backup that fails must publish nothing.
+///
+/// There is no index file to leave behind and no version number to skip, which is
+/// the easier half of the guarantee: the run's commit record is the only thing
+/// that makes a version exist, and a run that never got there wrote none.
 #[test]
-fn a_failed_backup_leaves_no_index_behind() {
+fn a_failed_backup_publishes_no_version() {
     let dir = tempfile::tempdir().unwrap();
 
     let error = fails(dir.path(), &["backup", "no-such-directory", "snap"]);
@@ -256,29 +321,112 @@ fn a_failed_backup_leaves_no_index_behind() {
         "the error should name the path it could not read: {error}"
     );
 
+    // Either nothing exists at all, or the store exists with no commit record in
+    // it. Both mean the same thing: no version can be restored.
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        0,
+        "a failed backup left behind a version"
+    );
+
     assert!(
-        !dir.path().join("snap.001.idx").exists(),
-        "a failed backup must not leave an index that looks like a version"
+        fails(dir.path(), &["restore", "out", "snap"]).contains("no committed version"),
+        "nothing should be restorable after a failed backup"
     );
 }
 
+/// A run killed part-way leaves the store exactly as the last good version.
+///
+/// This is the property the commit record buys, and it is what the old design
+/// could not promise: the previous version's data records are already on the
+/// device, and an unfinished run's records sit after them with no commit record
+/// of their own. The next run reclaims the space and the version that was there
+/// before is still restorable, and still the latest.
 #[test]
-fn an_empty_index_left_by_a_crash_is_skipped() {
+fn an_unfinished_run_leaves_the_previous_version_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    assert_eq!(count_entries(dir.path(), "snap.bin"), 1);
+
+    // Append a blob record that is then cut short, which is what a torn write at
+    // the tail of an interrupted run looks like: the header is there and the
+    // payload is not all of it. No commit record follows it, because the run
+    // never reached one.
+    let mut bytes = fs::read(dir.path().join("snap.bin")).unwrap();
+    bytes.extend_from_slice(b"LPB1\x00\x80\x01");
+    bytes.extend_from_slice(&[0u8; 16]);
+    bytes.extend_from_slice(b"half a record");
+    fs::write(dir.path().join("snap.bin"), &bytes).unwrap();
+
+    // The half-written record is not a version, and the one before it still is.
+    ok(dir.path(), &["restore", "out", "snap"]);
+    assert_eq!(
+        common::describe(&dir.path().join("src")),
+        common::describe(&dir.path().join("out")),
+        "the version before the torn record should still restore"
+    );
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        1,
+        "a torn record at the tail must not be counted as a version"
+    );
+
+    // And the next run reclaims the space and publishes over the top of it.
+    ok(dir.path(), &["backup", "src", "snap"]);
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        2,
+        "the recovery should have discarded the torn tail rather than keeping it"
+    );
+
+    ok(dir.path(), &["restore", "out2", "snap"]);
+    assert_eq!(
+        common::describe(&dir.path().join("src")),
+        common::describe(&dir.path().join("out2"))
+    );
+}
+
+/// A blob the store is missing is a damaged store, not a missing version.
+#[test]
+fn a_truncated_store_reports_a_damaged_store() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
 
     ok(dir.path(), &["backup", "src", "snap"]);
 
-    // A process killed after claiming version 2 leaves the file but never fills
-    // it in. It must not be mistaken for the latest usable version.
-    fs::write(dir.path().join("snap.002.idx"), b"").unwrap();
+    // Cut the store inside the records, so the last version's snapshot is not
+    // wholly present. The version is still committed, so the report has to be
+    // about damage rather than about the version being absent.
+    let bytes = fs::read(dir.path().join("snap.bin")).unwrap();
+    fs::write(dir.path().join("snap.bin"), &bytes[..bytes.len() - 40_000]).unwrap();
 
-    ok(dir.path(), &["restore", "out", "snap"]);
-
-    ok(dir.path(), &["backup", "src", "snap"]);
+    let error = fails(dir.path(), &["restore", "out", "snap"]);
     assert!(
-        dir.path().join("snap.003.idx").is_file(),
-        "version 2 should have been skipped, not reused"
+        error.contains("no committed version"),
+        "the version's commit record is in the chopped-off tail, so the right \
+         report is that the store holds no version: {error}"
+    );
+
+    // Cutting less off leaves the commit record in place and destroys the data it
+    // names. That is the case the store has to detect itself.
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    // Lop off the last chunk's worth of payload without reaching the commit
+    // record, which is written after all of the data.
+    let store = dir.path().join("snap.bin");
+    let bytes = fs::read(&store).unwrap();
+    let keep = bytes.len() - 20_000;
+    fs::write(&store, &bytes[..keep]).unwrap();
+
+    let listed = ok(dir.path(), &["versions", "snap", "--numbers-only"]);
+    assert_eq!(
+        listed.trim(),
+        "",
+        "a commit record whose payload is not all there must not be counted: {listed}"
     );
 }
 
@@ -302,8 +450,8 @@ fn restoring_a_name_with_no_snapshots_explains_itself() {
 
     let error = fails(dir.path(), &["restore", "out", "ghost"]);
     assert!(
-        error.contains("no usable snapshot") && error.contains("ghost"),
-        "the error should name what was looked for: {error}"
+        error.contains("no backup store at ghost.bin"),
+        "the error should name what it looked for and where: {error}"
     );
 }
 
@@ -315,7 +463,7 @@ fn restoring_an_absent_version_names_the_version() {
 
     let error = fails(dir.path(), &["restore", "out", "snap", "--version", "42"]);
     assert!(
-        error.contains("42") && error.contains("empty or malformed"),
+        error.contains("42") && error.contains("does not exist"),
         "the error should name the version and why: {error}"
     );
 }
@@ -346,7 +494,6 @@ fn a_backup_set_named_with_an_extension_keeps_it() {
     ok(dir.path(), &["backup", "src", "photos.tar"]);
 
     assert!(dir.path().join("photos.tar.bin").is_file());
-    assert!(dir.path().join("photos.tar.001.idx").is_file());
     assert!(
         !dir.path().join("photos.bin").exists(),
         "the base name's extension should not be replaced"
@@ -362,8 +509,8 @@ fn a_backup_set_can_live_in_a_subdirectory() {
     ok(dir.path(), &["backup", "src", "data/deep/snap"]);
     ok(dir.path(), &["restore", "out", "data/deep/snap"]);
 
-    assert!(dir.path().join("data/deep/snap.001.idx").is_file());
-    assert!(dir.path().join("data/deep/snap.002.idx").is_file());
+    assert!(dir.path().join("data/deep/snap.bin").is_file());
+    assert_eq!(count_entries(dir.path(), "data/deep/snap"), 2);
     assert_eq!(
         common::describe(&dir.path().join("src")),
         common::describe(&dir.path().join("out"))

@@ -10,10 +10,10 @@ fn sample() -> Snapshot {
         mode: 0o644,
         mtime: None,
     });
-    snapshot.chunks.push(metadata::Chunk {
-        hash: [7u8; 32],
-        location: r#"{"offset":0,"length":10}"#.into(),
-    });
+    // A chunk is the BLAKE3 of its contents, and that is also how the store
+    // finds it — so a snapshot records content identity and nothing about where
+    // the bytes happen to sit in a file.
+    snapshot.chunks.push([7u8; 32]);
     snapshot.file_chunks.push(metadata::FileChunk {
         chunk_index: 0,
         file_index: 0,

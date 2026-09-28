@@ -82,7 +82,7 @@ use std::{fmt::Write as _, time::Instant};
 
 use lepatch::{
     command::{Options, backup},
-    storage::BlobFileStorage,
+    storage::BlobStore,
 };
 
 /// Files in the tree. Enough for per-file costs to show, small enough that a
@@ -257,7 +257,7 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
     // report a throughput nothing else would ever see.
     let _ = std::fs::remove_file(blob);
 
-    let storage = BlobFileStorage::<true>::new(blob).await.expect("store");
+    let storage = BlobStore::<true>::open(blob).await.expect("store");
     let cpu_before = cpu_seconds();
     let started = Instant::now();
     backup(src, options, storage).await.expect("backup");

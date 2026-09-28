@@ -26,7 +26,7 @@ use std::{hint::black_box, io::Cursor, path::PathBuf};
 
 use criterion::{Criterion, Throughput};
 use lepatch::{
-    metadata::{Chunk, File, FileChunk, Snapshot},
+    metadata::{File, FileChunk, Snapshot},
     reader::{Chunker, ChunkerConfig},
 };
 use tempfile::TempDir;
@@ -96,11 +96,11 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
     });
 
     for i in 0..chunks {
-        let hash = *blake3::hash(&u64::try_from(i).unwrap_or(0).to_le_bytes()).as_bytes();
-        snapshot.chunks.push(Chunk {
-            hash,
-            location: format!(r#"{{"version":1,"offset":{},"length":16384}}"#, i * 16384),
-        });
+        // A chunk is the BLAKE3 of its contents, and that is also its address in
+        // the store, so a snapshot records no location of its own.
+        snapshot
+            .chunks
+            .push(*blake3::hash(&u64::try_from(i).unwrap_or(0).to_le_bytes()).as_bytes());
         snapshot.file_chunks.push(FileChunk {
             chunk_index: u32::try_from(i).unwrap_or(0),
             file_index: 0,

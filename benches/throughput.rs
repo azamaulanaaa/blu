@@ -80,7 +80,7 @@ use std::{
 use criterion::{Criterion, Throughput};
 use lepatch::{
     command::{Options, backup, restore},
-    storage::BlobFileStorage,
+    storage::BlobStore,
 };
 use tempfile::TempDir;
 
@@ -159,17 +159,17 @@ fn bench_backup(c: &mut Criterion) {
                         // would ever see.
                         let _ = std::fs::remove_file(&blob);
 
-                        let storage = BlobFileStorage::<true>::new(&blob).await.expect("store");
+                        let storage = BlobStore::<true>::open(&blob).await.expect("store");
                         let options = Options {
                             concurrency,
                             ..Options::default()
                         };
 
                         let started = Instant::now();
-                        let key = backup(&src, options, storage).await.expect("backup");
+                        let committed = backup(&src, options, storage).await.expect("backup");
                         elapsed += started.elapsed();
 
-                        black_box(key);
+                        black_box(committed.version);
                     }
 
                     elapsed
@@ -188,8 +188,8 @@ fn bench_restore(c: &mut Criterion) {
     let blob = dir.path().join("store.bin");
     let rt = runtime();
 
-    let key = rt.block_on(async {
-        let storage = BlobFileStorage::<true>::new(&blob).await.expect("store");
+    let committed = rt.block_on(async {
+        let storage = BlobStore::<true>::open(&blob).await.expect("store");
         backup(&src, Options::default(), storage)
             .await
             .expect("backup")
@@ -207,10 +207,10 @@ fn bench_restore(c: &mut Criterion) {
                     let destination = dir.path().join("out");
                     let _ = std::fs::remove_dir_all(&destination);
 
-                    let storage = BlobFileStorage::<false>::new(&blob).await.expect("store");
+                    let storage = BlobStore::<false>::open(&blob).await.expect("store");
 
                     let started = Instant::now();
-                    restore(&destination, key.clone(), storage)
+                    restore(&destination, committed.snapshot, storage)
                         .await
                         .expect("restore");
                     elapsed += started.elapsed();
@@ -236,16 +236,18 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
     let out = dir.path().join("out");
     let rt = runtime();
 
-    let key = rt.block_on(async {
-        let storage = BlobFileStorage::<true>::new(&blob).await.expect("store");
+    let committed = rt.block_on(async {
+        let storage = BlobStore::<true>::open(&blob).await.expect("store");
         backup(&src, Options::default(), storage)
             .await
             .expect("backup")
     });
 
     rt.block_on(async {
-        let storage = BlobFileStorage::<false>::new(&blob).await.expect("store");
-        restore(&out, key, storage).await.expect("restore");
+        let storage = BlobStore::<false>::open(&blob).await.expect("store");
+        restore(&out, committed.snapshot, storage)
+            .await
+            .expect("restore");
     });
 
     for i in 0..FILES {

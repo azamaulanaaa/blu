@@ -6,7 +6,7 @@ mod pipeline;
 mod restore;
 mod verify;
 
-pub use backup::{Options, backup};
+pub use backup::{Committed, Options, backup};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Restored, lock_destination, restore,
 };

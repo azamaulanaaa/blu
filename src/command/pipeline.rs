@@ -53,12 +53,6 @@ struct Stored {
     hash: [u8; 32],
     /// The file slices this chunk covers.
     sources: Vec<reader::ChunkSource>,
-    /// Where the content lives, once someone has put it there.
-    ///
-    /// The same value for every chunk of the same content, whichever of them did
-    /// the storing, so the committer can allocate a chunk index from whichever
-    /// of them it reaches first and have the rest reuse it.
-    chunk: metadata::Chunk,
 }
 
 /// One hash's cell in the run's deduplication map, filled exactly once.
@@ -66,7 +60,13 @@ struct Stored {
 /// Every chunk with the same content fills the same cell: the first to arrive
 /// stores it, the rest wait and reuse the result. Nothing is stored twice,
 /// however many stores happen to be running.
-type Slot = Arc<OnceCell<metadata::Chunk>>;
+///
+/// The store deduplicates too — it will not write a blob it already holds — so
+/// this is not what makes deduplication correct. It is what keeps a run from
+/// handing the store the same content once per copy of it: the store's index is
+/// only updated once a blob is written, so concurrent duplicates would each miss
+/// it and each write.
+type Slot = Arc<OnceCell<()>>;
 
 /// Deduplication state shared by every store in flight.
 type Slots = Arc<Mutex<HashMap<[u8; 32], Slot>>>;
@@ -159,23 +159,15 @@ pub(super) struct Pipeline<S> {
     root: PathBuf,
     /// Each regular file's index, by relative path.
     file_index: HashMap<PathBuf, u32>,
-    /// Chunks a previous snapshot already holds, so they are not stored again.
-    base_chunks: Arc<HashMap<[u8; 32], metadata::Chunk>>,
     pub(super) storage: Arc<S>,
     slots: Slots,
 }
 
-impl<S: storage::StoragePut + storage::StorageGet + 'static> Pipeline<S> {
-    pub(super) fn new(
-        root: PathBuf,
-        file_index: HashMap<PathBuf, u32>,
-        base_chunks: Arc<HashMap<[u8; 32], metadata::Chunk>>,
-        storage: S,
-    ) -> Arc<Self> {
+impl<S: storage::StoragePut + 'static> Pipeline<S> {
+    pub(super) fn new(root: PathBuf, file_index: HashMap<PathBuf, u32>, storage: S) -> Arc<Self> {
         Arc::new(Self {
             root,
             file_index,
-            base_chunks,
             storage: Arc::new(storage),
             slots: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -380,15 +372,15 @@ fn commit_ready<S>(
         // failed outright at high concurrency, under load.
         //
         // Deciding by the order results are committed in removes the assumption
-        // entirely. Every chunk of the same content carries the same stored
-        // location, so whichever reaches this point first allocates the index and
-        // the rest reuse it — which is the same answer a purely sequential run
-        // gives, and the same one every time.
+        // entirely. Every chunk of the same content carries the same hash, so
+        // whichever reaches this point first allocates the index and the rest
+        // reuse it — which is the same answer a purely sequential run gives,
+        // and the same one every time.
         let chunk_index = if let Some(&existing) = index_of.get(&stored.hash) {
             existing
         } else {
             let index = index_to_u32(snapshot.chunks.len())?;
-            snapshot.chunks.push(stored.chunk);
+            snapshot.chunks.push(stored.hash);
             index_of.insert(stored.hash, index);
             index
         };
@@ -447,37 +439,27 @@ async fn store_chunk<S: storage::StoragePut + 'static>(
         Arc::clone(map.entry(hash).or_insert_with(|| Arc::new(OnceCell::new())))
     };
 
-    let chunk = slot
-        .get_or_try_init(|| async {
-            // Content the base snapshot already holds is not stored again,
-            // which is the whole point of an incremental backup.
-            if let Some(base) = pipeline.base_chunks.get(&hash) {
-                return Ok(base.clone());
-            }
+    // The store decides whether this content is already held. A chunk the store
+    // has seen in *any* earlier version costs nothing here, which is what
+    // incremental backup is: not "the same tree again" but "nothing new to
+    // store", however far back the content was last seen.
+    slot.get_or_try_init(|| async {
+        let len = u64::try_from(data.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "chunk of {} bytes does not fit in a blob length",
+                    data.len()
+                ),
+            )
+        })?;
 
-            let len = u64::try_from(data.len()).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "chunk of {} bytes does not fit in a blob length",
-                        data.len()
-                    ),
-                )
-            })?;
-
-            let location = pipeline
-                .storage
-                .put(Box::new(Cursor::new(data)), len)
-                .await?;
-
-            Ok::<metadata::Chunk, io::Error>(metadata::Chunk { hash, location })
-        })
-        .await?;
-
-    Ok(Stored {
-        seq,
-        hash,
-        sources,
-        chunk: chunk.clone(),
+        pipeline
+            .storage
+            .put(&hash, Box::new(Cursor::new(data)), len)
+            .await
     })
+    .await?;
+
+    Ok(Stored { seq, hash, sources })
 }

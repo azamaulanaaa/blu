@@ -6,14 +6,15 @@ shifts only the chunks around it. Repeated content is stored once, both within a
 single backup and across every version that follows it.
 
 > **Status: pre-release.** The on-disk format is versioned and refuses to read a
-> snapshot it does not understand, but the layout itself is not stable yet. Do
-> not point this at anything you cannot afford to re-take.
+> store it does not understand, but the layout itself is not stable yet. Do not
+> point this at anything you cannot afford to re-take.
 
 ## Usage
 
 ```console
-$ lepatch backup ~/Documents docs      # creates docs.bin and docs.001.idx
-$ lepatch backup ~/Documents docs      # creates docs.002.idx, reusing chunks
+$ lepatch backup ~/Documents docs      # creates docs.bin, version 1
+$ lepatch backup ~/Documents docs      # version 2, reusing chunks
+$ lepatch versions docs                # list the versions
 $ lepatch verify docs                  # check the stored chunks
 $ lepatch restore /tmp/docs-restored docs
 ```
@@ -58,14 +59,22 @@ verbatim and resolved by whoever follows it: a tree containing a link to
 A backup set is named after a base path, which is treated as an opaque prefix:
 
 ```text
-docs.bin          append-only blob store
-docs.001.idx      one small index per version, holding that version's key
-docs.002.idx
+docs.bin          the store: every chunk, every snapshot, and a commit record per version
 docs.lock         held while a backup is writing
 ```
 
 The base name is a prefix, not a stem, so a set called `docs.tar` produces
 `docs.tar.bin` — no part of the name is silently reinterpreted.
+
+There is no second file. Versions used to be recorded in one small index file
+each, which made publishing a version a cross-file commit: an index named an
+offset inside the store, and nothing could make the two land together. A power cut
+could leave the index durable and the bytes it named unwritten, or the index's own
+directory entry missing while its contents were on the device. Now the store
+records its own versions, so publishing one is a single append to a single file
+and there is no ordering between two files to get right. Losing an index used to
+mean losing a backup whose bytes were still in the file, with no way to find them;
+losing nothing now loses nothing.
 
 ## What is preserved
 
@@ -82,14 +91,24 @@ outside the tree being backed up. Device nodes, FIFOs and sockets are skipped.
 
 The parts that matter when a backup runs unattended:
 
-- **A version is only published if it completed.** The index file is claimed
-  before the work starts and removed again on failure, so an interrupted run
-  never becomes the "latest" version. A process killed outright leaves a
-  skipped version number and an empty index, which is ignored rather than
-  mistaken for a finished one.
+- **A version is only published if it completed.** A run writes its chunks, then
+  its snapshot, then one commit record naming it — and the data is made durable
+  *before* the commit record is. That ordering is the whole guarantee, and it is
+  two syncs rather than one because pages within a file reach the device in no
+  particular order: with a single sync the page holding the commit record can
+  arrive while an earlier data page has not, and then the store holds a version
+  whose data is not there. A run that stops before the commit leaves nothing
+  published, and the next run's recovery scan discards the tail it left behind.
+  A killed run leaves no skipped version numbers to reason about, because a
+  version number is a position in the store's own log.
 - **Nothing is written from a corrupt store.** Every chunk is checked against
-  the hash recorded when it was written before restore writes a single byte.
+  the hash it is addressed by before restore writes a single byte. A chunk's
+  address *is* the hash of its contents, so this is one check rather than two.
   `lepatch verify` runs the same check without restoring.
+- **A file that is not a store is never modified.** Opening one for writing
+  recovers it by discarding an unfinished run, so a store written by a build that
+  predates this one would be destroyed by the very pass meant to read it. It is
+  refused instead, with a message saying so, and left exactly as it was.
 - **A file that changes mid-backup fails the backup.** Each file's chunks are
   checked against the length recorded when the tree was walked, so a file that
   grew or shrank while being read is an error rather than a snapshot whose
@@ -137,14 +156,19 @@ Stated rather than discovered:
 - **Ctrl-C stops the run and tidies up.** `SIGINT` and `SIGTERM` are both handled,
   the exit code follows the shell convention (130 and 143), and any claim on a
   backup set or a destination is released on the way out. What is *not* undone is
-  work already done: a killed backup leaves its version unclaimed and its
-  uploaded chunks unreferenced, which is harmless, and a killed merging restore
-  leaves whatever it had written.
+  work already done: a killed backup leaves no commit record, so no version is
+  published, and the chunks it did store are reclaimed by the next run, and a
+  killed merging restore leaves whatever it had written.
 - **The format limits above are for restore.** A backup holds one bounded window
   of chunks regardless of tree size, so it streams.
-- **The on-disk format is not stable.** `FORMAT_VERSION` guards it, so a snapshot
-  from an older build is reported as an unsupported version rather than misread,
-  but the versions are not interchangeable and the crate is not published. The
+- **The on-disk format is not stable, and changing it loses existing backup
+  sets.** `FORMAT_VERSION` guards the snapshot encoding and a store carries its
+  own version in its header, so a store from an older build is *reported* as
+  unreadable rather than misread — but it is not converted, and the old bytes
+  stay where they are. An older store is a bare concatenation of blobs with a
+  separate index file per version, and there is nothing in it that says where one
+  blob ends, so there is no way to walk one. Treat a format change as a reason to
+  re-take your backups. The crate is not published, and the
   encoding is hand-written in `src/metadata/codec.rs` rather than delegated, so
   there is no upstream whose policy can decide whether your backup set can still
   be read — which is how `bincode` came to be on an advisory list in the first
@@ -155,18 +179,27 @@ Stated rather than discovered:
 The crate is usable directly:
 
 ```rust
-use lepatch::{command::{Options, backup, restore}, storage::BlobFileStorage};
+use lepatch::{command::{Options, backup, restore}, storage::BlobStore};
 
-let store = BlobFileStorage::<true>::new("docs.bin").await?;
-let key = backup("~/Documents", Options::default(), store).await?;
+let store = BlobStore::<true>::open("docs.bin").await?;
+let first = backup("~/Documents", Options::default(), store).await?;
 
-let store = BlobFileStorage::<false>::new("docs.bin").await?;
-restore("~/Documents-restored", key, store).await?;
+// Later backups need nothing passed to deduplicate: the store holds every
+// version it has ever been given, so a chunk it already has is not written
+// again however far back it was last seen.
+let store = BlobStore::<true>::open("docs.bin").await?;
+backup("~/Documents", Options::default(), store).await?;
+
+let store = BlobStore::<false>::open("docs.bin").await?;
+restore("~/Documents-restored", first.snapshot, store).await?;
 ```
 
-Pass the previous run's key as `Options::base_key` to deduplicate against it.
-The `WRITE` const generic on `BlobFileStorage` is what stops a read-only restore
-from being handed something that can append to the store.
+`backup` returns a `Committed`: the version number the run was given and the hash
+of the snapshot it published. A version is a position in the store's commit
+records, so `store.versions()` and `store.snapshot(n)` address them directly.
+
+The `WRITE` const generic on `BlobStore` is what stops a read-only restore from
+being handed something that can append to the store.
 
 ## Releases
 

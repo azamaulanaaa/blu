@@ -21,24 +21,24 @@ use std::{
 
 use lepatch::{
     command::restore,
-    metadata::{Chunk, Dir, File, FileChunk, Link, LinkKind, Snapshot},
-    storage::{BlobFileStorage, StoragePut},
+    metadata::{Dir, File, FileChunk, Link, LinkKind, Snapshot},
+    storage::{BlobId, BlobStore, StoragePut},
 };
 
-/// A blob store holding a forged snapshot, and the key it is under.
+/// A store holding a forged snapshot, and the hash it is under.
 struct Forged {
     dir: tempfile::TempDir,
     blob: PathBuf,
-    key: String,
+    snapshot: BlobId,
 }
 
 impl Forged {
-    /// Store `snapshot` in a fresh blob store, with its chunks' contents
-    /// available so a restore that gets as far as writing would succeed.
+    /// Store `snapshot` in a fresh store, with its chunks' contents available so
+    /// a restore that gets as far as writing would succeed.
     async fn new(mutate: impl FnOnce(&mut Snapshot)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("store.bin");
-        let storage = BlobFileStorage::<true>::new(&blob).await.unwrap();
+        let storage = BlobStore::<true>::open(&blob).await.unwrap();
 
         let mut snapshot = Snapshot::new();
         mutate(&mut snapshot);
@@ -46,17 +46,14 @@ impl Forged {
         // Give every referenced chunk real content, so a restore that passes the
         // path checks goes on to succeed and the test can tell the two apart.
         let payload = b"OWNED\n";
-        let location = storage
-            .put(Box::new(Cursor::new(payload.to_vec())), 6)
+        let hash = *blake3::hash(payload).as_bytes();
+        storage
+            .put(&hash, Box::new(Cursor::new(payload.to_vec())), 6)
             .await
             .unwrap();
-        let hash = *blake3::hash(payload).as_bytes();
 
-        while snapshot.chunks.len() < snapshot.chunks.len().max(1) {
-            snapshot.chunks.push(Chunk {
-                hash,
-                location: location.clone(),
-            });
+        if snapshot.chunks.is_empty() {
+            snapshot.chunks.push(hash);
         }
 
         for slice in &mut snapshot.file_chunks {
@@ -67,18 +64,25 @@ impl Forged {
 
         let encoded = snapshot.to_bytes();
         let len = u64::try_from(encoded.len()).unwrap();
-        let key = storage
-            .put(Box::new(Cursor::new(encoded)), len)
+        let id = *blake3::hash(&encoded).as_bytes();
+        storage
+            .put(&id, Box::new(Cursor::new(encoded)), len)
             .await
             .unwrap();
 
-        Self { dir, blob, key }
+        // No commit: these snapshots are handed to a restore directly, and a
+        // version of the store is not what is under test here.
+        Self {
+            dir,
+            blob,
+            snapshot: id,
+        }
     }
 
     /// Restore into `dest`, and report the error if it refused.
     async fn restore_into(&self, dest: &Path) -> Result<(), String> {
-        let storage = BlobFileStorage::<false>::new(&self.blob).await.unwrap();
-        match restore(dest, self.key.clone(), storage).await {
+        let storage = BlobStore::<false>::open(&self.blob).await.unwrap();
+        match restore(dest, self.snapshot, storage).await {
             Ok(_) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
@@ -223,9 +227,9 @@ async fn an_ordinary_symbolic_link_out_of_the_tree_is_restored() {
     std::os::unix::fs::symlink("../nowhere", src.join("dangling")).unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&src, &blob, None).await;
+    let committed = common::run_backup(&src, &blob).await;
     let dest = dir.path().join("restored");
-    common::run_restore(&blob, &key, &dest).await;
+    common::run_restore(&blob, committed.snapshot, &dest).await;
 
     assert_eq!(
         fs::read_link(dest.join("to-etc")).unwrap(),
@@ -249,7 +253,7 @@ async fn a_file_is_not_written_through_a_symlink_left_by_an_earlier_restore() {
     fs::write(src.join("thing"), b"second version").unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&src, &blob, None).await;
+    let committed = common::run_backup(&src, &blob).await;
 
     // A first restore that leaves a link where the file will go.
     let dest = dir.path().join("restored");
@@ -258,7 +262,7 @@ async fn a_file_is_not_written_through_a_symlink_left_by_an_earlier_restore() {
     fs::write(&victim, b"do not touch").unwrap();
     std::os::unix::fs::symlink(&victim, dest.join("thing")).unwrap();
 
-    common::run_restore(&blob, &key, &dest).await;
+    common::run_restore(&blob, committed.snapshot, &dest).await;
 
     assert_eq!(
         fs::read(&victim).unwrap(),
@@ -279,9 +283,9 @@ async fn an_ordinary_tree_still_restores() {
     fs::write(src.join("top.txt"), b"top").unwrap();
 
     let blob = dir.path().join("store.bin");
-    let key = common::run_backup(&src, &blob, None).await;
+    let committed = common::run_backup(&src, &blob).await;
     let dest = dir.path().join("restored");
-    common::run_restore(&blob, &key, &dest).await;
+    common::run_restore(&blob, committed.snapshot, &dest).await;
 
     assert_eq!(common::describe(&src), common::describe(&dest));
 }

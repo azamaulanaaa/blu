@@ -1,10 +1,11 @@
 //! On-disk description of a backup.
 //!
-//! A snapshot is serialised into a single blob in the storage backend and is
-//! referenced from an index file by its storage key. Because the blob is written
-//! once and read back arbitrarily far in the future, the encoding is explicitly
-//! framed with a magic prefix and a format version so that a layout change is
-//! reported as such instead of surfacing as a confusing deserialisation error.
+//! A snapshot is serialised into a single blob in the storage backend, and the
+//! store's commit record names it by the BLAKE3 hash of those bytes. Because the
+//! blob is written once and read back arbitrarily far in the future, the
+//! encoding is explicitly framed with a magic prefix and a format version so
+//! that a layout change is reported as such instead of surfacing as a confusing
+//! deserialisation error.
 //!
 //! The wire format itself is hand-written; see the `codec` submodule for why, and
 //! for the layout.
@@ -12,6 +13,8 @@
 mod codec;
 
 use std::{fmt, path::PathBuf};
+
+use crate::storage;
 
 /// Magic prefix identifying a lepatch snapshot blob.
 pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
@@ -21,12 +24,13 @@ pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
 /// Bump this whenever the shape of [`Snapshot`], or the encoding in `codec`,
 /// changes in a way that makes previously written blobs undecodable.
 ///
-/// This is 2. Version 1 was bincode, whose encoding was fixed-width little
-/// endian; this one is the hand-written format and the two are not
-/// interchangeable. Snapshots written by an older build are reported as an
-/// unsupported version rather than misread, which is the whole reason the header
-/// exists.
-pub const FORMAT_VERSION: u32 = 2;
+/// This is 3. Version 2 recorded, for each chunk, both its content hash and a
+/// storage key naming a byte offset — the hash to deduplicate by, the offset to
+/// read from. The store's own index answers "where is this content" now, so the
+/// key is gone and a chunk is a bare hash. A snapshot is smaller for it, and it
+/// is the reason a store can be read back without trusting anything outside it.
+/// Version 1 was bincode, whose encoding was fixed-width little endian.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Reasons a snapshot blob could not be decoded.
 ///
@@ -121,7 +125,14 @@ pub struct Snapshot {
     /// Directories, including ones that contain no files.
     pub dirs: Vec<Dir>,
     /// Distinct chunk contents, referenced by `FileChunk::chunk_index`.
-    pub chunks: Vec<Chunk>,
+    ///
+    /// Each entry is the BLAKE3 hash of a chunk's contents, and that hash is
+    /// also how the store finds the bytes. A snapshot used to carry a second
+    /// copy of where each chunk lived, as a string of JSON naming an offset and
+    /// a length; the store keeps that mapping in its own index now, so a
+    /// snapshot is a description of the tree and nothing about the file it
+    /// happens to be in.
+    pub chunks: Vec<storage::BlobId>,
     /// Placement of each chunk slice within each file.
     pub file_chunks: Vec<FileChunk>,
     /// Symbolic and hard links, which carry no content of their own.
@@ -201,16 +212,6 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A distinct chunk of file content, addressed by its content hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunk {
-    /// BLAKE3 hash of the chunk contents, used for deduplication and to verify
-    /// the chunk on restore.
-    pub hash: [u8; 32],
-    /// Storage key the chunk contents can be read back from.
-    pub location: String,
 }
 
 /// Whether a [`Link`] shares an inode with another file or points elsewhere.

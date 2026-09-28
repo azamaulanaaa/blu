@@ -1,4 +1,4 @@
-//! Isolate `BlobFileStorage::put` from everything else.
+//! Isolate `BlobStore::put` from everything else.
 //!
 //! The end-to-end numbers cannot separate "the store is slow" from "the machine
 //! is busy", and both halves of the pipeline have been blamed incorrectly in
@@ -13,7 +13,7 @@
 use std::io::Cursor;
 use std::time::Instant;
 
-use lepatch::storage::{BlobFileStorage, StoragePut};
+use lepatch::storage::{BlobStore, StoragePut};
 
 const CHUNK: usize = 64 * 1024;
 const CHUNKS: usize = 1500;
@@ -23,7 +23,7 @@ fn payload(seed: u8) -> Vec<u8> {
     vec![seed; CHUNK]
 }
 
-async fn put_all(store: std::sync::Arc<BlobFileStorage<true>>) -> f64 {
+async fn put_all(store: std::sync::Arc<BlobStore<true>>) -> f64 {
     let start = Instant::now();
 
     let mut in_flight = Vec::new();
@@ -33,13 +33,16 @@ async fn put_all(store: std::sync::Arc<BlobFileStorage<true>>) -> f64 {
             let store = std::sync::Arc::clone(&store);
             async move {
                 let data = payload(seed);
+                // The store checks this itself, so the address is the payload's
+                // own hash rather than anything the caller invented.
+                let id = *blake3::hash(&data).as_bytes();
                 store
                     .put(
+                        &id,
                         Box::new(Cursor::new(data)) as lepatch::storage::StreamReadSeeker,
                         CHUNK as u64,
                     )
                     .await
-                    .map(|_| ())
             }
         }));
 
@@ -98,11 +101,7 @@ async fn main() {
     // growth that every later run gets for free.
     for _ in 0..2 {
         let _ = std::fs::remove_file(&store_path);
-        let store = std::sync::Arc::new(
-            BlobFileStorage::<true>::new(&store_path)
-                .await
-                .expect("store"),
-        );
+        let store = std::sync::Arc::new(BlobStore::<true>::open(&store_path).await.expect("store"));
         put_all(store.clone()).await;
     }
     let _ = write_all_blocking(&plain_path);
@@ -112,11 +111,7 @@ async fn main() {
 
     for _ in 0..5 {
         let _ = std::fs::remove_file(&store_path);
-        let store = std::sync::Arc::new(
-            BlobFileStorage::<true>::new(&store_path)
-                .await
-                .expect("store"),
-        );
+        let store = std::sync::Arc::new(BlobStore::<true>::open(&store_path).await.expect("store"));
         store_times.push(put_all(store.clone()).await);
         plain_times.push(write_all_blocking(&plain_path));
     }
