@@ -29,7 +29,7 @@ pub(super) fn concurrency(ceiling: usize) -> usize {
 /// error is mapped to [`io::ErrorKind::InvalidData`] rather than surfaced as the
 /// decoder's own type, because every caller here is already an `io::Result` and a
 /// malformed snapshot is a damaged store either way.
-pub(super) async fn load_snapshot<S: crate::storage::StorageGet>(
+pub async fn load_snapshot<S: crate::storage::StorageGet>(
     storage: &S,
     snapshot_id: crate::storage::BlobId,
 ) -> io::Result<crate::metadata::Snapshot> {

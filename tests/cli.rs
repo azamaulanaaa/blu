@@ -50,6 +50,24 @@ fn ok(dir: &Path, args: &[&str]) -> String {
     stdout(&output)
 }
 
+/// Run the binary, require success, and return its **diagnostics**.
+///
+/// Progress, warnings and summaries go to stderr; stdout carries only the data a
+/// command produces. Tests about what a run *said* want this, and tests about what
+/// it *produced* want [`ok`].
+fn ok_logs(dir: &Path, args: &[&str]) -> String {
+    let output = lepatch(dir, args);
+    assert!(
+        output.status.success(),
+        "`lepatch {}` failed with {:?}\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        output.status.code(),
+        stdout(&output),
+        stderr(&output)
+    );
+    stderr(&output)
+}
+
 fn fails(dir: &Path, args: &[&str]) -> String {
     let output = lepatch(dir, args);
     assert!(
@@ -613,13 +631,13 @@ fn quiet_suppresses_progress_and_verbose_adds_detail() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
 
-    let quiet = ok(dir.path(), &["--quiet", "backup", "src", "snap"]);
+    let quiet = ok_logs(dir.path(), &["--quiet", "backup", "src", "snap"]);
     assert!(
         quiet.is_empty(),
         "--quiet should print nothing on success, got: {quiet}"
     );
 
-    let verbose = ok(dir.path(), &["--verbose", "backup", "src", "snap"]);
+    let verbose = ok_logs(dir.path(), &["--verbose", "backup", "src", "snap"]);
     assert!(
         !verbose.is_empty(),
         "--verbose should report more than the default"
@@ -671,7 +689,7 @@ fn a_run_says_that_it_is_making_progress() {
     fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
     fs::write(source.join("b.bin"), noisy(200_000)).unwrap();
 
-    let backup = ok(dir.path(), &["backup", "source", "store"]);
+    let backup = ok_logs(dir.path(), &["backup", "source", "store"]);
     assert!(
         backup.contains("in progress"),
         "a backup said nothing while it ran:\n{backup}"
@@ -683,13 +701,13 @@ fn a_run_says_that_it_is_making_progress() {
         "the opening progress line should report the file count:\n{backup}"
     );
 
-    let restored = ok(dir.path(), &["restore", "out", "store"]);
+    let restored = ok_logs(dir.path(), &["restore", "out", "store"]);
     assert!(
         restored.contains("in progress"),
         "a restore said nothing while it ran:\n{restored}"
     );
 
-    let verified = ok(dir.path(), &["verify", "store"]);
+    let verified = ok_logs(dir.path(), &["verify", "store"]);
     assert!(
         verified.contains("in progress"),
         "a verify said nothing while it ran:\n{verified}"
@@ -713,7 +731,7 @@ fn progress_reporting_can_be_turned_off() {
         .output()
         .expect("failed to run the lepatch binary");
 
-    let text = stdout(&output);
+    let text = stderr(&output);
     assert!(
         !text.contains("in progress"),
         "progress was not silenced:\n{text}"
@@ -741,7 +759,7 @@ fn a_restore_merges_by_default_and_says_so() {
     fs::create_dir_all(&destination).unwrap();
     fs::write(destination.join("stale.bin"), b"from last week").unwrap();
 
-    let merged = ok(dir.path(), &["restore", "out", "store"]);
+    let merged = ok_logs(dir.path(), &["restore", "out", "store"]);
     assert!(
         destination.join("stale.bin").exists(),
         "a merging restore should not delete what it did not write"
@@ -1102,5 +1120,95 @@ fn a_clean_restore_is_never_left_partly_written() {
     assert!(
         leftovers.is_empty(),
         "a killed --clean restore left {leftovers:?} behind"
+    );
+}
+
+/// `lepatch pack` writes a file a client can fetch in one range.
+///
+/// The three properties that make a pack usable as a distributed artifact, checked
+/// through the command line rather than the library, because the command is what
+/// a user has:
+/// it can be produced at all; the same version packs to the same bytes whatever
+/// the set has done since; and a later version is a different artifact.
+#[test]
+fn a_pack_is_written_deterministically_and_per_version() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        fs::write(
+            dir.path().join(format!("f{i}.bin")),
+            noisy(200_000 + i * 30_000),
+        )
+        .unwrap();
+    }
+
+    ok(dir.path(), &["backup", ".", "set"]);
+    let first = ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    // The content hash is on stdout, and it is the pack's name: the same tree
+    // packs to the same bytes, so a cache can be keyed on it and a client can
+    // verify with one comparison.
+    let hash_of = |text: &str| {
+        text.lines()
+            .next()
+            .expect("the pack command should print the content hash")
+            .split_whitespace()
+            .next()
+            .expect("the hash should be the first field")
+            .to_owned()
+    };
+    assert_eq!(hash_of(&first).len(), 64, "expected a 32-byte hex digest");
+
+    // Same version, written again: identical bytes. A pack that varied would
+    // defeat the caching the hash is for.
+    ok(dir.path(), &["pack", "set", "v1-again.pack"]);
+    assert_eq!(
+        fs::read(dir.path().join("v1.pack")).unwrap(),
+        fs::read(dir.path().join("v1-again.pack")).unwrap(),
+        "packing the same version twice produced different bytes"
+    );
+
+    // Change a file and take a second version. That is a different artifact, and
+    // the first is still reproducible from the set afterwards — which is the
+    // property that makes a pack derived output rather than a second copy.
+    fs::write(dir.path().join("f2.bin"), noisy(230_000)).unwrap();
+    ok(dir.path(), &["backup", ".", "set"]);
+    let second = ok(dir.path(), &["pack", "set", "v2.pack"]);
+
+    assert_ne!(
+        hash_of(&first),
+        hash_of(&second),
+        "a changed tree produced the same pack"
+    );
+
+    ok(
+        dir.path(),
+        &["pack", "set", "v1-later.pack", "--version", "1"],
+    );
+    assert_eq!(
+        fs::read(dir.path().join("v1.pack")).unwrap(),
+        fs::read(dir.path().join("v1-later.pack")).unwrap(),
+        "version 1 should still pack to the same bytes after version 2 exists"
+    );
+}
+
+/// A pack reports a version the set does not hold rather than packing the wrong
+/// one.
+///
+/// `--version` is a number a user types, so it is exactly the input a stale script
+/// or a typo produces, and the failure has to be a refusal.
+#[test]
+fn packing_a_version_that_does_not_exist_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.bin"), noisy(50_000)).unwrap();
+    ok(dir.path(), &["backup", ".", "set"]);
+
+    let output = lepatch(dir.path(), &["pack", "set", "out.pack", "--version", "9"]);
+    assert!(
+        !output.status.success(),
+        "packing a version that does not exist should fail"
+    );
+    assert!(
+        !dir.path().join("out.pack").exists(),
+        "a refused pack should not leave a file behind"
     );
 }

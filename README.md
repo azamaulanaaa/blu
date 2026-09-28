@@ -18,10 +18,16 @@ $ lepatch versions docs                # list the versions
 $ lepatch verify docs                  # check the stored chunks
 $ lepatch restore /tmp/docs-restored docs
 $ lepatch reindex docs                 # rebuild the per-version index files
+$ lepatch pack docs game.pack          # one version as a single distributable file
 ```
 
-`--version N` selects a specific version; without it, restore and verify use the
-most recent one that completed successfully.
+`--version N` selects a specific version; without it, restore, verify and pack use
+the most recent one that completed successfully.
+
+**stdout is data, stderr is diagnostics.** `pack` prints the pack's content hash and
+`versions --numbers-only` prints a version per line, both meant to be captured, so
+progress and summary lines go to stderr. Every command is pipeable without
+`--quiet`.
 
 ### Restoring
 
@@ -178,6 +184,11 @@ one comparison.
 and the snapshot alone, and losing one loses nothing. The store's commit records
 remain the record of what versions exist, which is why nothing reads a pack to answer
 that.
+
+`lepatch pack <set> <out>` writes one, and prints its content hash — which is its
+name, since the same tree packs to the same bytes. `--version N` packs a specific
+version, and re-packing version 1 after version 2 exists reproduces the original
+bytes exactly.
 
 Where a header's counts and its own index could disagree, the pack is refused rather
 than one of them believed: the index is what locates chunks, so if the two disagree
