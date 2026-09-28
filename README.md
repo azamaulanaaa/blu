@@ -411,6 +411,33 @@ To have the fast checks run on every commit:
 $ git config core.hooksPath .githooks
 ```
 
+### CI
+
+`.github/workflows/ci.yml` runs one job per check, named after the mise task that
+runs the same command, so a red job is reproducible locally with `mise run <name>`.
+`test` runs on Linux, macOS and Windows; everything else runs once on Linux.
+
+Two things about the workflow are deliberate and worth knowing before changing
+them:
+
+- **The release gate is hand-edited, not generated.** `release.yml` is written by
+  `dist generate` and then edited to make publishing depend on this workflow, so
+  its bytes never match a regeneration and `dist generate --check` would always
+  fail. What is protected instead is the *gate* — a `release-config` job greps for
+  the two edits, so a regeneration that forgets them fails CI rather than
+  quietly letting a tag publish without passing it.
+- **The token is read-only here.** This workflow is called by the release workflow,
+  which needs `contents: write`, and a called workflow inherits the caller's
+  token. The explicit `permissions: contents: read` is what stops the lint, test
+  and coverage jobs from running with write access to the repository every time a
+  release is cut.
+
+Actions are referenced by tag rather than by commit SHA. That is the usual
+weakness in a workflow like this one — tags are mutable, so whoever controls the
+tag controls the code that runs with this repository's token — and pinning is
+worth doing, but it needs the real SHAs resolved rather than guessed, plus
+something to keep them current.
+
 ## License
 
 GPL-2.0-or-later. See [LICENSE](LICENSE).

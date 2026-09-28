@@ -1,5 +1,15 @@
 name: CI
 
+# Nothing here writes to the repository: these jobs read the checkout and publish
+# artifacts, nothing more. Saying so explicitly is not tidiness, though. This
+# workflow is *called* by release.yml, which grants `contents: write` because it
+# has to create a release, and a called workflow inherits the caller's token. So
+# without this line the lint, test and coverage jobs all run with write access to
+# the repository whenever a release is being cut — the widest token, on the
+# machines that run third-party actions, for jobs that need no write at all.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -9,6 +19,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+# Three of the eight jobs compile cargo-llvm-cov or cargo-dist from source, and the
+# test matrix is three operating systems, so a superseded run is real minutes of
+# runner time. Without this, pushing a second commit while the first is still
+# running queues the entire suite again and both results are equally irrelevant.
+#
+# Not set for tag pushes: a release run must finish even if something is pushed
+# meanwhile, so it gets its own group that nothing cancels.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 # One job per check, named after the mise task that runs the same command, so a
 # failure here is reproducible locally with `mise run <name>`.
@@ -63,17 +84,25 @@ jobs:
         uses: Swatinem/rust-cache@v2
       # llvm-cov instruments the test binary rather than sampling, so the number
       # is exact and does not drift between runs of the same commit.
+      #
+      # One invocation, not two. The default report goes to stdout as well as
+      # producing the HTML, so a separate `--summary-only` run would only re-run
+      # the whole instrumented suite to print a number this step already prints.
+      #
+      # `--output-dir`, not `--output-path`: `--output-path` is rejected alongside
+      # `--html`, and this step was failing for that reason alone. The report also
+      # lands in a `html/` subdirectory of whatever is passed, which is why the
+      # upload below points at `target/llvm-cov/html` and not `target/llvm-cov`.
+      #
+      # The HTML is uploaded rather than only summarised: a bare percentage says
+      # which commit regressed, not which lines.
       - name: Measure coverage
-        run: cargo llvm-cov --all-features --summary-only --locked
-      # An HTML report is uploaded rather than only summarised: a bare percentage
-      # says which commit regressed, not which lines.
-      - name: Collect HTML report
-        run: cargo llvm-cov --all-features --html --locked --output-path target/llvm-cov
+        run: cargo llvm-cov --all-features --html --locked --output-dir target/llvm-cov
       - name: Upload report
         uses: actions/upload-artifact@v4
         with:
           name: coverage-html
-          path: target/llvm-cov
+          path: target/llvm-cov/html
           retention-days: 7
 
   msrv:
