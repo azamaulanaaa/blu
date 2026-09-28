@@ -15,12 +15,9 @@ use crate::{
     storage::{self, StreamReadSeeker, hex},
 };
 
-/// Files to write at once.
-///
-/// Restore is almost entirely waiting — on the store, and on the disk it is
-/// writing to — so several files in flight is what keeps either from sitting
-/// idle. The cap is what keeps a tree of a million small files from opening a
-/// million of them at once.
+/// Files to write at once. Restore is almost entirely waiting, so several in
+/// flight is what keeps the store and the disk both busy; the cap keeps a tree of
+/// a million small files from opening a million of them.
 const RESTORE_CONCURRENCY: usize = 8;
 
 /// How many files to write at once.
@@ -30,10 +27,8 @@ fn restore_concurrency() -> usize {
 
 /// What a restore put into the destination.
 ///
-/// Reported so a caller can say what happened rather than only that something
-/// did. It is also the only way to tell, from the outside, that a restore left
-/// the destination holding more than the snapshot accounts for: a restore merges
-/// by default, and that is a choice the user is entitled to know about.
+/// A restore merges by default, so this is also the only way to tell from the
+/// outside that the destination may hold more than the snapshot accounts for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Restored {
     /// Regular files written.
@@ -69,19 +64,16 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     snapshot_id: storage::BlobId,
     storage: S,
 ) -> io::Result<Restored> {
-    // Shared, not copied. A clone of the chunk table is one allocation per chunk
-    // in the store — paid on top of the tree, on top of the snapshot, on top of
-    // the decoded bytes, for a value nothing ever writes to. The write tasks need
-    // owned data, and sharing is how they get it without the copy.
+    // Shared, not copied: the write tasks need owned data, and a clone of the
+    // chunk table would be one allocation per chunk in the store.
     let snapshot = Arc::new(super::load_snapshot(&storage, snapshot_id).await?);
 
     let root = root.as_ref();
     let storage = Arc::new(storage);
 
-    // Nothing below can detect damaged chunk data on its own — a short read
-    // would just leave a file quietly filled with the wrong bytes — so the
-    // whole snapshot is checked against the hashes its chunks are addressed by
-    // before a single byte is written.
+    // Nothing below can detect damaged chunk data on its own — a short read would
+    // leave a file quietly filled with the wrong bytes — so the whole snapshot is
+    // checked before a single byte is written.
     super::verify::check(&snapshot, Arc::clone(&storage))
         .await
         .into_result()
@@ -92,9 +84,8 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
             )
         })?;
 
-    // And the paths it would write are checked here, for the same reason and
-    // with the same guarantee: a snapshot is untrusted input, and nothing should
-    // be created on disk until it is known to be safe to create it.
+    // And the paths it would write, for the same reason: a snapshot is untrusted
+    // input, and nothing goes on disk until it is known to be safe there.
     check_paths(&snapshot).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -119,16 +110,14 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
 /// Resolve a path recorded in a snapshot against the restore root, refusing
 /// anything that would land outside it.
 ///
-/// A snapshot is a blob in a file that gets synced, shared and backed up like
-/// anything else, so its contents are untrusted input: a tampered or hostile
-/// store would otherwise choose what a restore writes and where. Every recorded
-/// path goes through here — directories, files, and both halves of a link — and
-/// the check is on the *recorded* path, before it is joined, because a `..`
-/// buried in the middle is just as effective as one at the front.
+/// A snapshot is a blob in a file that gets synced, shared and backed up, so its
+/// contents are untrusted input: a hostile store would otherwise choose what a
+/// restore writes and where. Every recorded path goes through here — directories,
+/// files, and both halves of a link — and the check is on the *recorded* path,
+/// before joining, so a `..` anywhere is caught.
 ///
-/// Only `..` and absolute paths are rejected. `.` and repeated separators are
-/// harmless and normalise to the same place, so there is no reason to refuse
-/// them.
+/// Only `..` and absolute paths are refused; `.` and repeated separators
+/// normalise to the same place.
 fn resolve(root: &Path, recorded: &Path, kind: &str) -> io::Result<PathBuf> {
     if recorded.as_os_str().is_empty() {
         return Err(io::Error::new(
@@ -168,10 +157,9 @@ fn resolve(root: &Path, recorded: &Path, kind: &str) -> io::Result<PathBuf> {
 
 /// Check every path a snapshot records, before anything is written.
 ///
-/// The verify pass already refuses a damaged store before a single byte is
-/// written, and a hostile snapshot deserves the same courtesy: finding out that
-/// entry 900,001 of a million escapes the destination after writing the other
-/// 900,000 would leave a tree that is neither the old one nor the new one.
+/// The whole snapshot is checked before a byte is written, so finding out that
+/// entry 900,001 of a million escapes the destination afterwards would leave a
+/// tree that is neither the old one nor the new one.
 fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
     let probe = Path::new(".");
 
@@ -186,15 +174,11 @@ fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
     for link in &snapshot.links {
         resolve(probe, &link.path, "a link")?;
 
-        // A hard link's target names another entry in the tree, so it is
-        // resolved against the root and has to stay inside it.
-        //
-        // A symbolic link's target does not: it is written into the link
-        // verbatim and resolved by whoever follows it later, wherever it
-        // happens to point. A tree containing a link to `/etc/passwd` is an
-        // ordinary tree, and reproducing it faithfully is the whole job — so
-        // refusing those would break restoring real backups to accommodate a
-        // threat that does not apply to them.
+        // A hard link's target names another entry in the tree, so it is resolved
+        // against the root and has to stay inside it. A symbolic link's target
+        // does not: it is written verbatim and resolved by whoever follows it.
+        // A tree containing a link to `/etc/passwd` is an ordinary tree, and
+        // reproducing it faithfully is the job.
         if link.kind == metadata::LinkKind::Hard {
             resolve(probe, &link.target, "a hard link target")?;
         }
@@ -216,17 +200,13 @@ pub const PREVIOUS_SUFFIX: &str = "lepatch-restore-previous";
 
 /// Held for as long as a destination is being written to.
 ///
-/// A restore creates or overwrites every file in a tree. Two of them at once
-/// would interleave — one truncating a file while the other is halfway through
-/// writing it — and neither would end up with the tree it meant to produce. The
-/// claim is a file beside the destination rather than inside it, so it does not
-/// turn up in the restored output.
+/// Two restores into one destination would interleave — one truncating a file
+/// while the other is halfway through writing it. The claim is a file *beside* the
+/// destination, so it never appears in the restored output.
 ///
-/// It also owns the scratch directories a `--clean` restore assembles in, so a
-/// run that is *interrupted* rather than failing — Ctrl-C, a `kill` — does not
-/// leave half a tree on disk. The `Drop` that releases the claim runs in that
-/// case precisely because the work future is dropped rather than resumed, which
-/// is what makes it the right place.
+/// Its `Drop` removes the claim together with any `--clean` scratch directories,
+/// and a run killed rather than failing drops the work future, so an interrupted
+/// restore leaves no half-written tree.
 #[derive(Debug)]
 pub struct DestinationLock {
     path: PathBuf,
@@ -239,8 +219,7 @@ pub struct DestinationLock {
 impl Drop for DestinationLock {
     fn drop(&mut self) {
         for path in &self.scratch {
-            // A successful swap has already renamed both away, so this is a
-            // no-op in the ordinary case and the cleanup in every other one.
+            // A successful swap has already renamed them away.
             let _ = fs::remove_dir_all(path);
         }
 
@@ -253,14 +232,13 @@ impl Drop for DestinationLock {
 /// # Errors
 ///
 /// Returns an error if the claim cannot be created, including when another
-/// restore already holds it. A claim left behind by a killed run has to be
-/// removed by hand, exactly as for a backup set.
+/// restore already holds it. A claim left behind by a killed run must be removed
+/// by hand, exactly as for a backup set.
 pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
-    // `.` and `/` have no file name of their own, and a lock beside them would
-    // be named after nothing — which is an error from the filesystem, not a
-    // useful message. Canonicalising first turns every spelling of a directory
-    // into one with a real name; a destination that does not exist yet has to
-    // keep the name it was given, since that is the directory being claimed.
+    // `.` and `/` have no file name, and a lock beside them would be named after
+    // nothing. Canonicalising gives every spelling of a directory one real name;
+    // one that does not exist yet keeps the name it was given, since that is the
+    // directory being claimed.
     let resolved = fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf());
 
     let name = resolved
@@ -279,19 +257,15 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
 
     let path = resolved.with_file_name(format!("{name}.{DESTINATION_LOCK}"));
 
-    // The two scratch siblings a `--clean` restore works through. Registered
-    // before the claim is taken so that nothing can create them without also
-    // being covered by the cleanup.
+    // Registered before the claim is taken, so nothing can create them without
+    // also being covered by the cleanup.
     let scratch = [PARTIAL_SUFFIX, PREVIOUS_SUFFIX]
         .map(|suffix| resolved.with_file_name(format!("{name}.{suffix}")))
         .into();
 
     // The claim is a sibling of the destination, so it needs the destination's
     // parent to exist. Restoring into `mnt/new/photos` is an ordinary thing to
-    // want and the restore itself would have created the missing directories
-    // anyway — without this the claim is the only part that cannot cope with a
-    // path that is not there yet, and the run fails with a bare ENOENT before it
-    // starts.
+    // want, and without this the run fails with a bare ENOENT before it starts.
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && !parent.is_dir()
@@ -343,22 +317,14 @@ async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()>
 }
 
 /// Create and fill every regular file, a few at a time.
-///
-/// Files are independent of each other here: hard links are made in a later
-/// phase, once every file is at its final size, so nothing about this loop can
-/// be observed by another file being written at the same time.
 async fn restore_files<S: storage::StorageGet + 'static>(
     root: &Path,
     snapshot: Arc<Snapshot>,
     storage: Arc<S>,
 ) -> io::Result<u64> {
-    // Grouped by *index* into `snapshot.file_chunks`, not by copying the slices.
-    //
-    // Copying them was the obvious way to get owned data out here and it cost a
-    // second full set of chunk slices on top of the snapshot for no reason. The
-    // snapshot is shared rather than cloned for the same reason, and that one
-    // matters more: every `Chunk` holds a `String`, so cloning the table meant a
-    // fresh allocation per chunk in the store, on top of the tree's own.
+    // Grouped by *index* into `snapshot.file_chunks`. Copying the slices would
+    // cost a second full set on top of the snapshot, and cloning the snapshot
+    // would cost an allocation per chunk in the store.
     let mut slices: Vec<Vec<usize>> = vec![Vec::new(); snapshot.files.len()];
     for (position, file_chunk) in snapshot.file_chunks.iter().enumerate() {
         let index = file_chunk.file_index as usize;
@@ -374,14 +340,11 @@ async fn restore_files<S: storage::StorageGet + 'static>(
     let concurrency = restore_concurrency();
     let total_files = u64::try_from(snapshot.files.len()).unwrap_or(0);
 
-    // Unlike a backup, the work is known up front: the snapshot says how many
-    // files there are, so this one can say how far along it is.
+    // Unlike a backup, the total is known up front, so this reports a fraction.
     let mut progress = Progress::new("restore");
     progress.set("files", total_files);
     progress.report();
 
-    // Counted as the files complete, so the caller can be told how much was
-    // written rather than only that something was.
     let mut written: u64 = 0;
 
     let mut writing = JoinSet::new();
@@ -416,15 +379,14 @@ async fn restore_files<S: storage::StorageGet + 'static>(
             Some(Err(join)) => {
                 return Err(io::Error::other(format!("a restore task failed: {join}")));
             }
-            // A finished file reports how many bytes it actually wrote, which is
-            // what the rate is computed from.
+            // A finished file reports the bytes it actually wrote, which is what
+            // the rate is computed from.
             Some(Ok(Ok(file_bytes))) => {
                 progress.add("done", 1);
                 progress.add("written", file_bytes);
                 progress.report();
                 written = written.saturating_add(file_bytes);
             }
-            // An empty set means keep going.
             None => {}
         }
     }
@@ -432,11 +394,10 @@ async fn restore_files<S: storage::StorageGet + 'static>(
     Ok(written)
 }
 
-/// One file.s worth of work, owned so it can outlive the loop that queued it.
+/// One file's worth of work, owned so it can outlive the loop that queued it.
 ///
-/// The snapshot is shared rather than copied: its chunk table is one allocation
-/// per chunk in the store, and a copy of it would be paid again on top of the
-/// tree being restored.
+/// The snapshot is shared rather than copied, so a task can hold a reference
+/// without paying an allocation per chunk in the store.
 struct RestoreJob {
     /// Where the file goes, already joined onto the restore root.
     path: PathBuf,
@@ -455,22 +416,16 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
         snapshot,
     } = job;
 
-    // Created before the content, at its final size, so that a file with no
-    // chunk slices still comes back and so there is never a moment where the
-    // file exists at the wrong length.
+    // Created before the content, at its final size, so an empty file still
+    // comes back and the file is never momentarily the wrong length.
     if let Some(parent) = path.parent() {
         fs_async::create_dir_all(parent).await?;
     }
 
-    // Anything already at this path is removed before the file is created,
-    // rather than being opened and truncated in place.
-    //
-    // A restore merges into its destination, so on a second run the path may
-    // hold a symbolic link from the first — and opening a file for writing
-    // *follows* a symbolic link. A tree that once had `link -> /etc` would end
-    // up with the next restore writing through `link` and truncating whatever
-    // it pointed at. Links are already removed before they are recreated; this
-    // is the same rule applied to files, and it closes the same hole.
+    // Removed rather than opened and truncated in place: opening for write
+    // *follows* a symbolic link, so a `link -> /etc` left by an earlier run would
+    // otherwise be written through and its target truncated. Links are removed
+    // before being recreated for the same reason.
     remove_existing(&path)?;
 
     let mut handle = fs_async::OpenOptions::new()
@@ -483,8 +438,8 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
     handle.set_len(file.len).await?;
 
     for position in slices {
-        // Borrowed from the shared snapshot rather than owned, which is the whole
-        // reason the positions were kept instead of copies of the slices.
+        // Borrowed from the shared snapshot, which is why positions were kept
+        // rather than copies of the slices.
         let Some(file_chunk) = snapshot.file_chunks.get(position) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -533,11 +488,9 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
         }
     }
 
-    // Guard against a gap in the recorded slices, which would otherwise leave a
-    // hole of zeroes in the middle of the file.
+    // Closes a recorded slice gap, which would otherwise leave zeroes mid-file.
     handle.set_len(file.len).await?;
 
-    // What the file turned out to be, for the progress line.
     Ok(file.len)
 }
 
@@ -597,6 +550,7 @@ fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     Ok(())
 }
 
+/// Apply one entry's recorded mode and modification time.
 fn apply(path: &Path, mode: u32, mtime: Option<metadata::Timestamp>) -> io::Result<()> {
     fsattr::set_mode(path, mode)?;
     if let Some(mtime) = mtime {
