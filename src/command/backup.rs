@@ -1,10 +1,7 @@
 //! Recording what a directory tree contains, and handing the contents over to be
-//! stored.
-//!
-//! This is the part of a backup that knows about the filesystem: walking, telling
-//! a file from a link from a directory, and writing down everything a restore
-//! will need to put the tree back. What happens to the file *contents* once they
-//! have been read belongs to [`super::pipeline`].
+//! stored: walking, telling a file from a link from a directory, and writing down
+//! what a restore needs to put the tree back. What happens to the file contents
+//! once read belongs to [`super::pipeline`].
 
 use std::{
     collections::HashMap,
@@ -21,11 +18,9 @@ use walkdir::WalkDir;
 use crate::{command::pipeline, fsattr, metadata, reader, storage};
 
 /// Uploads to run at once when the caller has not asked for a specific number.
-///
-/// Uploads are I/O bound, so oversubscribing the machine a little is what keeps
-/// them from stalling on round trips. The cap stops a many-core host from
-/// opening an unbounded number of blobs at the store at once, which for a
-/// remote backend is a way to get rate limited rather than to go faster.
+/// I/O bound, so a little oversubscription keeps them from stalling on round
+/// trips; the cap stops a many-core host opening an unbounded number of blobs at
+/// a remote store.
 const DEFAULT_CONCURRENCY: usize = 8;
 
 /// Hard ceiling on [`Options::concurrency`], whatever the caller asks for.
@@ -47,8 +42,7 @@ pub struct Options {
     /// order, and therefore the snapshot, is decided by the order chunks were
     /// *read* in, not by the order they finished uploading.
     ///
-    /// Values above 32 are treated as 32, and `0` as `1`, rather than being
-    /// rejected — this is a tuning knob, not a correctness setting.
+    /// Values above 32 are treated as 32, and `0` as `1`, rather than rejected.
     pub concurrency: usize,
 }
 
@@ -75,7 +69,7 @@ pub struct Committed {
     pub snapshot: storage::BlobId,
 }
 
-/// Uploads to run at once when the caller has not asked for a specific number.
+/// Uploads to run at once, bounded by what the machine can do.
 fn default_concurrency() -> usize {
     super::concurrency(DEFAULT_CONCURRENCY)
 }
@@ -124,15 +118,9 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     let root = root.as_ref();
     let concurrency = effective_concurrency(concurrency);
 
-    // Walking stats every entry in the tree, which blocks; reading and hashing
-    // the contents blocks and burns CPU. Both halves of that are the pipeline's
-    // job, run on blocking threads, while the only part that actually waits on
-    // anything — storing a chunk — runs concurrently on the async pool.
-    //
-    // The walk goes first and on its own, because the snapshot it records and
-    // the file index the pipeline needs have to exist before the first chunk
-    // comes back. It touches metadata only, so it is cheap next to reading the
-    // contents that follows it.
+    // The walk goes first and on its own: the snapshot it records and the file
+    // index the pipeline needs have to exist before the first chunk comes back,
+    // and it touches metadata only.
     let walk_root = root.to_path_buf();
     let excluded: Vec<PathBuf> = exclude.iter().map(|p| normalise(p)).collect();
 
@@ -144,9 +132,8 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
         .await
         .map_err(|join| io::Error::other(format!("the walk thread failed: {join}")))??;
 
-    // Counted before the index is moved into the pipeline, for its opening
-    // progress line: the walk knows how many files there are before a single one
-    // has been read.
+    // Counted before the index moves into the pipeline, so the opening progress
+    // line can report the file total before a single one is read.
     let files = u64::try_from(file_index.len()).unwrap_or(0);
 
     let pipeline = pipeline::Pipeline::new(root.to_path_buf(), file_index, storage);
@@ -155,14 +142,11 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
         .run(paths, config, concurrency, files, &mut snapshot)
         .await?;
 
-    // The chunker stats each file when it is registered and reads it again
-    // later, so a file that changed size in between would silently shift every
-    // subsequent chunk into the wrong file. Checking the reassembled lengths
-    // against what the walk recorded turns that into a hard failure.
+    // The chunker stats each file when it is registered and reads it again later,
+    // so a file that changed size in between would silently shift every
+    // subsequent chunk into the wrong file.
     verify_file_lengths(&snapshot)?;
 
-    // Infallible: every field of a snapshot is a number, a byte string or a
-    // byte array, so there is nothing here that can fail to be represented.
     let buffer = snapshot.to_bytes();
 
     // The snapshot is a blob like any other, addressed by the hash of its own
@@ -177,10 +161,8 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
         .put(&id, Box::new(Cursor::new(buffer)), len)
         .await?;
 
-    // The run's one data sync. Everything this run wrote — every chunk and the
-    // snapshot — is on the device before the commit record exists, which is what
-    // makes the commit safe to make durable. See `storage::blob` for why the
-    // commit is a second sync rather than part of this one.
+    // The run's one data sync, before the commit record exists. See
+    // `storage::blob` for why the commit is a second sync.
     pipeline.storage.sync_data().await?;
 
     let version = pipeline.storage.commit(&id).await?;
@@ -217,8 +199,8 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 .map_err(io::Error::other)?
                 .to_path_buf();
 
-            // The backup root itself is the destination on restore, so it is
-            // never recorded as an entry of its own.
+            // The backup root is the destination on restore, so it is never
+            // recorded as an entry of its own.
             if relative_path.as_os_str().is_empty() && meta.is_dir() {
                 return Ok(None);
             }
@@ -234,8 +216,7 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 return Ok(None);
             }
 
-            // Directories are recorded so that empty ones and their permissions
-            // survive a restore.
+            // Recorded so empty ones and their permissions survive a restore.
             if meta.is_dir() {
                 snapshot.dirs.push(metadata::Dir {
                     path: relative_path,
@@ -245,17 +226,11 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 return Ok(None);
             }
 
-            // Anything that is not a regular file and not one of the three cases
-            // above is a named pipe, a socket or a device node. Reading one is not
-            // slow, it never returns: opening a FIFO for reading blocks until a
-            // writer appears, so a tree containing one would hang the run
-            // forever — and, because this binary handles SIGTERM to release its
-            // claims, the signal would be caught by a handler that could not
-            // unwind a thread parked in `read`.
-            //
-            // So they are skipped, and said so, because a file in the tree that
-            // the backup does not contain is exactly the thing a user needs to
-            // know rather than discover.
+            // A named pipe, socket or device node. Reading one never returns —
+            // opening a FIFO for reading blocks until a writer appears — so they
+            // are skipped rather than hanging the run, and the skip is logged: a
+            // file in the tree the backup does not contain is what a user needs
+            // told.
             if !meta.is_file() {
                 tracing::info!(
                     path = %relative_path.display(),
@@ -316,9 +291,7 @@ fn normalise(path: &Path) -> PathBuf {
 /// Narrow a collection index to the `u32` the snapshot format stores.
 ///
 /// Wrapping instead of failing would point a file or chunk reference at a
-/// different entry, so the limit is reported rather than crossed. At the default
-/// chunk size `u32::MAX` chunks is a quarter of a petabyte of data, and
-/// `u32::MAX` files is unreachable in practice.
+/// different entry, so the limit is reported rather than crossed.
 pub(super) fn index_to_u32(index: usize) -> io::Result<u32> {
     u32::try_from(index).map_err(|_| {
         io::Error::new(
@@ -379,6 +352,7 @@ fn verify_file_lengths(snapshot: &metadata::Snapshot) -> io::Result<()> {
     Ok(())
 }
 
+/// A file's identity on disk, for telling hard links apart.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 struct FileId {
     volume_id: u64,
@@ -391,9 +365,8 @@ impl FileId {
         None
     }
 
-    // The signature is uniform across platforms even though the unix
-    // implementation below always succeeds: the other `cfg` variants genuinely
-    // return `None`, and callers should not have to care which one they got.
+    // Uniform across platforms, though the unix variant always succeeds: the
+    // others genuinely return `None` and callers should not have to care which.
     #[cfg(unix)]
     #[allow(clippy::unnecessary_wraps)]
     fn from_metadata(meta: &fs::Metadata) -> Option<FileId> {

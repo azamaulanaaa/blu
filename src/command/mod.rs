@@ -15,26 +15,19 @@ pub use restore::{
 };
 pub use verify::{Failure, Report, verify};
 
-/// How many things to work on at once, given a ceiling for what is worth doing.
-///
-/// The machine's parallelism, clamped into `1..=ceiling`. A single helper for
-/// all three operations, because they had drifted: two clamped the low end and one
-/// used `min`, so a platform reporting no usable parallelism would have had a
-/// backup run with a concurrency of zero and a restore fall back to one.
+/// How many things to work on at once: the machine's parallelism, clamped into
+/// `1..=ceiling` so a platform reporting none cannot produce a concurrency of
+/// zero.
 pub(super) fn concurrency(ceiling: usize) -> usize {
     std::thread::available_parallelism().map_or(ceiling, |n| n.get().clamp(1, ceiling))
 }
 
 /// Read a version's snapshot out of a store and decode it.
 ///
-/// Restore and verify both need this and had it written out twice; a pack needs it
-/// too, for the plan it packs. The decode error is mapped to
-/// [`io::ErrorKind::InvalidData`] rather than surfaced as the decoder's own type,
+/// Read whole, since a snapshot is held in memory while it is verified, restored
+/// or packed. A decode failure is reported as [`io::ErrorKind::InvalidData`],
 /// because every caller is already an `io::Result` and a malformed snapshot is a
 /// damaged store either way.
-///
-/// The snapshot is read whole, which is the same limit the rest of the crate has:
-/// a snapshot is held in memory while it is verified, restored or packed.
 ///
 /// # Errors
 ///
