@@ -6,25 +6,17 @@
 //! across all segments. Nothing outside the segments is needed to read a set, and
 //! nothing outside them is trusted to say what is in it.
 //!
-//! # Why segments, and what it costs
+//! # Format guarantees
 //!
-//! A single file that grows without bound eventually meets a limit that is
-//! somebody else's decision: a filesystem's maximum file size, a tool that
-//! cannot read it, a transfer that has to succeed in one piece. Segments under a
-//! fixed limit avoid all three, and a numbered segment can be moved, verified or
-//! replaced on its own.
-//!
-//! The property that makes it safe is that **a full segment is sealed**. Nothing
-//! writes to a sealed segment again, so a torn write can only ever be in the last
-//! one. A segment that is not last and has a tail which does not verify is
-//! therefore *corruption*, not an unfinished run, and is refused rather than
-//! truncated — the previous design had no way to tell those apart, and treating
-//! corruption as an unfinished run is how a damaged backup gets quietly trimmed
-//! down to whatever still parses.
-//!
-//! Records are never split across a boundary. A segment is sealed when the next
-//! record would not fit in it, so every record is whole within one file and a
-//! segment can be verified on its own.
+//! * A segment is **sealed** once the next record would not fit, and only the last
+//!   is written again. Records are never split across a boundary, so a segment can
+//!   be verified on its own.
+//! * A non-last segment with a tail that does not verify is *corruption*, not an
+//!   unfinished run, and is refused rather than truncated. Only the last
+//!   segment's tail is truncated, back to the end of its last valid record — which
+//!   is why a run may abandon a record mid-file: the scan stops at the hole, and
+//!   everything after it goes with it.
+//! * A file that does not begin with the store magic is refused, never truncated.
 //!
 //! # Commit protocol
 //!
@@ -34,31 +26,21 @@
 //! 2. one `sync_data`, which makes all of it durable;
 //! 3. the commit record, then one more `sync_data`.
 //!
-//! Two syncs rather than one, deliberately. A single sync after writing the
-//! commit record would be cheaper and is *not* correct: pages within a file are
-//! written back in no particular order, so the page holding the commit record
-//! can reach the device while an earlier data page has not. A crash then leaves
-//! a commit record naming data that is not there, and nothing in the store
-//! detects it — a digest over the records attests to what the payload *claims*,
-//! not to whether the payload is present. Ordering the two syncs is what makes
-//! the claim true, and two syncs on a run that takes seconds to hours is free.
+//! Two syncs rather than one: page write-back within a file is in no particular
+//! order, so a single sync after the commit record can leave a commit naming data
+//! that is not there, and a digest attests to what a payload *claims*, not to
+//! whether it is present. Two syncs on a run that takes seconds to hours is free.
 //!
-//! A crash before step 2 leaves a tail with no commit record, which the next
-//! open discards. A crash after step 3 leaves a whole committed run. There is
-//! no third outcome, which is the entire guarantee.
+//! A crash before step 2 leaves a tail with no commit record, which the next open
+//! discards. A crash after step 3 leaves a whole committed run. There is no third
+//! outcome, which is the entire guarantee.
 //!
 //! # Recovery
 //!
 //! Opening for writing scans every segment, and truncates the *last* one back to
-//! the end of its last valid record. That reclaims the space a failed run left
-//! behind — which the previous design could not do, because it had no way to tell
-//! a committed byte from an abandoned one — and it is why a run may abandon a
-//! record in the middle: nothing was committed, so the scan stops at the hole
-//! and everything after it goes with it.
-//!
-//! A segment that does not begin with the store magic is *not* truncated. It is
-//! refused, because a store from another build is a backup somebody cares about
-//! and a recovery scan that decides it is garbage would destroy it.
+//! the end of its last valid record, reclaiming the space a failed run left. A
+//! store from another build is a backup somebody cares about, so one that does
+//! not begin with the store magic is refused rather than scanned.
 
 use std::{
     collections::HashMap,
@@ -82,12 +64,8 @@ use crate::{
     storage::{self, BlobId, Compression, SegmentLimit, StreamReadSeeker, VersionIndex},
 };
 
-/// Copy buffer for a payload.
-///
-/// The payload is hashed on its way through, which is free for a chunk — that
-/// hash is what deduplication is keyed on — and this is the buffer it is done
-/// with. Also what coalesces the short reads a streaming backend hands out, so
-/// the store is not written one small read at a time.
+/// Copy buffer for a payload: where it is hashed on its way through, and what
+/// coalesces the short reads a streaming backend hands out.
 const COPY_BUFFER: usize = 256 * 1024;
 
 /// What a scan found, and what this handle may add to.
@@ -99,35 +77,24 @@ struct Contents {
     commits: Vec<BlobId>,
     /// How many commit records each segment holds, by segment number.
     ///
-    /// Seeded by the scan, so it is right for a set that was already there, and
-    /// grown by each commit, so a run that rolls over into a new segment starts it
-    /// at the right place. This is what an index file's ordinal is counted
-    /// against, and it has to be right or every index written after a rollover
-    /// would name the wrong commit record.
+    /// Seeded by the scan, grown by each commit. An index file's ordinal is
+    /// counted against this, so a rollover must not reset it.
     commits_per_segment: HashMap<u32, u32>,
 }
 
 impl Contents {
     /// Lock the contents, ignoring poisoning.
     ///
-    /// A panic while the lock was held would leave a half-updated index, but
-    /// unwinding through a backup aborts the run and the recovery scan on the
-    /// next open rebuilds the index from the files. The poison carries no
-    /// information worth propagating.
+    /// A panic mid-update leaves a half-updated index, but unwinding through a
+    /// backup aborts the run and the next open's scan rebuilds it from the files.
     fn lock(contents: &Mutex<Contents>) -> std::sync::MutexGuard<'_, Contents> {
         contents.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// Where the next record goes.
-///
-/// A reservation is a `(segment, offset)` rather than a bare offset, because the
-/// log spans several files. Taking one is a short critical section — a couple of
-/// comparisons and an addition — and the copy that follows happens outside it,
-/// which is what keeps uploads running in parallel. A lock held across the copy
-/// would serialise them, and that is the mistake the single-file design avoided
-/// by using one `fetch_add`; a rollover decision is not expressible as one
-/// atomic, so it takes a lock and that is the cost of segments.
+/// Where the next record goes: a `(segment, offset)` rather than a bare offset,
+/// because the log spans several files. Taking one is a short critical section,
+/// and the copy that follows happens outside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Reservation {
     /// Which segment the record goes in.
@@ -150,38 +117,31 @@ pub struct BlobStore<const WRITE: bool> {
     segments: Vec<PathBuf>,
     /// What the store holds, rebuilt by the scan that every open begins with.
     contents: Mutex<Contents>,
-    /// Where the next record goes, and how full the last segment is.
+    /// Where the next record goes, and how full the last segment is; seeded from
+    /// the end of the last valid record.
     ///
-    /// Seeded from the end of the last valid record. A failed record keeps the
-    /// range it claimed: reclaiming it would mean truncating past a writer that
-    /// has already been promised that space, and the recovery scan on the next
-    /// open reclaims the lot of them anyway.
+    /// A failed record keeps the range it claimed — the next open's scan reclaims
+    /// it, and reclaiming it here would mean truncating past a writer already
+    /// promised that space.
     reserved: Mutex<Reservation>,
     /// How large a segment may get. A write policy, not a format property, which
-    /// is why it is not recorded in the header: a set written under one limit
-    /// reads back under any other, because no record depends on where a boundary
-    /// fell.
+    /// is why it is not in the header: no record depends on where a boundary fell.
     limit: SegmentLimit,
-    /// How record payloads are compressed. A write policy for the same reason as
-    /// the segment limit, and a stronger one: each record names the codec it was
-    /// written with, so a set whose records were written at different levels, or
-    /// with compression off, still reads back correctly because nothing about a
-    /// record's interpretation depends on this value.
+    /// How record payloads are compressed. A write policy for the same reason, and
+    /// a stronger one: each record names its own codec.
     compression: Compression,
     /// Segments this run has written to, so `sync_data` knows which files to sync.
     ///
-    /// Empty until the first record, and not persisted: a run that wrote nothing
-    /// has nothing to sync, and a run that did has already synced by the time it
-    /// commits.
+    /// Not persisted: a run that wrote nothing has nothing to sync, and one that
+    /// did has synced by the time it commits.
     dirty: Mutex<Vec<u32>>,
 }
 
 impl<const WRITE: bool> BlobStore<WRITE> {
     /// The path of segment `segment`.
     ///
-    /// The last segment is the only one a run writes to; everything before it is
-    /// sealed. This is what a caller should name when it needs one file of a set
-    /// rather than the whole of it.
+    /// Every segment but the last is sealed, so this names the only one a run
+    /// writes to.
     #[must_use]
     pub fn segment_path(&self, segment: u32) -> PathBuf {
         self.set.blob_path(segment)
@@ -195,16 +155,14 @@ impl<const WRITE: bool> BlobStore<WRITE> {
 
     /// Every version this store holds, oldest first.
     ///
-    /// The commit records are the answer. The index files can only be as long as
-    /// this is, and are not consulted: a version whose index is missing still
-    /// exists, so counting the files would under-report a set whose index writes
-    /// were abandoned. [`crate::index::IndexSet::indexed_versions`] is the
-    /// file-name count, and it is a lower bound on this.
+    /// The commit records are the answer; the index files are not consulted,
+    /// because a version whose index write was abandoned still exists.
+    /// [`crate::index::IndexSet::indexed_versions`] is the file-name count, and
+    /// a lower bound on this.
     ///
     /// # Errors
     ///
-    /// Returns an error only if the version count does not fit in a `u32`, which
-    /// is four billion backups of one location.
+    /// Returns an error only if the version count does not fit in a `u32`.
     pub fn versions(&self) -> io::Result<Vec<u32>> {
         let commits = Contents::lock(&self.contents).commits.len();
         let count = u32::try_from(commits)
@@ -229,9 +187,7 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     /// Where the blob hashing to `id` sits in this store.
     ///
     /// The index a scan builds, answered directly. This is what
-    /// [`crate::storage::Plan`] resolves a snapshot against, and it is public
-    /// because anything that walks a version — a pack writer, a differ, a
-    /// uploader — needs locations and has no other way to get them.
+    /// [`crate::storage::Plan`] resolves a snapshot against.
     ///
     /// # Errors
     ///
@@ -253,38 +209,27 @@ impl<const WRITE: bool> BlobStore<WRITE> {
             })
     }
 
-    /// The snapshot a specific version names, using the per-version index file
-    /// when it can be trusted.
+    /// The snapshot a version names, via the per-version index file when it
+    /// verifies.
     ///
-    /// The file is **checked, not believed**: it must name a version this set
-    /// holds, a segment that exists, and a commit record in that segment whose
-    /// hash is the one the file claims. Anything else falls back to
-    /// [`BlobStore::snapshot`], so the answer is the store's either way — which is
-    /// what makes a file that is stale, edited, or copied from another set cost a
-    /// little time rather than correctness.
+    /// The file is **checked, not believed**: a version this set holds, a segment
+    /// that exists, and a commit record there with the hash the file claims.
+    /// Anything else falls back to [`BlobStore::snapshot`], so a stale, edited or
+    /// copied index costs a scan rather than correctness.
     ///
-    /// **This is not the fast path for a restore, and it is worth being honest
-    /// about why.** A restore needs every chunk a snapshot names, and locating
-    /// those is the blob index, which only a scan builds. So a caller that wants
-    /// one version still pays for the scan. What the index file does remove is the
-    /// scan for the *version list*: `lepatch versions` on a set of ten thousand
-    /// reads ten thousand file names instead of every record header in the set, and
-    /// a caller that only wants to know how far a set has got does not have to
-    /// open it at all.
+    /// This is not the fast path for a restore: a restore needs every chunk a
+    /// snapshot names, and those live in the blob index a scan builds. What it
+    /// removes is the scan for the *version list*.
     ///
-    /// The fallback is *reported*, because a caller asking this is trying to avoid
-    /// a scan and needs to know it did not get one. A version with no index file is
-    /// the ordinary case — the set has run since it was written — so that is a
-    /// debug line. An index that disagrees with the store is not ordinary, and
-    /// means a file is stale, edited, or copied from another set, so that is a
-    /// warning. Without this the two are indistinguishable from a version that does
-    /// not exist, and `lepatch versions` under-reports for reasons nobody can see.
+    /// The fallback is logged, because a caller asking this is trying to avoid a
+    /// scan and needs to know it did not get one: `debug` when no file exists, the
+    /// ordinary case for a version written before the set's last run, and `warn`
+    /// when one disagrees with the store.
     ///
     /// # Errors
     ///
-    /// Returns an error if the store has no such version, the same one
-    /// [`BlobStore::snapshot`] would give, so a caller cannot tell which path
-    /// answered — which is the point.
+    /// The error [`BlobStore::snapshot`] would give, so a caller cannot tell which
+    /// path answered.
     pub fn snapshot_via_index(&self, version: u32) -> io::Result<BlobId> {
         let versions = u32::try_from(Contents::lock(&self.contents).commits.len()).unwrap_or(0);
 
@@ -307,9 +252,8 @@ impl<const WRITE: bool> BlobStore<WRITE> {
 
     /// The snapshot a specific version names.
     ///
-    /// Answered from the in-memory index, which the open's scan built. That
-    /// index is not the per-version file: it is in memory, and it is always
-    /// complete, because it is derived from the store's own commit records.
+    /// From the in-memory index the open's scan built, not the per-version file.
+    /// Always complete, because it comes from the store's own commit records.
     ///
     /// # Errors
     ///
@@ -346,8 +290,7 @@ impl BlobStore<true> {
     /// necessary.
     ///
     /// Runs the recovery scan on a blocking thread: it is proportional to the
-    /// number of records in the set, which on a large one is long enough that
-    /// holding up the async pool while it happens would be visible.
+    /// record count, long enough on a large set to stall the async pool.
     ///
     /// # Errors
     ///
@@ -357,7 +300,7 @@ impl BlobStore<true> {
     /// which is reported rather than repaired, because a store written by another
     /// version is a backup and not a broken file; if the set is missing a segment
     /// in the middle; or if a *sealed* segment has a tail that does not verify,
-    /// which is corruption rather than an unfinished run and is never truncated.
+    /// which is corruption and is never truncated.
     #[instrument(skip_all, err)]
     pub async fn open<P: Into<PathBuf> + Debug>(
         path: P,
@@ -397,17 +340,12 @@ impl BlobStore<true> {
 impl BlobStore<false> {
     /// Open a set for reading.
     ///
-    /// The set must already exist and must be a store: reading a path that is not
-    /// one is an error rather than an empty backup set, so a mistyped name cannot
-    /// come back as "no versions".
+    /// The set must already exist and must be a store: a path that is not one is
+    /// an error, not an empty set, so a mistyped name cannot come back as "no
+    /// versions".
     ///
-    /// No `SegmentLimit`, unlike the writing constructor. A read does not roll
-    /// over and no record depends on where a segment boundary fell, so the value
-    /// a writer used is not needed to read what it wrote — and accepting a
-    /// parameter the function ignores is worse than an asymmetry. It was taken
-    /// only so the two constructors looked interchangeable, which is a property of
-    /// the signature rather than of the store, and it cost every reader a
-    /// `SegmentLimit::default()` that said nothing about the set being read.
+    /// No `SegmentLimit`, unlike the writing constructor: a read never rolls over
+    /// and no record depends on where a segment boundary fell.
     ///
     /// # Errors
     ///
@@ -448,11 +386,9 @@ impl BlobStore<false> {
 impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
     /// Open the blob with this content hash.
     ///
-    /// The returned stream yields the blob's **content**, decompressed if it is
-    /// stored compressed, and is bounded to that content — so nothing downstream
-    /// can read past it into its neighbour, and a caller comparing against a
-    /// length the snapshot recorded is comparing like with like. The compressed
-    /// bytes on disk are a different length again, and only this layer sees them.
+    /// The stream yields the blob's **content**, decompressed if it is stored
+    /// compressed, and is bounded to that content — so a caller comparing against a
+    /// length the snapshot recorded is comparing like with like.
     #[instrument(skip_all, err)]
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
         let placement = self.locate(id)?;
@@ -522,14 +458,11 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
 impl storage::StoragePut for BlobStore<true> {
     /// Store `len` bytes whose content hashes to `id`.
     ///
-    /// A blob the store already holds is not written again, so the caller can
-    /// hand over every chunk it read without tracking what it has seen: that is
-    /// what makes deduplication independent of which version the last one was.
+    /// A blob the store already holds is not written again, so the caller can hand
+    /// over every chunk it read without tracking what it has seen.
     ///
-    /// The payload is hashed on its way through and checked against `id`. A
-    /// mismatch fails the run rather than storing content under the wrong name,
-    /// which would otherwise be a corruption that reads back perfectly and is
-    /// only ever noticed by a full verify.
+    /// The payload is hashed on its way through and checked against `id`: a
+    /// mismatch fails the run rather than storing content under the wrong name.
     #[instrument(skip_all, err)]
     async fn put(&self, id: &BlobId, mut reader: StreamReadSeeker, len: u64) -> io::Result<()> {
         if Contents::lock(&self.contents).blobs.contains_key(id) {
@@ -537,13 +470,11 @@ impl storage::StoragePut for BlobStore<true> {
             return Ok(());
         }
 
-        // The payload is read in full before anything is written, because a
-        // record's length lives in its header and a header cannot be written
-        // twice: the stored length is not known until the payload has been
-        // compressed, and the reservation needs it. The chunker already
-        // materialises each chunk, so this is a copy of a buffer the caller
-        // holds rather than a new peak in the run's memory — the largest thing
-        // here is one chunk, which the chunker caps.
+        // The payload is read in full before anything is written: a header cannot
+        // be written twice, and the stored length is not known until the payload
+        // has been compressed. The chunker already materialises each chunk, so
+        // this copies a buffer the caller holds rather than raising the run's
+        // peak.
         let raw_len = usize::try_from(len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -571,15 +502,11 @@ impl storage::StoragePut for BlobStore<true> {
             ));
         }
 
-        // The hash is of the content, checked before anything is stored. A
-        // mismatch means the bytes are not what the caller said they were, and
-        // writing them under `id` would store content under the wrong name. It is
-        // also what makes the codec a write policy: the address depends on the
-        // content alone, so the same bytes deduplicate whether they were stored
-        // raw or compressed.
+        // Checked before anything is stored, so nothing is written under the wrong
+        // name. Hashing the content is also what makes the codec a write policy:
+        // the same bytes deduplicate whether they were stored raw or compressed.
         if blake3::hash(&raw).as_bytes() != id {
-            // Nothing has been written yet, so there is nothing to abandon: the
-            // run simply fails, and the store is exactly as it was.
+            // Nothing written yet, so the run simply fails and the store is as it was.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -589,11 +516,9 @@ impl storage::StoragePut for BlobStore<true> {
             ));
         }
 
-        // Compress, and fall back to storing the bytes as they are when that
-        // does not help. zstd frames carry a few bytes of header of their own,
-        // so on content it cannot compress — already-compressed assets, above
-        // all — a frame would be *larger* than the input, and storing it would
-        // make the store bigger for nothing.
+        // Compress, storing the bytes as they are when that does not help: a zstd
+        // frame carries a header of its own, so on content it cannot compress it
+        // comes out larger than the input.
         let (codec, stored) = self.compression.compress(&raw);
         let stored_len = u64::try_from(stored.len()).unwrap_or(u64::MAX);
 
@@ -605,15 +530,9 @@ impl storage::StoragePut for BlobStore<true> {
         let reservation = self.reserve(total)?;
         let offset = reservation.offset;
 
-        // A handle of its own, not a clone of a shared one.
-        //
-        // `dup` — which is what `try_clone` is — shares the file offset between
-        // the original and the copy, so every concurrent `put` would seek the
-        // same cursor and interleave its header into somebody else's payload.
-        // The records would still each be individually valid, and the store would
-        // read back as a shorter prefix of itself: no error anywhere, just data
-        // that quietly went missing. Each writer needs a descriptor with a
-        // private offset, which means a separate open.
+        // A handle of its own, never `try_clone`: a dup shares the file offset, so
+        // concurrent puts would interleave headers into each other's payloads and
+        // the store would read back as a shorter prefix of itself.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -628,10 +547,8 @@ impl storage::StoragePut for BlobStore<true> {
         file.write_all(&header).await?;
         file.write_all(&stored).await?;
 
-        // `copy` returning is not the bytes having reached the file. Nothing is
-        // synced here: the run's single `sync_data` is the durability point, and
-        // syncing per blob would pay for thousands of them to protect a run that
-        // publishes itself all at once.
+        // Nothing is synced here: the run's single `sync_data` is the durability
+        // point, and syncing per blob would pay for thousands of them.
         file.flush().await?;
 
         let payload_offset = offset + u64::try_from(header.len()).unwrap_or(u64::MAX);
@@ -663,21 +580,18 @@ impl storage::StoragePut for BlobStore<true> {
 
     /// Make every record written so far durable.
     ///
-    /// Called once per run, after the last of its data records and before the
-    /// commit record. See the module docs for why the commit is a second sync
-    /// rather than a continuation of this one.
+    /// Called once per run, after the last data record and before the commit
+    /// record (see the module docs).
     ///
-    /// Every segment this run wrote to is synced, not just the last one. A run
-    /// that crossed a boundary has records in two files, and syncing only the
-    /// newer one would leave the older one's pages unordered against it — which is
-    /// the failure the two syncs exist to prevent, one level up.
+    /// Every segment this run wrote to is synced, not just the last: a run that
+    /// crossed a boundary has records in two files, and syncing only the newer
+    /// would leave the older's pages unordered against it.
     async fn sync_data(&self) -> io::Result<()> {
         let dirty = self.dirty_segments()?;
 
         for segment in dirty {
-            // A handle of its own per segment for the same reason `put` takes one
-            // per record: this is a standalone sync, not a write, and nothing is
-            // seeking.
+            // A handle of its own per segment, for the same reason `put` takes one
+            // per record: this is a standalone sync and nothing is seeking.
             let file = fs::OpenOptions::new().write(true).open(segment).await?;
 
             file.sync_data().await?;
@@ -694,10 +608,8 @@ impl storage::StoragePut for BlobStore<true> {
     async fn commit(&self, snapshot: &BlobId) -> io::Result<u32> {
         let hash = *blake3::hash(snapshot).as_bytes();
 
-        // A commit record is 32 bytes of hash and is always stored raw. There is
-        // nothing to gain from compressing it, and the scan requires a commit to
-        // be exactly one uncompressed hash, so compressing one would make it
-        // invisible to the scan that finds it.
+        // Always raw: the scan requires a commit to be exactly one uncompressed
+        // hash, so a compressed one would be invisible to the scan that finds it.
         let mut header = Vec::new();
         let hash_len = u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
         record::encode_header(
@@ -714,11 +626,8 @@ impl storage::StoragePut for BlobStore<true> {
         let reservation = self.reserve(total)?;
         let offset = reservation.offset;
 
-        // Its own handle, for the same reason `put` takes one: a clone shares its
-        // offset with the original, and the offset is what this write is aimed
-        // with. Nothing else is writing at this point — a commit is the end of a
-        // run — but relying on that to make a shared cursor safe is the kind of
-        // thing that stops being true the moment something is added.
+        // Its own handle, for the same reason `put` takes one: a clone shares the
+        // offset this write is aimed with.
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -734,11 +643,9 @@ impl storage::StoragePut for BlobStore<true> {
         // The second sync, and the one that makes the run real.
         file.sync_data().await?;
 
-        // The version, and which commit record within this segment it is.
-        //
-        // The ordinal is counted here rather than read back, because the run knows
-        // it: this is the n-th commit written to this segment. It is what lets a
-        // reader confirm an index file from this segment alone.
+        // The version, and which commit record within this segment it is. The
+        // ordinal is counted rather than read back because the run knows it, and
+        // it is what lets a reader confirm an index file from this segment alone.
         let (version, ordinal) = {
             let mut contents = Contents::lock(&self.contents);
 
@@ -756,14 +663,10 @@ impl storage::StoragePut for BlobStore<true> {
             (version, ordinal)
         };
 
-        // The index file, written after the commit and never allowed to fail the
-        // run.
-        //
-        // A version whose index write is lost still exists and still restores; it
-        // costs a scan to find. That asymmetry is what makes the file a cache
-        // rather than a second source of truth, and it is why this cannot be an
-        // error: a run that reported failure here would have published a version
-        // and told the caller it had not.
+        // Written after the commit, and never allowed to fail the run: a version
+        // whose index write is lost still exists and still restores, and a run
+        // that reported failure here would have published a version and told the
+        // caller it had not.
         if let Err(e) = write_index(
             &self.set,
             VersionIndex {
@@ -798,14 +701,13 @@ impl BlobStore<true> {
     /// Claim `total` bytes for a record, rolling into a new segment if it will not
     /// fit in the last one.
     ///
-    /// The lock is held only for the decision. A record is never split across a
-    /// boundary, so this either returns a range inside the current segment or
-    /// starts the next one — and only the first of those is the common case.
+    /// The lock is held only for the decision, and the copy that follows happens
+    /// outside it. A record is never split across a boundary, so this either
+    /// returns a range inside the current segment or starts the next one.
     ///
-    /// A record that is larger than the whole limit is an error rather than a
-    /// segment that quietly grows past the cap. "No file over 4 GiB" is the
-    /// reason segments exist; silently breaking it would defeat that, and the
-    /// error names the cap so the caller can raise it deliberately.
+    /// A record larger than the whole limit is an error rather than a segment that
+    /// quietly grows past the cap, and the error names the cap so the caller can
+    /// raise it deliberately.
     fn reserve(&self, total: u64) -> io::Result<Reservation> {
         let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -876,20 +778,16 @@ impl BlobStore<true> {
 impl BlobStore<true> {
     /// Write an index file for every version this store holds.
     ///
-    /// The operation that makes the index files disposable: everything here is
-    /// derived from the commit records, so a set with no index files at all is
-    /// still a complete set, and this brings the cache back up to date without
-    /// the store losing anything by having lost it.
+    /// Everything here is derived from the commit records, so a set with no index
+    /// files at all is still a complete set and this only brings the cache back up
+    /// to date.
     ///
-    /// A file that cannot be written is counted as not written rather than failing
-    /// the whole run, for the same reason a backup's index write cannot fail a
-    /// backup: the version exists either way, and the file is only a faster way
-    /// to find it.
+    /// A file that cannot be written is counted as not written, not an error.
     ///
     /// # Errors
     ///
-    /// Returns an error only if the version list cannot be read, which is the
-    /// store's own in-memory index and so cannot really fail.
+    /// Only if the version list cannot be read, which is the store's own in-memory
+    /// index and so cannot really fail.
     pub fn write_index_files(&self) -> io::Result<usize> {
         let mut written = 0;
 
@@ -924,8 +822,7 @@ impl BlobStore<true> {
     /// by.
     ///
     /// Derived from the per-segment commit counts the scan built, so it is the
-    /// same arithmetic the writer used when it recorded the ordinal — and it
-    /// costs nothing.
+    /// arithmetic the writer used when it recorded the ordinal.
     fn commit_position(&self, version: u32) -> Option<(u32, u32)> {
         let counts = Contents::lock(&self.contents);
 
@@ -964,10 +861,8 @@ struct Scanned {
     /// The segment a run writes into: the last one, which is the only one not
     /// sealed.
     ///
-    /// Always a real index — segment 0 for a fresh set — so the reservation
-    /// arithmetic is the same for a store with one segment and one with a
-    /// thousand. A reader leaves it at `u32::MAX` and never uses it, because a
-    /// reader has nowhere to write.
+    /// Always a real index — segment 0 for a fresh set. A reader leaves it at
+    /// `u32::MAX` and never uses it, having nowhere to write.
     write_into: u32,
     /// First byte past the last valid record in `write_into`.
     end: u64,
@@ -978,8 +873,7 @@ struct Scanned {
 ///
 /// Only the last segment is ever truncated. A segment before it was sealed, and a
 /// sealed segment is never written again, so a tail that does not verify there is
-/// damage rather than a run that stopped — and damage that this pass quietly
-/// shortened away would be damage nobody ever heard about.
+/// damage rather than a run that stopped.
 fn recover(set: &IndexSet) -> io::Result<Scanned> {
     let mut segments = set.segments()?;
 
@@ -1038,12 +932,10 @@ fn recover(set: &IndexSet) -> io::Result<Scanned> {
                 ));
             }
 
-            // A run that did not finish. The bytes past the last valid record
-            // were never published, so they are not data anybody can lose, and the
-            // file is shortened back over them. Synced, because the truncation has
-            // to be durable before anything is written over the space: a crash
-            // that brought the old tail back would put the scan and the append
-            // pointer out of step with each other.
+            // Bytes past the last valid record were never published, so they are
+            // not data anybody can lose. Synced before anything is written over
+            // the space: a crash that brought the old tail back would put the scan
+            // and the append pointer out of step.
             file.set_len(scan.end)?;
             file.sync_data()?;
 
@@ -1062,9 +954,8 @@ fn recover(set: &IndexSet) -> io::Result<Scanned> {
         out.commits.extend(scan.commits);
 
         if is_last {
-            // The last segment is the one a run writes into. Recording it rather
-            // than "how many are sealed" is what makes a fresh set — one segment,
-            // nothing sealed — use the same arithmetic as a set of a thousand.
+            // Recording the last segment rather than how many are sealed is what
+            // makes a fresh set use the same arithmetic as a set of a thousand.
             out.write_into = last;
             out.end = scan.end;
         }
@@ -1106,10 +997,8 @@ fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
             ));
         }
 
-        // A read does not repair, so a segment with a tail that does not verify is
-        // reported the same way the writing open reports damage in a sealed one:
-        // the bytes are there, they are not readable, and pretending otherwise
-        // would mean a restore that quietly omits whatever they held.
+        // A read does not repair, so an unverified tail is reported rather than
+        // treated as an unfinished run.
         let scan = record::scan(&mut file, segment)?;
         let len = file.metadata()?.len();
 
@@ -1134,8 +1023,7 @@ fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
     }
 
     // A reader never writes, so it has no segment to write into and no end to
-    // carry on from. Both are left saying so rather than pretending to be a
-    // one-segment set.
+    // carry on from.
     out.write_into = u32::MAX;
     out.end = 0;
 
@@ -1144,8 +1032,8 @@ fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
 
 /// Create segment `segment` and write its header.
 ///
-/// `create_new` rather than `create`, so a segment that already exists is an error
-/// instead of a header written over the top of records that are already there.
+/// `create_new` rather than `create`, so an existing segment is an error rather
+/// than a header written over the top of records already there.
 fn create_segment(path: &Path, segment: u32) -> io::Result<()> {
     use std::io::Write as _;
 
@@ -1163,8 +1051,7 @@ fn create_segment(path: &Path, segment: u32) -> io::Result<()> {
 /// Check that `path` is a store segment, and return the number its header claims.
 ///
 /// Never repairs and never truncates: a file that does not start with the store
-/// magic is somebody's data that this build does not understand, and the one
-/// thing a recovery pass must not do is decide otherwise on its own.
+/// magic is somebody's data this build does not understand.
 fn check_store_header(file: &mut std::fs::File, path: &Path) -> io::Result<u32> {
     use std::io::{Read as _, Seek as _};
 
@@ -1175,10 +1062,8 @@ fn check_store_header(file: &mut std::fs::File, path: &Path) -> io::Result<u32> 
 
     let mut header = [0u8; STORE_HEADER];
 
-    // From the start, whatever the handle happens to be positioned at. A handle
-    // that has just written the header is left at the end of the file, and
-    // reading from there would be a read past the end of a 12-byte file rather
-    // than a read of its header.
+    // From the start, whatever the handle is positioned at: one that has just
+    // written the header is left at the end of the file.
     file.seek(io::SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
 
