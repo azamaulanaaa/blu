@@ -78,8 +78,8 @@ use tracing::instrument;
 use super::record::{self, Kind, Placement, STORE_HEADER};
 use crate::{
     index::IndexSet,
-    slice::SliceAsyncReader,
-    storage::{self, BlobId, SegmentLimit, StreamReadSeeker, VersionIndex},
+    slice::{DecompressReader, SliceAsyncReader},
+    storage::{self, BlobId, Compression, SegmentLimit, StreamReadSeeker, VersionIndex},
 };
 
 /// Copy buffer for a payload.
@@ -162,6 +162,12 @@ pub struct BlobStore<const WRITE: bool> {
     /// reads back under any other, because no record depends on where a boundary
     /// fell.
     limit: SegmentLimit,
+    /// How record payloads are compressed. A write policy for the same reason as
+    /// the segment limit, and a stronger one: each record names the codec it was
+    /// written with, so a set whose records were written at different levels, or
+    /// with compression off, still reads back correctly because nothing about a
+    /// record's interpretation depends on this value.
+    compression: Compression,
     /// Segments this run has written to, so `sync_data` knows which files to sync.
     ///
     /// Empty until the first record, and not persisted: a run that wrote nothing
@@ -353,7 +359,11 @@ impl BlobStore<true> {
     /// in the middle; or if a *sealed* segment has a tail that does not verify,
     /// which is corruption rather than an unfinished run and is never truncated.
     #[instrument(skip_all, err)]
-    pub async fn open<P: Into<PathBuf> + Debug>(path: P, limit: SegmentLimit) -> io::Result<Self> {
+    pub async fn open<P: Into<PathBuf> + Debug>(
+        path: P,
+        limit: SegmentLimit,
+        compression: Compression,
+    ) -> io::Result<Self> {
         let set = IndexSet::new(path.into());
 
         if let Some(parent) = set.base().parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -378,6 +388,7 @@ impl BlobStore<true> {
                 offset: scanned.end,
             }),
             limit,
+            compression,
             dirty: Mutex::new(Vec::new()),
         })
     }
@@ -423,10 +434,11 @@ impl BlobStore<false> {
                 segment: scanned.write_into,
                 offset: scanned.end,
             }),
-            // The field is shared with the writing constructor, and only the
-            // writing one consults it. There is no value to record here: a read
-            // never rolls over, so there is no limit in force to record.
+            // Both fields are shared with the writing constructor, and only that
+            // one consults them. Neither has a value worth recording on a read: a
+            // read never rolls over, and never compresses anything.
             limit: SegmentLimit::default(),
+            compression: Compression::default(),
             dirty: Mutex::new(Vec::new()),
         })
     }
@@ -436,8 +448,11 @@ impl BlobStore<false> {
 impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
     /// Open the blob with this content hash.
     ///
-    /// The returned stream is bounded to the blob, so nothing downstream can
-    /// read past it into its neighbour.
+    /// The returned stream yields the blob's **content**, decompressed if it is
+    /// stored compressed, and is bounded to that content — so nothing downstream
+    /// can read past it into its neighbour, and a caller comparing against a
+    /// length the snapshot recorded is comparing like with like. The compressed
+    /// bytes on disk are a different length again, and only this layer sees them.
     #[instrument(skip_all, err)]
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
         let placement = self.locate(id)?;
@@ -461,6 +476,9 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
         // shrunk since, which only a hand-edited store can arrange. Checked
         // rather than trusted, so the answer is a short read reported here
         // instead of a silent hole in a restored file.
+        //
+        // This is the *stored* length: it is the span the record occupies on disk,
+        // and a compressed record is shorter than its content.
         let end = placement.offset.checked_add(placement.len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "a blob's range overflows")
         })?;
@@ -483,7 +501,20 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
         let mut file = file;
         file.seek(SeekFrom::Start(placement.offset)).await?;
 
-        Ok(Box::new(SliceAsyncReader::new(file, placement.len)))
+        match placement.codec {
+            storage::Codec::Raw => Ok(Box::new(SliceAsyncReader::new(file, placement.raw_len))),
+            storage::Codec::Zstd => {
+                // Read the frame, then decode it. The read is bounded to the
+                // stored length so a damaged record cannot pull in its neighbour,
+                // and the decode is told the expected size so a frame that does
+                // not produce it is refused rather than handed on short.
+                let mut frame = vec![0u8; usize::try_from(placement.len).unwrap_or(0)];
+                file.read_exact(&mut frame).await?;
+
+                let reader = DecompressReader::new(frame, placement.raw_len).await?;
+                Ok(Box::new(reader))
+            }
+        }
     }
 }
 
@@ -506,12 +537,71 @@ impl storage::StoragePut for BlobStore<true> {
             return Ok(());
         }
 
-        // A record header is a few dozen bytes by construction, so this cannot
-        // overflow on any target that can address the file at all.
-        let mut header = Vec::with_capacity(usize::try_from(record::header_len(len)).unwrap_or(0));
-        record::encode_header(&mut header, Kind::Blob, id, len);
+        // The payload is read in full before anything is written, because a
+        // record's length lives in its header and a header cannot be written
+        // twice: the stored length is not known until the payload has been
+        // compressed, and the reservation needs it. The chunker already
+        // materialises each chunk, so this is a copy of a buffer the caller
+        // holds rather than a new peak in the run's memory — the largest thing
+        // here is one chunk, which the chunker caps.
+        let raw_len = usize::try_from(len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a payload of {len} bytes does not fit in memory"),
+            )
+        })?;
+        let mut raw = Vec::with_capacity(raw_len);
 
-        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + len;
+        {
+            let mut source = BufReader::with_capacity(COPY_BUFFER, reader.as_mut().take(len));
+            let read = tokio::io::AsyncReadExt::read_to_end(&mut source, &mut raw).await?;
+            if u64::try_from(read).unwrap_or(u64::MAX) != len {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("declared {len} bytes but the reader yielded only {read}"),
+                ));
+            }
+        }
+
+        let mut trailing = [0u8; 1];
+        if reader.read(&mut trailing).await? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the reader yielded more than the declared {len} bytes"),
+            ));
+        }
+
+        // The hash is of the content, checked before anything is stored. A
+        // mismatch means the bytes are not what the caller said they were, and
+        // writing them under `id` would store content under the wrong name. It is
+        // also what makes the codec a write policy: the address depends on the
+        // content alone, so the same bytes deduplicate whether they were stored
+        // raw or compressed.
+        if blake3::hash(&raw).as_bytes() != id {
+            // Nothing has been written yet, so there is nothing to abandon: the
+            // run simply fails, and the store is exactly as it was.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the content does not hash to {}, so it was not stored",
+                    storage::hex(id)
+                ),
+            ));
+        }
+
+        // Compress, and fall back to storing the bytes as they are when that
+        // does not help. zstd frames carry a few bytes of header of their own,
+        // so on content it cannot compress — already-compressed assets, above
+        // all — a frame would be *larger* than the input, and storing it would
+        // make the store bigger for nothing.
+        let (codec, stored) = self.compression.compress(&raw);
+        let stored_len = u64::try_from(stored.len()).unwrap_or(u64::MAX);
+
+        let mut header =
+            Vec::with_capacity(usize::try_from(record::header_len(stored_len, len)).unwrap_or(0));
+        record::encode_header(&mut header, Kind::Blob, codec, id, stored_len, len);
+
+        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + stored_len;
         let reservation = self.reserve(total)?;
         let offset = reservation.offset;
 
@@ -536,69 +626,7 @@ impl storage::StoragePut for BlobStore<true> {
         // decided not to use.
         file.seek(SeekFrom::Start(offset)).await?;
         file.write_all(&header).await?;
-
-        let mut hasher = blake3::Hasher::new();
-        let mut scratch = vec![0u8; COPY_BUFFER];
-        let mut remaining = len;
-
-        {
-            let mut source = BufReader::with_capacity(COPY_BUFFER, reader.as_mut().take(len));
-
-            while remaining > 0 {
-                let want =
-                    usize::try_from(remaining.min(scratch.len() as u64)).unwrap_or(scratch.len());
-
-                let read = source.read(&mut scratch[..want]).await?;
-                if read == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "declared {len} bytes but the reader yielded only {}",
-                            len - remaining
-                        ),
-                    ));
-                }
-
-                hasher.update(&scratch[..read]);
-                file.write_all(&scratch[..read]).await?;
-                remaining -= u64::try_from(read).unwrap_or(u64::MAX);
-            }
-        }
-
-        let mut trailing = [0u8; 1];
-        if reader.read(&mut trailing).await? != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the reader yielded more than the declared {len} bytes"),
-            ));
-        }
-
-        if hasher.finalize().as_bytes() != id {
-            // The header already names the content it was given, and it is
-            // wrong. Leaving that header where it is would make the next open
-            // index a record under a hash its payload does not have — a blob the
-            // store would then hand out as if it were sound, and which only a
-            // full verify would ever catch.
-            //
-            // So the record is made unreadable rather than merely unindexed, by
-            // taking its magic away. A header that does not verify is where the
-            // scan stops, which is the same signal a torn write leaves, and the
-            // next run's recovery truncates from here. It is the documented way a
-            // run abandons a record: nothing was committed, so everything after
-            // this point goes with it.
-            let hole = [0u8; 4];
-            file.seek(SeekFrom::Start(offset)).await?;
-            file.write_all(&hole).await?;
-            file.flush().await?;
-
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "the content does not hash to {}, so it was not stored",
-                    storage::hex(id)
-                ),
-            ));
-        }
+        file.write_all(&stored).await?;
 
         // `copy` returning is not the bytes having reached the file. Nothing is
         // synced here: the run's single `sync_data` is the durability point, and
@@ -615,14 +643,18 @@ impl storage::StoragePut for BlobStore<true> {
             Placement {
                 segment: reservation.segment,
                 offset: payload_offset,
-                len,
+                len: stored_len,
+                raw_len: len,
+                codec,
             },
         );
 
         tracing::trace!(
             segment = reservation.segment,
             offset,
-            length = len,
+            raw_length = len,
+            stored_length = stored_len,
+            ?codec,
             "stored blob"
         );
 
@@ -662,12 +694,19 @@ impl storage::StoragePut for BlobStore<true> {
     async fn commit(&self, snapshot: &BlobId) -> io::Result<u32> {
         let hash = *blake3::hash(snapshot).as_bytes();
 
+        // A commit record is 32 bytes of hash and is always stored raw. There is
+        // nothing to gain from compressing it, and the scan requires a commit to
+        // be exactly one uncompressed hash, so compressing one would make it
+        // invisible to the scan that finds it.
         let mut header = Vec::new();
+        let hash_len = u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
         record::encode_header(
             &mut header,
             Kind::Commit,
+            storage::Codec::Raw,
             &hash,
-            u64::try_from(snapshot.len()).unwrap_or(u64::MAX),
+            hash_len,
+            hash_len,
         );
 
         let total = u64::try_from(header.len()).unwrap_or(u64::MAX)

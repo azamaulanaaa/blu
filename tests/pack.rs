@@ -240,7 +240,7 @@ async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
     {
         fs::write(
             source.join(format!("f{i}.bin")),
-            common::untagged_stream(i as u8, size),
+            common::untagged_stream(u8::try_from(i).unwrap(), size),
         )
         .unwrap();
     }

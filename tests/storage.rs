@@ -9,7 +9,7 @@ mod common;
 
 use lepatch::{
     index::IndexSet,
-    storage::{BlobId, BlobStore, SegmentLimit, StorageGet, StoragePut},
+    storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet, StoragePut},
 };
 use tokio::io::AsyncReadExt;
 
@@ -39,7 +39,7 @@ async fn a_stored_blob_reads_back_byte_for_byte() {
 
     let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 253) as u8).collect();
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store
@@ -63,7 +63,7 @@ async fn blobs_appended_in_sequence_do_not_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
 
@@ -98,7 +98,7 @@ async fn an_empty_blob_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store
@@ -120,7 +120,7 @@ async fn a_reader_shorter_than_the_declared_length_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
 
@@ -142,7 +142,7 @@ async fn a_reader_longer_than_the_declared_length_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
 
@@ -177,7 +177,7 @@ async fn content_that_does_not_hash_to_its_address_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
 
@@ -200,17 +200,24 @@ async fn content_that_does_not_hash_to_its_address_is_rejected() {
         "the error should say the hash did not match, got: {error}"
     );
 
-    // And the record is not left readable under that name. `put` takes the
-    // record's magic away, so the next open stops at it and reports the segment
-    // as damaged rather than indexing a blob whose bytes are not the ones the
-    // name promises. The alternative — writing the record and merely not indexing
-    // it — would leave a store whose index and contents disagree, which is
-    // exactly the cross-file problem the single-file log was meant to be free of.
-    let error = BlobStore::<false>::open(&blob).await.unwrap_err();
-
+    // And nothing was stored at all. `put` checks the content against the address
+    // it was given *before* it reserves a place in the file or writes a byte, so
+    // there is no record to abandon and no hole to punch: the set is exactly as
+    // it was before the call.
+    //
+    // An earlier design wrote the record first and took its magic away on a
+    // mismatch, which left the store reporting itself as damaged until something
+    // repaired it. That worked, but it needed a window in which a record whose
+    // bytes were not the ones its name promised existed on disk at all.
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    assert_eq!(
+        store.segment_count(),
+        1,
+        "the set should be intact and hold only its empty header"
+    );
     assert!(
-        error.to_string().contains("damaged"),
-        "the abandoned record should be reported, not indexed: {error}"
+        store.locate(&wrong).is_err(),
+        "content that does not hash to its address must not be indexed under it"
     );
 }
 
@@ -223,7 +230,7 @@ async fn a_blob_the_store_does_not_hold_is_rejected() {
 
     // A store that exists and is empty, so this is about the blob rather than
     // about the file being missing.
-    let _ = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let _ = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     let store = BlobStore::<false>::open(&blob).await.unwrap();
@@ -255,7 +262,7 @@ async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
     let id = common::id_of(&payload);
     let len = common::len_of(&payload);
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store.put(&id, common::reader(payload), len).await.unwrap();
@@ -299,7 +306,7 @@ async fn a_file_that_is_not_a_store_is_refused_without_being_truncated() {
     );
 
     // Opening for writing refuses it too, and must leave it exactly as it was.
-    let error = BlobStore::<true>::open(&path, SegmentLimit::default())
+    let error = BlobStore::<true>::open(&path, SegmentLimit::default(), Compression::default())
         .await
         .unwrap_err();
     assert!(
@@ -344,7 +351,7 @@ async fn a_store_in_a_missing_directory_is_created() {
     let blob = dir.path().join("nested/deeper/store");
 
     let payload = vec![3u8; 10];
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store
@@ -381,7 +388,7 @@ async fn content_the_store_already_holds_is_not_written_again() {
     let payload = common::noisy(64 * 1024);
     let id = common::id_of(&payload);
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store
@@ -398,7 +405,7 @@ async fn content_the_store_already_holds_is_not_written_again() {
     let after_first = common::set_size(&blob);
 
     // The same content again, in a second run against the same store.
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store
@@ -434,7 +441,7 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
     let second = common::noisy(49_999);
     assert_ne!(first, second, "the fixtures must differ");
 
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store
@@ -449,7 +456,7 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
     store.commit(&common::id_of(&first)).await.unwrap();
 
     // Reopen, as a second run does, so the index is rebuilt from the file.
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     store
@@ -496,16 +503,33 @@ async fn concurrent_uploads_do_not_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
     let store = std::sync::Arc::new(
-        BlobStore::<true>::open(&blob, SegmentLimit::default())
+        BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
             .await
             .unwrap(),
     );
 
     // Uneven, and big enough that the copies genuinely overlap in time.
+    //
+    // Filled from a hash rather than a repeated byte, for two reasons. An overlap
+    // would otherwise be masked: a run of one byte compresses to almost nothing,
+    // so two writers whose ranges overlapped could still produce a store that
+    // *looked* the right size. And the size assertion below only means "the
+    // claimed ranges are disjoint" while the stored bytes are the bytes handed in,
+    // which is a property of the payloads rather than of the store.
     let payloads: Vec<Vec<u8>> = (0..BLOBS)
         .map(|i| {
             let len = 40_000 + (i * 977) % 90_000;
-            vec![u8::try_from(i % 251).expect("in range") + 1; len]
+            let mut out = Vec::with_capacity(len);
+            let mut key = [0u8; 32];
+            key[0] = u8::try_from(i).expect("in range");
+            for counter in 0..u64::try_from(len.div_ceil(64)).expect("small") {
+                let mut input = [0u8; 40];
+                input[..32].copy_from_slice(&key);
+                input[32..].copy_from_slice(&counter.to_le_bytes());
+                out.extend_from_slice(blake3::hash(&input).as_bytes());
+            }
+            out.truncate(len);
+            out
         })
         .collect();
 
@@ -564,7 +588,7 @@ async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
     let store = std::sync::Arc::new(
-        BlobStore::<true>::open(&blob, SegmentLimit::default())
+        BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
             .await
             .unwrap(),
     );

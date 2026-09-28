@@ -81,7 +81,7 @@ use criterion::{Criterion, Throughput};
 use lepatch::{
     command::{Options, backup, restore},
     index::IndexSet,
-    storage::{BlobStore, SegmentLimit},
+    storage::{BlobStore, Compression, SegmentLimit},
 };
 use tempfile::TempDir;
 
@@ -162,9 +162,13 @@ fn bench_backup(c: &mut Criterion) {
                             let _ = std::fs::remove_file(IndexSet::new(&blob).blob_path(segment));
                         }
 
-                        let storage = BlobStore::<true>::open(&blob, SegmentLimit::default())
-                            .await
-                            .expect("store");
+                        let storage = BlobStore::<true>::open(
+                            &blob,
+                            SegmentLimit::default(),
+                            Compression::default(),
+                        )
+                        .await
+                        .expect("store");
                         let options = Options {
                             concurrency,
                             ..Options::default()
@@ -194,9 +198,10 @@ fn bench_restore(c: &mut Criterion) {
     let rt = runtime();
 
     let committed = rt.block_on(async {
-        let storage = BlobStore::<true>::open(&blob, SegmentLimit::default())
-            .await
-            .expect("store");
+        let storage =
+            BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+                .await
+                .expect("store");
         backup(&src, Options::default(), storage)
             .await
             .expect("backup")
@@ -244,9 +249,10 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
     let rt = runtime();
 
     let committed = rt.block_on(async {
-        let storage = BlobStore::<true>::open(&blob, SegmentLimit::default())
-            .await
-            .expect("store");
+        let storage =
+            BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+                .await
+                .expect("store");
         backup(&src, Options::default(), storage)
             .await
             .expect("backup")

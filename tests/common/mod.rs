@@ -17,7 +17,7 @@ use std::{
 use lepatch::{
     command::{Committed, Options, backup, restore},
     index::IndexSet,
-    storage::{BlobId, BlobStore, SegmentLimit, StreamReadSeeker},
+    storage::{BlobId, BlobStore, Compression, SegmentLimit, StreamReadSeeker},
 };
 
 /// A reader over `bytes`, for handing a store something to put.
@@ -190,7 +190,7 @@ pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
 /// Back up `source` with specific options, for tests that need to pin a knob the
 /// defaults would otherwise choose.
 pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
-    let storage = BlobStore::<true>::open(blob, SegmentLimit::default())
+    let storage = BlobStore::<true>::open(blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     backup(source, opts, storage).await.unwrap()
@@ -206,13 +206,38 @@ pub(crate) async fn run_backup_limited(
     blob: &Path,
     limit: SegmentLimit,
 ) -> Committed {
-    let storage = BlobStore::<true>::open(blob, limit).await.unwrap();
+    let storage = BlobStore::<true>::open(blob, limit, Compression::default())
+        .await
+        .unwrap();
     backup(source, Options::default(), storage).await.unwrap()
 }
 
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
 pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Path) {
     let storage = BlobStore::<false>::open(blob).await.unwrap();
+    restore(destination, snapshot, storage).await.unwrap();
+}
+
+/// Back up `source` into a store with a given compression policy.
+///
+/// Compression is a property of the *store* rather than of the run's options,
+/// because it is the store that frames and writes each record, so this opens the
+/// store itself rather than going through [`run_backup`].
+pub(crate) async fn run_backup_compressed(
+    source: &Path,
+    blob: &Path,
+    compression: lepatch::storage::Compression,
+) -> Committed {
+    let storage = BlobStore::<true>::open(blob, SegmentLimit::default(), compression)
+        .await
+        .unwrap();
+    backup(source, Options::default(), storage).await.unwrap()
+}
+
+/// Restore one specific version of a set.
+pub(crate) async fn run_restore_version(blob: &Path, destination: &Path, version: u32) {
+    let storage = BlobStore::<false>::open(blob).await.unwrap();
+    let snapshot = storage.snapshot(version).unwrap();
     restore(destination, snapshot, storage).await.unwrap();
 }
 

@@ -1301,8 +1301,7 @@ fn a_named_pipe_is_skipped_rather_than_read() {
         std::process::Command::new("mkfifo")
             .arg(dir.path().join("pipe"))
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false),
+            .is_ok_and(|status| status.success()),
         "could not create a FIFO to test with"
     );
     let _listener = UnixListener::bind(dir.path().join("sock")).expect("bind a socket");
@@ -1375,7 +1374,7 @@ fn a_command_piped_into_something_that_stops_early_does_not_panic() {
         ok(dir.path(), &["backup", ".", "store"]);
     }
 
-    let mut child = Command::new("sh")
+    let child = Command::new("sh")
         .current_dir(dir.path())
         .arg("-c")
         .arg(format!(

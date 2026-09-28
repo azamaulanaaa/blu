@@ -27,7 +27,7 @@ use std::fs;
 
 use lepatch::{
     index::IndexSet,
-    storage::{BlobStore, Resolved, SegmentLimit, VersionIndex, resolve},
+    storage::{BlobStore, Compression, Resolved, SegmentLimit, VersionIndex, resolve},
 };
 
 /// A set with `versions` versions in it, and a store handle for it.
@@ -391,7 +391,7 @@ async fn the_index_files_can_all_be_deleted_and_rebuilt() {
     }
 
     // And they can be rebuilt from the store.
-    let written = BlobStore::<true>::open(&blob, SegmentLimit::default())
+    let written = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap()
         .write_index_files()
@@ -427,7 +427,9 @@ async fn a_rebuilt_index_resolves_to_the_right_commit() {
         common::run_backup_limited(&source, &blob, small).await;
     }
 
-    let store = BlobStore::<true>::open(&blob, small).await.unwrap();
+    let store = BlobStore::<true>::open(&blob, small, Compression::default())
+        .await
+        .unwrap();
     assert!(store.segment_count() > 1, "the set should have rolled over");
 
     for v in 1..=5u32 {

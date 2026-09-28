@@ -22,7 +22,7 @@ use std::{
 use lepatch::{
     command::restore,
     metadata::{Dir, File, FileChunk, Link, LinkKind, Snapshot},
-    storage::{BlobId, BlobStore, SegmentLimit, StoragePut},
+    storage::{BlobId, BlobStore, Compression, SegmentLimit, StoragePut},
 };
 
 /// A store holding a forged snapshot, and the hash it is under.
@@ -38,9 +38,10 @@ impl Forged {
     async fn new(mutate: impl FnOnce(&mut Snapshot)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("store.bin");
-        let storage = BlobStore::<true>::open(&blob, SegmentLimit::default())
-            .await
-            .unwrap();
+        let storage =
+            BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+                .await
+                .unwrap();
 
         let mut snapshot = Snapshot::new();
         mutate(&mut snapshot);

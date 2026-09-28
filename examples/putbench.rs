@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use lepatch::{
     index::IndexSet,
-    storage::{BlobStore, SegmentLimit, StoragePut},
+    storage::{BlobStore, Compression, SegmentLimit, StoragePut},
 };
 
 const CHUNK: usize = 64 * 1024;
@@ -107,7 +107,7 @@ async fn main() {
             let _ = std::fs::remove_file(IndexSet::new(&store_path).blob_path(segment));
         }
         let store = std::sync::Arc::new(
-            BlobStore::<true>::open(&store_path, SegmentLimit::default())
+            BlobStore::<true>::open(&store_path, SegmentLimit::default(), Compression::default())
                 .await
                 .expect("store"),
         );
@@ -123,7 +123,7 @@ async fn main() {
             let _ = std::fs::remove_file(IndexSet::new(&store_path).blob_path(segment));
         }
         let store = std::sync::Arc::new(
-            BlobStore::<true>::open(&store_path, SegmentLimit::default())
+            BlobStore::<true>::open(&store_path, SegmentLimit::default(), Compression::default())
                 .await
                 .expect("store"),
         );

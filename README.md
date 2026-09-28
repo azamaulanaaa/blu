@@ -210,6 +210,50 @@ than one of them believed: the index is what locates chunks, so if the two disag
 one is wrong, and picking the wrong one produces a pack that reads as valid and hands
 out ranges covering the wrong bytes.
 
+### Compression
+
+Record payloads are stored as **zstd frames** by default, at level 1:
+
+```console
+$ lepatch backup ~/Documents docs                        # zstd level 1
+$ lepatch backup ~/Documents docs --compression-level 9   # smaller, much slower
+$ lepatch backup ~/Documents docs --no-compression        # stored as-is
+```
+
+Measured on a mixed game tree — an executable, a texture, mesh JSON and config
+text, 7.5 MB in total:
+
+| | size | vs uncompressed |
+|---|---|---|
+| `--no-compression` | 7,519,423 | — |
+| **level 1 (default)** | **4,358,018** | **42% smaller** |
+| level 9 | 4,177,469 | 44% smaller |
+
+**Level 1 is the default because the levels are not close.** On a 4 MB executable:
+level 1 is 2.7x smaller at 468 MB/s, level 3 gains three more percent for half the
+speed, and level 19 — a hundred times slower than level 1 — gains four percent more.
+A backup runs once and is read many times, so write speed is the cost that matters.
+
+**Already-compressed content gains nothing, and does not cost anything either.**
+Textures, audio and video are entropy-coded, so zstd produces something no smaller
+than what it was given — on a 4 MB file of random bytes, every level returns
+100.0%. A payload that does not get smaller is therefore **stored raw** rather than
+as a frame that would be a few bytes *larger* than the bytes it replaced. The win is
+on executables, debug symbols, text and uncompressed audio; the rest is neutral.
+
+**It is a write policy, not a format property.** Every record names the codec it was
+written with, and a record's hash is always of its *content*, never of the compressed
+bytes. So three things follow, and each is asserted in `tests/compression.rs`:
+
+- Changing the level between runs is safe and never rewrites what is already there.
+- A set whose records were written at different levels — or with compression off
+  entirely — is one store, and every version of it restores.
+- Deduplication holds across codecs. The same content stored raw and then
+  compressed is **one** blob, so changing the flag does not re-upload the tree.
+
+`FORMAT_VERSION` is **2**: a record header now carries a codec byte and two lengths,
+and a store written by version 1 is *refused* rather than misparsed.
+
 ## What is preserved
 
 Regular files, directories, symbolic links, hard links, permission bits and
@@ -315,10 +359,11 @@ Stated rather than discovered:
   sets.** `FORMAT_VERSION` guards the snapshot encoding and a store carries its
   own version in its header, so a store from an older build is *reported* as
   unreadable rather than misread — but it is not converted, and the old bytes
-  stay where they are. An older store is a bare concatenation of blobs with a
-  separate index file per version, and there is nothing in it that says where one
-  blob ends, so there is no way to walk one. Treat a format change as a reason to
-  re-take your backups. The crate is not published, and the
+  stay where they are. Two layouts exist so far: version 1, whose record headers
+  had no codec and one length, and the current version 2. A version 1 store is
+  refused, and there is nothing in it that would let it be walked anyway. Treat a
+  format change as a reason to re-take your backups. The crate is not published,
+  and the
   encoding is hand-written in `src/metadata/codec.rs` rather than delegated, so
   there is no upstream whose policy can decide whether your backup set can still
   be read — which is how `bincode` came to be on an advisory list in the first

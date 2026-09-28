@@ -257,3 +257,170 @@ where
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
+
+/// An [`AsyncRead`] that yields the decompressed bytes of a compressed payload.
+///
+/// The compressed form is decompressed in one go, on a blocking thread, and the
+/// result is served from memory. That is a deliberate shape rather than a lazy
+/// stream:
+///
+/// * The payloads this is used for are chunks, which the chunker already caps
+///   (64 KiB by default), so buffering one is the same order of memory the backup
+///   pipeline already holds. A restore that streamed compressed bytes through a
+///   streaming decoder would hold less, but would pay a decode call per read for
+///   the privilege.
+/// * Seeking is the real constraint. [`crate::storage::AsyncReadSeek`] is part of
+///   the reader type every storage backend hands out, and a streaming zstd frame
+///   cannot seek backwards without an index. Buffering makes seek a slice, which
+///   is what a caller expects and needs.
+///
+/// A future format that stores large multi-gigabyte payloads would want the
+/// streaming decoder here instead, and the seam for it is this one type.
+pub struct DecompressReader {
+    bytes: Vec<u8>,
+    position: u64,
+}
+
+impl std::fmt::Debug for DecompressReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecompressReader")
+            .field("len", &self.bytes.len())
+            .field("position", &self.position)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecompressReader {
+    /// Decompress `compressed` into a reader, on a blocking thread.
+    ///
+    /// `raw_len` is the expected size of the result and is used to pre-size the
+    /// buffer; a frame that does not decode to exactly that many bytes is an
+    /// error, because a record's raw length is in its header and disagreeing with
+    /// it means the record is not what the store says it is.
+    ///
+    /// The frame's own idea of how many bytes it decodes to, read out of its
+    /// header, checked against the length the record claims before anything is
+    /// allocated.
+    ///
+    /// This is the step that keeps a damaged or hostile record from being a crash.
+    /// `raw_len` comes out of a record header, and a header is covered by a
+    /// truncated hash rather than a MAC — so a file that has been tampered with
+    /// could carry a perfectly valid check and an absurd length. Handing that to
+    /// the decompressor means either a multi-gigabyte allocation or, when the
+    /// frame turns out to be *longer* than the buffer, a panic from deep inside
+    /// zstd. Neither is a thing a read of a backup should be able to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are not a zstd frame, if the frame does not
+    /// declare a size, if that size is not `raw_len`, or if `raw_len` is not
+    /// something this process can hold in memory.
+    pub async fn new(compressed: Vec<u8>, raw_len: u64) -> std::io::Result<Self> {
+        let expected = usize::try_from(raw_len).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("a payload of {raw_len} bytes does not fit in memory"),
+            )
+        })?;
+
+        // `None` means the frame does not say how big it is, which happens when
+        // whatever produced it was compressing a stream rather than a buffer and
+        // could not know the length in advance. Nothing here produces such a
+        // frame, and accepting one would mean decoding blind — which is exactly
+        // the allocation this check exists to prevent.
+        let declared = zstd::zstd_safe::get_frame_content_size(&compressed)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("a compressed payload is not a readable zstd frame: {e}"),
+                )
+            })?
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "a compressed payload does not say how many bytes it decodes to",
+                )
+            })?;
+
+        if usize::try_from(declared).unwrap_or(usize::MAX) != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "a compressed payload declares {declared} bytes but its record claims \
+                     {expected}"
+                ),
+            ));
+        }
+
+        // Now that the frame and the header agree, the decode cannot come up
+        // short or long, and the buffer is exactly the size it needs to be.
+        let bytes =
+            tokio::task::spawn_blocking(move || zstd::bulk::decompress(&compressed, expected))
+                .await
+                .map_err(|join| {
+                    std::io::Error::other(format!("decompression panicked: {join}"))
+                })??;
+
+        if bytes.len() != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "a compressed payload decoded to {} bytes but its record claims {expected}",
+                    bytes.len()
+                ),
+            ));
+        }
+
+        Ok(Self { bytes, position: 0 })
+    }
+}
+
+impl AsyncRead for DecompressReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let remaining = self.bytes.len() - usize::try_from(self.position).unwrap_or(0);
+        if remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let wanted = buf.remaining().min(remaining);
+        let at = usize::try_from(self.position).unwrap_or(0);
+        buf.put_slice(&self.bytes[at..at + wanted]);
+        self.position += u64::try_from(wanted).unwrap_or(0);
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncSeek for DecompressReader {
+    fn start_seek(mut self: Pin<&mut Self>, position: tokio::io::SeekFrom) -> std::io::Result<()> {
+        let target: i128 = match position {
+            tokio::io::SeekFrom::Start(at) => i128::from(at),
+            tokio::io::SeekFrom::End(offset) => {
+                let len = self.bytes.len() as i128;
+                len.saturating_add(i128::from(offset))
+            }
+            tokio::io::SeekFrom::Current(offset) => {
+                let at = i128::from(self.position);
+                at.saturating_add(i128::from(offset))
+            }
+        };
+
+        // The `i128` above is what makes a negative target impossible to reach
+        // as a `u64`, so the conversion is also the bounds check.
+        self.position = u64::try_from(target).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot seek before the start of a payload",
+            )
+        })?;
+        Ok(())
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        Poll::Ready(Ok(self.position))
+    }
+}

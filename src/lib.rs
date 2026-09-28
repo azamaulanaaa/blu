@@ -30,15 +30,17 @@
 //! # async fn example() -> std::io::Result<()> {
 //! use lepatch::{
 //!     command::{Options, backup, restore},
-//!     storage::{BlobStore, SegmentLimit},
+//!     storage::{BlobStore, Compression, SegmentLimit},
 //! };
 //!
-//! // First backup. Four gibibytes per segment, the default.
-//! let store = BlobStore::<true>::open("photos", SegmentLimit::default()).await?;
+//! // First backup. Four gibibytes per segment and zstd level 1, both the defaults.
+//! let store =
+//!     BlobStore::<true>::open("photos", SegmentLimit::default(), Compression::default()).await?;
 //! let first = backup("~/Pictures", Options::default(), store).await?;
 //!
 //! // Later backup. Nothing new to store means nothing is written.
-//! let store = BlobStore::<true>::open("photos", SegmentLimit::default()).await?;
+//! let store =
+//!     BlobStore::<true>::open("photos", SegmentLimit::default(), Compression::default()).await?;
 //! backup("~/Pictures", Options::default(), store).await?;
 //!
 //! // Restore.

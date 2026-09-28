@@ -45,6 +45,22 @@ enum Command {
         /// what is already there.
         #[arg(long, value_name = "SIZE", value_parser = parse_size)]
         segment_size: Option<u64>,
+        /// zstd level for compressing record payloads, 1 (fast) to 22 (small).
+        ///
+        /// Only affects records written from now on. Every record names the codec
+        /// it was written with, so a set written at one level reads back correctly
+        /// whatever level it is read or written at later, and changing it never
+        /// rewrites what is already there. A payload that does not compress —
+        /// most already-compressed assets — is stored raw at any level.
+        #[arg(long, value_name = "LEVEL")]
+        compression_level: Option<u8>,
+        /// Store record payloads uncompressed.
+        ///
+        /// Larger on disk and faster to write. What a set written this way loses
+        /// is nothing that affects reading it, so this and `--compression-level`
+        /// can be mixed within one set.
+        #[arg(long, conflicts_with = "compression_level")]
+        no_compression: bool,
     },
     /// Rebuild the per-version index files from the store's commit records.
     ///
@@ -279,7 +295,12 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             source,
             name,
             segment_size,
-        } => run_backup(&source, &name, segment_size).await,
+            compression_level,
+            no_compression,
+        } => {
+            let compression = compression_policy(compression_level, no_compression);
+            run_backup(&source, &name, segment_size, compression).await
+        }
         Command::Restore {
             destination,
             name,
@@ -401,8 +422,12 @@ async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
 
     let _lock = set.lock()?;
 
-    let store =
-        storage::BlobStore::<true>::open(set.base(), storage::SegmentLimit::default()).await?;
+    let store = storage::BlobStore::<true>::open(
+        set.base(),
+        storage::SegmentLimit::default(),
+        storage::Compression::default(),
+    )
+    .await?;
     let versions = store.versions()?;
 
     let written = store.write_index_files()?;
@@ -488,10 +513,29 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     Ok(())
 }
 
+/// The compression policy from the two flags, which cannot both be given.
+///
+/// `--no-compression` is a flag and `--compression-level` takes a value, so the
+/// level is the one that has to be interpreted: a bare `--compression-level`
+/// without a number is a usage error clap catches, and the value is clamped to
+/// zstd's range rather than rejected, because a knob out of range is a tuning
+/// mistake, not a correctness one.
+fn compression_policy(level: Option<u8>, off: bool) -> storage::Compression {
+    if off {
+        return storage::Compression::Off;
+    }
+
+    match level {
+        Some(level) => storage::Compression::zstd(level),
+        None => storage::Compression::default(),
+    }
+}
+
 async fn run_backup(
     source: &std::path::Path,
     name: &std::path::Path,
     segment_size: Option<u64>,
+    compression: storage::Compression,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
@@ -534,7 +578,7 @@ async fn run_backup(
     // Opening recovers the store: a tail past the last valid record in the last
     // segment is a run that did not finish, and is discarded here rather than
     // being read as data.
-    let store = storage::BlobStore::<true>::open(set.base(), limit).await?;
+    let store = storage::BlobStore::<true>::open(set.base(), limit, compression).await?;
 
     if let Some(previous) = store.versions()?.last() {
         tracing::debug!(previous, name = %set.base().display(), "deduplicating against the store");

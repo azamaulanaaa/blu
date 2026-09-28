@@ -100,13 +100,20 @@ impl Plan {
             }
 
             let placement = locate(id)?;
-            let stored = placement.len;
 
-            if length > stored {
+            // Against the *raw* length, not the stored one. A snapshot describes
+            // files and records its slices in content bytes, while a compressed
+            // placement's `len` is how many bytes the frame occupies on disk —
+            // which is a different, usually smaller, number. Comparing content to
+            // storage would either accept a chunk that is genuinely too short or
+            // reject a perfectly good one.
+            let held = placement.raw_len;
+
+            if length > held {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "a snapshot needs {} bytes of chunk {} but the store holds {stored}",
+                        "a snapshot needs {} bytes of chunk {} but the store holds {held}",
                         length,
                         crate::storage::hex(id)
                     ),
@@ -192,7 +199,7 @@ fn bad_index(snapshot: &Snapshot, slice: &FileChunk) -> io::Error {
 mod tests {
     use super::Plan;
     use crate::metadata::{File, FileChunk, Snapshot};
-    use crate::storage::{BlobId, Placement};
+    use crate::storage::{BlobId, Codec, Placement};
 
     fn chunk() -> BlobId {
         [7u8; 32]
@@ -203,6 +210,11 @@ mod tests {
             segment: 0,
             offset,
             len,
+            // These tests are about a plan's ordering and coverage, which do not
+            // depend on how a payload is stored, so every placement here is raw
+            // and its raw length is its length on disk.
+            raw_len: len,
+            codec: Codec::Raw,
         }
     }
 

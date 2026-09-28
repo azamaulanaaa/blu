@@ -20,7 +20,7 @@ use std::{fs, path::Path};
 
 use lepatch::{
     index::IndexSet,
-    storage::{BlobId, BlobStore, SegmentLimit, StorageGet, StoragePut},
+    storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet, StoragePut},
 };
 
 /// A limit small enough that a few hand-placed blobs roll over.
@@ -36,7 +36,9 @@ fn small() -> SegmentLimit {
 
 /// Store `payloads` one at a time, returning the ids in the order stored.
 async fn put_all(blob: &Path, limit: SegmentLimit, payloads: &[Vec<u8>]) -> Vec<BlobId> {
-    let store = BlobStore::<true>::open(blob, limit).await.unwrap();
+    let store = BlobStore::<true>::open(blob, limit, Compression::default())
+        .await
+        .unwrap();
 
     let mut ids = Vec::new();
     for payload in payloads {
@@ -55,12 +57,29 @@ async fn put_all(blob: &Path, limit: SegmentLimit, payloads: &[Vec<u8>]) -> Vec<
     ids
 }
 
-/// Content that is not a repeating pattern, so the chunker is irrelevant here but
-/// the hashes are still distinct.
+/// Content that is neither a repeating pattern nor compressible, so the chunker is
+/// irrelevant here, the hashes are still distinct, and the bytes on disk are the
+/// bytes handed in.
+///
+/// The last part is the point. Every test in this file is about *how many bytes a
+/// record occupies on disk* — roll-over, sealing, the size of a header — and the
+/// store compresses what it stores. A payload that compressed would make a set fit
+/// in fewer segments than the test is asserting about, so these use content zstd
+/// cannot improve on and the arithmetic means what it says.
 fn payload(seed: u8, len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| u8::try_from((i * 31 + usize::from(seed) * 7) % 251).unwrap())
-        .collect()
+    // blake3 in counter mode: high-entropy, so a frame is never smaller than the
+    // input and the store falls back to storing it raw.
+    let mut out = Vec::with_capacity(len);
+    let mut key = [0u8; 32];
+    key[0] = seed;
+    for counter in 0..u64::try_from(len.div_ceil(64)).unwrap_or(0) {
+        let mut input = [0u8; 72];
+        input[..32].copy_from_slice(&key);
+        input[32..40].copy_from_slice(&counter.to_le_bytes());
+        out.extend_from_slice(blake3::hash(&input).as_bytes());
+    }
+    out.truncate(len);
+    out
 }
 
 /// A set that outgrows its limit has more than one segment.
@@ -130,7 +149,9 @@ async fn a_record_larger_than_the_limit_is_refused() {
     let limit = tiny();
 
     let big = payload(1, 8_192);
-    let store = BlobStore::<true>::open(&blob, limit).await.unwrap();
+    let store = BlobStore::<true>::open(&blob, limit, Compression::default())
+        .await
+        .unwrap();
 
     let error = store
         .put(
@@ -262,7 +283,9 @@ async fn a_sealed_segment_with_a_damaged_tail_is_refused_not_truncated() {
     let damaged_len = bytes.len();
     fs::write(sealed, &bytes).unwrap();
 
-    let error = BlobStore::<true>::open(&blob, tiny()).await.unwrap_err();
+    let error = BlobStore::<true>::open(&blob, tiny(), Compression::default())
+        .await
+        .unwrap_err();
     assert!(
         error.to_string().contains("sealed segment"),
         "a sealed segment's damage should be named as such, got: {error}"
@@ -386,7 +409,11 @@ async fn concurrent_writes_across_a_rollover_do_not_overlap() {
     let payloads: Vec<Vec<u8>> = (0..BLOBS)
         .map(|i| payload(u8::try_from(i).unwrap(), 600 + i * 3))
         .collect();
-    let store = std::sync::Arc::new(BlobStore::<true>::open(&blob, limit).await.unwrap());
+    let store = std::sync::Arc::new(
+        BlobStore::<true>::open(&blob, limit, Compression::default())
+            .await
+            .unwrap(),
+    );
 
     let mut tasks = Vec::new();
     for payload in payloads.iter().cloned() {
