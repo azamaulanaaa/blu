@@ -10,8 +10,7 @@
 //! blob's worth of one file's worth of bytes.
 //!
 //! Neither type is specific to chunking or to any storage backend; they are
-//! general adapters, which is why they live here rather than in [`crate::reader`]
-//! next to the chunker.
+//! general adapters.
 
 use std::{
     pin::Pin,
@@ -23,10 +22,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Size of the stack scratch buffer used to stage bytes out of the inner
 /// reader.
 ///
-/// The inner reader cannot be handed the caller's buffer directly, because only
-/// this type knows how much of it is within the limit. Matches
-/// `tokio::io::copy`'s own buffer size so a copy through this reader does not
-/// split every read in two.
+/// The inner reader cannot be handed the caller's buffer, because only this type
+/// knows how much of it is within the limit. Matches `tokio::io::copy`'s own
+/// buffer so a copy through this reader does not split every read in two.
 const SCRATCH: usize = 8 * 1024;
 
 /// An [`AsyncRead`] over at most the first `limit` bytes of `inner`.
@@ -41,8 +39,8 @@ pub struct SliceAsyncReader<R> {
 
 impl<R> std::fmt::Debug for SliceAsyncReader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Deliberately not derived: `R` is an arbitrary stream type, and
-        // requiring `R: Debug` here would be a needless bound.
+        // Hand-written rather than derived: `R` is an arbitrary stream type, and
+        // a bound on it would be needless.
         f.debug_struct("SliceAsyncReader")
             .field("position", &self.position)
             .field("limit", &self.limit)
@@ -81,15 +79,14 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // `wanted` is bounded by `self.remaining()`, a `u64`, so narrowing it to
-        // `usize` is exact on every target that can hold a `u32` limit.
+        // Bounded by `self.remaining()`, a `u64`, so the narrowing to `usize` is
+        // exact on any target that can hold the limit.
         let offered = u64::try_from(buf.remaining()).unwrap_or(u64::MAX);
         let wanted = usize::try_from(self.remaining().min(offered)).unwrap_or(0);
 
         // The caller has no room. Polling the inner reader with an empty buffer
-        // would make it report end of stream, which it would then keep doing —
-        // so the inner reader is left untouched and only the caller's
-        // zero-length request is answered.
+        // would make it report end of stream, and keep doing so, so the inner
+        // reader is left untouched.
         if wanted == 0 {
             return Poll::Ready(Ok(()));
         }
@@ -120,7 +117,10 @@ impl<R> tokio::io::AsyncSeek for SliceAsyncReader<R>
 where
     R: tokio::io::AsyncSeek + Unpin,
 {
-    /// Seeks are per slice rather than per read, so tracing them is cheap.
+    /// # Errors
+    ///
+    /// Returns an error for a seek before the start of the slice, one past its
+    /// limit, or one whose delta is too large to express as a relative seek.
     #[tracing::instrument(level = "trace", skip(self), err)]
     fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
         let new_position = match position {
@@ -142,8 +142,7 @@ where
             ));
         }
 
-        // Move the inner reader by a relative delta rather than an absolute
-        // position, because its own origin is wherever the caller left it.
+        // Relative, because the inner reader's origin is wherever the caller left it.
         let delta = i128::from(new_position) - i128::from(self.position);
         self.position = new_position;
 
@@ -188,7 +187,7 @@ where
     W: AsyncWrite + Unpin,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Deliberately not derived: `W` is an arbitrary writer type.
+        // Hand-written, so `W` need not be `Debug`.
         f.debug_struct("SliceAsyncWriter")
             .field("remaining", &self.remaining)
             .finish_non_exhaustive()
@@ -227,10 +226,9 @@ where
             return Poll::Ready(Ok(0));
         }
 
-        // Clamped in `usize` space, where `buf.len()` already is. Taking the
-        // minimum in `u64` and narrowing afterwards would be lossy on a 32-bit
-        // target; converting the limit first is exact everywhere, because a
-        // limit above `usize::MAX` can only mean "more than any buffer".
+        // Clamped in `usize` space, where `buf.len()` already is: taking the
+        // minimum in `u64` and narrowing after would be lossy on a 32-bit target.
+        // A limit above `usize::MAX` can only mean "more than any buffer".
         let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
         let limit = std::cmp::min(remaining, buf.len());
 
@@ -258,24 +256,12 @@ where
     }
 }
 
-/// An [`AsyncRead`] that yields the decompressed bytes of a compressed payload.
+/// An [`AsyncRead`] over the decompressed bytes of a compressed payload,
+/// decompressed in one go on a blocking thread and served from memory.
 ///
-/// The compressed form is decompressed in one go, on a blocking thread, and the
-/// result is served from memory. That is a deliberate shape rather than a lazy
-/// stream:
-///
-/// * The payloads this is used for are chunks, which the chunker already caps
-///   (64 KiB by default), so buffering one is the same order of memory the backup
-///   pipeline already holds. A restore that streamed compressed bytes through a
-///   streaming decoder would hold less, but would pay a decode call per read for
-///   the privilege.
-/// * Seeking is the real constraint. [`crate::storage::AsyncReadSeek`] is part of
-///   the reader type every storage backend hands out, and a streaming zstd frame
-///   cannot seek backwards without an index. Buffering makes seek a slice, which
-///   is what a caller expects and needs.
-///
-/// A future format that stores large multi-gigabyte payloads would want the
-/// streaming decoder here instead, and the seam for it is this one type.
+/// It is seekable because [`crate::storage::AsyncReadSeek`] is part of the reader
+/// every storage backend hands out, and a streaming zstd frame cannot seek
+/// backwards without an index.
 pub struct DecompressReader {
     bytes: Vec<u8>,
     position: u64,
@@ -293,22 +279,10 @@ impl std::fmt::Debug for DecompressReader {
 impl DecompressReader {
     /// Decompress `compressed` into a reader, on a blocking thread.
     ///
-    /// `raw_len` is the expected size of the result and is used to pre-size the
-    /// buffer; a frame that does not decode to exactly that many bytes is an
-    /// error, because a record's raw length is in its header and disagreeing with
-    /// it means the record is not what the store says it is.
-    ///
-    /// The frame's own idea of how many bytes it decodes to, read out of its
-    /// header, checked against the length the record claims before anything is
-    /// allocated.
-    ///
-    /// This is the step that keeps a damaged or hostile record from being a crash.
-    /// `raw_len` comes out of a record header, and a header is covered by a
-    /// truncated hash rather than a MAC — so a file that has been tampered with
-    /// could carry a perfectly valid check and an absurd length. Handing that to
-    /// the decompressor means either a multi-gigabyte allocation or, when the
-    /// frame turns out to be *longer* than the buffer, a panic from deep inside
-    /// zstd. Neither is a thing a read of a backup should be able to do.
+    /// `raw_len` pre-sizes the buffer, and the frame's declared content size is
+    /// checked against it *before* anything is allocated: a record header is a
+    /// truncated hash, not a MAC, so `raw_len` is untrusted. Any other decoded
+    /// length is an error, because the record is not what the store says it is.
     ///
     /// # Errors
     ///
@@ -323,11 +297,9 @@ impl DecompressReader {
             )
         })?;
 
-        // `None` means the frame does not say how big it is, which happens when
-        // whatever produced it was compressing a stream rather than a buffer and
-        // could not know the length in advance. Nothing here produces such a
-        // frame, and accepting one would mean decoding blind — which is exactly
-        // the allocation this check exists to prevent.
+        // `None` means the frame does not declare a size, which is what a
+        // compressed *stream* looks like. Nothing here produces one, and
+        // accepting one would mean decoding blind.
         let declared = zstd::zstd_safe::get_frame_content_size(&compressed)
             .map_err(|e| {
                 std::io::Error::new(
@@ -352,8 +324,7 @@ impl DecompressReader {
             ));
         }
 
-        // Now that the frame and the header agree, the decode cannot come up
-        // short or long, and the buffer is exactly the size it needs to be.
+        // Frame and header agree, so the decode can come up neither short nor long.
         let bytes =
             tokio::task::spawn_blocking(move || zstd::bulk::decompress(&compressed, expected))
                 .await
@@ -409,8 +380,8 @@ impl tokio::io::AsyncSeek for DecompressReader {
             }
         };
 
-        // The `i128` above is what makes a negative target impossible to reach
-        // as a `u64`, so the conversion is also the bounds check.
+        // The `i128` target makes a negative position impossible to convert, so
+        // the conversion is the bounds check.
         self.position = u64::try_from(target).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
