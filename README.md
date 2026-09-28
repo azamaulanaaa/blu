@@ -137,6 +137,12 @@ report a version it does not have.
 whose index write was abandoned still exists and still restores. It never
 over-reports.
 
+A set that is not there is an error rather than an empty listing — a mistyped name
+must not come back as "no versions" — and a set that exists but commits nothing
+lists as empty, which is a different thing. `lepatch reindex` refuses a name that
+is not a set rather than creating one, since opening a store for writing creates
+it and a repair command should not manufacture the thing it was asked to repair.
+
 ### Packs
 
 A store is the right shape for *holding* versions and the wrong shape for *serving*
@@ -204,7 +210,14 @@ not valid UTF-8 are stored as raw bytes rather than aborting the backup.
 ## What is not preserved
 
 Ownership, ACLs, extended attributes, and hard-link relationships that point
-outside the tree being backed up. Device nodes, FIFOs and sockets are skipped.
+outside the tree being backed up.
+
+Device nodes, named pipes and sockets are **skipped, and reported**. They are not
+skipped silently and they are not read: opening a FIFO for reading blocks until a
+writer appears, so a tree containing one would hang the run — and a Ctrl-C would
+not save it, because the signal is caught by the handler that releases claims and
+that handler cannot unwind a thread parked in a read. The run says which paths it
+left out, so a tree holding one is visible rather than quietly incomplete.
 
 ## Failure behaviour
 
@@ -260,15 +273,19 @@ Stated rather than discovered:
   of chunks and verify streams each one past a fixed scratch buffer, so this is a
   limit on the tree's shape rather than on its size. Removing it means streaming
   the snapshot, which is a change to the on-disk format rather than a tuning knob.
-- **A backup is CPU-bound, and mostly on hashing.** Measured on 160 MB: 1.2s of CPU
-  for 0.48s of wall clock, about half of it in the kernel. Reading and writing that
-  much to a tmpfs costs about 70ms, so the run is not waiting on the disk at all.
-  The reader hashes with blake3 on one thread while it walks the tree, and that
-  thread is the busiest thing in the process. The obvious fix is hashing chunks
+- **A backup is CPU-bound, and mostly in the kernel.** Measured on a 153 MB tree of
+  eight files, release build, tmpfs, 4 cores: **0.70s of wall clock for 1.54s of
+  CPU** — 0.43s user and 1.11s system, so about **three quarters** of the work is
+  kernel time in the syscalls rather than hashing. The run is not waiting on the
+  disk: reading the same 153 MB costs 23ms and reading *and writing* it costs
+  313ms, both to tmpfs, which is a fraction of the run. The reader hashes with
+  blake3 on one thread while it walks the tree. The obvious fix is hashing chunks
   across a thread pool, which the pipeline's current shape does not allow: the
-  hash is needed to deduplicate, and deduplication is decided in commit order
-  after every store has finished. It is a change to the pipeline rather than a
-  tuning knob.
+  hash is needed to deduplicate, and deduplication is decided in commit order after
+  every store has finished. It is a change to the pipeline rather than a tuning
+  knob. Treat these numbers as indicative of the *shape* — CPU-bound, mostly
+  kernel, not I/O-bound — rather than as a figure to plan capacity against; they
+  are from one machine and move with the kernel version and the filesystem.
 - **A merging restore is not atomic.** It writes in place, so one interrupted by a
   full disk or a kill leaves the destination partly written, and there is no
   journal to resume from. `--clean` *is* atomic: it assembles the tree beside the

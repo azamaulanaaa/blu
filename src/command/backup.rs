@@ -245,6 +245,25 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 return Ok(None);
             }
 
+            // Anything that is not a regular file and not one of the three cases
+            // above is a named pipe, a socket or a device node. Reading one is not
+            // slow, it never returns: opening a FIFO for reading blocks until a
+            // writer appears, so a tree containing one would hang the run
+            // forever — and, because this binary handles SIGTERM to release its
+            // claims, the signal would be caught by a handler that could not
+            // unwind a thread parked in `read`.
+            //
+            // So they are skipped, and said so, because a file in the tree that
+            // the backup does not contain is exactly the thing a user needs to
+            // know rather than discover.
+            if !meta.is_file() {
+                tracing::info!(
+                    path = %relative_path.display(),
+                    "skipping a named pipe, socket or device node",
+                );
+                return Ok(None);
+            }
+
             // The first path to reference an inode carries the content; every
             // later path sharing it becomes a hard link to that one.
             if let Some(file_id) = FileId::from_metadata(&meta) {

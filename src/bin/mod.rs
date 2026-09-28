@@ -188,6 +188,40 @@ fn init_tracing(verbose: bool, quiet: bool) {
 /// signal is the reason the run was abandoned, not the reason it failed.
 static STOP_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Print one line of a command's output.
+///
+/// `println!` is not usable here. Rust sets `SIGPIPE` to ignored at startup, so a
+/// write to a pipe whose reader has gone returns `EPIPE` rather than raising the
+/// signal, and the print macros panic on a write error. So `lepatch versions set |
+/// head -1` printed a version and then panicked with a backtrace, exiting 101.
+///
+/// A panic is the wrong answer three times over: the reader going away is what
+/// `head` does on purpose, a backtrace is not an error report, and 101 is a
+/// failure a script would act on. The usual fix is to restore the default
+/// `SIGPIPE` disposition, which needs `unsafe` — and this crate forbids `unsafe`
+/// outright rather than allowing it by exception, which is the right line for
+/// something meant to be trusted with a copy of someone's data.
+///
+/// So the pipe is handled here instead: print until the reader goes, then stop and
+/// exit as the run otherwise would. Any other write failure is still an error,
+/// because a full disk on a redirected file is not the reader's fault.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        match writeln!(out, $($arg)*) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            Err(e) => {
+                eprintln!("error: could not write output: {e}");
+                std::process::exit(1);
+            }
+        }
+    }};
+}
+
 /// Run a command, abandoning it if the process is asked to stop.
 ///
 /// Without this, Ctrl-C left a restore claim behind that had to be removed by
@@ -349,6 +383,22 @@ fn select_version(
 /// lock is taken so a run cannot be appending while the records are being read.
 async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
     let set = IndexSet::new(name);
+
+    // Refuse before taking the lock and before opening, because opening for
+    // writing *creates* a set that is not there. Without this a mistyped name
+    // left a new empty store behind and reported a successful repair of it —
+    // which is the one thing a repair command must never do.
+    if set.segments()?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no backup set at {}: there is nothing to reindex (looked in {})",
+                set.base().display(),
+                set.directory().display()
+            ),
+        ));
+    }
+
     let _lock = set.lock()?;
 
     let store =
@@ -385,12 +435,31 @@ async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
 /// been backed up yet should see an empty list rather than a failure.
 async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Result<()> {
     let set = IndexSet::new(name);
+
+    // No segments at all is not an empty set, it is a mistyped name. The store
+    // reports both as `NotFound`, and answering "no versions" to a name that
+    // names nothing is exactly the failure this command must not have: the set
+    // read refuses it, and a listing of an empty but real set is still a listing.
+    if set.segments()?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no backup set at {} (looked in {})",
+                set.base().display(),
+                set.directory().display()
+            ),
+        ));
+    }
+
     let versions = set.indexed_versions()?;
 
     // The hashes, which the file names cannot supply. Opened once, read-only: a
     // store cannot be recovered and then left alone, because recovery truncates,
     // and listing what is there must not be the thing that discards an unfinished
     // run.
+    //
+    // A set whose segments are all here but which commits no version is a real
+    // set with nothing in it, and lists as empty rather than as an error.
     let store = match storage::BlobStore::<false>::open(set.base()).await {
         Ok(store) => store,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -404,7 +473,7 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
         if numbers_only {
             let path = set.index_path(version);
             if storage::VersionIndex::read(&path).is_some() {
-                println!("{version}");
+                say!("{version}");
             }
             continue;
         }
@@ -413,7 +482,7 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
             continue;
         };
 
-        println!("{version}  {}", storage::hex(&snapshot));
+        say!("{version}  {}", storage::hex(&snapshot));
     }
 
     Ok(())
@@ -765,7 +834,7 @@ async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Re
         eprintln!("error: {}", failure.detail);
     }
 
-    println!(
+    say!(
         "checked {} chunks ({} bytes) in version {version}: {}",
         report.chunks,
         report.bytes,
@@ -823,8 +892,8 @@ async fn run_pack(
     // pack's name: the same tree packs to the same bytes, so this is a value a
     // cache can be keyed on and a client can verify with one comparison. Printing
     // the file's own size alongside it makes the two comparable.
-    println!("{}  {}", storage::hex(&content), out.display());
-    println!(
+    say!("{}  {}", storage::hex(&content), out.display());
+    say!(
         "version {version}: {} chunks, {} bytes of payload, {} bytes on disk",
         pack.len(),
         pack.payload_len(),

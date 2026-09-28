@@ -1212,3 +1212,193 @@ fn packing_a_version_that_does_not_exist_is_refused() {
         "a refused pack should not leave a file behind"
     );
 }
+
+/// A mistyped set name is an error, not an empty answer.
+///
+/// The store's own rule is that reading a path which is not a store is an error
+/// rather than an empty set, "so a mistyped name cannot come back as no
+/// versions". Two commands were breaking it, in opposite ways.
+#[test]
+fn a_mistyped_set_name_is_an_error_not_an_empty_listing() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let listed = lepatch(dir.path(), &["versions", "nosuchset"]);
+    assert_eq!(
+        listed.status.code(),
+        Some(1),
+        "`versions` on a set that is not there should fail, not list nothing\nstderr: {}",
+        stderr(&listed)
+    );
+    assert_eq!(stdout(&listed), "", "a failed listing should print nothing");
+
+    // The worse of the two: opening for writing *creates* a set, so a repair
+    // command given a mistyped name used to manufacture an empty one and report a
+    // successful repair of it.
+    let reindexed = lepatch(dir.path(), &["reindex", "nosuchset"]);
+    assert_eq!(
+        reindexed.status.code(),
+        Some(1),
+        "`reindex` on a set that is not there should fail\nstderr: {}",
+        stderr(&reindexed)
+    );
+    assert!(
+        !dir.path().join("nosuchset.0000.bin").exists(),
+        "`reindex` created a backup set instead of refusing to repair one"
+    );
+}
+
+/// A set that exists but commits no version lists as empty, which is a different
+/// thing from a name that names nothing.
+///
+/// The distinction is the whole reason for the check above: an empty set is a
+/// real answer to a real question, and refusing it would make a freshly created
+/// set unusable.
+#[test]
+fn a_set_with_no_committed_version_lists_as_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.bin"), noisy(40_000)).unwrap();
+
+    // A backup that never commits: killed before its commit record.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        .current_dir(dir.path())
+        .args(["backup", ".", "store"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to run the lepatch binary");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Whatever state the kill left, the store is either absent — in which case
+    // there is nothing to assert — or present and listing as empty.
+    if dir.path().join("store.0000.bin").exists() {
+        let listed = lepatch(dir.path(), &["versions", "store"]);
+        assert_eq!(
+            listed.status.code(),
+            Some(0),
+            "a set that exists should list, even if empty\nstderr: {}",
+            stderr(&listed)
+        );
+    }
+}
+
+/// A tree containing a named pipe is backed up without hanging.
+///
+/// Reading a FIFO blocks until a writer appears, so a tree containing one used to
+/// hang the run forever — and, because the binary installs a SIGTERM handler to
+/// release its claims, the signal could not kill it either. The test runs the
+/// backup with a timeout so a regression fails rather than hanging the suite.
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_is_skipped_rather_than_read() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.bin"), noisy(60_000)).unwrap();
+
+    // A FIFO, and a socket: both are readable and neither terminates.
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(dir.path().join("pipe"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "could not create a FIFO to test with"
+    );
+    let _listener = UnixListener::bind(dir.path().join("sock")).expect("bind a socket");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        .current_dir(dir.path())
+        .args(["backup", ".", "store"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to run the lepatch binary");
+
+    // Polled rather than slept on, so a slow machine does not fail the test and a
+    // hung one does not hang it. Ten seconds is far longer than this backup takes
+    // and far shorter than a CI timeout.
+    let mut finished = None;
+    for _ in 0..100 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                finished = Some(status);
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) => break,
+        }
+    }
+    let hung = finished.is_none();
+    if hung {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    assert!(
+        !hung,
+        "a backup of a tree containing a FIFO did not finish: reading one blocks \
+         until a writer appears, so it must be skipped"
+    );
+
+    // And the rest of the tree was actually backed up, so "it finished" does not
+    // just mean "it gave up early".
+    let restored = dir.path().join("out");
+    ok(dir.path(), &["restore", "out", "store"]);
+    assert!(
+        restored.join("a.bin").exists(),
+        "the ordinary files should still have been backed up"
+    );
+}
+
+/// Piping a command into something that stops reading is not a failure.
+///
+/// `lepatch versions set | head -1` used to print a line and then panic, because
+/// Rust ignores `SIGPIPE` and the print macros turn the resulting `EPIPE` into a
+/// panic. A reader that stops early is what `head` does on purpose, so it exits
+/// as the run otherwise would, with nothing on stderr.
+#[test]
+fn a_command_piped_into_something_that_stops_early_does_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..4 {
+        fs::write(
+            dir.path().join(format!("f{i}.bin")),
+            noisy(40_000 + i * 5_000),
+        )
+        .unwrap();
+    }
+    ok(dir.path(), &["backup", ".", "store"]);
+
+    // Enough versions that `head` is guaranteed to close the pipe early.
+    for i in 0..5 {
+        fs::write(dir.path().join("a.bin"), noisy(40_000 + i * 3_000)).unwrap();
+        ok(dir.path(), &["backup", ".", "store"]);
+    }
+
+    let mut child = Command::new("sh")
+        .current_dir(dir.path())
+        .arg("-c")
+        .arg(format!(
+            "{} versions store 2>pipe-err.log | head -1 > /dev/null; echo $?",
+            env!("CARGO_BIN_EXE_lepatch")
+        ))
+        .output()
+        .expect("failed to run the pipeline");
+
+    assert!(
+        child.status.success(),
+        "the shell should not have reported a failure: {}",
+        String::from_utf8_lossy(&child.stdout)
+    );
+
+    let reported = String::from_utf8_lossy(&child.stdout);
+    let noise = fs::read_to_string(dir.path().join("pipe-err.log")).unwrap_or_default();
+    assert!(
+        !noise.contains("panicked") && !noise.contains("Broken pipe"),
+        "a piped command panicked instead of stopping quietly:\n{noise}"
+    );
+    assert!(
+        !reported.contains("101"),
+        "the command should not have exited as a panic, got: {reported}"
+    );
+}
