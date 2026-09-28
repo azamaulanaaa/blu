@@ -11,20 +11,15 @@
 //! photos.lock         held for the duration of a write
 //! ```
 //!
-//! ## Why segments
+//! ## Segments
 //!
-//! One file that grows without bound hits a limit sooner or later — a
-//! filesystem's maximum file size, a backup tool that cannot read it, a transfer
-//! that has to succeed in one piece. A set that is several files each under a
-//! fixed limit has none of those problems, and the numbering means a segment can
-//! be handled on its own.
+//! Each file is under a fixed limit, so nothing here meets a maximum file size,
+//! a tool that cannot read the set, or a transfer that has to succeed in one
+//! piece, and a segment can be moved, verified or replaced on its own.
 //!
-//! The property that makes this safe rather than merely possible is that **a
-//! full segment is sealed**. Nothing writes to it again, so a torn write — which
-//! the commit protocol already anticipated as a tail that fails to verify — can
-//! only ever be in the last segment. Every other segment is immutable, which
-//! means a failure inside one is permanent and detectable rather than something
-//! the next open can quietly paper over by truncating it.
+//! A full segment is **sealed** and never written again, so a torn write can only
+//! be in the last one: a failure inside any other is permanent and detectable
+//! rather than something the next open papers over by truncating it.
 //!
 //! Every segment's header carries its own number, and a file whose header does
 //! not match the number in its name is refused rather than read as though it
@@ -36,27 +31,21 @@
 //! ## Index files
 //!
 //! One small file per version, saying which segment that version's snapshot is
-//! in. They exist for one reason: without them, answering "where is version 7's
-//! snapshot" means reading the headers of every record in every segment, and that
-//! scan is on the critical path of every restore and every verify.
+//! in — so answering "where is version 7's snapshot" costs a file name rather
+//! than the headers of every record in the set.
 //!
 //! **They are a cache, not a second source of truth.** The store's commit records
 //! are the record of what versions exist; an index file is derived from them and
 //! can be lost, stale, or wrong without the store disagreeing about anything. If
-//! the two conflict, the store wins and the index is rebuilt. That is the
-//! inversion from the previous design, where an index file *was* the only place a
-//! version existed and publishing it was the commit — a cross-file commit, since
-//! nothing could make an index and the bytes it named land together. Now the
-//! commit record is the commit, a single append to a single file, and the index
-//! can be written after it, best-effort, and losing it costs a scan rather than a
-//! backup.
+//! the two conflict, the store wins and the index is rebuilt. The commit record
+//! is the commit, a single append to a single file, and the index is written
+//! after it, best-effort, so losing one costs a scan rather than a backup.
+//! `lepatch reindex` rebuilds them from the store.
 //!
-//! `lepatch reindex` rebuilds them from the store, which is the operation the
-//! previous design had no equivalent of.
-//!
-//! The `v` in `photos.v001.idx` is deliberate. Without it, `photos.001.idx` and
-//! `photos.001.bin` would name different things in the same directory, and a glob
-//! or a person clearing out old index files would hit both.
+//! The `v` in `photos.v0001.idx` separates the two kinds of file: without it,
+//! `photos.0001.idx` and `photos.0001.bin` would name different things in the
+//! same directory, and a glob or a person clearing out old index files would hit
+//! both.
 //!
 //! The base path is treated as an opaque prefix rather than a stem, so a base
 //! of `photos.tar` yields `photos.tar.0000.bin` instead of silently losing the
@@ -100,9 +89,8 @@ impl IndexSet {
 
     /// Path of segment `segment` of the store.
     ///
-    /// Zero-padded to [`SEGMENT_DIGITS`], so that lexical order over the files in
-    /// a directory is numeric order over the segments — a listing that reads
-    /// `0010` before `0002` is a set that restores its records out of order.
+    /// Zero-padded to [`SEGMENT_DIGITS`], so lexical order over the files in a
+    /// directory is numeric order over the segments.
     #[must_use]
     pub fn blob_path(&self, segment: u32) -> PathBuf {
         self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{BLOB_EXTENSION}"))
@@ -111,10 +99,9 @@ impl IndexSet {
     /// Every segment of the set that is on disk, in order.
     ///
     /// Reads the directory rather than probing for `0`, `1`, `2` until one is
-    /// missing, so a set with a gap in it is reported as the set it is instead of
-    /// as a shorter one. A base path whose directory does not exist yet is an
-    /// empty set rather than an error, so the first backup of a fresh location
-    /// does not have to special-case it.
+    /// missing, and takes only files named exactly `base.NNNN.bin` — this reads a
+    /// directory a person can put things in. A base path whose directory does not
+    /// exist yet is an empty set rather than an error.
     ///
     /// # Errors
     ///
@@ -137,10 +124,6 @@ impl IndexSet {
                 continue;
             }
 
-            // Only the layout's own shape. A file that merely starts with
-            // `photos.` is somebody's, and this reads a directory a person can put
-            // things in — so anything that is not exactly `NNNN.bin` is left alone
-            // rather than guessed at.
             let Some(number) = Self::segment_number(&path, &prefix) else {
                 continue;
             };
@@ -150,9 +133,9 @@ impl IndexSet {
 
         found.sort_by_key(|(number, _)| *number);
 
-        // A gap is refused rather than tolerated. The segments are the only place
-        // the data is, and a set missing one in the middle would otherwise read
-        // as though the chunks in it had never been stored.
+        // A gap is refused rather than tolerated: the segments are the only place
+        // the data is, so a missing one would read as though those chunks had
+        // never been stored.
         for (index, (number, _)) in found.iter().enumerate() {
             let expected = u32::try_from(index).unwrap_or(u32::MAX);
             if *number != expected {
@@ -179,10 +162,8 @@ impl IndexSet {
 
     /// Every version that has an index file, in order.
     ///
-    /// The names, not the contents: reading them is the cheap half, and the count
-    /// of them is what lets an open know how far a set has got without scanning
-    /// it. Which of them are *current* is the store's business, not this
-    /// function's.
+    /// The names, not the contents: which of them are *current* is the store's
+    /// business, not this function's.
     ///
     /// # Errors
     ///
@@ -231,10 +212,6 @@ impl IndexSet {
     }
 
     /// The `base.v` part every index file of this set shares.
-    ///
-    /// The `v` is what keeps an index file from ever being mistaken for a
-    /// segment: both are `base.` plus digits plus an extension, and they live in
-    /// the same directory.
     fn index_prefix(&self) -> String {
         let base = self
             .base
@@ -246,6 +223,9 @@ impl IndexSet {
     }
 
     /// Directory the set's files live in.
+    ///
+    /// The working directory for a base path with no parent, which is what a bare
+    /// name like `photos` gives.
     #[must_use]
     pub fn directory(&self) -> &Path {
         self.base
@@ -287,9 +267,8 @@ impl IndexSet {
 
     /// The segment number in `path`'s file name, if it is one of this set's.
     ///
-    /// `None` for anything that is not exactly `base.NNNN.bin` — a neighbouring
-    /// set, a different extension, a note somebody left. Those are skipped rather
-    /// than reported, because they are not this set's business.
+    /// `None` for anything that is not exactly `base.NNNN.bin`, which is skipped
+    /// rather than reported.
     fn segment_number(path: &Path, prefix: &str) -> Option<u32> {
         let name = path.file_name()?.to_str()?;
 
@@ -323,9 +302,8 @@ impl IndexSet {
 
     /// Take the write lock, excluding other processes.
     ///
-    /// The lock is advisory and self-releasing only for a clean exit: if the
-    /// process is killed the file survives, and the error message says how to
-    /// recover.
+    /// Advisory, and released on drop only for a clean exit: a killed process
+    /// leaves the file behind, and the error says how to recover.
     ///
     /// # Errors
     ///
