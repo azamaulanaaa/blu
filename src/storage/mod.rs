@@ -9,11 +9,6 @@
 //! deduplicate against every version the store has ever held rather than only
 //! against the one before it, and it is why the caller does not have to know
 //! what is already there.
-//!
-//! The stream types live here rather than alongside the chunker because they are
-//! this module's own vocabulary: [`StorageGet::get`] hands one back, and
-//! [`StoragePut::put`] takes one. Keeping them with the chunker made the
-//! dependency run the wrong way, from storage up into chunking.
 
 use std::io;
 
@@ -36,9 +31,7 @@ mod version_index;
 
 /// The first `N` bytes of a BLAKE3 hash, for a checksum over fixed-size bytes.
 ///
-/// Both on-disk formats here — a record header and a version index file — are
-/// small, fixed-size, and carry a truncated digest to catch a torn or foreign
-/// write. They are the same computation and had it written out twice.
+/// The record header and the version index file both use it.
 pub(super) fn truncated_hash<const N: usize>(bytes: &[u8]) -> [u8; N] {
     let mut out = [0u8; N];
     out.copy_from_slice(&blake3::hash(bytes).as_bytes()[..N]);
@@ -47,29 +40,24 @@ pub(super) fn truncated_hash<const N: usize>(bytes: &[u8]) -> [u8; N] {
 
 /// Where a blob's payload sits in a store.
 ///
-/// A blob's offset and length are an implementation detail of the store holding
-/// it — a location in this file, an object key there — so a plan resolves a
-/// snapshot against a store and speaks in terms a pack writer can use.
+/// A location in this file, an object key there: an implementation detail of
+/// whichever backend holds the blob.
 pub use record::Placement;
 
 /// Address of a blob: the BLAKE3 hash of its contents.
 ///
-/// The store's index is keyed by this and the snapshot records it and nothing
-/// else, so the same type is a chunk's identity in a snapshot and its location
-/// in the store.
+/// Both a chunk's identity in a snapshot and its key in the store's index.
 pub type BlobId = [u8; 32];
 
 /// How large a store segment may get before a new one is started.
 ///
-/// A write policy, not part of the format, and deliberately so: a set written
-/// under one limit reads back under any other, because no record depends on where
-/// a segment boundary fell. A reader is given a limit only so that one value can
-/// be passed to both constructors, and ignores it.
+/// A write policy, not part of the format: a set written under one limit reads
+/// back under any other, because no record depends on where a segment boundary
+/// fell. A reader is given a limit only so one value can be passed to both
+/// constructors, and ignores it.
 ///
-/// The default is 4 GiB, which is chosen for the limits other tools impose
-/// rather than for lepatch's own: it is under the 4 GiB that FAT32 and several
-/// older archive formats refuse, and small enough that no single file needs 64-bit
-/// offsets to be handled by anything that moves data around.
+/// The default is 4 GiB, under what FAT32 and several older archive formats
+/// refuse, and small enough that no single file needs 64-bit offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SegmentLimit(u64);
 
@@ -99,27 +87,14 @@ impl Default for SegmentLimit {
 
 /// How record payloads are compressed on the way in.
 ///
-/// A write policy, and not a format property: every record names the codec it was
-/// written with, and its hash is always of the content rather than of the stored
-/// bytes. So a set whose records were written at different levels — or with
-/// compression off entirely — reads back correctly, and a chunk deduplicates
-/// against the same content no matter which run stored it first.
-///
-/// The default is [`Compression::Zstd`] at level 1, chosen from measurement
-/// rather than from habit. On a 4 MB executable, level 1 is 2.7x smaller at
-/// 468 MB/s and level 9 is 3.3x at 65 MB/s. zstd's own levels run to 22, and the
-/// last thirteen of them are not worth offering: they buy a few percent for a
-/// hundred times the time. On content that is already entropy-coded, which is most
-/// of what a game ships as textures, audio and video, every level produces
-/// something no smaller than the input, and a payload that does not shrink is
-/// stored raw rather than as a frame a few bytes larger than the bytes it
-/// replaced.
+/// A write policy, not a format property: every record names the codec it was
+/// written with and hashes the content rather than the stored bytes, so a set
+/// written at mixed levels — or with compression off — reads back and
+/// deduplicates correctly. The default is [`Compression::Zstd`] at level 1; the
+/// measurements behind that are in the README.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
-    /// Store payloads as they are.
-    ///
-    /// What [`Compression::from_level`] returns for 0, and the reason there is one
-    /// flag rather than a level and a switch.
+    /// Store payloads as they are. What [`Compression::from_level`] returns for 0.
     Off,
     /// Compress payloads as zstd frames at `level`.
     Zstd {
@@ -141,10 +116,9 @@ impl Compression {
     /// The policy for a level the way a user counts them: 0 stores payloads as they
     /// are, and 1 to 9 are zstd levels.
     ///
-    /// Out-of-range values are clamped rather than rejected, because this is a
-    /// library entry point and a caller with a bad number should get a working
-    /// policy rather than a panic. A command line rejects them instead, at the
-    /// point where the user can be told.
+    /// Out-of-range values are clamped rather than rejected, so a bad number gives
+    /// a working policy rather than a panic. A command line rejects them instead,
+    /// where the user can be told.
     #[must_use]
     pub fn from_level(level: u8) -> Self {
         match level {
@@ -174,23 +148,18 @@ impl Compression {
 
     /// Compress `raw`, returning the codec to record and the bytes to store.
     ///
-    /// A payload is stored as a zstd frame only when that frame is actually
-    /// smaller than the input. When it is not, the codec is [`Codec::Raw`] and the
-    /// bytes are returned unchanged: a frame that came out a few bytes *larger*
-    /// would make the store bigger for content zstd could not improve on, which is
-    /// the normal case for already-compressed assets.
+    /// A payload becomes a zstd frame only when that frame is strictly smaller
+    /// than the input; otherwise [`Codec::Raw`] and the bytes unchanged, so
+    /// already-compressed content never grows by a frame header.
     ///
-    /// The return type is a [`Vec`], so the fallback paths copy rather than
-    /// borrowing the caller's slice.
+    /// The return type is a [`Vec`], so the fallback paths copy.
     pub(super) fn compress(self, raw: &[u8]) -> (Codec, Vec<u8>) {
         let Some(level) = self.level() else {
             return (Codec::Raw, raw.to_vec());
         };
 
-        // `bulk::compress` is the one-shot form and pairs with the
-        // `bulk::decompress` the read path uses. A failure is not an error: the
-        // fallback below stores the bytes as they are, which is a correct record
-        // and a better outcome than failing a backup over a compressor hiccup.
+        // A compressor failure is not an error: the fallback stores the bytes as
+        // they are, which is a correct record and beats failing a backup.
         let Ok(encoded) = zstd::bulk::compress(raw, i32::from(level)) else {
             return (Codec::Raw, raw.to_vec());
         };
@@ -204,9 +173,6 @@ impl Compression {
 }
 
 /// The smallest record that can be written: a header and an empty payload.
-///
-/// The header is magic, kind, codec, two one-byte lengths of zero, a 32-byte hash
-/// and an 8-byte check.
 const MIN_RECORD: u64 = 6 + 2 + 32 + 8;
 
 /// A [`BlobId`] in lowercase hex, for messages a person can read off a screen
@@ -223,9 +189,7 @@ pub fn hex(id: &BlobId) -> String {
 
 /// A stream that is both [`AsyncRead`] and [`AsyncSeek`].
 ///
-/// This exists because `trait_alias` is still unstable. Every type that is both
-/// implements it automatically, so it is never implemented by hand; use
-/// [`StreamReadSeeker`] rather than naming it.
+/// Blanket-implemented, never by hand: use [`StreamReadSeeker`].
 pub trait AsyncReadSeek: AsyncRead + AsyncSeek {}
 
 impl<T: AsyncRead + AsyncSeek + ?Sized> AsyncReadSeek for T {}
@@ -233,9 +197,7 @@ impl<T: AsyncRead + AsyncSeek + ?Sized> AsyncReadSeek for T {}
 /// A boxed, seekable async stream, as handed out by a storage backend.
 ///
 /// Seekable because a blob is a region of a larger store: reading one means
-/// opening the store and seeking to where it starts, not reading the store from
-/// the beginning. That is what keeps deduplicated storage from turning into
-/// deduplicated *downloads*.
+/// seeking to where it starts rather than reading the store from the beginning.
 pub type StreamReadSeeker = Box<dyn AsyncReadSeek + Unpin + Send>;
 
 /// Reading blobs back out of a store.
@@ -273,10 +235,8 @@ pub trait StoragePut: Send + Sync {
 
     /// Make every record written so far durable.
     ///
-    /// A run calls this once, after its last data record and before committing.
-    /// It is a separate call rather than something `put` does because the
-    /// durability of a backup is the commit's business, not each blob's: a
-    /// store that synced every blob would pay for millions of them.
+    /// A run calls this once, after its last data record and before
+    /// [`StoragePut::commit`]. The run's durability point, not each blob's.
     ///
     /// # Errors
     ///
@@ -285,11 +245,9 @@ pub trait StoragePut: Send + Sync {
 
     /// Publish `snapshot` as the next version, and return the number it got.
     ///
-    /// Called after [`StoragePut::sync_data`], and durable itself. The caller
-    /// must not report a run as successful before this returns: a run that stops
-    /// before it leaves nothing behind, which is the guarantee, and a run that
-    /// claims success without it would leave a version nothing can be restored
-    /// from.
+    /// Called after [`StoragePut::sync_data`], and itself durable: a run that
+    /// stops before this leaves nothing behind, and one that reports success
+    /// without it publishes a version nothing can be restored from.
     ///
     /// # Errors
     ///
