@@ -3,24 +3,22 @@
 // functions that a benchmark calls, so they need the exemption spelled out: a
 // benchmark that cannot build its fixture has nothing useful to measure.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-// only covers code inside a `#[test]` function. The helpers below are plain
-// benchmark that cannot build the fixture tree or the sample snapshot
 
 //! Benchmarks for the unit-level work a backup is made of.
 //!
-//! These are the numbers that decide where an optimisation is worth making. They
-//! exist because a previous round of guessing was wrong twice: task spawns were
-//! blamed for a cost that was not theirs, and a worker pool was proposed on the
-//! strength of that guess and would have been seven times slower.
-//!
-//! Measured against a 200 MiB tree of 400 files, a backup spends its time like
-//! this, and each benchmark below covers one line of it:
+//! These are the numbers that decide where an optimisation is worth making, and
+//! each covers one line of a backup's cost. Measured against a 200 MiB tree of
+//! 400 files, a backup spends its time like this:
 //!
 //! ```text
 //! read + chunk (CDC)   0.086s   46%   chunking
 //! blake3                0.051s   27%   hashing
 //! plumbing              0.052s   28%   (channel and task handoffs — not here)
 //! ```
+//!
+//! Criterion is reliable for a ratio within one run and unreliable for a
+//! comparison against a previous run on a shared machine; `examples/ab.rs`
+//! documents why, with the measurements.
 
 use std::{hint::black_box, io::Cursor, path::PathBuf};
 

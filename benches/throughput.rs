@@ -3,8 +3,6 @@
 // functions that a benchmark calls, so they need the exemption spelled out: a
 // benchmark that cannot build its fixture has nothing useful to measure.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-// only covers code inside a `#[test]` function. The helpers below are plain
-// benchmark that cannot build the fixture tree
 
 //! End-to-end throughput for a whole backup and a whole restore.
 //!
@@ -20,37 +18,13 @@
 //!
 //! **Comparing one of these rows against a previous run of criterion is not.**
 //! Criterion's interval covers sampling noise within a run, which is not the
-//! dominant noise source on a shared machine. Measured here, on four cores with
-//! a background load average above 2:
+//! dominant noise source on a shared machine, and an effect under about 20% is
+//! not measurable that way. `examples/ab.rs` documents this with the
+//! measurements behind it, and is what a before/after claim should use.
 //!
-//! ```text
-//!                              within-run interval   across-run shift
-//! chunking/read_and_cut                  3.8%              4.3%
-//! adapters/bounded_read                  0.9%             16.0%
-//! adapters/bounded_write                 0.1%             12.0%
-//! ```
-//!
-//! A 0.9% interval around a number that then moved 16% on the next run. Criterion
-//! would have reported that as "no change". Run-to-run shifts of up to 29% have
-//! been observed on identical code here, so **an effect under about 20% is not
-//! measurable by comparing two separate runs** — and criterion will happily
-//! report one.
-//!
-//! For a before/after claim use `cargo run --release --example ab`, which takes
-//! the minimum over several rounds and interleaves variants, rather than
-//! criterion's stored baseline. `examples/ab.rs` documents why, and includes the
-//! measurements behind it.
-//!
-//! **Its absolute numbers are higher than the real binary's, and that gap is
-//! unexplained.** Measured here on a 50 MiB tree, byte for byte the same, with an
-//! identical `Options::default()` on a four-core box: the binary takes 0.14s and
-//! the harness 0.36s, with about half again as much CPU in the harness. The
-//! fixture, the data, the store's location, the number of trees resident, the
-//! concurrency, the worker count, building the fixture before the runtime exists
-//! and letting writeback settle were each ruled out by measuring. So the
-//! *ratios* this harness reports are sound — it measures every variant the same
-//! way — but the absolute throughput it prints is not the product's. For a number
-//! to quote about how fast a backup is, time the binary.
+//! **The absolute throughput here is higher than the real binary's, and that gap
+//! is unexplained.** The *ratios* are sound — every variant is measured the same
+//! way — but for a number to quote about how fast a backup is, time the binary.
 //!
 //! Setup is deliberately outside the timed region: the tree is built once, and
 //! each iteration starts from an empty store. A backup that deduped against its
@@ -58,18 +32,10 @@
 //!
 //! Backup is measured across a range of `Options::concurrency` rather than at
 //! one value, because the interesting question is not "how fast is this" but
-//! "where does it stop getting faster".
-//!
-//! That answer was wrong here for a long time, because of a fault in
-//! `examples/ab.rs`'s fixture: its pseudo-random generator was a function of
-//! `position + seed`, so every file in the tree was the same byte stream at a
-//! different offset. Deduplication removed over 90% of it and the curve flattened
-//! at 2.3x. With the fixture repaired — 50 MiB genuinely reaching the store — the
-//! same four-core box gives **3.0x from concurrency 1 to 8, still climbing at the
-//! top of the range**, and CPU time falls as concurrency rises (340 ms to 260 ms)
-//! rather than staying flat, which is what a store that is no longer serialising
-//! uploads looks like. The default of eight remains the right default; it is now
-//! the measured answer rather than an assumption.
+//! "where does it stop getting faster". On a four-core box with 50 MiB genuinely
+//! reaching the store, that is **3.0x from concurrency 1 to 8, still climbing at
+//! the top of the range**, with CPU time falling as concurrency rises rather than
+//! staying flat. The default of eight is the measured answer.
 
 use std::{
     hint::black_box,
