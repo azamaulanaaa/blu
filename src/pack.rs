@@ -1,41 +1,18 @@
 //! A pack: one version's chunks, concatenated into a single distributable file.
 //!
-//! # Why
-//!
-//! A store is a deduplicated content pool. It is the right shape for *holding*
-//! versions and the wrong shape for *serving* one, because a restore of a new
-//! version out of a store is a request per chunk. A pack is the same chunks laid
-//! end to end with no framing between them, so the bytes a player needs are
-//! contiguous and are one range request rather than thousands.
-//!
-//! Measured on a synthetic tree of 8 binaries and 6 asset blobs, patching one
-//! 500 KB binary:
-//!
-//! ```text
-//! v1 from nothing      1,309,726 bytes in  1 request
-//! v2 having v1           25,325 bytes in  1 request   (1.9% of the pack)
-//! ```
-//!
-//! One request in both cases, including the patch. That is the whole argument for
-//! packing, and it is not a small one: the same delta served out of the store is
-//! 25,325 requests.
-//!
-//! **The 1.9% is a best case and the request count is the result.** That fixture
-//! comes from a generator that is a function of position only, so every file in it
-//! is a prefix of the next and rewriting one truncates the original stream — the
-//! most favourable case content-defined chunking can be given. On a tree with no
-//! such relationship the same patch is 6.1% of the pack, still in one request.
-//! `a_patch_is_one_range_on_a_tree_that_is_not_a_special_case` asserts the
-//! request count on content that is not degenerate, which is the claim that
-//! generalises.
+//! A store is a deduplicated pool, and the wrong shape for serving one version: a
+//! restore out of a store is a request per chunk. A pack lays the same chunks end
+//! to end with no framing between them, so a version's bytes are contiguous and
+//! are one range request rather than thousands. The measurements behind that are
+//! in the README.
 //!
 //! ## Determinism
 //!
 //! A pack is a function of its [`crate::storage::Plan`], and a plan is ordered by
 //! the snapshot's chunk table rather than by the order chunks happened to be
 //! written. So the same tree packs to the same bytes every time, which is what
-//! makes a pack nameable by the hash of its own contents: an immutable artifact
-//! that a CDN can cache forever and a client can verify with one comparison.
+//! makes a pack nameable by the hash of its own contents: an immutable artifact a
+//! CDN can cache forever and a client can verify with one comparison.
 //!
 //! ## The index is at the end
 //!
@@ -48,11 +25,10 @@
 //!
 //! A player fetches the last twelve bytes, learns where the index is and how long
 //! it is, fetches *that* range, and then knows every chunk's offset without having
-//! read a byte of payload. A header would be the wrong way round: it would have to
-//! be read before anything, including before it is known whether the pack is worth
-//! having at all.
+//! read a byte of payload — so the cost of finding out what a pack holds does not
+//! depend on how much it holds.
 //!
-//! The trailing magic is what makes that reverse read reliable — the length alone
+//! The trailing magic is what makes that reverse read reliable: the length alone
 //! is indistinguishable from payload bytes, and a truncated download would
 //! otherwise be read as a short index.
 //!
@@ -99,7 +75,7 @@ const COUNTS_MAX: usize = 20;
 pub struct Located {
     /// The chunk's content hash.
     pub id: BlobId,
-    /// Byte offset of its payload in the pack.
+    /// Byte offset of its payload, relative to [`Pack::payload_start`].
     pub offset: u64,
     /// Length of its payload.
     pub len: u64,
@@ -128,7 +104,7 @@ impl Range {
     }
 }
 
-/// A pack on disk: the payload region, the chunk index, and nothing else.
+/// A pack on disk: the snapshot it holds, the payload region, and the index.
 #[derive(Debug, Clone)]
 pub struct Pack {
     path: PathBuf,
@@ -145,24 +121,17 @@ pub struct Pack {
 impl Pack {
     /// Write a pack of `plan` to `path`, reading payloads from `store`.
     ///
-    /// The file is written to `path` directly and is complete when this returns;
-    /// a pack is a derived artifact, so a partial one is a file to be written
-    /// again rather than a thing to be recovered.
+    /// Written in place and complete when this returns; a pack is derived output,
+    /// so a partial one is a file to write again rather than a thing to recover.
+    /// One chunk is buffered at a time, never a whole version, though the index
+    /// does grow with the chunk count.
     ///
-    /// Memory is one chunk, not one version. The payload streams straight to the
-    /// file as it is read, because a version of a game is the size of a game and
-    /// buffering one to write it out would make the largest input the thing that
-    /// does not fit in memory. The index does grow with the chunk count, at about
-    /// forty bytes per chunk against the chunk's own bytes.
+    /// The header comes first and its counts are the plan's — `plan.len()` chunks
+    /// and `plan.total_bytes()` bytes — while the walk accumulates the same
+    /// totals to build the index, saturating, so the two agree by construction.
     ///
-    /// The header comes first and its counts are known before the walk, because
-    /// they are the plan's: `plan.len()` chunks and `plan.total_bytes()` bytes.
-    /// The walk accumulates the same totals to build the index, saturating, so the
-    /// two agree by construction rather than by comparison.
-    ///
-    /// Only the used prefix of each chunk is read, which is what the version needs
-    /// and not the whole blob: a chunk that spans a file boundary is stored whole
-    /// but used in part.
+    /// Only the used prefix of each chunk is read: a chunk spanning a file
+    /// boundary is stored whole but used in part.
     ///
     /// # Errors
     ///
@@ -182,9 +151,8 @@ impl Pack {
         let mut chunks = Vec::with_capacity(plan.len());
         let mut offset = 0u64;
 
-        // The header's length depends on the counts — each varint runs until its
-        // high bit clears, so a version over 127 chunks needs a second byte — which
-        // is why it is built before the payload starts rather than reserved.
+        // The header's length depends on the counts, since a varint runs until its
+        // high bit clears, so it is built before the payload starts.
         let header = encode_header(planned_count, planned_bytes, *snapshot);
         let payload_start = u64::try_from(header.len()).unwrap_or(u64::MAX);
 
@@ -206,11 +174,9 @@ impl Pack {
                 len: planned.length,
             });
 
-            // Saturating, because `Plan::total_bytes` is the same fold and the two
-            // have to agree: the header reports one and the index is built on the
-            // other. A plain `+=` would panic on a version large enough to wrap
-            // where `total_bytes` would have clamped, which is the kind of
-            // difference that only shows up at 16 exabytes.
+            // Saturating, to match `Plan::total_bytes`: the header reports one
+            // total and the index is built on the other, and a plain `+=` would
+            // panic where that would have clamped.
             offset = offset.saturating_add(planned.length);
         }
 
@@ -298,13 +264,11 @@ impl Pack {
         let mut snapshot = [0u8; 32];
         snapshot.copy_from_slice(&header[8..40]);
 
-        // The two varints. Reading the header's fixed part alone would leave the
-        // payload starting at the wrong offset — the counts are part of it, and
-        // getting this wrong shifts every chunk by a couple of bytes rather than
-        // failing. Only what lies between the fixed part and the index is read:
-        // two varints need at most 20 bytes, but a pack of an empty plan has
-        // just the two one-byte counts there, and asking for 20 regardless turns
-        // a readable pack into a read error.
+        // The two varints, which are part of the header: reading the fixed part
+        // alone would start the payload at the wrong offset, shifting every
+        // chunk rather than failing. Only what lies between the fixed part and
+        // the index is read, since a pack of an empty plan has two one-byte
+        // counts there and no more.
         let mut head = [0u8; COUNTS_MAX];
         let available = index_start.saturating_sub(u64::try_from(HEADER).unwrap_or(u64::MAX));
         let to_read = usize::try_from(available.min(u64::try_from(COUNTS_MAX).unwrap_or(u64::MAX)))
@@ -320,9 +284,8 @@ impl Pack {
             .saturating_add(u64::try_from(count_len).unwrap_or(u64::MAX))
             .saturating_add(u64::try_from(payload_len_len).unwrap_or(u64::MAX));
 
-        // The counts are redundant with the index — the index is what locates
-        // chunks — so they are a claim to check rather than a source of truth. A
-        // pack whose header disagrees with its own index is not one worth reading.
+        // The counts are redundant with the index, which is what locates chunks,
+        // so they are a claim to check rather than a source of truth.
         if count != u64::try_from(chunks.len()).unwrap_or(u64::MAX) {
             return Err(not_a_pack(
                 path,
@@ -356,8 +319,8 @@ impl Pack {
     /// Where the pack's payload region starts in the file.
     ///
     /// A [`Located::offset`] is relative to this, so a client turning a chunk into
-    /// a byte range adds it. Exposed because the two differ: the header's counts
-    /// are varints, and hardcoding the header's size would shift every offset.
+    /// a byte range adds it. Not a constant, because the header's counts are
+    /// varints.
     #[must_use]
     pub fn payload_start(&self) -> u64 {
         self.payload_start
@@ -408,17 +371,13 @@ impl Pack {
         fs::metadata(&self.path).map(|m| m.len())
     }
 
-    /// The bytes a client already holding `have` still needs from this pack.
+    /// The bytes a client not holding `have` still needs, as half-open ranges in
+    /// *file* coordinates — [`Pack::payload_start`] plus a [`Located::offset`].
     ///
-    /// This is the question a delta download asks, and the answer is deliberately
-    /// in terms of *what it does not have*: a client that already holds every
-    /// chunk gets nothing, and one holding nothing gets the whole payload region
-    /// as a single range.
-    ///
-    /// Adjacent ranges are merged, which is the entire value of packing — the
-    /// payload is laid end to end with no framing, so chunks a client needs are
-    /// contiguous and the merged count is small. The measured case is one request,
-    /// for a patch of between 2% and 6% of the pack depending on the tree.
+    /// Stated as what the client lacks: holding every chunk gets nothing, holding
+    /// nothing gets the whole payload region as one range. Adjacent ranges are
+    /// merged, which the no-framing layout is what makes worthwhile — chunks a
+    /// client needs are contiguous, so the merged count is small.
     #[must_use]
     pub fn needed(&self, have: &BTreeSet<BlobId>) -> Vec<Range> {
         let mut ranges: Vec<Range> = Vec::new();
@@ -477,6 +436,13 @@ fn encode_index(chunks: &[Located]) -> Vec<u8> {
     out
 }
 
+/// The index read back.
+///
+/// # Errors
+///
+/// Returns an error if a 32-byte hash or either varint runs past the end of
+/// `bytes`, if a number is overlong or overflows, or if a hash is repeated —
+/// which would mean two chunks at one offset.
 fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -514,6 +480,12 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+/// A LEB128 number at `at`, and how many bytes it occupied.
+///
+/// # Errors
+///
+/// Returns an error if the number runs past the end of `bytes`, is over ten
+/// bytes, or would overflow a `u64`.
 fn read_varint(bytes: &[u8], at: usize) -> io::Result<(u64, usize)> {
     let mut out: u64 = 0;
     let mut shift: u32 = 0;
@@ -566,6 +538,7 @@ fn not_a_pack(path: &Path, why: &str) -> io::Error {
 ///
 /// The inverse of [`Pack::needed`]: given a pack and a set of ranges, the chunks
 /// those ranges cover, so a client can record them after fetching and ask again.
+/// A range covering only part of a chunk is not that chunk and records nothing.
 #[must_use]
 pub fn chunks_covering(pack: &Pack, ranges: &[Range]) -> BTreeSet<BlobId> {
     let mut out = BTreeSet::new();
@@ -584,15 +557,10 @@ pub fn chunks_covering(pack: &Pack, ranges: &[Range]) -> BTreeSet<BlobId> {
 
 /// The hash of a pack's contents, for naming it.
 ///
-/// Naming by content is what makes a pack immutable: the name is the identity, so
-/// two packs with the same name are the same bytes, and a cache can hold one
-/// forever. It is the whole file — header, payloads, index and trailer — so the
-/// name covers the format too, and a pack written by a future format version is a
-/// different name rather than a collision.
-///
-/// Read once, after writing, in constant memory. A second pass over a pack the
-/// size of a game is a real cost, and a hash that can only be computed by holding
-/// the file would be a hash nobody computes.
+/// The whole file — header, payloads, index and trailer — so the name covers the
+/// format too, and a pack written by a future format version is a different name
+/// rather than a collision. Streamed once in constant memory; call it after
+/// writing.
 ///
 /// # Errors
 ///
