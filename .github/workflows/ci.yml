@@ -49,17 +49,27 @@ jobs:
         # covers anything rustc or a lint group emits outside the declared set.
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+  # Linux only, and deliberately not a matrix: one runner is not a matrix, and
+  # keeping the shape would suggest a knob nobody turns.
+  #
+  # To run on more than one platform again, put this back:
+  #
+  #   runs-on: ${{ matrix.os }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       os: [ubuntu-latest, macos-latest, windows-latest]
+  #
+  # What that costs to restore is written down in the README, because dropping the
+  # other two stopped testing code rather than only stopping running it twice —
+  # see the note on the release targets there.
   test:
     name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # rustfmt and clippy are not needed to run tests, and leaving them out means
-      # a test failure on one OS is not a formatting failure on another.
+      # rustfmt and clippy are not needed to run tests, and leaving them out keeps
+      # this job to a compile and a run.
       - uses: ./.github/actions/setup-rust
         with:
           components: ''

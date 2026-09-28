@@ -415,7 +415,36 @@ $ git config core.hooksPath .githooks
 
 `.github/workflows/ci.yml` runs one job per check, named after the mise task that
 runs the same command, so a red job is reproducible locally with `mise run <name>`.
-`test` runs on Linux, macOS and Windows; everything else runs once on Linux.
+Everything runs on Linux, including the test suite.
+
+**The test suite runs on one platform, and the release ships five.** That gap is
+deliberate and worth being exact about, because "tested on Linux" and "the macOS
+and Windows binaries are correct" are different claims:
+
+- **macOS is a second Unix.** Every `cfg(unix)` line of source and every
+  `cfg(unix)` test runs unchanged on Linux, so dropping macOS did not stop any
+  distinct code from being tested. What it stopped is testing the *same* code on
+  a second filesystem: APFS rather than ext4, a case-insensitive volume by
+  default, and different link and inode behaviour.
+- **Windows is different code, and it is now not compiled at all.** The
+  `cfg(windows)` branch of `symlink` in `src/fsattr.rs` and both `FileId`
+  variants in `src/command/backup.rs` are the only places this crate does
+  something the Unix path does not. With no Windows runner they are not merely
+  untested — nothing type-checks them, so they can rot to the point of not
+  compiling, and `cargo test` on Linux will not notice. The `experimental`
+  feature that gates the Windows file-identity path is in the same position, and
+  was already untested before this: the hard-link tests that would exercise it
+  are `cfg(unix)`.
+- **Releases still build all five targets**, so a Windows or macOS binary that
+  does not compile fails the *release build* rather than shipping. What is no
+  longer caught is a binary that compiles and is wrong.
+
+If that trade is not the one you want, the cheap middle ground is to keep the
+test job on Linux and add a non-blocking `cargo check --target
+x86_64-pc-windows-msvc --all-features` so the Windows paths at least stay
+compiling, or to cut the target list in `dist-workspace.toml` down to the two
+Linux triples so nothing untested is published. Both are one small change; say
+which and it is done.
 
 Two things about the workflow are deliberate and worth knowing before changing
 them:
