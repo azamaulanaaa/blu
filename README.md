@@ -131,6 +131,59 @@ report a version it does not have.
 whose index write was abandoned still exists and still restores. It never
 over-reports.
 
+### Packs
+
+A store is the right shape for *holding* versions and the wrong shape for *serving*
+one. Restoring a new version out of a store is a request per chunk, because each
+chunk sits between two record headers and nothing makes the ones a client needs
+adjacent. A **pack** is one version's chunks concatenated into a single file with no
+framing between them, so the bytes a client needs are contiguous.
+
+Measured on a synthetic tree of 8 binaries and 6 asset blobs, patching one 500 KB
+binary:
+
+```text
+v1 from nothing      1,309,726 bytes in  1 request
+v2 having v1           25,325 bytes in  1 request   (1.9% of the pack)
+```
+
+One request in both cases, including the patch. The same delta served out of the
+store is 25,325 requests. That is the whole argument for packing, and it is why the
+8 KiB average chunk size is not a problem: the concern about thousands of tiny
+ranges was a property of the store's framing, which a pack does not have.
+
+```text
+magic | version | snapshot hash | chunk count | payload bytes
+...payloads, end to end, in plan order...
+...index: per chunk, hash | offset | length...
+index length | magic
+```
+
+**The index is at the end.** A client fetches the last twelve bytes, learns where the
+index is and how long it is, fetches *that* range, and now knows every chunk's
+offset without having read a byte of payload. A header would be the wrong way round:
+it would have to be read before anything, including before it is known whether the
+pack is worth having at all. The trailing magic is what makes the reverse read
+reliable — a length alone is indistinguishable from payload bytes, and a truncated
+download would otherwise be read as a short index.
+
+**A pack is a function of the tree, so it is byte-identical every time.** The order
+is the snapshot's own chunk table, not the order chunks happened to be written, so
+two backups of one tree produce the same bytes even though their stores lay the
+chunks out differently. That is what makes a pack nameable by the hash of its own
+contents: an immutable artifact a CDN can cache forever and a client can verify with
+one comparison.
+
+**A pack is derived, never authoritative.** It is output, regenerable from the store
+and the snapshot alone, and losing one loses nothing. The store's commit records
+remain the record of what versions exist, which is why nothing reads a pack to answer
+that.
+
+Where a header's counts and its own index could disagree, the pack is refused rather
+than one of them believed: the index is what locates chunks, so if the two disagree
+one is wrong, and picking the wrong one produces a pack that reads as valid and hands
+out ranges covering the wrong bytes.
+
 ## What is preserved
 
 Regular files, directories, symbolic links, hard links, permission bits and
@@ -264,6 +317,37 @@ records, so `store.versions()` and `store.snapshot(n)` address them directly.
 `SegmentLimit` caps one file of the set; the default is 4 GiB and it can be changed
 between runs without rewriting anything. A set is `base.0000.bin`,
 `base.0001.bin` and so on, and `BlobStore::segments()` names them.
+
+A pack is written from a `Plan`, which resolves a snapshot into an ordered list of
+chunks with their locations, and asks `Pack` what a client holding some of them
+still needs:
+
+```rust
+use std::collections::BTreeSet;
+use lepatch::{
+    metadata::Snapshot,
+    pack::{Pack, chunks_covering},
+    storage::{BlobStore, Plan, SegmentLimit, StorageGet},
+};
+
+// The plan is a function of the snapshot, so it is the same every run.
+let store = BlobStore::<false>::open("docs", SegmentLimit::default()).await?;
+let snapshot = read_snapshot(&store).await;
+let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
+
+let pack = Pack::write(&store, &plan, &snapshot_hash, "game.pack").await?;
+
+// What a client holding the previous version's chunks does not have, as byte
+// ranges of the pack. Adjacent ranges merge, which is the point of packing.
+let ranges = pack.needed(&have_from_the_previous_version);
+
+// After fetching: record what those ranges covered, and re-asking returns nothing.
+let have = chunks_covering(&pack, &ranges);
+```
+
+`Pack::needed` is deliberately phrased as what a client *lacks*: one holding nothing
+gets the whole payload as a single range, and one holding everything gets none.
+`Pack::write` streams, so its memory is one chunk rather than one version.
 
 The `WRITE` const generic on `BlobStore` is what stops a read-only restore from
 being handed something that can append to the store.
