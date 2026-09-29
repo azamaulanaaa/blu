@@ -10,7 +10,7 @@
 //! against the one before it, and it is why the caller does not have to know
 //! what is already there.
 
-use std::{io, path::Path};
+use std::{borrow::Cow, io, path::Path};
 
 use tokio::io::{AsyncRead, AsyncSeek};
 
@@ -339,23 +339,33 @@ impl Compression {
     /// than the input; otherwise [`Codec::Raw`] and the bytes unchanged, so
     /// already-compressed content never grows by a frame header.
     ///
-    /// The return type is a [`Vec`], so the fallback paths copy.
-    pub(super) fn compress(self, raw: &[u8]) -> (Codec, Vec<u8>) {
+    /// The bytes are a [`Cow`] because three of the four answers are "the input,
+    /// unchanged", and returning a [`Vec`] made each of them a full copy of a
+    /// payload the caller was already holding. That is not a rare path either: it
+    /// is every payload with compression off, and every payload zstd cannot make
+    /// smaller — which is most of a tree of photos, archives or video, since a
+    /// zstd frame on content like that comes out *larger* and takes the fallback.
+    /// So the common case copied every byte of the tree an extra time to then hand
+    /// back exactly what it was given.
+    ///
+    /// The copy for the fourth answer is unavoidable and worth it: a frame is
+    /// built before it is known to be smaller than the input.
+    pub(super) fn compress(self, raw: &[u8]) -> (Codec, Cow<'_, [u8]>) {
         let Some(level) = self.level() else {
-            return (Codec::Raw, raw.to_vec());
+            return (Codec::Raw, Cow::Borrowed(raw));
         };
 
         // A compressor failure is not an error: the fallback stores the bytes as
         // they are, which is a correct record and beats failing a backup.
         let Ok(encoded) = zstd::bulk::compress(raw, i32::from(level)) else {
-            return (Codec::Raw, raw.to_vec());
+            return (Codec::Raw, Cow::Borrowed(raw));
         };
 
         if encoded.len() >= raw.len() {
-            return (Codec::Raw, raw.to_vec());
+            return (Codec::Raw, Cow::Borrowed(raw));
         }
 
-        (Codec::Zstd, encoded)
+        (Codec::Zstd, Cow::Owned(encoded))
     }
 }
 
@@ -457,4 +467,106 @@ pub trait StoragePut: Send + Sync {
     /// Returns an error if the commit record cannot be written or made durable,
     /// in which case the run is not published.
     fn commit(&self, snapshot: &BlobId) -> impl Future<Output = io::Result<u32>> + Send;
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use std::borrow::Cow;
+
+    use super::{Codec, Compression};
+
+    /// A payload the compressor cannot make smaller falls through untouched.
+    ///
+    /// The three "the input, unchanged" answers are the ones worth pinning, and
+    /// pointer identity is how: the borrowed variant's data address is the input's
+    /// address, so a copy cannot have happened. A timing comparison cannot say
+    /// this — a backup here turns out to be bound by per-record filesystem work
+    /// rather than by memory bandwidth, so removing a full copy of every payload
+    /// measures as nothing. Whether the copy happens is a fact about the code, and
+    /// this asserts it directly.
+    ///
+    /// Incompressible input is the realistic trigger, not a corner: photos, video
+    /// and archives are most of a real tree, and a zstd frame around one is larger
+    /// than the payload, so every one of them takes the fallback.
+    #[test]
+    fn a_payload_the_compressor_cannot_shrink_is_handed_back_untouched() {
+        let raw = incompressible(64 * 1024);
+
+        for (what, policy) in [
+            ("compression off", Compression::Off),
+            ("compression on", Compression::zstd(9)),
+        ] {
+            let (codec, stored) = policy.compress(&raw);
+
+            assert_eq!(
+                codec,
+                Codec::Raw,
+                "{what}: a payload that does not compress is stored as it is"
+            );
+            assert_eq!(
+                stored.as_ref(),
+                raw.as_slice(),
+                "{what}: the fallback must return the bytes unchanged"
+            );
+            assert!(
+                matches!(stored, Cow::Borrowed(_)),
+                "{what}: the fallback copied {} bytes it was handed",
+                raw.len()
+            );
+            assert_eq!(
+                stored.as_ptr(),
+                raw.as_ptr(),
+                "{what}: the borrowed variant must point at the input, not a copy"
+            );
+        }
+    }
+
+    /// Compression that works still owns its buffer.
+    ///
+    /// The complement, so the previous test cannot be satisfied by never
+    /// compressing anything: when a frame *is* smaller, it is a fresh allocation
+    /// and does not alias the input.
+    #[test]
+    fn a_payload_that_compresses_is_an_owned_copy() {
+        let raw = vec![b'a'; 64 * 1024];
+        let (codec, stored) = Compression::zstd(3).compress(&raw);
+
+        assert_eq!(codec, Codec::Zstd, "repetitive input must compress");
+        assert!(
+            stored.len() < raw.len(),
+            "a zstd frame of {} identical bytes should be much smaller, got {}",
+            raw.len(),
+            stored.len()
+        );
+        assert!(
+            matches!(stored, Cow::Owned(_)),
+            "a compressed payload owns its frame"
+        );
+    }
+
+    /// Bytes zstd cannot compress, without needing a fixture on disk.
+    ///
+    /// BLAKE3 of a counter, so the input has no structure to find but is not
+    /// obviously patterned either — the shape that defeats a general-purpose
+    /// compressor. Asserted here rather than assumed, because a test that
+    /// *assumes* its input is incompressible passes for the wrong reason when it
+    /// is not: it would be testing the compressed path and calling it the fallback.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut counter = 0u64;
+        while out.len() < len {
+            out.extend_from_slice(blake3::hash(&counter.to_le_bytes()).as_bytes());
+            counter = counter.wrapping_add(1);
+        }
+        out.truncate(len);
+
+        assert!(
+            zstd::bulk::compress(&out, 19).map_or(true, |z| z.len() >= out.len()),
+            "the fixture is supposed to be incompressible, and zstd made it {} bytes \
+             from {} — this test would be exercising the compressed path",
+            zstd::bulk::compress(&out, 19).map_or(0, |z| z.len()),
+            out.len()
+        );
+        out
+    }
 }
