@@ -43,6 +43,6 @@ pub async fn load_snapshot<S: storage::StorageGet>(
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await?;
 
-    metadata::Snapshot::from_bytes(buffer.as_slice())
+    metadata::Snapshot::try_from(buffer.as_slice())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }

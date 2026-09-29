@@ -26,7 +26,7 @@ async fn snapshot(blob: &std::path::Path, id: &BlobId) -> lepatch::metadata::Sna
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
 
-    lepatch::metadata::Snapshot::from_bytes(&buffer).unwrap()
+    lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap()
 }
 
 #[tokio::test]

@@ -62,7 +62,7 @@ fn a_version_index_round_trips() {
         snapshot: BlobId::from_bytes([9u8; 32]),
     };
 
-    let decoded = VersionIndex::from_bytes(&original.to_bytes()).unwrap();
+    let decoded = VersionIndex::try_from(&original.to_bytes()[..]).unwrap();
     assert_eq!(decoded, original);
 }
 
@@ -81,7 +81,7 @@ fn a_corrupted_index_does_not_verify() {
         bytes[byte] ^= 0xff;
 
         assert!(
-            VersionIndex::from_bytes(&bytes).is_err(),
+            VersionIndex::try_from(bytes.as_slice()).is_err(),
             "byte {byte} was flipped and the index still verified"
         );
     }
@@ -100,8 +100,8 @@ fn an_index_of_the_wrong_length_is_refused() {
     let mut short = original.to_bytes().to_vec();
     short.pop();
 
-    assert!(VersionIndex::from_bytes(&short).is_err());
-    assert!(VersionIndex::from_bytes(&[0u8; 52]).is_err());
+    assert!(VersionIndex::try_from(short.as_slice()).is_err());
+    assert!(VersionIndex::try_from(&[0u8; 52][..]).is_err());
 }
 
 /// The writer is atomic: a reader never sees a partial file, and no temporary is

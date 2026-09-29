@@ -36,14 +36,14 @@ fn snapshot_round_trips_through_the_framed_encoding() {
     // One comparison, not five. `Snapshot` could not be compared at all before,
     // so this test compared its fields one at a time and would have silently
     // stopped checking two of them the day a sixth was added.
-    let decoded = Snapshot::from_bytes(&encoded).unwrap();
+    let decoded = Snapshot::try_from(encoded.as_slice()).unwrap();
     assert_eq!(decoded, sample());
 }
 
 /// The version in the frame is this build's, whatever the snapshot contains.
 ///
 /// There is no field to set any more: the version belongs to the encoder. The
-/// frame still carries it, because that is the format, and `from_bytes` still
+/// frame still carries it, because that is the format, and `TryFrom` still
 /// checks it — so a blob written by another build's layout is refused rather
 /// than misread.
 #[test]
@@ -57,7 +57,7 @@ fn the_frame_carries_this_builds_version() {
         metadata::FORMAT_VERSION,
         "the frame should name the version this build writes"
     );
-    assert!(Snapshot::from_bytes(&encoded).is_ok());
+    assert!(Snapshot::try_from(encoded.as_slice()).is_ok());
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn a_blob_without_the_magic_prefix_is_rejected() {
     let mut encoded = sample().to_bytes();
     encoded[0] = b'X';
 
-    match Snapshot::from_bytes(&encoded) {
+    match Snapshot::try_from(encoded.as_slice()) {
         Err(Error::BadMagic(_)) => {}
         other => panic!("expected BadMagic, got {other:?}"),
     }
@@ -77,7 +77,7 @@ fn an_unknown_format_version_is_reported_as_such() {
     let version_at = metadata::MAGIC.len();
     encoded[version_at..version_at + 4].copy_from_slice(&999u32.to_le_bytes());
 
-    match Snapshot::from_bytes(&encoded) {
+    match Snapshot::try_from(encoded.as_slice()) {
         Err(Error::UnsupportedVersion { found, supported }) => {
             assert_eq!(found, 999);
             assert_eq!(supported, metadata::FORMAT_VERSION);
@@ -91,7 +91,7 @@ fn a_truncated_blob_is_rejected_rather_than_panicking() {
     let encoded = sample().to_bytes();
 
     for len in 0..metadata::MAGIC.len() + 4 {
-        match Snapshot::from_bytes(&encoded[..len]) {
+        match Snapshot::try_from(&encoded[..len]) {
             Err(Error::Truncated) => {}
             other => panic!("expected Truncated at len {len}, got {other:?}"),
         }
@@ -110,7 +110,7 @@ fn a_corrupt_body_is_reported_as_a_decode_error() {
     // trailing-bytes case a reader would guess. A `matches!(.., Err(Decode(_)))`
     // could not tell those apart, which is the whole reason for the change.
     assert_eq!(
-        Snapshot::from_bytes(&encoded),
+        Snapshot::try_from(encoded.as_slice()),
         Err(Error::Decode(Malformed(
             "the snapshot ends in the middle of a value"
         ))),
@@ -126,7 +126,7 @@ fn trailing_bytes_after_a_snapshot_are_refused_rather_than_ignored() {
     // different malformations that a caller would otherwise have to tell apart by
     // reading the message.
     assert_eq!(
-        Snapshot::from_bytes(&encoded),
+        Snapshot::try_from(encoded.as_slice()),
         Err(Error::Decode(Malformed("the snapshot has trailing bytes"))),
     );
 }
@@ -187,7 +187,7 @@ fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
     // Claim to be version 1, with a body that is not a version 1 body.
     encoded[header..header + 4].copy_from_slice(&1u32.to_le_bytes());
 
-    match lepatch::metadata::Snapshot::from_bytes(&encoded) {
+    match lepatch::metadata::Snapshot::try_from(encoded.as_slice()) {
         Err(lepatch::metadata::Error::UnsupportedVersion { found, supported }) => {
             assert_eq!(found, 1);
             assert_eq!(supported, lepatch::metadata::FORMAT_VERSION);

@@ -258,16 +258,7 @@ impl Snapshot {
         out
     }
 
-    /// Parse the framed on-disk representation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Truncated`] if the header is incomplete,
-    /// [`Error::BadMagic`] if the blob is not a snapshot,
-    /// [`Error::UnsupportedVersion`] if it was written by an incompatible
-    /// layout, and [`Error::Decode`] if the body does not match this version's
-    /// shape.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let header = MAGIC.len() + 4;
         if bytes.len() < header {
             return Err(Error::Truncated);
@@ -291,6 +282,28 @@ impl Snapshot {
         }
 
         codec::decode_body(&bytes[header..]).map_err(Error::Decode)
+    }
+}
+
+impl TryFrom<&[u8]> for Snapshot {
+    type Error = Error;
+
+    /// Parse the framed on-disk representation.
+    ///
+    /// `TryFrom` rather than an inherent `from_bytes`, so that "these bytes are a
+    /// snapshot" is a conversion like any other, and the same vocabulary as
+    /// `VersionIndex`, which parses a different wire format into a different type
+    /// and now says so the same way. One implementation, not an inherent method
+    /// beside a trait impl.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Truncated`] if the header is incomplete,
+    /// [`Error::BadMagic`] if the blob is not a snapshot,
+    /// [`Error::UnsupportedVersion`] if it was written by an incompatible layout,
+    /// and [`Error::Decode`] if the body does not match this version's shape.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Self::parse(bytes)
     }
 }
 

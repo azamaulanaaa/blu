@@ -46,7 +46,7 @@ async fn plan_of(blob: &Path) -> Plan {
     let mut reader = store.get(&id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = Snapshot::from_bytes(&buffer).unwrap();
+    let snapshot = Snapshot::try_from(buffer.as_slice()).unwrap();
 
     Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap()
 }

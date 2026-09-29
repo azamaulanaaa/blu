@@ -76,16 +76,7 @@ impl VersionIndex {
         out
     }
 
-    /// Read an index file's bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file is the wrong length, which is a file that is
-    /// not one of these, or if the checksum does not verify, which is a torn write
-    /// or something else entirely. Both are treated as "no index" by
-    /// [`resolve`](super::resolve): a cache that cannot be read is not a cache
-    /// that can be believed.
-    pub fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+    fn parse(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() != LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -164,7 +155,34 @@ impl VersionIndex {
     #[must_use]
     pub fn read(path: &Path) -> Option<Self> {
         let bytes = fs::read(path).ok()?;
-        Self::from_bytes(&bytes).ok()
+        Self::try_from(bytes.as_slice()).ok()
+    }
+}
+
+impl TryFrom<&[u8]> for VersionIndex {
+    type Error = io::Error;
+
+    /// Parse an index file's bytes.
+    ///
+    /// `TryFrom` rather than an inherent `from_bytes`, so that "these bytes are a
+    /// version index" is a conversion like any other and this type shares a
+    /// vocabulary with everything else that parses a file. One implementation, not
+    /// an inherent method beside a trait impl — a `from_bytes` that only called
+    /// `try_from` would be a second spelling of one decision, and removing those
+    /// is most of what this branch has been about.
+    ///
+    /// The whole file rather than a prefix: an index is exactly `LEN` bytes, so
+    /// the length is a check and not a bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is the wrong length, which is a file that is
+    /// not one of these, or if the checksum does not verify, which is a torn write
+    /// or something else entirely. Both are treated as "no index" by
+    /// [`resolve`](super::resolve): a cache that cannot be read is not a cache
+    /// that can be believed.
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Self::parse(bytes)
     }
 }
 

@@ -34,7 +34,7 @@ async fn latest_snapshot(store: &BlobStore<false>) -> Snapshot {
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
 
-    Snapshot::from_bytes(&buffer).unwrap()
+    Snapshot::try_from(buffer.as_slice()).unwrap()
 }
 
 #[tokio::test]

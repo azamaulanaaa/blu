@@ -204,7 +204,7 @@ fn serialisation(c: &mut Criterion) {
             b.iter(|| black_box(snapshot.to_bytes()));
         });
         group.bench_function(format!("decode_{chunks}_chunks"), |b| {
-            b.iter(|| black_box(Snapshot::from_bytes(black_box(&encoded)).expect("decode")));
+            b.iter(|| black_box(Snapshot::try_from(black_box(&encoded[..])).expect("decode")));
         });
     }
 
