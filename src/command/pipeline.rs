@@ -125,7 +125,6 @@ pub(super) struct Pipeline<S> {
     /// Each regular file's index, by relative path.
     file_index: HashMap<PathBuf, u32>,
     pub(super) storage: Arc<S>,
-    slots: Slots,
 }
 
 impl<S: storage::StoragePut + 'static> Pipeline<S> {
@@ -134,7 +133,6 @@ impl<S: storage::StoragePut + 'static> Pipeline<S> {
             root,
             file_index,
             storage: Arc::new(storage),
-            slots: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -211,6 +209,24 @@ async fn commit<S: storage::StoragePut + 'static>(
 
     let mut in_flight = JoinSet::new();
 
+    // The deduplication map lives here rather than on `Pipeline`, and that is the
+    // whole change. `Pipeline` is an `Arc` the caller holds for the whole run —
+    // through `reader.await`, through the snapshot being serialised, through the
+    // commit — while this map is read only inside this loop. As a field it stayed
+    // alive for all of that, holding one entry per *distinct* chunk the tree
+    // contains, which is a hash plus an `Arc<OnceCell<()>>` each, at exactly the
+    // moment the run is holding the most of everything else: every chunk in
+    // flight, and the snapshot growing a `FileChunk` per slice.
+    //
+    // Scoped to the loop, it is freed the moment `commit` returns, and `Arc::clone`
+    // into each task keeps it alive exactly as long as a task needs it.
+    //
+    // The saving is one entry per distinct chunk, so it is arithmetic rather than
+    // a measurement: a 150 MB tree of 256 KiB chunks is about 60 KB, which is
+    // nothing, and a 1 TB tree is about 400 MB held through the phases that need
+    // the most memory of the whole run.
+    let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
+
     // Results that finished before the one they follow, keyed by read order.
     // Bounded by the number of stores running, so it cannot grow with the size
     // of the tree.
@@ -246,7 +262,11 @@ async fn commit<S: storage::StoragePut + 'static>(
             );
             progress.report();
 
-            in_flight.spawn(store_chunk(pending, Arc::clone(&pipeline)));
+            in_flight.spawn(store_chunk(
+                pending,
+                Arc::clone(&pipeline),
+                Arc::clone(&slots),
+            ));
         }
 
         // The loop ends when there is nothing left to wait for.
@@ -386,6 +406,7 @@ fn commit_ready<S>(
 async fn store_chunk<S: storage::StoragePut + 'static>(
     pending: Pending,
     pipeline: Arc<Pipeline<S>>,
+    slots: Slots,
 ) -> io::Result<Stored> {
     let Pending {
         seq,
@@ -395,7 +416,7 @@ async fn store_chunk<S: storage::StoragePut + 'static>(
     } = pending;
 
     let slot = {
-        let mut map = lock_slots(&pipeline.slots);
+        let mut map = lock_slots(&slots);
         Arc::clone(map.entry(hash).or_insert_with(|| Arc::new(OnceCell::new())))
     };
 
