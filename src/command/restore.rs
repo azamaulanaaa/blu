@@ -192,15 +192,19 @@ fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
     }
 
     for link in &snapshot.links {
-        resolve(probe, &link.path, "a link")?;
-
-        // A hard link's target names another entry in the tree, so it is resolved
-        // against the root and has to stay inside it. A symbolic link's target
-        // does not: it is written verbatim and resolved by whoever follows it.
-        // A tree containing a link to `/etc/passwd` is an ordinary tree, and
-        // reproducing it faithfully is the job.
-        if link.kind == metadata::LinkKind::Hard {
-            resolve(probe, &link.target, "a hard link target")?;
+        // A hard link names another entry in the tree, so its second path is
+        // resolved against the root and has to stay inside it. A symbolic link's
+        // is not resolved at all: it is written verbatim and followed by whoever
+        // ends up following it. A tree containing a link to `/etc/passwd` is an
+        // ordinary tree, and reproducing it faithfully is the job.
+        match link {
+            metadata::Link::Symbolic { path, .. } => {
+                resolve(probe, path, "a link")?;
+            }
+            metadata::Link::Hard { path, shares } => {
+                resolve(probe, path, "a link")?;
+                resolve(probe, shares, "a hard link target")?;
+            }
         }
     }
 
@@ -570,14 +574,32 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
 /// Recreate hard links and symbolic links.
 fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     for link in &snapshot.links {
-        let path = resolve(root, &link.path, "a link")?;
+        // Restoring over an existing tree must not trip over the old entry, so
+        // each arm removes before it creates. Two arms rather than one `match` on
+        // a `kind` field, because the whole point of the type is that the two
+        // cases are not the same operation on the same field.
+        match link {
+            metadata::Link::Symbolic { path, target } => {
+                let path = resolve(root, path, "a link")?;
+                remove_existing(&path)?;
 
-        // Restoring over an existing tree must not trip over the old entry.
-        remove_existing(&path)?;
+                let target_is_dir = symlink_points_at_directory(&path, target);
+                fsattr::symlink(target, &path, target_is_dir).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to create symlink {} -> {}: {e}",
+                            path.display(),
+                            target.display()
+                        ),
+                    )
+                })?;
+            }
+            metadata::Link::Hard { path, shares } => {
+                let path = resolve(root, path, "a link")?;
+                remove_existing(&path)?;
 
-        match link.kind {
-            metadata::LinkKind::Hard => {
-                let target = resolve(root, &link.target, "a hard link target")?;
+                let target = resolve(root, shares, "a hard link target")?;
                 fsattr::hard_link(&target, &path).map_err(|e| {
                     io::Error::new(
                         e.kind(),
@@ -585,19 +607,6 @@ fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
                             "failed to link {} to {}: {e}",
                             path.display(),
                             target.display()
-                        ),
-                    )
-                })?;
-            }
-            metadata::LinkKind::Symbolic => {
-                let target_is_dir = symlink_points_at_directory(&path, &link.target);
-                fsattr::symlink(&link.target, &path, target_is_dir).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to create symlink {} -> {}: {e}",
-                            path.display(),
-                            link.target.display()
                         ),
                     )
                 })?;

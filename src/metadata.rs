@@ -314,27 +314,48 @@ impl Default for Snapshot {
     }
 }
 
-/// Whether a [`Link`] shares an inode with another file or points elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkKind {
-    /// Shares its contents with [`Link::target`], which is another path in the
-    /// same backup.
-    Hard,
-    /// A symbolic link whose [`Link::target`] is stored verbatim and may point
-    /// anywhere, including outside the backup.
-    Symbolic,
-}
-
 /// A symbolic or hard link, recorded but never chunked.
+///
+/// A sum type rather than a struct with a `kind`, because the two cases give the
+/// same field two different meanings and subject it to two different rules.
+///
+/// `target` used to be "the raw link target" for a symbolic link and "the path of
+/// the file within the backup whose contents are shared" for a hard link. A
+/// restore does not treat them alike: a hard link's is resolved against the
+/// restore root and must land inside it, while a symbolic link's is used verbatim
+/// and is allowed to point anywhere including outside the backup. Two rules for
+/// one field, and nothing in the type said which applied — the only signal was
+/// the `kind` sitting next to it, and a field access reads as though it were just
+/// a field.
+///
+/// So there are two variants and each names its own second path. `target` means
+/// a link target and exists only on [`Link::Symbolic`]; a hard link has `shares`,
+/// which is what it does rather than where it points.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Link {
-    /// Path of the link relative to the backup root.
-    pub path: PathBuf,
-    /// For a symbolic link, the raw link target; for a hard link, the path of
-    /// the file within the backup whose contents are shared.
-    pub target: PathBuf,
-    /// Which kind of link this is.
-    pub kind: LinkKind,
+pub enum Link {
+    /// Points elsewhere. The target is stored verbatim and may name anything,
+    /// including a path outside the backup, because a symbolic link is only ever
+    /// a string until something follows it.
+    Symbolic {
+        /// Path of the link relative to the backup root.
+        path: PathBuf,
+        /// Where it points, as written. Not resolved against the backup root and
+        /// not required to be inside it.
+        target: PathBuf,
+    },
+    /// Shares an inode with another file in the same backup, so there is no
+    /// content of its own to store.
+    Hard {
+        /// Path of the link relative to the backup root.
+        path: PathBuf,
+        /// Path, within the backup, of the file whose contents this shares.
+        ///
+        /// Resolved against the restore root and required to land inside it, which
+        /// is the whole difference from [`Link::Symbolic::target`]: a hard link
+        /// is a claim about this tree, so a claim that names somewhere else is a
+        /// damaged snapshot rather than a link.
+        shares: PathBuf,
+    },
 }
 
 /// A regular file.

@@ -21,7 +21,7 @@ use std::{
 
 use lepatch::{
     command::restore,
-    metadata::{Dir, File, FileChunk, Link, LinkKind, Snapshot},
+    metadata::{Dir, File, FileChunk, Link, Snapshot},
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StoragePut},
 };
 
@@ -189,8 +189,11 @@ async fn an_escaping_directory_path_is_refused() {
 
 #[tokio::test]
 async fn an_escaping_hard_link_target_is_refused() {
-    // A hard link's target is resolved against the root, so it has to stay
-    // inside it.
+    // A hard link's second path names another entry in the tree, so it is
+    // resolved against the root and has to stay inside it. This is the only thing
+    // that distinguishes the two link kinds, and the reason `Link` is a sum type
+    // rather than a struct with a `kind`: the field is called `shares`, not
+    // `target`, because it is a claim about this tree rather than a pointer.
     let forged = Forged::new(|snapshot: &mut Snapshot| {
         snapshot.files.push(File {
             path: PathBuf::from("innocent.txt"),
@@ -198,10 +201,9 @@ async fn an_escaping_hard_link_target_is_refused() {
             mode: 0o644,
             mtime: None,
         });
-        snapshot.links.push(Link {
+        snapshot.links.push(Link::Hard {
             path: PathBuf::from("sneaky.txt"),
-            target: PathBuf::from("../../etc/passwd"),
-            kind: LinkKind::Hard,
+            shares: PathBuf::from("../../etc/passwd"),
         });
     })
     .await;

@@ -34,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Dir, File, FileChunk, Link, LinkKind, Snapshot, Timestamp};
+use super::{Dir, File, FileChunk, Link, Snapshot, Timestamp};
 
 /// Refuse a count that cannot fit in the bytes left: every collection entry costs
 /// at least one byte on the wire, so a count above the remaining input is
@@ -305,12 +305,16 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Vec<u8> {
 
     out.count(snapshot.links.len());
     for link in &snapshot.links {
-        out.path(&link.path);
-        out.path(&link.target);
-        out.u8(match link.kind {
-            LinkKind::Hard => 0,
-            LinkKind::Symbolic => 1,
-        });
+        // Two paths and a tag, in that order, for both variants — the two cases
+        // have always shared a field and the format has never distinguished them
+        // beyond the tag, so this writes exactly the bytes it always wrote.
+        let (path, second, kind) = match link {
+            Link::Symbolic { path, target } => (path, target, 1),
+            Link::Hard { path, shares } => (path, shares, 0),
+        };
+        out.path(path);
+        out.path(second);
+        out.u8(kind);
     }
 
     out.bytes
@@ -370,14 +374,19 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
     let links = (0..reader.count()?)
         .map(|_| {
             let path = reader.path()?;
-            let target = reader.path()?;
-            let kind = match reader.u8()? {
-                0 => LinkKind::Hard,
-                1 => LinkKind::Symbolic,
-                _ => return Err(Malformed("a link has an unknown kind")),
-            };
+            let second = reader.path()?;
 
-            Ok(Link { path, target, kind })
+            match reader.u8()? {
+                0 => Ok(Link::Hard {
+                    path,
+                    shares: second,
+                }),
+                1 => Ok(Link::Symbolic {
+                    path,
+                    target: second,
+                }),
+                _ => Err(Malformed("a link has an unknown kind")),
+            }
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -422,10 +431,9 @@ mod tests {
             file_offset: 0,
             length: 3,
         });
-        snapshot.links.push(Link {
+        snapshot.links.push(Link::Symbolic {
             path: PathBuf::from("a/link"),
             target: PathBuf::from("../elsewhere"),
-            kind: LinkKind::Symbolic,
         });
         snapshot
     }

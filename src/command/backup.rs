@@ -239,10 +239,9 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
             // A symlink is recorded as a link and never followed, including one
             // that resolves to a directory.
             if meta.file_type().is_symlink() {
-                snapshot.links.push(metadata::Link {
+                snapshot.links.push(metadata::Link::Symbolic {
                     path: relative_path,
                     target: path.read_link()?,
-                    kind: metadata::LinkKind::Symbolic,
                 });
                 return Ok(None);
             }
@@ -274,10 +273,9 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
             // later path sharing it becomes a hard link to that one.
             if let Some(file_id) = FileId::from_metadata(&meta) {
                 if let Some(first) = inode_map.get(&file_id) {
-                    snapshot.links.push(metadata::Link {
+                    snapshot.links.push(metadata::Link::Hard {
                         path: relative_path,
-                        target: first.clone(),
-                        kind: metadata::LinkKind::Hard,
+                        shares: first.clone(),
                     });
 
                     return Ok(None);
