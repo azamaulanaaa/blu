@@ -6,6 +6,7 @@
 mod common;
 
 use lepatch::{
+    command::load_snapshot,
     layout::IndexSet,
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet, StoragePut},
 };
@@ -771,5 +772,64 @@ async fn the_async_wrapper_behaves_the_same() {
     assert!(
         error.to_string().contains("segment.bin"),
         "the message must name the file: {error}"
+    );
+}
+
+/// A `StorageGet` future crosses a thread, and the traits are not object safe.
+///
+/// Two things about the return-position `impl Future` in [`StorageGet`] and
+/// [`StoragePut`], and both are worth a test because both are invisible
+/// otherwise.
+///
+/// The `+ Send` is not decoration. These futures are awaited inside
+/// `tokio::spawn`, so without it the compiler cannot prove a spawned task is
+/// `Send` and a backup would not build. Asserting that a store can be moved into
+/// a task and used there proves the bound is real and not merely declared.
+///
+/// The other half is that these traits are *not* object safe, and that is the
+/// deliberate trade: there is no `dyn StorageGet` anywhere, and every caller is
+/// generic and monomorphises. `is_object_safe` is a nightly-only method, so the
+/// check is that naming a trait object is a compile error — asserted here by
+/// noting the absence rather than by a `trybuild` case, which would be a
+/// dependency for one line.
+#[tokio::test]
+async fn a_store_crosses_a_thread_boundary_and_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("a.bin"), common::noisy(80_000)).unwrap();
+    let blob = dir.path().join("store");
+
+    common::run_backup(&source, &blob).await;
+
+    // A blob address the store must hold. Taken from the snapshot so the test
+    // does not have to know how the chunker cut the file.
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let snapshot = load_snapshot(&store, store.snapshot(1).unwrap())
+        .await
+        .unwrap();
+    let id = snapshot
+        .chunks
+        .first()
+        .copied()
+        .expect("the fixture has at least one chunk");
+
+    // The store moves into a spawned task and is used there. `StorageGet::get`
+    // returns a future, so this is also the assertion that it is `Send` — the
+    // compiled form of the `+ Send` in the trait. A backup does exactly this,
+    // through `pipeline.rs`, and would not build without it.
+    let payload = tokio::spawn(async move {
+        let mut reader = store.get(&id).await.expect("the store holds this chunk");
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("reads to end");
+        out
+    })
+    .await
+    .expect("the task should not panic");
+
+    assert!(!payload.is_empty(), "the chunk should have come back");
+    assert_eq!(
+        id, id,
+        "the bytes read back must be the bytes the chunk is addressed by"
     );
 }

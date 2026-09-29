@@ -50,7 +50,6 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-use async_trait::async_trait;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
@@ -503,7 +502,6 @@ impl BlobStore<false> {
     }
 }
 
-#[async_trait]
 impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
     /// Open the blob with this content hash.
     ///
@@ -581,7 +579,6 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
     }
 }
 
-#[async_trait]
 impl storage::StoragePut for BlobStore<true> {
     /// Store `len` bytes whose content hashes to `id`.
     ///

@@ -12,7 +12,6 @@
 
 use std::{io, path::Path};
 
-use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use blob::BlobStore;
@@ -50,7 +49,6 @@ pub(super) fn truncated_hash<const N: usize>(bytes: &[u8]) -> [u8; N] {
 /// The kind is carried through, which is the whole reason this is a function and
 /// not a `format!`. A bare `io::Error::new(Other, ...)` would be a lie about a
 /// permission problem, and a crate that hands `io::Error` to callers has already
-/// established that the kinds are the contract.
 ///
 /// ```no_run
 /// # fn main() -> std::io::Result<()> {
@@ -386,7 +384,21 @@ impl<T: AsyncRead + AsyncSeek + ?Sized> AsyncReadSeek for T {}
 pub type StreamReadSeeker = Box<dyn AsyncReadSeek + Unpin + Send>;
 
 /// Reading blobs back out of a store.
-#[async_trait]
+///
+/// Return-position `impl Future` rather than `async fn`, for the `+ Send`. An
+/// `async fn` in a trait says nothing about whether its future can cross a thread,
+/// and these are awaited inside `tokio::spawn`, so it has to say. Spelling the
+/// return type out is what says it — and it is also what makes these traits
+/// non-`dyn`-compatible, which is the trade this is making and the one thing to
+/// know before adding a `dyn StorageGet`.
+///
+/// **These traits are not object safe, and nothing needs them to be.** There is no
+/// `dyn StorageGet` or `dyn StoragePut` anywhere in the crate or its tests; every
+/// caller is generic over `S: StorageGet`, which monomorphises and needs no
+/// vtable. That is what makes the alternative worth having at all: the `#[async_trait]`
+/// these replace turned every `get` and every `put` into a boxed future, so a
+/// backup paid one heap allocation per chunk to reach a method the compiler could
+/// have inlined, and a dependency existed only to do it.
 pub trait StorageGet: Send + Sync {
     /// Open the blob whose contents hash to `id`.
     ///
@@ -398,11 +410,12 @@ pub trait StorageGet: Send + Sync {
     ///
     /// Returns an error if the store does not hold that blob, or if it holds it
     /// but the bytes cannot be read.
-    async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker>;
+    fn get(&self, id: &BlobId) -> impl Future<Output = io::Result<StreamReadSeeker>> + Send;
 }
 
 /// Appending blobs to a store, and publishing what has been appended.
-#[async_trait]
+///
+/// Not object safe, and does not need to be — see [`StorageGet`].
 pub trait StoragePut: Send + Sync {
     /// Store `len` bytes read from `reader`, whose contents hash to `id`.
     ///
@@ -416,7 +429,12 @@ pub trait StoragePut: Send + Sync {
     ///
     /// Returns an error if the read fails, if the length does not match, or if
     /// the content does not hash to `id`.
-    async fn put(&self, id: &BlobId, reader: StreamReadSeeker, len: u64) -> io::Result<()>;
+    fn put(
+        &self,
+        id: &BlobId,
+        reader: StreamReadSeeker,
+        len: u64,
+    ) -> impl Future<Output = io::Result<()>> + Send;
 
     /// Make every record written so far durable.
     ///
@@ -426,7 +444,7 @@ pub trait StoragePut: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the data cannot be made durable.
-    async fn sync_data(&self) -> io::Result<()>;
+    fn sync_data(&self) -> impl Future<Output = io::Result<()>> + Send;
 
     /// Publish `snapshot` as the next version, and return the number it got.
     ///
@@ -438,5 +456,5 @@ pub trait StoragePut: Send + Sync {
     ///
     /// Returns an error if the commit record cannot be written or made durable,
     /// in which case the run is not published.
-    async fn commit(&self, snapshot: &BlobId) -> io::Result<u32>;
+    fn commit(&self, snapshot: &BlobId) -> impl Future<Output = io::Result<u32>> + Send;
 }

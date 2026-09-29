@@ -43,7 +43,6 @@ publish = false
 dist = true
 
 [dependencies]
-async-trait = "0.1.89"
 blake3 = { version = "1.8.2", features = ["traits-preview"] }
 clap = { version = "4.5.53", features = ["derive"] }
 fastcdc = "5.0.0"
