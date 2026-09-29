@@ -16,7 +16,7 @@
 
 mod common;
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::HashSet, fs, path::Path};
 
 use lepatch::{
     metadata::Snapshot,
@@ -52,7 +52,7 @@ async fn plan_of(blob: &Path) -> Plan {
 }
 
 /// The chunk hashes a set's latest version names.
-async fn hashes_of(blob: &Path) -> BTreeSet<lepatch::storage::BlobId> {
+async fn hashes_of(blob: &Path) -> HashSet<lepatch::storage::BlobId> {
     plan_of(blob).await.chunks().iter().map(|c| c.id).collect()
 }
 
@@ -190,7 +190,7 @@ async fn a_client_holding_nothing_needs_one_range() {
     let built = build(5, 200_000).await;
     let pack = built.pack(&built.dir.path().join("v1.pack")).await;
 
-    let needed = pack.needed(&BTreeSet::new());
+    let needed = pack.needed(&HashSet::new());
 
     assert_eq!(
         needed.len(),
@@ -198,7 +198,7 @@ async fn a_client_holding_nothing_needs_one_range() {
         "a full download should be one range, not {}",
         needed.len()
     );
-    assert_eq!(pack.needed_bytes(&BTreeSet::new()), pack.payload_len());
+    assert_eq!(pack.needed_bytes(&HashSet::new()), pack.payload_len());
 }
 
 /// A client holding a version's chunks needs only the rest, in one range.
@@ -283,7 +283,7 @@ async fn a_client_holding_everything_needs_nothing() {
     let built = build(4, 150_000).await;
     let pack = built.pack(&built.dir.path().join("v1.pack")).await;
 
-    let have: BTreeSet<_> = built.plan.chunks().iter().map(|c| c.id).collect();
+    let have: HashSet<_> = built.plan.chunks().iter().map(|c| c.id).collect();
 
     assert!(pack.needed(&have).is_empty());
     assert_eq!(pack.needed_bytes(&have), 0);
@@ -299,7 +299,7 @@ async fn recording_a_fetch_makes_the_next_ask_empty() {
     let built = build(6, 200_000).await;
     let pack = built.pack(&built.dir.path().join("v1.pack")).await;
 
-    let first = pack.needed(&BTreeSet::new());
+    let first = pack.needed(&HashSet::new());
     assert_eq!(first.len(), 1);
 
     let have = chunks_covering(&pack, &first);

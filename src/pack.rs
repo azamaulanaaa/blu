@@ -40,13 +40,11 @@
 //! nothing reads a pack to answer that.
 
 use std::{
-    collections::BTreeSet,
+    collections::HashSet,
     fs,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
-
-use std::collections::HashSet;
 
 use tokio::{
     fs as tfs,
@@ -413,8 +411,15 @@ impl Pack {
     /// nothing gets the whole payload region as one range. Adjacent ranges are
     /// merged, which the no-framing layout is what makes worthwhile — chunks a
     /// client needs are contiguous, so the merged count is small.
+    ///
+    /// A set rather than anything ordered, because the set is only ever asked
+    /// whether it holds a chunk. The order of the result comes from the order of
+    /// [`Pack::chunks`], not from the set, so nothing observable depends on it —
+    /// and `BlobId` is a `blake3::Hash`, which deliberately has no `Ord`: hash
+    /// order is not content order and pretending otherwise would be a lie a
+    /// caller could come to rely on.
     #[must_use]
-    pub fn needed(&self, have: &BTreeSet<BlobId>) -> Vec<Range> {
+    pub fn needed(&self, have: &HashSet<BlobId>) -> Vec<Range> {
         let mut ranges: Vec<Range> = Vec::new();
 
         for chunk in &self.chunks {
@@ -439,7 +444,7 @@ impl Pack {
 
     /// Bytes a client already holding `have` still needs.
     #[must_use]
-    pub fn needed_bytes(&self, have: &BTreeSet<BlobId>) -> u64 {
+    pub fn needed_bytes(&self, have: &HashSet<BlobId>) -> u64 {
         // Folded rather than `sum()`, for the same reason: a total that wrapped
         // would report a client needs fewer bytes than the ranges describe.
         self.needed(have)
@@ -564,8 +569,8 @@ fn not_a_pack(path: &Path, why: &str) -> io::Error {
 /// those ranges cover, so a client can record them after fetching and ask again.
 /// A range covering only part of a chunk is not that chunk and records nothing.
 #[must_use]
-pub fn chunks_covering(pack: &Pack, ranges: &[Range]) -> BTreeSet<BlobId> {
-    let mut out = BTreeSet::new();
+pub fn chunks_covering(pack: &Pack, ranges: &[Range]) -> HashSet<BlobId> {
+    let mut out = HashSet::new();
 
     for chunk in &pack.chunks {
         let start = pack.payload_start.saturating_add(chunk.offset);
