@@ -32,10 +32,20 @@
 //!
 //! Backup is measured across a range of `Options::concurrency` rather than at
 //! one value, because the interesting question is not "how fast is this" but
-//! "where does it stop getting faster". On a four-core box with 50 MiB genuinely
-//! reaching the store, that is **3.0x from concurrency 1 to 8, still climbing at
-//! the top of the range**, with CPU time falling as concurrency rises rather than
-//! staying flat. The default of eight is the measured answer.
+//! "where does it stop getting faster". On a four-core box the curve is strongly
+//! rising to a default of 8 and still climbing at the top of the range, with CPU
+//! time falling as concurrency rises rather than staying flat, which is why 8 is
+//! the default.
+//!
+//! **The 3.0x figure this used to quote was measured on a broken fixture and is
+//! gone.** The byte generator was a function of `seed + position`, so the 50 MiB
+//! tree was one 128 KiB stream repeated 200 times and deduplicated away almost
+//! entirely: the benchmark was timing the cost of storing 128 KiB. The shape of
+//! the curve above was re-measured on the fixed fixture, but the number is not
+//! reproduced here — it is a property of the machine, and this file's own header
+//! already says the absolute figures are not a number to quote about how fast a
+//! backup is. `benches/fixture.rs` records what was wrong with the old one, and
+//! `tests/fixtures.rs` is what stops it coming back.
 
 use std::{
     hint::black_box,
@@ -51,28 +61,16 @@ use lepatch::{
 };
 use tempfile::TempDir;
 
+#[path = "fixture.rs"]
+mod fixture;
+use fixture::noisy;
+
 /// Files in the benchmark tree. Enough that per-file costs are visible, small
 /// enough that a full run stays in the low seconds.
 const FILES: usize = 200;
 
 /// Size of each file.
 const FILE_BYTES: usize = 256 * 1024;
-
-/// Pseudo-random bytes with no long runs, so the chunker finds real boundaries.
-fn noisy(len: usize, seed: u64) -> Vec<u8> {
-    (0..len)
-        .map(|i| {
-            let mut x = u64::try_from(i).unwrap_or(0).wrapping_add(seed);
-            x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            x ^= x >> 30;
-            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            x ^= x >> 27;
-            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-            x ^= x >> 31;
-            u8::try_from(x & 0xff).unwrap_or(0)
-        })
-        .collect()
-}
 
 /// Build the benchmark tree, half of each file shared with every other.
 fn tree(dir: &TempDir) -> PathBuf {

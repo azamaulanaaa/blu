@@ -1,5 +1,11 @@
 [package]
 name = "lepatch"
+# Both benches are declared by hand below, because criterion is not a libtest
+# harness. With auto-discovery left on, `benches/fixture.rs` — a module both
+# benches include for its byte generator, not a target — would be built as a
+# third benchmark and fail to link. Every target this package has is listed
+# explicitly, so nothing is lost by saying so.
+autobenches = false
 version = "0.1.0"
 edition = "2024"
 # Minimum supported Rust version.

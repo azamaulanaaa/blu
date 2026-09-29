@@ -7,14 +7,21 @@
 //! Benchmarks for the unit-level work a backup is made of.
 //!
 //! These are the numbers that decide where an optimisation is worth making, and
-//! each covers one line of a backup's cost. Measured against a 200 MiB tree of
-//! 400 files, a backup spends its time like this:
+//! each covers one line of a backup's cost. Roughly, a backup spends its time
+//! like this:
 //!
 //! ```text
-//! read + chunk (CDC)   0.086s   46%   chunking
-//! blake3                0.051s   27%   hashing
-//! plumbing              0.052s   28%   (channel and task handoffs — not here)
+//! read + chunk (CDC)   ~46%   chunking
+//! blake3                ~27%   hashing
+//! plumbing              ~28%   (channel and task handoffs — not here)
 //! ```
+//!
+//! The split is indicative, and the third line is a plug rather than a
+//! measurement: it is the remainder once the other two are subtracted, which is
+//! why the parenthesis says "not here". These were taken on a 200 MiB tree,
+//! which this file does not reproduce — its own fixture is 32 MiB — so treat the
+//! proportions as a starting point for deciding what to measure, and take the
+//! absolute figures from `benches/throughput.rs` or from the binary.
 //!
 //! Criterion is reliable for a ratio within one run and unreliable for a
 //! comparison against a previous run on a shared machine; `examples/ab.rs`
@@ -29,32 +36,16 @@ use lepatch::{
 };
 use tempfile::TempDir;
 
+#[path = "fixture.rs"]
+mod fixture;
+use fixture::noisy;
+
 /// Bytes each generated file holds. Matches the CLI's default chunker's scale:
 /// 8 KiB minimum, 16 KiB average, so a file is a handful of chunks.
 const FILE_BYTES: usize = 512 * 1024;
 
 /// How many files the tree benchmarks run over.
 const FILES: usize = 64;
-
-/// Pseudo-random bytes with no long runs.
-///
-/// Content-defined chunking puts boundaries where the data changes, so a constant
-/// or short-cycle stream would cut at the maximum size and measure almost
-/// nothing.
-fn noisy(len: usize, seed: u64) -> Vec<u8> {
-    (0..len)
-        .map(|i| {
-            let mut x = u64::try_from(i).unwrap_or(0).wrapping_add(seed);
-            x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            x ^= x >> 30;
-            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            x ^= x >> 27;
-            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-            x ^= x >> 31;
-            u8::try_from(x & 0xff).unwrap_or(0)
-        })
-        .collect()
-}
 
 /// A tree on disk to chunk, built once per benchmark process.
 fn tree(dir: &TempDir) -> Vec<PathBuf> {
