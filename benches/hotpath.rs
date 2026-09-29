@@ -89,7 +89,7 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
         // the store, so a snapshot records no location of its own.
         snapshot
             .chunks
-            .push(*blake3::hash(&u64::try_from(i).unwrap_or(0).to_le_bytes()).as_bytes());
+            .push(blake3::hash(&u64::try_from(i).unwrap_or(0).to_le_bytes()));
         snapshot.file_chunks.push(FileChunk {
             chunk_index: u32::try_from(i).unwrap_or(0),
             file_index: 0,

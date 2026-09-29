@@ -38,7 +38,7 @@ async fn put_all(store: std::sync::Arc<BlobStore<true>>) -> f64 {
                 let data = payload(seed);
                 // The store checks this itself, so the address is the payload's
                 // own hash rather than anything the caller invented.
-                let id = *blake3::hash(&data).as_bytes();
+                let id = blake3::hash(&data);
                 store
                     .put(
                         &id,

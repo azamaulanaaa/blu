@@ -34,6 +34,8 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
 };
 
+use super::BlobId;
+
 /// Magic at the start of a store file.
 ///
 /// A file that does not begin with this is not a store and is never written to,
@@ -214,12 +216,12 @@ pub(super) struct Scan {
     ///
     /// From record headers only: the scan never reads a payload, so a blob with a
     /// damaged payload is still listed here and fails when it is read.
-    pub blobs: HashMap<[u8; HASH], Placement>,
+    pub blobs: HashMap<BlobId, Placement>,
     /// The snapshot hash of each committed version, oldest first.
     ///
     /// A version number is an index into this, plus one, so the numbering can
     /// never drift from the log.
-    pub commits: Vec<[u8; HASH]>,
+    pub commits: Vec<BlobId>,
     /// First byte past the last valid record, where the store should be truncated.
     pub end: u64,
 }
@@ -389,7 +391,7 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 ///
 /// One segment's worth of headers and no payloads: what a lookup that would
 /// otherwise scan the whole set costs instead.
-pub(super) fn commits_in(file: &mut std::fs::File, segment: u32) -> io::Result<Vec<[u8; HASH]>> {
+pub(super) fn commits_in(file: &mut std::fs::File, segment: u32) -> io::Result<Vec<BlobId>> {
     Ok(scan(file, segment, Blobs::Discard)?.commits)
 }
 
@@ -500,7 +502,7 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::
                 }
 
                 scan.blobs.insert(
-                    header.hash,
+                    BlobId::from_bytes(header.hash),
                     Placement {
                         segment,
                         offset: header.payload_offset,
@@ -522,7 +524,7 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::
                     if let Some(snapshot) = start.map(|s| {
                         let mut hash = [0u8; HASH];
                         hash.copy_from_slice(&buffer[s..s + HASH]);
-                        hash
+                        BlobId::from_bytes(hash)
                     }) {
                         scan.commits.push(snapshot);
                     } else {
@@ -532,7 +534,7 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::
                         let mut hash = [0u8; HASH];
                         file.seek(SeekFrom::Start(header.payload_offset))?;
                         if read_exact_or_eof(file, &mut hash)? {
-                            scan.commits.push(hash);
+                            scan.commits.push(BlobId::from_bytes(hash));
                         } else {
                             break;
                         }

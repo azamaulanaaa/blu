@@ -95,9 +95,7 @@ impl Plan {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "a snapshot needs {} bytes of chunk {} but the store holds {held}",
-                        length,
-                        crate::storage::Hex(id)
+                        "a snapshot needs {length} bytes of chunk {id} but the store holds {held}"
                     ),
                 ));
             }
@@ -181,7 +179,7 @@ mod tests {
     use crate::storage::{BlobId, Codec, Placement};
 
     fn chunk() -> BlobId {
-        [7u8; 32]
+        BlobId::from_bytes([7u8; 32])
     }
 
     fn at(offset: u64, len: u64) -> Placement {
@@ -207,7 +205,7 @@ mod tests {
             mtime: None,
         });
         s.chunks.push(chunk());
-        s.chunks.push([8u8; 32]);
+        s.chunks.push(BlobId::from_bytes([8u8; 32]));
         s.file_chunks.push(FileChunk {
             chunk_index: 0,
             file_index: 0,
@@ -280,7 +278,7 @@ mod tests {
     #[test]
     fn a_chunk_the_snapshot_lists_but_never_reads_is_left_out() {
         let mut s = two_chunks();
-        s.chunks.push([9u8; 32]);
+        s.chunks.push(BlobId::from_bytes([9u8; 32]));
 
         let plan = Plan::from_snapshot(&s, |_| Ok(at(0, 50))).unwrap();
 

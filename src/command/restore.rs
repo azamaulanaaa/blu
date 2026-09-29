@@ -80,10 +80,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         .map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!(
-                    "refusing to restore snapshot {}: {e}",
-                    storage::Hex(&snapshot_id)
-                ),
+                format!("refusing to restore snapshot {snapshot_id}: {e}"),
             )
         })?;
 
@@ -92,10 +89,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     check_paths(&snapshot).map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!(
-                "refusing to restore snapshot {}: {e}",
-                storage::Hex(&snapshot_id)
-            ),
+            format!("refusing to restore snapshot {snapshot_id}: {e}"),
         )
     })?;
 
@@ -487,7 +481,7 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
                 io::ErrorKind::UnexpectedEof,
                 format!(
                     "chunk {} is shorter than the {length} bytes recorded for {}",
-                    storage::Hex(chunk),
+                    chunk,
                     file.path.display()
                 ),
             ));

@@ -14,7 +14,7 @@ use std::fs;
 
 use lepatch::{
     metadata::Snapshot,
-    storage::{BlobStore, Plan, StorageGet},
+    storage::{BlobId, BlobStore, Plan, StorageGet},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -183,7 +183,7 @@ async fn two_backups_of_one_tree_produce_the_same_plan() {
     assert_eq!(a.total_bytes(), b.total_bytes());
     assert_eq!(a.len(), b.len());
 
-    let ids = |p: &Plan| -> Vec<[u8; 32]> { p.chunks().iter().map(|c| c.id).collect() };
+    let ids = |p: &Plan| -> Vec<BlobId> { p.chunks().iter().map(|c| c.id).collect() };
     assert_eq!(
         ids(&a),
         ids(&b),

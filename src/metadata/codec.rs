@@ -194,11 +194,15 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn hash(&mut self) -> Result<[u8; 32]> {
+    fn hash(&mut self) -> Result<super::storage::BlobId> {
         let bytes = self.take(32)?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(bytes);
-        Ok(out)
+        // The length is checked by `take`, so this cannot fail; a hash of the
+        // wrong width is not a thing a snapshot can hold.
+        Ok(super::storage::BlobId::from_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| Malformed("a chunk hash is not 32 bytes"))?,
+        ))
     }
 }
 
@@ -261,8 +265,8 @@ impl Writer {
         }
     }
 
-    fn hash(&mut self, hash: &[u8; 32]) {
-        self.bytes.extend_from_slice(hash);
+    fn hash(&mut self, hash: &super::storage::BlobId) {
+        self.bytes.extend_from_slice(hash.as_bytes());
     }
 }
 
@@ -408,7 +412,9 @@ mod tests {
             mode: 0o644,
             mtime: None,
         });
-        snapshot.chunks.push([3u8; 32]);
+        snapshot
+            .chunks
+            .push(crate::storage::BlobId::from_bytes([3u8; 32]));
         snapshot.file_chunks.push(FileChunk {
             chunk_index: 0,
             file_index: 0,

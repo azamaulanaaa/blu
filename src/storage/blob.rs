@@ -201,10 +201,7 @@ impl<const WRITE: bool> BlobStore<WRITE> {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!(
-                        "this store does not hold a blob hashing to {}",
-                        storage::Hex(id)
-                    ),
+                    format!("this store does not hold a blob hashing to {id}"),
                 )
             })
     }
@@ -469,7 +466,7 @@ impl storage::StoragePut for BlobStore<true> {
     #[instrument(skip_all, err)]
     async fn put(&self, id: &BlobId, mut reader: StreamReadSeeker, len: u64) -> io::Result<()> {
         if Contents::lock(&self.contents).blobs.contains_key(id) {
-            tracing::trace!(already = %storage::Hex(id), "already stored");
+            tracing::trace!(already = %id, "already stored");
             return Ok(());
         }
 
@@ -508,14 +505,11 @@ impl storage::StoragePut for BlobStore<true> {
         // Checked before anything is stored, so nothing is written under the wrong
         // name. Hashing the content is also what makes the codec a write policy:
         // the same bytes deduplicate whether they were stored raw or compressed.
-        if blake3::hash(&raw).as_bytes() != id {
+        if blake3::hash(&raw) != *id {
             // Nothing written yet, so the run simply fails and the store is as it was.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "the content does not hash to {}, so it was not stored",
-                    storage::Hex(id)
-                ),
+                format!("the content does not hash to {id}, so it was not stored"),
             ));
         }
 
@@ -527,7 +521,14 @@ impl storage::StoragePut for BlobStore<true> {
 
         let mut header =
             Vec::with_capacity(usize::try_from(record::header_len(stored_len, len)).unwrap_or(0));
-        record::encode_header(&mut header, Kind::Blob, codec, id, stored_len, len);
+        record::encode_header(
+            &mut header,
+            Kind::Blob,
+            codec,
+            id.as_bytes(),
+            stored_len,
+            len,
+        );
 
         let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + stored_len;
         let reservation = self.reserve(total)?;
@@ -612,23 +613,27 @@ impl storage::StoragePut for BlobStore<true> {
     /// record that makes the run visible and syncs it, and only then is the
     /// version reported as taken.
     async fn commit(&self, snapshot: &BlobId) -> io::Result<u32> {
-        let hash = *blake3::hash(snapshot).as_bytes();
+        // A commit's payload is the hash it commits to, and its two lengths are
+        // that hash's width. `HASH`, not `snapshot.len()`: a `BlobId` is a hash
+        // and a hash is not an array, so asking it for a length is a question
+        // about the wrong thing — and it compiled, because it used to be a
+        // `[u8; 32]`.
+        let hash = snapshot.as_bytes();
+        let hash_len = 32_u64;
 
         // Always raw: the scan requires a commit to be exactly one uncompressed
         // hash, so a compressed one would be invisible to the scan that finds it.
         let mut header = Vec::new();
-        let hash_len = u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
         record::encode_header(
             &mut header,
             Kind::Commit,
             storage::Codec::Raw,
-            &hash,
+            hash,
             hash_len,
             hash_len,
         );
 
-        let total = u64::try_from(header.len()).unwrap_or(u64::MAX)
-            + u64::try_from(snapshot.len()).unwrap_or(u64::MAX);
+        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + hash_len;
         let reservation = self.reserve(total)?;
         let offset = reservation.offset;
 
@@ -643,7 +648,7 @@ impl storage::StoragePut for BlobStore<true> {
 
         file.seek(SeekFrom::Start(offset)).await?;
         file.write_all(&header).await?;
-        file.write_all(snapshot).await?;
+        file.write_all(snapshot.as_bytes()).await?;
         file.flush().await?;
 
         // The second sync, and the one that makes the run real.

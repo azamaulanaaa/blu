@@ -129,10 +129,10 @@ fn read_commits(path: &Path, segment: u32) -> std::io::Result<Vec<BlobId>> {
         ));
     }
 
-    // Already a `Vec<BlobId>`: `BlobId` is `[u8; HASH]` and the collect was
-    // re-allocating and re-copying every hash to change nothing. Clippy's
-    // `useless_conversion` cannot see it, because the two types are spelled
-    // differently and one of them is an alias.
+    // Already a `Vec<BlobId>`, and the collect was re-allocating and re-copying
+    // every hash to change nothing. Clippy's `useless_conversion` could not see
+    // it while `BlobId` was an alias for `[u8; HASH]`, because the two types
+    // were spelled differently and one of them was a synonym.
     record::commits_in(&mut file, segment)
 }
 

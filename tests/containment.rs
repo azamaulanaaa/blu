@@ -49,7 +49,7 @@ impl Forged {
         // Give every referenced chunk real content, so a restore that passes the
         // path checks goes on to succeed and the test can tell the two apart.
         let payload = b"OWNED\n";
-        let hash = *blake3::hash(payload).as_bytes();
+        let hash = blake3::hash(payload);
         storage
             .put(&hash, Box::new(Cursor::new(payload.to_vec())), 6)
             .await
@@ -67,7 +67,7 @@ impl Forged {
 
         let encoded = snapshot.to_bytes();
         let len = u64::try_from(encoded.len()).unwrap();
-        let id = *blake3::hash(&encoded).as_bytes();
+        let id = blake3::hash(&encoded);
         storage
             .put(&id, Box::new(Cursor::new(encoded)), len)
             .await

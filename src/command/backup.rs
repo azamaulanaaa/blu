@@ -154,7 +154,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 
     // The snapshot is a blob like any other, addressed by the hash of its own
     // bytes — which is what the commit record names.
-    let id = *blake3::hash(&buffer).as_bytes();
+    let id = blake3::hash(&buffer);
 
     let len = u64::try_from(buffer.len())
         .map_err(|_| io::Error::other("the snapshot is too large to store"))?;

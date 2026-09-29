@@ -26,7 +26,7 @@ pub(crate) fn reader(bytes: Vec<u8>) -> StreamReadSeeker {
 
 /// The address a payload is stored under: the BLAKE3 of its contents.
 pub(crate) fn id_of(bytes: &[u8]) -> BlobId {
-    *blake3::hash(bytes).as_bytes()
+    blake3::hash(bytes)
 }
 
 /// A length as the store's `u64`, from a slice the test already has in hand.

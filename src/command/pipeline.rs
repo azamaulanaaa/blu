@@ -30,7 +30,7 @@ use crate::{command::backup::index_to_u32, metadata, progress::Progress, reader,
 struct Pending {
     /// Position of this chunk in the order the tree was read.
     seq: u64,
-    hash: [u8; 32],
+    hash: storage::BlobId,
     sources: Vec<reader::ChunkSource>,
     data: Vec<u8>,
 }
@@ -38,7 +38,7 @@ struct Pending {
 /// A chunk that has been stored, or found already stored.
 struct Stored {
     seq: u64,
-    hash: [u8; 32],
+    hash: storage::BlobId,
     /// The file slices this chunk covers.
     sources: Vec<reader::ChunkSource>,
 }
@@ -52,11 +52,11 @@ struct Stored {
 type Slot = Arc<OnceCell<()>>;
 
 /// Deduplication state shared by every store in flight.
-type Slots = Arc<Mutex<HashMap<[u8; 32], Slot>>>;
+type Slots = Arc<Mutex<HashMap<storage::BlobId, Slot>>>;
 
 /// Lock the deduplication map, ignoring poisoning: the only code under it is a
 /// hash insert, which cannot panic.
-fn lock_slots(slots: &Slots) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Slot>> {
+fn lock_slots(slots: &Slots) -> std::sync::MutexGuard<'_, HashMap<storage::BlobId, Slot>> {
     slots.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -85,7 +85,7 @@ fn produce(
         // already blocks, rather than by the upload that consumes it: the hash
         // is needed for deduplication, whereas the store is the part that wants
         // the async pool to itself.
-        let hash = *blake3::hash(&chunk.data).as_bytes();
+        let hash = blake3::hash(&chunk.data);
 
         // `blocking_send`, because this is a blocking thread. An error means every
         // receiver is gone, so the run has already failed.
@@ -214,7 +214,7 @@ async fn commit<S: storage::StoragePut + 'static>(
 
     // Which chunk index each distinct content was given, so a later chunk with
     // the same content reuses it instead of being stored again.
-    let mut index_of: HashMap<[u8; 32], u32> = HashMap::new();
+    let mut index_of: HashMap<storage::BlobId, u32> = HashMap::new();
 
     // The committer sees every chunk exactly once, so it is the one place that
     // can count them. The file count comes from the walk and is the only thing
@@ -300,7 +300,7 @@ fn commit_ready<S>(
     pipeline: &Pipeline<S>,
     ready: &mut BTreeMap<u64, Stored>,
     next_seq: &mut u64,
-    index_of: &mut HashMap<[u8; 32], u32>,
+    index_of: &mut HashMap<storage::BlobId, u32>,
     snapshot: &mut metadata::Snapshot,
 ) -> io::Result<()> {
     while let Some(stored) = ready.remove(next_seq) {

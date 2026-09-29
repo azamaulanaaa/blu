@@ -265,8 +265,9 @@ impl Pack {
             ));
         }
 
-        let mut snapshot = [0u8; 32];
-        snapshot.copy_from_slice(&header[8..40]);
+        let mut snapshot_raw = [0u8; 32];
+        snapshot_raw.copy_from_slice(&header[8..40]);
+        let snapshot = BlobId::from_bytes(snapshot_raw);
 
         // The two varints, which are part of the header: reading the fixed part
         // alone would start the payload at the wrong offset, shifting every
@@ -311,34 +312,7 @@ impl Pack {
             ));
         }
 
-        // The index is a claim about where each chunk sits, and the only thing
-        // checked above is the payload's extent. A chunk may therefore name an
-        // offset and a length that reach past the payload, or wrap around it, and
-        // the arithmetic that combines them — `payload_start + offset + len` —
-        // would overflow rather than fail. Checking here means every later
-        // consumer can add those numbers without re-deriving whether they hold.
-        for chunk in &chunks {
-            let end = chunk.offset.checked_add(chunk.len).ok_or_else(|| {
-                not_a_pack(
-                    path,
-                    &format!(
-                        "its index places a chunk at {} for {} bytes, which is not a \
-                         position in any file",
-                        chunk.offset, chunk.len
-                    ),
-                )
-            })?;
-            if end > payload_len {
-                return Err(not_a_pack(
-                    path,
-                    &format!(
-                        "its index places a chunk at {} for {} bytes, past the {payload_len}-byte \
-                         payload",
-                        chunk.offset, chunk.len
-                    ),
-                ));
-            }
-        }
+        check_index_geometry(path, &chunks, payload_len)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -464,7 +438,7 @@ fn encode_header(chunks: u64, payload_len: u64, snapshot: BlobId) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + COUNTS_MAX);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    out.extend_from_slice(&snapshot);
+    out.extend_from_slice(snapshot.as_bytes());
     write_varint(&mut out, chunks);
     write_varint(&mut out, payload_len);
 
@@ -475,7 +449,7 @@ fn encode_header(chunks: u64, payload_len: u64, snapshot: BlobId) -> Vec<u8> {
 fn encode_index(chunks: &[Located]) -> Vec<u8> {
     let mut out = Vec::with_capacity(chunks.len() * (32 + 18));
     for chunk in chunks {
-        out.extend_from_slice(&chunk.id);
+        out.extend_from_slice(chunk.id.as_bytes());
         write_varint(&mut out, chunk.offset);
         write_varint(&mut out, chunk.len);
     }
@@ -499,9 +473,12 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
         let truncated = || io::Error::new(io::ErrorKind::InvalidData, "a pack index is truncated");
 
         let end = at.checked_add(32).ok_or_else(truncated)?;
-        let mut id = [0u8; 32];
-        id.copy_from_slice(bytes.get(at..end).ok_or_else(truncated)?);
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(bytes.get(at..end).ok_or_else(truncated)?);
         at = end;
+        // A 32-byte wire field, read into the type that addresses a chunk. The
+        // slice above is exactly 32 bytes, so the array is fully initialised.
+        let id = BlobId::from_bytes(raw);
 
         let (offset, used) = read_varint(bytes, at)?;
         at = at.checked_add(used).ok_or_else(truncated)?;
@@ -584,6 +561,48 @@ pub fn chunks_covering(pack: &Pack, ranges: &[Range]) -> HashSet<BlobId> {
     out
 }
 
+/// Check that every chunk the index names lies inside the payload.
+///
+/// The index is a claim about where each chunk sits, and `open` checks only the
+/// payload's *extent*. A chunk may therefore name an offset and a length that
+/// reach past the end, or that wrap around it — and the arithmetic which
+/// combines them, `payload_start + offset + len`, would then overflow rather
+/// than fail. Both `needed` and `chunks_covering` do exactly that arithmetic, and
+/// `Range` is the type they hand the answer to, so it is checked here that every
+/// later consumer can add those numbers without re-deriving whether they hold.
+///
+/// # Errors
+///
+/// Returns an error naming the chunk that does not fit, and why: either its two
+/// numbers cannot be added at all, or they describe a position past the end of
+/// the payload.
+fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io::Result<()> {
+    for chunk in chunks {
+        let end = chunk.offset.checked_add(chunk.len).ok_or_else(|| {
+            not_a_pack(
+                path,
+                &format!(
+                    "its index places a chunk at {} for {} bytes, which is not a \
+                     position in any file",
+                    chunk.offset, chunk.len
+                ),
+            )
+        })?;
+        if end > payload_len {
+            return Err(not_a_pack(
+                path,
+                &format!(
+                    "its index places a chunk at {} for {} bytes, past the {payload_len}-byte \
+                     payload",
+                    chunk.offset, chunk.len
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// The hash of a pack's contents, for naming it.
 ///
 /// The whole file — header, payloads, index and trailer — so the name covers the
@@ -607,5 +626,5 @@ pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(*hasher.finalize().as_bytes())
+    Ok(hasher.finalize())
 }

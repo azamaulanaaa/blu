@@ -35,7 +35,7 @@ async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
 
-    *blake3::hash(&buffer).as_bytes()
+    blake3::hash(&buffer)
 }
 
 /// The plan for a set's latest version, and the chunk hashes it names.

@@ -20,7 +20,7 @@ use common::noisy;
 use lepatch::{
     command::PARTIAL_SUFFIX,
     index::IndexSet,
-    storage::{BlobStore, Codec, VersionIndex},
+    storage::{BlobId, BlobStore, Codec, VersionIndex},
 };
 
 /// Run the binary in `dir` and return its output.
@@ -1606,7 +1606,7 @@ fn both_listing_modes_name_the_same_versions() {
             version: 999,
             segment: 0,
             ordinal: 0,
-            snapshot: [7u8; 32],
+            snapshot: BlobId::from_bytes([7u8; 32]),
         }
         .to_bytes(),
     )

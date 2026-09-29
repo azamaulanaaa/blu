@@ -366,7 +366,7 @@ async fn no_two_stored_chunks_share_content() {
         .await;
         let snapshot = snapshot(&blob, &committed.snapshot).await;
 
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = std::collections::HashSet::new();
         for chunk in &snapshot.chunks {
             assert!(
                 seen.insert(*chunk),

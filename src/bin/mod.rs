@@ -441,7 +441,7 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
         if numbers_only {
             say!("{version}")?;
         } else {
-            say!("{version}  {}", storage::Hex(&snapshot))?;
+            say!("{version}  {}", &snapshot)?;
         }
     }
 
@@ -517,7 +517,7 @@ async fn run_backup(
     tracing::info!(
         name = %set.base().display(),
         version = committed.version,
-        snapshot = %storage::Hex(&committed.snapshot),
+        snapshot = %&committed.snapshot,
         store = %set.base().display(),
         segments,
         "backup complete"
@@ -832,13 +832,13 @@ async fn run_pack(
         version,
         chunks = pack.len(),
         bytes = file_len,
-        content = %storage::Hex(&content),
+        content = %&content,
         "wrote pack"
     );
 
     // The content hash is the pack's name, so it goes to stdout for a script to
     // key a cache on.
-    say!("{}  {}", storage::Hex(&content), out.display())?;
+    say!("{}  {}", &content, out.display())?;
     say!(
         "version {version}: {} chunks, {} bytes of payload, {} bytes on disk",
         pack.len(),

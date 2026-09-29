@@ -66,7 +66,7 @@ impl VersionIndex {
         out[..4].copy_from_slice(&self.version.to_le_bytes());
         out[4..8].copy_from_slice(&self.segment.to_le_bytes());
         out[8..12].copy_from_slice(&self.ordinal.to_le_bytes());
-        out[12..44].copy_from_slice(&self.snapshot);
+        out[12..44].copy_from_slice(self.snapshot.as_bytes());
 
         // Computed before the final copy, because the checksum is over everything
         // ahead of itself and the borrow cannot overlap.
@@ -110,7 +110,7 @@ impl VersionIndex {
             version: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             segment: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             ordinal: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            snapshot,
+            snapshot: BlobId::from_bytes(snapshot),
         })
     }
 

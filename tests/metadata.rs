@@ -1,6 +1,9 @@
 //! Tests for the snapshot encoding: framing, versioning and error reporting.
 
-use lepatch::metadata::{self, Error, Malformed, Snapshot};
+use lepatch::{
+    metadata::{self, Error, Malformed, Snapshot},
+    storage::BlobId,
+};
 
 fn sample() -> Snapshot {
     let mut snapshot = Snapshot::new();
@@ -13,7 +16,7 @@ fn sample() -> Snapshot {
     // A chunk is the BLAKE3 of its contents, and that is also how the store
     // finds it — so a snapshot records content identity and nothing about where
     // the bytes happen to sit in a file.
-    snapshot.chunks.push([7u8; 32]);
+    snapshot.chunks.push(BlobId::from_bytes([7u8; 32]));
     snapshot.file_chunks.push(metadata::FileChunk {
         chunk_index: 0,
         file_index: 0,

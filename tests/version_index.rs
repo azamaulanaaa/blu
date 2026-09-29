@@ -25,7 +25,7 @@ use std::fs;
 
 use lepatch::{
     index::IndexSet,
-    storage::{BlobStore, Compression, Resolved, SegmentLimit, VersionIndex, resolve},
+    storage::{BlobId, BlobStore, Compression, Resolved, SegmentLimit, VersionIndex, resolve},
 };
 
 /// A set with `versions` versions in it, and a store handle for it.
@@ -59,7 +59,7 @@ fn a_version_index_round_trips() {
         version: 7,
         segment: 12,
         ordinal: 3,
-        snapshot: [9u8; 32],
+        snapshot: BlobId::from_bytes([9u8; 32]),
     };
 
     let decoded = VersionIndex::from_bytes(&original.to_bytes()).unwrap();
@@ -73,7 +73,7 @@ fn a_corrupted_index_does_not_verify() {
         version: 7,
         segment: 12,
         ordinal: 3,
-        snapshot: [9u8; 32],
+        snapshot: BlobId::from_bytes([9u8; 32]),
     };
 
     for byte in 0..original.to_bytes().len() {
@@ -94,7 +94,7 @@ fn an_index_of_the_wrong_length_is_refused() {
         version: 1,
         segment: 0,
         ordinal: 0,
-        snapshot: [1u8; 32],
+        snapshot: BlobId::from_bytes([9u8; 32]),
     };
 
     let mut short = original.to_bytes().to_vec();
@@ -115,7 +115,7 @@ fn writing_an_index_leaves_no_temporary() {
         version: 1,
         segment: 0,
         ordinal: 0,
-        snapshot: [2u8; 32],
+        snapshot: BlobId::from_bytes([9u8; 32]),
     }
     .write_atomic(&path)
     .unwrap();
@@ -235,7 +235,7 @@ async fn an_index_naming_a_version_this_set_does_not_hold_is_refused() {
         version: 5,
         segment: 0,
         ordinal: 0,
-        snapshot: [3u8; 32],
+        snapshot: BlobId::from_bytes([9u8; 32]),
     }
     .write_atomic(&set.index_path(5))
     .unwrap();
@@ -262,7 +262,7 @@ async fn an_index_naming_a_snapshot_the_segment_does_not_hold_is_refused() {
     // Take a real index and change only the snapshot, leaving the segment and the
     // ordinal pointing at a commit record that names something else.
     let mut index = version(&blob, 2);
-    index.snapshot = [0xabu8; 32];
+    index.snapshot = BlobId::from_bytes([0xabu8; 32]);
     index.write_atomic(&set.index_path(2)).unwrap();
 
     assert_eq!(
@@ -461,7 +461,7 @@ async fn an_index_cannot_invent_a_version() {
             version: v,
             segment: 0,
             ordinal: v - 1,
-            snapshot: [u8::try_from(v).unwrap(); 32],
+            snapshot: BlobId::from_bytes([u8::try_from(v).unwrap(); 32]),
         }
         .write_atomic(&set.index_path(v))
         .unwrap();

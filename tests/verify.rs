@@ -8,7 +8,7 @@ use common::noisy;
 use lepatch::{
     command::{Report, restore, verify},
     index::IndexSet,
-    storage::BlobStore,
+    storage::{BlobId, BlobStore},
 };
 
 #[tokio::test]
@@ -141,7 +141,7 @@ fn a_report_with_failures_summarises_them() {
         bytes: 100,
         failures: (0..7)
             .map(|i| lepatch::command::Failure {
-                location: [u8::try_from(i).unwrap_or(0); 32],
+                location: BlobId::from_bytes([u8::try_from(i).unwrap_or(0); 32]),
                 detail: format!("chunk {i} is corrupt"),
             })
             .collect(),

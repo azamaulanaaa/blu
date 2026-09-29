@@ -193,7 +193,7 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
             }
             None => report.failures.push(Failure {
                 location: *chunk,
-                detail: format!("chunk {} was never checked", storage::Hex(chunk)),
+                detail: format!("chunk {chunk} was never checked"),
             }),
         }
     }
@@ -223,7 +223,7 @@ async fn check_chunk<S: StorageGet>(
         Err(e) => {
             checked.failure = Some(Failure {
                 location: chunk,
-                detail: format!("chunk {} could not be read: {e}", storage::Hex(&chunk)),
+                detail: format!("chunk {chunk} could not be read: {e}"),
             });
             return checked;
         }
@@ -241,7 +241,7 @@ async fn check_chunk<S: StorageGet>(
                 checked.bytes = bytes;
                 checked.failure = Some(Failure {
                     location: chunk,
-                    detail: format!("chunk {} could not be read: {e}", storage::Hex(&chunk)),
+                    detail: format!("chunk {chunk} could not be read: {e}"),
                 });
                 return checked;
             }
@@ -261,13 +261,11 @@ async fn check_chunk<S: StorageGet>(
     // expected value: a mismatch means the bytes under this name are not the bytes
     // that were named.
     let actual = hasher.finalize();
-    if actual.as_bytes() != &chunk {
+    if actual != chunk {
         checked.failure = Some(Failure {
             location: chunk,
             detail: format!(
-                "the bytes stored as chunk {} actually hash to {} ({bytes} bytes)",
-                storage::Hex(&chunk),
-                storage::Hex(actual.as_bytes()),
+                "the bytes stored as chunk {chunk} actually hash to {actual} ({bytes} bytes)"
             ),
         });
     }

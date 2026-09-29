@@ -47,7 +47,34 @@ pub use record::Placement;
 /// Address of a blob: the BLAKE3 hash of its contents.
 ///
 /// Both a chunk's identity in a snapshot and its key in the store's index.
-pub type BlobId = [u8; 32];
+///
+/// This is [`blake3::Hash`] rather than a `[u8; 32]` of our own, which is what
+/// the `traits-preview` feature on the `blake3` dependency has been providing
+/// this whole time. The alias it replaced was not a newtype — `BlobId` and
+/// `[u8; 32]` were the same type, interchangeable in both directions, so it
+/// distinguished nothing — and it was spelled three ways across the crate:
+/// `BlobId` in most places, `[u8; 32]` in `command::pipeline` and `metadata`,
+/// and `[u8; HASH]` in `storage::record`, with `HASH` being 32.
+///
+/// `blake3::Hash` brings what this crate was writing by hand:
+///
+/// * [`Display`](std::fmt::Display) as lowercase hex, which is what every
+///   message and log line in the crate wanted, and is why a `Hex` wrapper
+///   existed until this landed;
+/// * [`From<[u8; 32]>`](blake3::Hash::from_bytes) and
+///   [`as_bytes`](blake3::Hash::as_bytes), so the record header and the
+///   snapshot's chunk table keep writing the same 32 bytes;
+/// * `PartialEq` against `[u8; 32]` and `[u8]`, both constant-time, so
+///   comparing a computed hash to a decoded one needs no conversion;
+/// * [`Copy`], [`Hash`] and [`Eq`], so it is usable as a map key as it was.
+///
+/// It deliberately has no `Ord`, no `AsRef<[u8]>` and no `Deref`: asking for the
+/// bytes is how you get them, and a `Deref` to a byte array would hand out the
+/// non-constant-time comparison that `Hash` exists to avoid.
+///
+/// [`from_slice`](blake3::Hash::from_slice) is `TryFrom<&[u8]>`, so a length
+/// error is a type error rather than a check.
+pub type BlobId = blake3::Hash;
 
 /// How large a store segment may get before a new one is started.
 ///
@@ -182,26 +209,6 @@ impl Compression {
 /// `SegmentLimit::new`'s floor, silently, on the way to a store that refuses its
 /// own records.
 const MIN_RECORD: u64 = record::MIN_HEADER as u64;
-
-/// A [`BlobId`] in lowercase hex, for messages a person can read off a screen
-/// and compare against a `blake3` sum they ran themselves.
-///
-/// A `Display` rather than a function returning a `String`, because every one of
-/// its seventeen call sites put the result straight into a `format!`, a
-/// `tracing` field or a line of stdout — so the sixty-four-byte `String` was
-/// allocated and then copied into a larger one, sixteen times over, to produce
-/// text nobody reads twice.
-#[derive(Debug, Clone, Copy)]
-pub struct Hex<'a>(pub &'a BlobId);
-
-impl std::fmt::Display for Hex<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
-    }
-}
 
 /// A stream that is both [`AsyncRead`] and [`AsyncSeek`].
 ///
