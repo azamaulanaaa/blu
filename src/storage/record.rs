@@ -432,6 +432,32 @@ impl Blobs {
 /// store is not an error here — that is [`crate::storage::blob`]'s business,
 /// because only it can tell a truncated tail from a file that was never a store.
 pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::Result<Scan> {
+    scan_with_buffer(file, segment, blobs, SCAN_BUFFER)
+}
+
+/// [`scan`], with the read size chosen rather than fixed.
+///
+/// `scan_buffer` is a parameter so that `benches/throughput.rs` can measure it.
+/// It was a `const`, which is the right thing for a value nobody has ever varied:
+/// a constant that has never been measured is a constant nobody can say is right,
+/// and this is the one that decides how many `read` syscalls a whole-set scan
+/// makes and how large a buffer it holds while doing it.
+///
+/// A record is skipped with a seek rather than read, so the scan is proportional
+/// to the *record count* and not to the size of the store. This is what that count
+/// is proportional to as well: one read per refill rather than one per record.
+///
+/// Below one buffer's worth the scan still works — the refill guarantees
+/// [`MAX_HEADER`] bytes whatever the size — so a caller passing something tiny gets
+/// a slower scan and not a wrong answer. There is no floor to enforce, because a
+/// floor would be a claim about the size being *sensible*, and the caller is the
+/// only one who knows what it is measuring.
+pub(super) fn scan_with_buffer(
+    file: &mut std::fs::File,
+    segment: u32,
+    blobs: Blobs,
+    scan_buffer: usize,
+) -> io::Result<Scan> {
     let file_len = file.metadata()?.len();
     let mut scan = Scan::default();
 
@@ -449,8 +475,8 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::
             file.seek(SeekFrom::Start(position))?;
             buffer.clear();
             buffer.resize(
-                usize::try_from((file_len - position).min(SCAN_BUFFER as u64))
-                    .unwrap_or(SCAN_BUFFER),
+                usize::try_from((file_len - position).min(scan_buffer as u64))
+                    .unwrap_or(scan_buffer),
                 0,
             );
             let mut filled = 0;
@@ -960,4 +986,95 @@ mod golden {
         encode_header(&mut smallest, Kind::Blob, Codec::Raw, &[0u8; 32], 0, 0);
         assert_eq!(smallest.len(), super::MIN_HEADER);
     }
+}
+
+/// Measure the read size, which is the one constant here nobody had ever varied.
+///
+/// `SCAN_BUFFER` decides how many `read` syscalls a whole-set scan makes and how
+/// large a buffer it holds while doing so, and it was a `const` — which is the
+/// right thing for a value nobody has questioned and a poor thing for a value
+/// nobody can check. Criterion cannot help: a bench target is an external crate
+/// and everything in this module is `pub(super)`, so exposing a knob to measure it
+/// would put an internal tuning parameter in the public API. Here, instead, where
+/// the function is.
+///
+/// Ignored by default because it writes a temporary file and takes a second or
+/// two. Run it with:
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture scan_read_size
+/// ```
+///
+/// It prints a table and asserts nothing about the numbers — the output is for a
+/// person, and the machine it runs on is not the machine the constant was chosen
+/// on. What it does assert is that every size produces the same answer, because a
+/// buffer below `MAX_HEADER` is the interesting boundary and a size that changed
+/// the result would be a bug rather than a tuning finding.
+#[test]
+#[ignore = "writes a temporary file and takes a second; run it by hand"]
+fn scan_read_size() {
+    /// Records, and bytes per record, chosen so the file is a few tens of
+    /// megabytes — big enough that the read count is the thing being timed, and
+    /// small enough to build in a test.
+    const RECORDS: usize = 20_000;
+    const PAYLOAD: usize = 1024;
+
+    let file = std::env::temp_dir().join(format!(
+        "lepatch-bench-{}-{:?}.bin",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::remove_file(&file).ok();
+
+    let mut bytes = encode_store_header(0).to_vec();
+    for n in 0..RECORDS {
+        let mut hash = [0u8; HASH];
+        hash[..8].copy_from_slice(&u64::try_from(n).unwrap().to_le_bytes());
+        let mut header = Vec::new();
+        let payload = u64::try_from(PAYLOAD).expect("fits in u64");
+        encode_header(&mut header, Kind::Blob, Codec::Raw, &hash, payload, payload);
+        bytes.extend_from_slice(&header);
+        bytes.extend(std::iter::repeat_n(u8::try_from(n % 251).unwrap(), PAYLOAD));
+    }
+    std::fs::write(&file, &bytes).unwrap();
+    let size = u64::try_from(bytes.len()).unwrap();
+
+    println!("\n{RECORDS} records, {size} bytes, {SCAN_BUFFER} default");
+    println!("{:>12}  {:>10}  {:>12}", "buffer", "time", "MiB/s");
+
+    for buffer in [
+        4 * 1024,
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        SCAN_BUFFER,
+        4 * SCAN_BUFFER,
+    ] {
+        // The smallest buffer the refill guarantee makes legal, and one below it:
+        // both must give the same answer, which is the part worth asserting.
+        let mut slowest = std::time::Duration::ZERO;
+        let mut found = 0usize;
+
+        for _ in 0..3 {
+            let mut handle = std::fs::File::open(&file).unwrap();
+            let started = std::time::Instant::now();
+            let scan = scan_with_buffer(&mut handle, 0, Blobs::Index, buffer).unwrap();
+            slowest += started.elapsed();
+            found = scan.blobs.len();
+        }
+
+        assert_eq!(
+            found, RECORDS,
+            "a {buffer}-byte buffer found a different number of records"
+        );
+
+        let mib = f64::from(u32::try_from(size / (1024 * 1024)).unwrap_or(u32::MAX))
+            / slowest.as_secs_f64();
+        println!(
+            "{buffer:>12}  {:>9.1}ms  {mib:>12.0}",
+            slowest.as_secs_f64() * 1000.0
+        );
+    }
+
+    std::fs::remove_file(&file).ok();
 }
