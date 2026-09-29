@@ -479,3 +479,80 @@ async fn an_index_cannot_invent_a_version() {
         );
     }
 }
+
+/// An index path that is a directory is no index, and the set still reads.
+///
+/// The doc on `VersionIndex::read` used to call this out as the one failure it
+/// did *not* swallow: "a directory that cannot be read at all is not swallowed —
+/// that is a problem with the set". The implementation is `fs::read(path).ok()?`,
+/// which discards the `io::Error` whole, so a directory and a permission problem
+/// both arrive as `None` and no distinction is made. The sentence described an
+/// intention the code never had.
+///
+/// An index file is a cache. One that cannot be read — for any reason, including
+/// being the wrong type of file entirely — is one to rebuild, and rebuilding is
+/// always available, so refusing the whole set over it would be the wrong answer
+/// anyway. The set's own problems are reported where the set is read: listing the
+/// directory cannot read, or the store's scan refusing to open.
+#[tokio::test]
+async fn an_index_path_that_is_a_directory_is_treated_as_no_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (blob, _store) = set_with_versions(dir.path(), 3).await;
+    let set = IndexSet::new(&blob);
+
+    // What each version's own index says, read from the files rather than
+    // worked out — the snapshot hash is the hash of the snapshot, not of the
+    // version number.
+    let indexed: Vec<VersionIndex> = (1..=3)
+        .map(|v| {
+            VersionIndex::read(&set.index_path(v))
+                .unwrap_or_else(|| panic!("version {v} should have an index file"))
+        })
+        .collect();
+
+    // All three resolve, from their own index files.
+    for (i, index) in indexed.iter().enumerate() {
+        let v = u32::try_from(i).unwrap_or(0) + 1;
+        assert_eq!(
+            resolve(&set, v, 3),
+            Resolved::Confirmed {
+                segment: index.segment,
+                snapshot: index.snapshot,
+            },
+            "version {v} should resolve from its index file"
+        );
+    }
+
+    // Version 2's index becomes a directory. `read` must say "no index" rather
+    // than fail, and the version must still be servable from the store.
+    let path = set.index_path(2);
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+
+    assert_eq!(
+        resolve(&set, 2, 3),
+        Resolved::Absent,
+        "a directory is not a usable index"
+    );
+
+    // The store's own commit log still knows the version, which is the point of
+    // not making the index authoritative.
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    assert_eq!(
+        store.snapshot(2).unwrap(),
+        indexed[1].snapshot,
+        "the version is still there, and the index file was only ever a cache"
+    );
+
+    // And the other two are untouched: one bad path does not disturb the rest.
+    for (v, index) in [(1, &indexed[0]), (3, &indexed[2])] {
+        assert_eq!(
+            resolve(&set, v, 3),
+            Resolved::Confirmed {
+                segment: index.segment,
+                snapshot: index.snapshot,
+            },
+            "version {v} should be unaffected by version 2's index being a directory"
+        );
+    }
+}

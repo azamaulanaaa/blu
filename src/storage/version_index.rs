@@ -142,11 +142,25 @@ impl VersionIndex {
         Ok(())
     }
 
-    /// Read the index at `path`, or `None` if it is not there or not readable.
+    /// Read the index at `path`, or `None` if it is not there or not usable.
     ///
     /// Never an error: absent, truncated, wrong checksum and unreadable are all
-    /// "no usable index" to a caller treating this as a cache. A directory that
-    /// cannot be read at all is not swallowed — that is a problem with the set.
+    /// "no usable index" to a caller treating this as a cache, because an index
+    /// that cannot be read is one that must be rebuilt, and rebuilding is always
+    /// available. See [`crate::storage::resolve`] for what a caller does next.
+    ///
+    /// A directory at `path` is also `None`, not an error. It used to be called
+    /// out here as the one thing not swallowed — "a directory that cannot be read
+    /// at all is not swallowed, that is a problem with the set" — and the code
+    /// underneath cannot tell that case from any other: `fs::read(path).ok()?`
+    /// discards the `io::Error` whole, so a permission problem and a directory
+    /// both arrive as `None`. The sentence described an intention the
+    /// implementation never had.
+    ///
+    /// The distinction is not lost so much as not made here. A set whose directory
+    /// cannot be read fails at `IndexSet::indexed_versions`, which lists the
+    /// directory it could not read and says so, and the store's own scan refuses
+    /// to open. This is the cache, and a cache that cannot be read is empty.
     #[must_use]
     pub fn read(path: &Path) -> Option<Self> {
         let bytes = fs::read(path).ok()?;

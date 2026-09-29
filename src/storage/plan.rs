@@ -64,8 +64,15 @@ impl Plan {
     /// # Errors
     ///
     /// Returns an error if `locate` fails for any chunk the snapshot names, or if
-    /// the snapshot's tables disagree — a slice naming a chunk or file index that
-    /// does not exist.
+    /// a slice names a **chunk** index that does not exist.
+    ///
+    /// A slice naming a *file* index that does not exist is not refused here, and
+    /// used to be claimed to be. Nothing in a `Plan` consumes `file_index` — the
+    /// tables are flattened to one entry per distinct chunk — so checking it would
+    /// be this function reaching into a table it does not read. It is checked
+    /// where it is used, by
+    /// [`Snapshot::verify_file_lengths`](crate::metadata::Snapshot::verify_file_lengths),
+    /// which a restore runs before it writes anything.
     pub fn from_snapshot<F>(snapshot: &Snapshot, mut locate: F) -> io::Result<Self>
     where
         F: FnMut(&BlobId) -> io::Result<Placement>,
@@ -190,20 +197,20 @@ fn reach(slice: &FileChunk) -> io::Result<u64> {
         })
 }
 
-/// The error for a slice naming a chunk or a file the snapshot does not have.
+/// The error for a slice naming a chunk the snapshot does not contain.
 ///
-/// Both counts go in the message: a damaged snapshot is the one case where the
-/// indices on the wire and in memory have to be reconciled by a human, and the
-/// numbers are the only thing that makes it possible.
+/// Names only the chunk index, because that is the only one checked — see
+/// [`Plan::from_snapshot`]. It used to name the file index too, and to say
+/// "cannot be resolved", which read as though both were being resolved. A message
+/// that reports a check the function does not perform is worse than a short one:
+/// it tells a reader the snapshot was fully validated when it was not.
 fn bad_index(snapshot: &Snapshot, slice: &FileChunk) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "a snapshot slice names chunk {} of {} and file {} of {}, which cannot be resolved",
+            "a snapshot slice names chunk {} of {}, which it does not contain",
             slice.chunk_index,
             snapshot.chunks.len(),
-            slice.file_index,
-            snapshot.files.len()
         ),
     )
 }
