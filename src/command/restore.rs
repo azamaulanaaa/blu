@@ -583,8 +583,7 @@ fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
                 let path = resolve(root, path, "a link")?;
                 remove_existing(&path)?;
 
-                let target_is_dir = symlink_points_at_directory(&path, target);
-                fsattr::symlink(target, &path, target_is_dir).map_err(|e| {
+                fsattr::symlink(target, &path).map_err(|e| {
                     io::Error::new(
                         e.kind(),
                         format!(
@@ -649,18 +648,5 @@ fn remove_existing(path: &Path) -> io::Result<()> {
         Ok(_) => fs::remove_file(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
-    }
-}
-
-/// Resolve a link target the way the link itself would, and report whether it
-/// names a directory. Only Windows needs this to pick a symlink flavour.
-fn symlink_points_at_directory(link: &Path, target: &Path) -> bool {
-    if target.is_absolute() {
-        return target.is_dir();
-    }
-
-    match link.parent() {
-        Some(parent) => parent.join(target).is_dir(),
-        None => target.is_dir(),
     }
 }

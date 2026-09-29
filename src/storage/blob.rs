@@ -344,17 +344,22 @@ impl<const WRITE: bool> BlobStore<WRITE> {
             let commits = store.segment_commits(segment);
             (!commits.is_empty()).then_some(commits)
         });
-        if let Some((_, snapshot)) = resolved.confirmed() {
-            return Ok(snapshot);
-        }
-
+        // One match, three arms, no panic.
+        //
+        // This used to ask `confirmed()` first, returned early on it, and then
+        // matched on the same value again to log why it had *not* confirmed — so
+        // the `Confirmed` arm could not be written without an `unreachable!`. A
+        // crate that denies `unwrap_used` and `expect_used` had a live panic
+        // because a value was inspected twice.
+        //
         // `reason` is the one place that says in a sentence why the file was not
         // used, so it is the message rather than a second wording of it here.
         let why = resolved.reason(version, &self.set);
+
         match resolved {
+            storage::Resolved::Confirmed { snapshot, .. } => return Ok(snapshot),
             storage::Resolved::Absent => tracing::debug!(version, reason = %why),
             storage::Resolved::Disagrees => tracing::warn!(version, reason = %why),
-            storage::Resolved::Confirmed { .. } => unreachable!("confirmed returns early"),
         }
 
         self.snapshot(version)

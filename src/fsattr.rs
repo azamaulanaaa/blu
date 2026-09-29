@@ -97,27 +97,32 @@ pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
 
 /// Create a symbolic link at `link` pointing at `target`.
 ///
-/// `target_is_dir` selects the Windows flavour of symlink, which has no
-/// equivalent on other platforms.
+/// The caller does not say whether `target` is a directory, and that is the point:
+/// only Windows needs to know, and it is a question about the filesystem rather
+/// than about the snapshot being restored. The old signature took a
+/// `target_is_dir: bool`, which meant the caller had to answer it on every
+/// platform — paying a `stat` per symbolic link to produce a value that unix then
+/// discarded with `let _ =`. So a restore of a tree with a thousand links paid a
+/// thousand `stat` calls to build an argument nobody read.
+///
+/// The probe moves here instead, behind a `cfg`, where it is both used and
+/// compiled. A relative target is resolved against the *link's* directory, which
+/// is what the filesystem will do and what `target.is_dir()` would get wrong.
 ///
 /// # Errors
 ///
 /// Returns an error if `link` already exists, if its parent directory is
 /// missing, if the platform does not support symbolic links, or — on Windows —
 /// if the caller lacks the privilege required to create one.
-pub fn symlink(target: &Path, link: &Path, target_is_dir: bool) -> io::Result<()> {
+pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        let _ = target_is_dir;
-
         std::os::unix::fs::symlink(target, link)
     }
 
     #[cfg(windows)]
     {
-        let _ = target_is_dir;
-
-        if target_is_dir {
+        if points_at_directory(link, target) {
             std::os::windows::fs::symlink_dir(target, link)
         } else {
             std::os::windows::fs::symlink_file(target, link)
@@ -126,11 +131,28 @@ pub fn symlink(target: &Path, link: &Path, target_is_dir: bool) -> io::Result<()
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (target, link, target_is_dir);
+        let _ = (target, link);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "symbolic links are not supported on this platform",
         ))
+    }
+}
+
+/// Whether `target`, as a symbolic link at `link`, names a directory.
+///
+/// Windows only, and only because it is the only place that has two kinds of
+/// symbolic link to choose between. A relative target is resolved against the
+/// link's own directory, which is the rule the filesystem applies.
+#[cfg(windows)]
+fn points_at_directory(link: &Path, target: &Path) -> bool {
+    if target.is_absolute() {
+        return target.is_dir();
+    }
+
+    match link.parent() {
+        Some(parent) => parent.join(target).is_dir(),
+        None => target.is_dir(),
     }
 }
 
