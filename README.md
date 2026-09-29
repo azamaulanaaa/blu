@@ -483,11 +483,10 @@ use std::collections::HashSet;
 
 use lepatch::{
     command::load_snapshot,
-    pack::{Pack, chunks_covering},
+    pack::Pack,
     storage::{BlobId, BlobStore, Plan},
 };
 
-# async fn example_inner() -> std::io::Result<()> {
 let store = BlobStore::<false>::open("docs").await?;
 
 // The plan is a function of the snapshot, so it is the same every run.
@@ -509,16 +508,16 @@ let already: HashSet<BlobId> = HashSet::new();
 let ranges = pack.needed(&already);
 
 // After fetching: record what those ranges covered, and re-asking returns nothing.
-let have = chunks_covering(&pack, &ranges);
-# Ok(())
-# }
+let have = pack.chunks_covering(&ranges);
 # Ok(())
 # }
 ```
 
 `Pack::needed` is deliberately phrased as what a client *lacks*: one holding nothing
 gets the whole payload as a single range, and one holding everything gets none.
-`Pack::write` streams, so its memory is one chunk rather than one version.
+`chunks_covering` is its inverse, and both are methods — the two halves of the
+same exchange. `Pack::write` streams, so its memory is one chunk rather than one
+version.
 
 The `WRITE` const generic on `BlobStore` is what stops a read-only restore from
 being handed something that can append to the store.

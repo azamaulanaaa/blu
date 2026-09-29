@@ -51,7 +51,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
-use crate::storage::{BlobId, BlobStore, Plan, StorageGet};
+use crate::storage::{BlobId, Plan, StorageGet};
 
 /// Magic at the start of a pack, and again at the very end.
 const MAGIC: [u8; 4] = *b"LPK1";
@@ -143,12 +143,22 @@ impl Pack {
     /// the file cannot be written. A store that yields fewer bytes than the plan
     /// says is a short read, which is an error here rather than a hole in the
     /// payload.
-    pub async fn write(
-        store: &BlobStore<false>,
+    ///
+    /// Generic over [`StorageGet`] because that is the whole of what it needs, and
+    /// because every sibling command already is. It was bound to a concrete
+    /// `&BlobStore<false>`, which meant `lepatch pack` was the one command that
+    /// could not be pointed at any other backend — a read-only store over a
+    /// directory, say, or a store held in memory. A pack is derived output, so
+    /// there is no reason it should care where the bytes came from.
+    pub async fn write<S>(
+        store: &S,
         plan: &Plan,
         snapshot: &BlobId,
         path: &Path,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Self>
+    where
+        S: StorageGet + ?Sized,
+    {
         let planned_count = u64::try_from(plan.len()).unwrap_or(0);
         let planned_bytes = plan.total_bytes();
 
@@ -594,25 +604,37 @@ fn not_a_pack(path: &Path, why: &str) -> io::Error {
     )
 }
 
-/// The chunks a client must already hold to avoid a range request.
-///
-/// The inverse of [`Pack::needed`]: given a pack and a set of ranges, the chunks
-/// those ranges cover, so a client can record them after fetching and ask again.
-/// A range covering only part of a chunk is not that chunk and records nothing.
-#[must_use]
-pub fn chunks_covering(pack: &Pack, ranges: &[Range]) -> HashSet<BlobId> {
-    let mut out = HashSet::new();
+impl Pack {
+    /// The chunks a client must already hold to avoid a range request.
+    ///
+    /// The inverse of [`Pack::needed`]: given a set of ranges, the chunks those
+    /// ranges cover, so a client can record them after fetching and ask again. A
+    /// range covering only part of a chunk is not that chunk and records nothing.
+    ///
+    /// A method rather than a free function taking a `&Pack`, because it reads
+    /// three of the pack's own fields and is the other half of `needed`. As a
+    /// free function the receiver was the first argument and the naming gave no
+    /// hint that the two belonged together:
+    ///
+    /// ```text
+    /// pack.needed(&have)                  // what the client lacks
+    /// chunks_covering(&pack, &ranges)     // what the client now has
+    /// ```
+    #[must_use]
+    pub fn chunks_covering(&self, ranges: &[Range]) -> HashSet<BlobId> {
+        let mut out = HashSet::new();
 
-    for chunk in &pack.chunks {
-        let start = pack.payload_start.saturating_add(chunk.offset);
-        let end = start.saturating_add(chunk.len);
+        for chunk in &self.chunks {
+            let start = self.payload_start.saturating_add(chunk.offset);
+            let end = start.saturating_add(chunk.len);
 
-        if ranges.iter().any(|r| r.start <= start && end <= r.end) {
-            out.insert(chunk.id);
+            if ranges.iter().any(|r| r.start <= start && end <= r.end) {
+                out.insert(chunk.id);
+            }
         }
-    }
 
-    out
+        out
+    }
 }
 
 /// Check that every chunk the index names lies inside the payload.

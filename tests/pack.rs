@@ -20,7 +20,7 @@ use std::{collections::HashSet, fs, path::Path};
 
 use lepatch::{
     metadata::Snapshot,
-    pack::{Pack, Range, chunks_covering, hash_file},
+    pack::{Pack, Range, hash_file},
     storage::{BlobStore, Plan, StorageGet},
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -302,7 +302,7 @@ async fn recording_a_fetch_makes_the_next_ask_empty() {
     let first = pack.needed(&HashSet::new());
     assert_eq!(first.len(), 1);
 
-    let have = chunks_covering(&pack, &first);
+    let have = pack.chunks_covering(&first);
     assert_eq!(
         have.len(),
         pack.len(),
@@ -819,7 +819,7 @@ async fn a_partial_range_records_nothing() {
     };
 
     assert!(
-        chunks_covering(&pack, &[half]).is_empty(),
+        pack.chunks_covering(&[half]).is_empty(),
         "half a chunk should not be recorded as the chunk"
     );
 
@@ -827,5 +827,5 @@ async fn a_partial_range_records_nothing() {
         start,
         end: start + first.len,
     };
-    assert_eq!(chunks_covering(&pack, &[whole]).len(), 1);
+    assert_eq!(pack.chunks_covering(&[whole]).len(), 1);
 }
