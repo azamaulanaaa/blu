@@ -182,10 +182,13 @@ where
 /// [`tokio::io::copy`] stop at exactly the limit. It is *not* a valid response
 /// for [`tokio::io::AsyncWriteExt::write_all`], which treats a zero-length
 /// write as an error, so this type is for `copy` and similar.
-pub struct SliceAsyncWriter<W>
-where
-    W: AsyncWrite + Unpin,
-{
+///
+/// The `AsyncWrite + Unpin` bound is on the impls rather than here, as it is for
+/// [`SliceAsyncReader`] above. On the struct it would be a second thing to keep in
+/// step with the impls, and it already was: three of them repeated it, and the
+/// type could not be *named* without satisfying it — which is a bound on a type
+/// that holds an `AsyncWrite` and does nothing else with it yet.
+pub struct SliceAsyncWriter<W> {
     inner: W,
     remaining: u64,
 }

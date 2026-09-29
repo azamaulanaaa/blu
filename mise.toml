@@ -21,7 +21,15 @@ rust = { version = "stable", components = "rust-analyzer" }
 run = "cargo build --all-targets --all-features"
 
 [tasks.test]
-run = "cargo test --all-targets --all-features"
+# `--all-targets` does *not* imply doctests: cargo runs them for the library
+# target only, and the README's examples are collected as doctests of a
+# `#[cfg(doctest)]` item in `lib.rs`. Without this second command the only
+# compiled prose in the repository would go unchecked, which is how the README's
+# library examples came to call a function that does not exist.
+run = [
+  "cargo test --all-targets --all-features",
+  "cargo test --doc",
+]
 
 [tasks.cov]
 run = "cargo llvm-cov --all-features --summary-only"

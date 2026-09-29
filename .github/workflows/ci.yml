@@ -74,6 +74,10 @@ jobs:
         with:
           components: ''
       - run: cargo test --all-targets --all-features --locked
+      # `--all-targets` does not imply doctests, and the README's examples are
+      # collected as doctests of a `#[cfg(doctest)]` item in `lib.rs`. Without
+      # this the only compiled prose in the repository goes unchecked.
+      - run: cargo test --doc --locked
 
   coverage:
     name: Coverage

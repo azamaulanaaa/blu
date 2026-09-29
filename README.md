@@ -426,22 +426,39 @@ Stated rather than discovered:
 The crate is usable directly:
 
 ```rust
+# async fn example() -> std::io::Result<()> {
 use lepatch::{
-    command::{Options, backup, restore},
-    storage::{BlobStore, SegmentLimit},
+    command::{Options, backup, lock_destination, restore},
+    storage::{BlobStore, Compression, SegmentLimit},
 };
 
-let store = BlobStore::<true>::open("docs", SegmentLimit::default()).await?;
+// The claim excludes other runs. A backup takes no lock of its own, so this is
+// the caller's to make and the caller's to hold.
+let _claim = lock_destination(std::path::Path::new("docs-restored"))?;
+
+// First backup. Four gibibytes per segment and zstd level 1, both the defaults.
+let store = BlobStore::<true>::open(
+    "docs",
+    SegmentLimit::default(),
+    Compression::default(),
+).await?;
 let first = backup("~/Documents", Options::default(), store).await?;
 
 // Later backups need nothing passed to deduplicate: the store holds every
 // version it has ever been given, so a chunk it already has is not written
 // again however far back it was last seen.
-let store = BlobStore::<true>::open("docs", SegmentLimit::default()).await?;
+let store = BlobStore::<true>::open(
+    "docs",
+    SegmentLimit::default(),
+    Compression::default(),
+).await?;
 backup("~/Documents", Options::default(), store).await?;
 
+// A read-only store takes no segment limit, because a read never rolls over.
 let store = BlobStore::<false>::open("docs").await?;
 restore("~/Documents-restored", first.snapshot, store).await?;
+# Ok(())
+# }
 ```
 
 `backup` returns a `Committed`: the version number the run was given and the hash
@@ -461,26 +478,42 @@ chunks with their locations, and asks `Pack` what a client holding some of them
 still needs:
 
 ```rust
-use std::collections::BTreeSet;
+# async fn example() -> std::io::Result<()> {
+use std::collections::HashSet;
+
 use lepatch::{
-    metadata::Snapshot,
+    command::load_snapshot,
     pack::{Pack, chunks_covering},
-    storage::{BlobStore, Plan, StorageGet},
+    storage::{BlobId, BlobStore, Plan},
 };
 
-// The plan is a function of the snapshot, so it is the same every run.
+# async fn example_inner() -> std::io::Result<()> {
 let store = BlobStore::<false>::open("docs").await?;
-let snapshot = read_snapshot(&store).await;
+
+// The plan is a function of the snapshot, so it is the same every run.
+let snapshot = load_snapshot(&store, store.snapshot(2)?).await?;
 let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 
-let pack = Pack::write(&store, &plan, &snapshot_hash, "game.pack").await?;
+let pack = Pack::write(
+    &store,
+    &plan,
+    &store.snapshot(2)?,
+    std::path::Path::new("game.pack"),
+)
+.await?;
 
-// What a client holding the previous version's chunks does not have, as byte
-// ranges of the pack. Adjacent ranges merge, which is the point of packing.
-let ranges = pack.needed(&have_from_the_previous_version);
+// What a client already holding some of it does not have, as byte ranges of the
+// pack. Adjacent ranges merge, which is the point of packing: a client needs one
+// range, not one per chunk.
+let already: HashSet<BlobId> = HashSet::new();
+let ranges = pack.needed(&already);
 
 // After fetching: record what those ranges covered, and re-asking returns nothing.
 let have = chunks_covering(&pack, &ranges);
+# Ok(())
+# }
+# Ok(())
+# }
 ```
 
 `Pack::needed` is deliberately phrased as what a client *lacks*: one holding nothing
