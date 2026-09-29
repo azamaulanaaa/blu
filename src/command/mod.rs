@@ -45,4 +45,35 @@ pub async fn load_snapshot<S: storage::StorageGet>(
 
     metadata::Snapshot::try_from(buffer.as_slice())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    // `metadata::Error` has four variants and all four are being flattened to
+    // one `ErrorKind` here, which looks like a loss. It is not, and this is
+    // where to argue about it.
+    //
+    // The four are `Decode`, `BadMagic`, `UnsupportedVersion` and
+    // `Truncated` — a body that will not decode, a blob that is not a
+    // snapshot, a blob from a different layout, and a blob that ends early.
+    // All four keep their meaning: the `Display` is the one a person reads,
+    // and it names which of the four it is ("not a lepatch snapshot: expected
+    // magic …", "unsupported snapshot format version N, this build supports
+    // M", "snapshot is truncated"). A caller that wants to *match* on them
+    // calls `Snapshot::try_from`, where the enum is intact and public —
+    // `tests/metadata.rs` does exactly that, and reaches none of this.
+    //
+    // So the alternative — a crate-wide error enum, with `From` in both
+    // directions so the ~40 passthrough `?`s keep working — would add fifteen
+    // variants whose only consumer is `main`, which prints them. That is the
+    // same argument that retired `thiserror` and the `caused by:` walk, and it
+    // has the same shape: this crate's errors are deliberately flat complete
+    // sentences, and nothing branches on them but one `AlreadyExists` check
+    // in `lock_destination` and one `BrokenPipe` check in `say!`, both of
+    // which are on the *underlying* OS error rather than on a failure mode of
+    // ours.
+    //
+    // There is a real distinction this does lose, and it is deliberately not
+    // made here: a corrupt snapshot and a store that cannot be read are both
+    // `InvalidData`. They are told apart by *where* the refusal happens —
+    // `BlobStore::open` refuses a store it cannot read whole, before any
+    // snapshot is decoded, and `tests/verify.rs` pins that. Moving the
+    // distinction into the kind would mean choosing between them everywhere
+    // the two are produced.
 }
