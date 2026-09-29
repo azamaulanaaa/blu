@@ -378,7 +378,7 @@ pub enum Link {
 /// absent by convention and a documented no-op. A restore then took both and had
 /// to know which was which.
 ///
-/// Now they are one struct, one `Option` for both, and [`fsattr::mode_of`]
+/// Now they are one struct, one `Option` for both, and [`fsattr::mode_of`](crate::fsattr::mode_of)
 /// returns `Option<u32>` rather than inventing a `0`. "This platform has no
 /// permission bits" and "the permissions are the empty set" are different facts,
 /// and a `0` could not tell them apart.

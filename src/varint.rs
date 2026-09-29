@@ -105,7 +105,7 @@ pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
 
 /// Bytes `value` occupies as LEB128.
 ///
-/// The same count [`write`] produces, and checked against it: a disagreement
+/// The same count [`write()`] produces, and checked against it: a disagreement
 /// between the two would mean a header sized one way and written another.
 #[must_use]
 pub fn len(value: u64) -> usize {

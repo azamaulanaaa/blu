@@ -92,7 +92,7 @@ pub const SEGMENT_DIGITS: usize = 4;
 /// `10^SEGMENT_DIGITS - 1`. A segment's number is zero-padded to
 /// [`SEGMENT_DIGITS`], which pads but never truncates, so the number just past
 /// this one is *written* as a five-digit name and then *rejected* by
-/// [`IndexSet::segment_number`]: the file would exist, the set would not see it,
+/// the reader that numbers the set's files, which the file would exist, the set would not see it,
 /// and any commit record inside it would be invisible to every later run.
 pub const MAX_SEGMENT: u32 = 9_999;
 
@@ -147,7 +147,7 @@ impl IndexSet {
     /// Zero-padded to [`SEGMENT_DIGITS`], so lexical order over the files in a
     /// directory is numeric order over the segments. Padding is not truncation:
     /// a number wider than the width is named with its own digits, which no
-    /// longer sorts, and which [`IndexSet::segment_number`] will not read back.
+    /// longer sorts, and which the set's own file-numbering reader will not read back.
     /// Callers should hold `segment` to [`MAX_SEGMENT`]; the store refuses to
     /// roll over past it.
     ///
