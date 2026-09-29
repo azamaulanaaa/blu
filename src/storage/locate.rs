@@ -122,13 +122,18 @@ fn read_commits(path: &Path, segment: u32) -> std::io::Result<Vec<BlobId>> {
     if record::decode_store_header(&header).ok() != Some(segment) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("{} does not hold segment {segment}", path.display()),
+            format!(
+                "{} is not segment {segment} of a store this build reads",
+                path.display()
+            ),
         ));
     }
 
-    let commits = record::commits_in(&mut file, segment)?;
-
-    Ok(commits.into_iter().collect())
+    // Already a `Vec<BlobId>`: `BlobId` is `[u8; HASH]` and the collect was
+    // re-allocating and re-copying every hash to change nothing. Clippy's
+    // `useless_conversion` cannot see it, because the two types are spelled
+    // differently and one of them is an alias.
+    record::commits_in(&mut file, segment)
 }
 
 impl Resolved {

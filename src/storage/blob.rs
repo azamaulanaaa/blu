@@ -941,7 +941,7 @@ fn recover(set: &IndexSet) -> io::Result<Scanned> {
             ));
         }
 
-        let scan = record::scan(&mut file, segment)?;
+        let scan = record::scan(&mut file, segment, record::Blobs::Index)?;
         let len = file.metadata()?.len();
 
         if scan.end < len {
@@ -1024,7 +1024,7 @@ fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
 
         // A read does not repair, so an unverified tail is reported rather than
         // treated as an unfinished run.
-        let scan = record::scan(&mut file, segment)?;
+        let scan = record::scan(&mut file, segment, record::Blobs::Index)?;
         let len = file.metadata()?.len();
 
         if scan.end < len {

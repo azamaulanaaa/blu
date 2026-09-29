@@ -386,7 +386,31 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 /// One segment's worth of headers and no payloads: what a lookup that would
 /// otherwise scan the whole set costs instead.
 pub(super) fn commits_in(file: &mut std::fs::File, segment: u32) -> io::Result<Vec<[u8; HASH]>> {
-    Ok(scan(file, segment)?.commits)
+    Ok(scan(file, segment, Blobs::Discard)?.commits)
+}
+
+/// What a scan is being asked to collect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Blobs {
+    /// Index every blob record, for a caller that is about to read from the store
+    /// and needs to know where each chunk is.
+    Index,
+    /// Skip them, for a caller that wants only the commit records.
+    ///
+    /// This is not a micro-optimisation. A scan that indexes builds a
+    /// `HashMap` entry per blob record: at the default 4 GiB segment size and
+    /// 16 KiB average chunks that is 262,144 entries, about 42 MB allocated,
+    /// grown and freed. The one caller that wants only commits asks once per
+    /// version listed, so a set of a thousand versions sharing a segment paid
+    /// for the map a thousand times over to print a list.
+    Discard,
+}
+
+impl Blobs {
+    /// Whether blob records go into the index.
+    const fn indexes(self) -> bool {
+        matches!(self, Self::Index)
+    }
 }
 
 /// Read one segment's records, stopping at the first one that is not valid.
@@ -401,7 +425,7 @@ pub(super) fn commits_in(file: &mut std::fs::File, segment: u32) -> io::Result<V
 /// Returns an error if the seek or read fails. A file whose contents are not a
 /// store is not an error here — that is [`crate::storage::blob`]'s business,
 /// because only it can tell a truncated tail from a file that was never a store.
-pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
+pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::Result<Scan> {
     let file_len = file.metadata()?.len();
     let mut scan = Scan::default();
 
@@ -463,6 +487,14 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
 
         match header.kind {
             Kind::Blob => {
+                if !blobs.indexes() {
+                    // The header has already been decoded and bounds-checked, so
+                    // the record is known good; the only thing being skipped is
+                    // the index entry nobody asked for.
+                    position = end;
+                    continue;
+                }
+
                 scan.blobs.insert(
                     header.hash,
                     Placement {
@@ -531,12 +563,19 @@ mod tests {
     /// A segment whose records are sized so that a header lands in the last few
     /// bytes of the scan buffer.
     ///
-    /// `SCAN_BUFFER` is 1 MiB and the refill guarantees `MIN_HEADER` (48) bytes,
-    /// but a header carrying two three-byte varints is 52. A record boundary
-    /// falling in `[buffer.len() - 51, buffer.len() - 48]` therefore cannot be
-    /// decoded, and the scan stops there and reports the rest of a perfectly good
-    /// segment as damaged. Two records of 524 263 bytes put the third header
-    /// exactly at 1 048 526.
+    /// The refill guarantees `MAX_HEADER` (66) bytes, which is the widest a
+    /// header can be: `PREFIX` (6) plus two varints at their ten-byte maximum
+    /// (20) plus `HASH` (32) and `CHECK` (8). Guaranteeing only `MIN_HEADER` (48)
+    /// was the bug — a header carrying two three-byte varints is 52 bytes, so a
+    /// record boundary in `[buffer.len() - 51, buffer.len() - 48]` could not be
+    /// decoded and the scan reported the rest of a perfectly good segment as
+    /// damaged. That was a false positive on a sealed segment, which means
+    /// refusing to open the set at all.
+    ///
+    /// Two records of 524 263 bytes put the third header at buffer offset
+    /// 1 048 526, which is in that window. (Buffer offset, not file offset: the
+    /// offset is 1 048 538 in the file and the scan's base is the store header,
+    /// so the two differ by `STORE_HEADER`.)
     #[test]
     fn a_header_in_the_last_bytes_of_the_scan_buffer_is_not_damage() {
         const RECORD: u64 = 524_263;
@@ -567,7 +606,7 @@ mod tests {
         std::fs::write(&file, &bytes).unwrap();
 
         let mut handle = std::fs::File::open(&file).unwrap();
-        let scan = scan(&mut handle, 0).unwrap();
+        let scan = scan(&mut handle, 0, Blobs::Index).unwrap();
         drop(handle);
         std::fs::remove_file(&file).ok();
 
@@ -577,5 +616,84 @@ mod tests {
             "the scan stopped early: a valid record boundary was read as damage"
         );
         assert_eq!(scan.blobs.len(), 4, "every record should be indexed");
+    }
+
+    /// A scan that is not asked for the blob index finds the same records.
+    ///
+    /// `Blobs::Discard` skips the `HashMap` insert and nothing else: the header
+    /// is still decoded, still bounds-checked against the file length, and the
+    /// scan still advances by the record's own total length. If it did less than
+    /// that, a commit record past a discarded blob would be missed, and
+    /// `commits_in` would return a version list missing whatever came after it.
+    #[test]
+    fn a_scan_that_skips_the_index_finds_the_same_records() {
+        let file = std::env::temp_dir().join(format!(
+            "lepatch-discard-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        // Four blobs and two commits, so the commits are not simply "everything
+        // at the start" — one of them follows a discarded blob record.
+        let mut bytes = encode_store_header(0).to_vec();
+        let mut commits = Vec::new();
+        for n in 0u8..6 {
+            if n % 3 == 2 {
+                let mut hash = [0u8; HASH];
+                hash[0] = 0xff;
+                hash[1] = n;
+                // A commit's payload is the snapshot hash — 32 bytes, and both of
+                // its lengths say so. Without the payload the record is
+                // malformed and the scan would be reading the next record's
+                // header as this one's content.
+                let payload = HASH as u64;
+                let mut header = Vec::new();
+                encode_header(
+                    &mut header,
+                    Kind::Commit,
+                    Codec::Raw,
+                    &hash,
+                    payload,
+                    payload,
+                );
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(&hash);
+                commits.push(hash);
+            } else {
+                let mut hash = [0u8; HASH];
+                hash[0] = n;
+                let payload = 100;
+                let mut header = Vec::new();
+                encode_header(&mut header, Kind::Blob, Codec::Raw, &hash, payload, payload);
+                bytes.extend_from_slice(&header);
+                bytes.extend(std::iter::repeat_n(0u8, usize::try_from(payload).unwrap()));
+            }
+        }
+        std::fs::write(&file, &bytes).unwrap();
+
+        let indexed = {
+            let mut handle = std::fs::File::open(&file).unwrap();
+            scan(&mut handle, 0, Blobs::Index).unwrap()
+        };
+        let skipped = {
+            let mut handle = std::fs::File::open(&file).unwrap();
+            scan(&mut handle, 0, Blobs::Discard).unwrap()
+        };
+        std::fs::remove_file(&file).ok();
+
+        assert_eq!(indexed.blobs.len(), 4);
+        assert!(
+            skipped.blobs.is_empty(),
+            "the index should not have been built"
+        );
+        assert_eq!(
+            skipped.commits, indexed.commits,
+            "a skipped blob record must not hide the commit after it"
+        );
+        assert_eq!(skipped.commits, commits);
+        assert_eq!(
+            skipped.end, indexed.end,
+            "both modes must agree on where the segment's records end"
+        );
     }
 }
