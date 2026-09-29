@@ -52,6 +52,7 @@
 //! extension the way `Path::with_extension` would.
 
 use std::{
+    ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
 };
@@ -134,7 +135,7 @@ impl IndexSet {
     /// Returns an error if the directory exists but cannot be read, or if the set
     /// is missing a segment in the middle.
     pub fn segments(&self) -> io::Result<Vec<PathBuf>> {
-        let prefix = self.segment_prefix();
+        let base = self.base_name();
         let directory = self.directory();
 
         let entries = match fs::read_dir(directory) {
@@ -150,7 +151,7 @@ impl IndexSet {
                 continue;
             }
 
-            let Some(number) = Self::segment_number(&path, &prefix) else {
+            let Some(number) = Self::numbered_file(&path, base, "", SEGMENT_EXTENSION) else {
                 continue;
             };
 
@@ -195,7 +196,7 @@ impl IndexSet {
     ///
     /// Returns an error if the directory exists but cannot be read.
     pub fn indexed_versions(&self) -> io::Result<Vec<u32>> {
-        let prefix = self.index_prefix();
+        let base = self.base_name();
         let directory = self.directory();
 
         let entries = match fs::read_dir(directory) {
@@ -211,7 +212,7 @@ impl IndexSet {
                 continue;
             }
 
-            if let Some(version) = Self::indexed_version(&path, &prefix) {
+            if let Some(version) = Self::numbered_file(&path, base, "v", INDEX_EXTENSION) {
                 found.push(version);
             }
         }
@@ -226,26 +227,16 @@ impl IndexSet {
         self.suffixed(LOCK_EXTENSION)
     }
 
-    /// The `base.` part every file of this set shares.
-    fn segment_prefix(&self) -> String {
-        let base = self
-            .base
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        format!("{base}.")
-    }
-
-    /// The `base.v` part every index file of this set shares.
-    fn index_prefix(&self) -> String {
-        let base = self
-            .base
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        format!("{base}.v")
+    /// The base path's file name, which every file of this set is named after.
+    ///
+    /// An [`OsStr`], not a `String`. This is the user's path and it is not
+    /// necessarily UTF-8: a set at `/data/\xFFphotos` has segments named
+    /// `\xFFphotos.0000.bin`, and every one of them is a legal file name. Reading
+    /// it as a `String` needs a choice — reject it, or replace what is not UTF-8
+    /// — and the code was making that choice twice, inconsistently, and getting
+    /// it wrong both ways.
+    fn base_name(&self) -> &OsStr {
+        self.base.file_name().unwrap_or(OsStr::new(""))
     }
 
     /// Directory the set's files live in.
@@ -270,47 +261,60 @@ impl IndexSet {
         fs::create_dir_all(self.directory())
     }
 
-    /// The version in `path`'s file name, if it is one of this set's index files.
+    /// The number in `path`'s file name, if it is one of this set's.
     ///
-    /// `None` for anything that is not exactly `base.vNNNN.idx`.
-    fn indexed_version(path: &Path, prefix: &str) -> Option<u32> {
-        let name = path.file_name()?.to_str()?;
-
-        if path.extension().is_none_or(|ext| ext != INDEX_EXTENSION) {
-            return None;
-        }
-
-        let digits = name
-            .strip_prefix(prefix)?
-            .strip_suffix(&format!(".{INDEX_EXTENSION}"))?;
-
-        if digits.len() != SEGMENT_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-
-        digits.parse().ok()
-    }
-
-    /// The segment number in `path`'s file name, if it is one of this set's.
+    /// Every file of a set is named `<base>.<tag>NNNN.<ext>`, where `tag` is
+    /// empty for a segment and `v` for an index file. Both have the same shape
+    /// and differed only in those two literals, so they are one function.
     ///
-    /// `None` for anything that is not exactly `base.NNNN.bin`, which is skipped
-    /// rather than reported.
-    fn segment_number(path: &Path, prefix: &str) -> Option<u32> {
-        let name = path.file_name()?.to_str()?;
+    /// Returns `None` for anything else, which is skipped rather than reported:
+    /// this reads a directory a person can put things in, and most of what is in
+    /// it is not part of the set.
+    ///
+    /// The name is compared as **bytes**, not decoded. That is the whole point:
+    /// `to_str` answers `None` for a name that is not UTF-8, and the set's own
+    /// name is not required to be. A set at a non-UTF-8 base path used to be
+    /// written by [`IndexSet::suffixed`], which keeps the bytes, and then
+    /// invisible to the scan, which decoded them — so `lepatch` wrote a store it
+    /// could not read back, and a second run failed with `File exists` against
+    /// the segment it had already made. The two ends disagreed about a name they
+    /// had both just agreed on.
+    ///
+    /// [`OsStr::as_encoded_bytes`] is the right tool despite the encoding being
+    /// formally unspecified: both sides go through it, so the comparison is
+    /// between two views produced the same way, which is what it is defined to
+    /// support. It is not a claim about what the bytes mean.
+    fn numbered_file(path: &Path, base: &OsStr, tag: &str, ext: &str) -> Option<u32> {
+        let full = path.file_name()?.as_encoded_bytes();
 
-        if path.extension().is_none_or(|ext| ext != SEGMENT_EXTENSION) {
+        // The name is the base, then a fixed-shape tail. Checking the whole
+        // length up front means the slices below are known to be in bounds, and
+        // it rejects a name carrying a longer base than this set's.
+        let tail = 1 + tag.len() + SEGMENT_DIGITS + 1 + ext.len();
+        let (name, rest) = full.split_at_checked(full.len().checked_sub(tail)?)?;
+
+        if name != base.as_encoded_bytes() {
             return None;
         }
 
-        let digits = name
-            .strip_prefix(prefix)?
-            .strip_suffix(&format!(".{SEGMENT_EXTENSION}"))?;
-
-        if digits.len() != SEGMENT_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        // `.`, then the tag — empty for a segment, `v` for an index file.
+        if rest.first() != Some(&b'.') || &rest[1..=tag.len()] != tag.as_bytes() {
             return None;
         }
 
-        digits.parse().ok()
+        let after_tag = 1 + tag.len();
+        let digits = rest.get(after_tag..after_tag + SEGMENT_DIGITS)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+
+        // `.`, then the extension, which is whatever is left.
+        let suffix = rest.get(after_tag + SEGMENT_DIGITS..)?;
+        if suffix.first() != Some(&b'.') || &suffix[1..] != ext.as_bytes() {
+            return None;
+        }
+
+        std::str::from_utf8(digits).ok()?.parse().ok()
     }
 
     /// Append `suffix` to the base path's file name, leaving the base itself

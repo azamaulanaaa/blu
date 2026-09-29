@@ -240,3 +240,73 @@ fn taking_the_lock_creates_the_containing_directory() {
     assert!(set.directory().is_dir());
     assert!(set.lock_path().exists());
 }
+
+/// A set whose base path is not valid UTF-8 is a set.
+///
+/// The base path is the user's, and nothing about it is required to be UTF-8 — a
+/// name restored from an archive, or typed on a system whose encoding is not
+/// UTF-8, is a perfectly ordinary thing to back up to. Every file of the set is
+/// named after it, and those names are legal files.
+///
+/// This used to work exactly once. `suffixed` builds the file name from the
+/// `OsStr` and so kept the bytes; the directory scan that finds them decoded the
+/// name and gave up on anything that was not UTF-8. Both ends had just agreed on
+/// a name, and then one of them forgot it:
+///
+/// ```text
+/// $ lepatch backup src $'sto\xffre'
+///   backup complete  segments=1
+/// $ lepatch versions $'sto\xffre'
+///   error: no backup set at sto?re (looked in .)
+/// $ lepatch backup src $'sto\xffre'
+///   error: File exists (os error 17)
+/// ```
+///
+/// So the first backup reported success, the store could not be read, listed,
+/// verified or restored, and a second backup failed against the segment that
+/// first one had written. `create_new` in `create_segment` is the only reason
+/// that last one is an error and not a truncated store — the set was wedged
+/// rather than destroyed, and the data was intact throughout.
+///
+/// A person recovers by renaming the files, which works because nothing about
+/// the bytes was ever wrong.
+#[test]
+#[cfg(unix)]
+fn a_set_at_a_non_utf8_base_path_is_readable() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A file name with a byte that cannot appear in UTF-8.
+    let base: OsString = OsString::from_vec(b"sto\xffre".to_vec());
+    let store = dir.path().join(base);
+    let set = IndexSet::new(&store);
+
+    // The names are built from the real bytes, which is half the bug: they were
+    // always right on disk, and only unreadable in memory.
+    let segment = set.segment_path(0);
+    assert_eq!(
+        segment.file_name().unwrap().as_encoded_bytes(),
+        b"sto\xffre.0000.bin",
+        "the segment should be named after the base path's own bytes"
+    );
+
+    let index = set.index_path(1);
+    assert_eq!(
+        index.file_name().unwrap().as_encoded_bytes(),
+        b"sto\xffre.v0001.idx"
+    );
+
+    // Write two segments and one index file, the way a set looks on disk.
+    std::fs::write(&segment, b"one").unwrap();
+    std::fs::write(set.segment_path(1), b"two").unwrap();
+    std::fs::write(&index, b"idx").unwrap();
+
+    assert_eq!(
+        set.segments().unwrap(),
+        vec![segment.clone(), set.segment_path(1)],
+        "both segments should be found despite the base path not being UTF-8"
+    );
+    assert_eq!(set.indexed_versions().unwrap(), vec![1]);
+}
