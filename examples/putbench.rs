@@ -104,7 +104,7 @@ async fn main() {
     // growth that every later run gets for free.
     for _ in 0..2 {
         for segment in 0..64 {
-            let _ = std::fs::remove_file(IndexSet::new(&store_path).blob_path(segment));
+            let _ = std::fs::remove_file(IndexSet::new(&store_path).segment_path(segment));
         }
         let store = std::sync::Arc::new(
             BlobStore::<true>::open(&store_path, SegmentLimit::default(), Compression::default())
@@ -120,7 +120,7 @@ async fn main() {
 
     for _ in 0..5 {
         for segment in 0..64 {
-            let _ = std::fs::remove_file(IndexSet::new(&store_path).blob_path(segment));
+            let _ = std::fs::remove_file(IndexSet::new(&store_path).segment_path(segment));
         }
         let store = std::sync::Arc::new(
             BlobStore::<true>::open(&store_path, SegmentLimit::default(), Compression::default())

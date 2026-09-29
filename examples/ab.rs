@@ -280,7 +280,7 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
 /// A set is several files, and a benchmark that measures one backup wants a clean
 /// one every round — so it has to remove all of them, not just the first.
 fn store_segment(base: &std::path::Path, segment: u32) -> std::path::PathBuf {
-    IndexSet::new(base).blob_path(segment)
+    IndexSet::new(base).segment_path(segment)
 }
 
 /// One measurement, in both clocks.

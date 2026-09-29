@@ -57,7 +57,12 @@ use std::{
 };
 
 /// Extension of a store segment.
-pub const BLOB_EXTENSION: &str = "bin";
+///
+/// Named for the segment rather than for a blob, because that is what it is: a
+/// segment is a run of records, and "blob" already means a chunk's content
+/// everywhere else in this crate. A `blob_path` returning `photos.0000.bin` was
+/// naming a file that holds thousands of blobs, or none.
+pub const SEGMENT_EXTENSION: &str = "bin";
 /// Extension of a per-version index file.
 pub const INDEX_EXTENSION: &str = "idx";
 /// Extension of the write lock.
@@ -107,9 +112,14 @@ impl IndexSet {
     /// longer sorts, and which [`IndexSet::segment_number`] will not read back.
     /// Callers should hold `segment` to [`MAX_SEGMENT`]; the store refuses to
     /// roll over past it.
+    ///
+    /// This was `blob_path`, which named a segment file as though it held one
+    /// blob. It does not: it holds whatever records the run wrote into it, and a
+    /// segment boundary is a write policy rather than anything the content
+    /// implies, so there is no "the blob" for such a path to belong to.
     #[must_use]
-    pub fn blob_path(&self, segment: u32) -> PathBuf {
-        self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{BLOB_EXTENSION}"))
+    pub fn segment_path(&self, segment: u32) -> PathBuf {
+        self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{SEGMENT_EXTENSION}"))
     }
 
     /// Every segment of the set that is on disk, in order.
@@ -288,13 +298,13 @@ impl IndexSet {
     fn segment_number(path: &Path, prefix: &str) -> Option<u32> {
         let name = path.file_name()?.to_str()?;
 
-        if path.extension().is_none_or(|ext| ext != BLOB_EXTENSION) {
+        if path.extension().is_none_or(|ext| ext != SEGMENT_EXTENSION) {
             return None;
         }
 
         let digits = name
             .strip_prefix(prefix)?
-            .strip_suffix(&format!(".{BLOB_EXTENSION}"))?;
+            .strip_suffix(&format!(".{SEGMENT_EXTENSION}"))?;
 
         if digits.len() != SEGMENT_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;

@@ -517,7 +517,7 @@ fn the_naming_scheme_names_exactly_its_own_width() {
     // The formatter pads to the width, up to and including the last segment the
     // scheme can name, and not one further.
     for segment in [0, 1, 999, MAX_SEGMENT] {
-        let name = set.blob_path(segment);
+        let name = set.segment_path(segment);
         let digits: String = name
             .file_name()
             .unwrap()
@@ -538,7 +538,7 @@ fn the_naming_scheme_names_exactly_its_own_width() {
     // reader will not accept. Pinned here so that a change to the formatter or
     // to the parser that silently widens one of them is visible as a test
     // failure rather than as a set that loses a version.
-    let past = set.blob_path(MAX_SEGMENT + 1);
+    let past = set.segment_path(MAX_SEGMENT + 1);
     let digits: String = past
         .file_name()
         .unwrap()
@@ -571,8 +571,8 @@ fn a_gap_in_the_segments_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let set = IndexSet::new(dir.path().join("photos"));
 
-    fs::write(set.blob_path(0), b"first").unwrap();
-    fs::write(set.blob_path(2), b"third").unwrap();
+    fs::write(set.segment_path(0), b"first").unwrap();
+    fs::write(set.segment_path(2), b"third").unwrap();
 
     let error = set.segments().unwrap_err();
     let message = error.to_string();

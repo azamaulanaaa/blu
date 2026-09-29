@@ -491,7 +491,7 @@ async fn run_backup(
         .unwrap_or(0)
         .saturating_add(4)
     {
-        exclude.push(set.blob_path(segment));
+        exclude.push(set.segment_path(segment));
     }
 
     let options = Options {
@@ -697,7 +697,7 @@ fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std
 
     // The segment a run would write next: not yet on disk, but part of the set
     // and created inside the destination.
-    if absolutise(&set.blob_path(u32::try_from(segments.len()).unwrap_or(u32::MAX)))
+    if absolutise(&set.segment_path(u32::try_from(segments.len()).unwrap_or(u32::MAX)))
         .starts_with(&target)
     {
         return Err(std::io::Error::new(

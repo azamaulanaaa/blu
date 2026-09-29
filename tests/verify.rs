@@ -40,7 +40,7 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     let committed = common::run_backup(&source, &blob).await;
 
     // Corrupt a byte in the middle of the chunk data, in the segment it is in.
-    let segment = IndexSet::new(&blob).blob_path(0);
+    let segment = IndexSet::new(&blob).segment_path(0);
     let offset = fs::metadata(&segment).unwrap().len() / 2;
     let mut bytes = fs::read(&segment).unwrap();
     bytes[offset as usize] ^= 0xff;
@@ -74,7 +74,7 @@ async fn a_store_truncated_before_its_snapshot_is_refused() {
     let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;
 
-    let segment = IndexSet::new(&blob).blob_path(0);
+    let segment = IndexSet::new(&blob).segment_path(0);
     let bytes = fs::read(&segment).unwrap();
     fs::write(&segment, &bytes[..bytes.len() - 50_000]).unwrap();
 
@@ -97,7 +97,7 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
 
-    let segment = IndexSet::new(&blob).blob_path(0);
+    let segment = IndexSet::new(&blob).segment_path(0);
     let offset = fs::metadata(&segment).unwrap().len() / 2;
     let mut bytes = fs::read(&segment).unwrap();
     bytes[offset as usize] ^= 0xff;

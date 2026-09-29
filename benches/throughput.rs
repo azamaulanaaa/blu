@@ -123,7 +123,8 @@ fn bench_backup(c: &mut Criterion) {
                         // against itself and report a throughput nothing else
                         // would ever see.
                         for segment in 0..64 {
-                            let _ = std::fs::remove_file(IndexSet::new(&blob).blob_path(segment));
+                            let _ =
+                                std::fs::remove_file(IndexSet::new(&blob).segment_path(segment));
                         }
 
                         let storage = BlobStore::<true>::open(

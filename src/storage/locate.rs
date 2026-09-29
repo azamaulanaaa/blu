@@ -84,7 +84,7 @@ pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
         return Resolved::Disagrees;
     }
 
-    let segment_path = set.blob_path(index.segment);
+    let segment_path = set.segment_path(index.segment);
     if !segment_path.is_file() {
         return Resolved::Disagrees;
     }

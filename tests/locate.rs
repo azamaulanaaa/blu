@@ -177,7 +177,7 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
 
     // Put segment 0's file where segment `last` should be: a real store, with real
     // commit records, that is not the one the index claims.
-    fs::copy(set.blob_path(0), set.blob_path(last)).unwrap();
+    fs::copy(set.segment_path(0), set.segment_path(last)).unwrap();
 
     let misfiled = VersionIndex {
         version: 1,
@@ -220,7 +220,7 @@ async fn a_segment_that_is_present_but_unreadable_is_refused() {
     let set = IndexSet::new(&blob);
 
     let segment = index_of(&blob, 1).segment;
-    let path = set.blob_path(segment);
+    let path = set.segment_path(segment);
 
     // The right name, the wrong contents: not a store header at all.
     fs::write(&path, b"this is not a segment, it is a sentence about one").unwrap();

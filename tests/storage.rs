@@ -266,7 +266,7 @@ async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
     store.put(&id, common::reader(payload), len).await.unwrap();
 
     // Chop the last segment in half, which lands inside the one record it holds.
-    let segment = IndexSet::new(&blob).blob_path(0);
+    let segment = IndexSet::new(&blob).segment_path(0);
     let bytes = std::fs::read(&segment).unwrap();
     std::fs::write(&segment, &bytes[..40]).unwrap();
 
@@ -291,7 +291,7 @@ async fn a_file_that_is_not_a_store_is_refused_without_being_truncated() {
 
     // Somebody's data in the place a segment would go: long enough to look
     // plausible, and named so the set finds it and tries to read it.
-    let segment = IndexSet::new(&path).blob_path(0);
+    let segment = IndexSet::new(&path).segment_path(0);
     let contents = vec![0xabu8; 4_096];
     std::fs::write(&segment, &contents).unwrap();
 
@@ -327,7 +327,7 @@ async fn a_store_written_by_another_build_is_refused() {
     let path = dir.path().join("future");
 
     // A store header naming a layout this build does not know.
-    let segment = IndexSet::new(&path).blob_path(0);
+    let segment = IndexSet::new(&path).segment_path(0);
     let mut header = Vec::from(*b"LPST");
     header.extend_from_slice(&99u32.to_le_bytes());
     header.extend_from_slice(&[0u8; 64]);
@@ -362,7 +362,7 @@ async fn a_store_in_a_missing_directory_is_created() {
         .unwrap();
 
     assert!(
-        IndexSet::new(&blob).blob_path(0).is_file(),
+        IndexSet::new(&blob).segment_path(0).is_file(),
         "a set in a missing directory should create it and its first segment"
     );
 

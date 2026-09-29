@@ -7,7 +7,7 @@
 //! the part that is still the set's own business — where its files go, how they
 //! are numbered, and how two writers are kept apart.
 
-use lepatch::index::{BLOB_EXTENSION, IndexSet, SEGMENT_DIGITS};
+use lepatch::index::{IndexSet, SEGMENT_DIGITS, SEGMENT_EXTENSION};
 
 #[test]
 fn derived_paths_do_not_clobber_an_extension_in_the_base_name() {
@@ -15,7 +15,7 @@ fn derived_paths_do_not_clobber_an_extension_in_the_base_name() {
     let set = IndexSet::new("photos.tar");
 
     assert_eq!(
-        set.blob_path(0),
+        set.segment_path(0),
         std::path::Path::new("photos.tar.0000.bin")
     );
     assert_eq!(set.lock_path(), std::path::Path::new("photos.tar.lock"));
@@ -30,7 +30,7 @@ fn a_backup_set_is_a_sequence_of_segments_and_a_lock() {
     // never will be one again.
     let set = IndexSet::new("photos");
 
-    assert_eq!(set.blob_path(0), std::path::Path::new("photos.0000.bin"));
+    assert_eq!(set.segment_path(0), std::path::Path::new("photos.0000.bin"));
     assert_eq!(set.lock_path(), std::path::Path::new("photos.lock"));
     assert_eq!(set.base(), std::path::Path::new("photos"));
 }
@@ -46,10 +46,10 @@ fn a_backup_set_is_a_sequence_of_segments_and_a_lock() {
 fn segment_numbers_sort_into_numerical_order() {
     let set = IndexSet::new("photos");
 
-    let mut listing: Vec<_> = (0..12).map(|n| set.blob_path(n)).collect();
+    let mut listing: Vec<_> = (0..12).map(|n| set.segment_path(n)).collect();
     listing.sort();
 
-    let expected: Vec<_> = (0..12).map(|n| set.blob_path(n)).collect();
+    let expected: Vec<_> = (0..12).map(|n| set.segment_path(n)).collect();
     assert_eq!(
         listing, expected,
         "a directory listing of {SEGMENT_DIGITS}-digit segments should already be \
@@ -59,11 +59,11 @@ fn segment_numbers_sort_into_numerical_order() {
     // 12 segments is past the point where 3 digits would still sort right, which
     // is the case a narrower field would get wrong.
     assert!(
-        set.blob_path(2) < set.blob_path(10),
+        set.segment_path(2) < set.segment_path(10),
         "segment 10 must sort after segment 2"
     );
     assert_eq!(SEGMENT_DIGITS, 4, "the width is part of the on-disk layout");
-    assert_eq!(BLOB_EXTENSION, "bin");
+    assert_eq!(SEGMENT_EXTENSION, "bin");
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn derived_paths_honour_a_directory_component() {
     let set = IndexSet::new("backups/photos");
 
     assert_eq!(
-        set.blob_path(3),
+        set.segment_path(3),
         std::path::Path::new("backups/photos.0003.bin")
     );
     assert_eq!(
@@ -98,7 +98,7 @@ fn an_index_file_is_never_confusable_with_a_segment() {
             std::path::Path::new(&format!("photos.v{version:04}.idx"))
         );
         assert_eq!(
-            set.blob_path(version),
+            set.segment_path(version),
             std::path::Path::new(&format!("photos.{version:04}.bin"))
         );
     }
@@ -113,15 +113,15 @@ fn segments_and_index_files_are_told_apart_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let set = IndexSet::new(dir.path().join("photos"));
 
-    std::fs::write(set.blob_path(0), b"x").unwrap();
-    std::fs::write(set.blob_path(1), b"x").unwrap();
+    std::fs::write(set.segment_path(0), b"x").unwrap();
+    std::fs::write(set.segment_path(1), b"x").unwrap();
     std::fs::write(set.index_path(1), b"x").unwrap();
     std::fs::write(set.index_path(2), b"x").unwrap();
     std::fs::write(dir.path().join("photos.0003.idx"), b"x").unwrap();
 
     assert_eq!(
         set.segments().unwrap(),
-        vec![set.blob_path(0), set.blob_path(1)],
+        vec![set.segment_path(0), set.segment_path(1)],
         "an index file must not be listed as a segment"
     );
     assert_eq!(
@@ -153,12 +153,16 @@ fn segments_are_listed_in_order() {
 
     // Written out of order, because a directory does not promise otherwise.
     for segment in [2u32, 0, 1] {
-        std::fs::write(set.blob_path(segment), b"x").unwrap();
+        std::fs::write(set.segment_path(segment), b"x").unwrap();
     }
 
     assert_eq!(
         set.segments().unwrap(),
-        vec![set.blob_path(0), set.blob_path(1), set.blob_path(2)]
+        vec![
+            set.segment_path(0),
+            set.segment_path(1),
+            set.segment_path(2)
+        ]
     );
 }
 
@@ -173,7 +177,7 @@ fn a_missing_segment_in_the_middle_is_refused() {
     let set = IndexSet::new(dir.path().join("photos"));
 
     for segment in [0u32, 2] {
-        std::fs::write(set.blob_path(segment), b"x").unwrap();
+        std::fs::write(set.segment_path(segment), b"x").unwrap();
     }
 
     let error = set.segments().unwrap_err();
@@ -189,8 +193,8 @@ fn files_belonging_to_other_sets_are_ignored() {
     let dir = tempfile::tempdir().unwrap();
     let set = IndexSet::new(dir.path().join("photos"));
 
-    std::fs::write(set.blob_path(0), b"x").unwrap();
-    std::fs::write(set.blob_path(1), b"x").unwrap();
+    std::fs::write(set.segment_path(0), b"x").unwrap();
+    std::fs::write(set.segment_path(1), b"x").unwrap();
 
     // Another set, a different extension, and the lock.
     std::fs::write(dir.path().join("videos.0000.bin"), b"other").unwrap();
@@ -199,7 +203,7 @@ fn files_belonging_to_other_sets_are_ignored() {
 
     assert_eq!(
         set.segments().unwrap(),
-        vec![set.blob_path(0), set.blob_path(1)],
+        vec![set.segment_path(0), set.segment_path(1)],
         "a file that looks like another set's segment is not this set's"
     );
 }

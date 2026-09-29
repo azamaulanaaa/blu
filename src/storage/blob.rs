@@ -144,7 +144,7 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     /// writes to.
     #[must_use]
     pub fn segment_path(&self, segment: u32) -> PathBuf {
-        self.set.blob_path(segment)
+        self.set.segment_path(segment)
     }
 
     /// How many segments this store has, counting from zero.
@@ -969,7 +969,7 @@ fn scan_set(set: &IndexSet, mode: Scan) -> io::Result<Scanned> {
                 format!("no backup store at {}", set.base().display()),
             ));
         }
-        let first = set.blob_path(0);
+        let first = set.segment_path(0);
         create_segment(&first, 0)?;
         sync_parent(&first)?;
         segments.push(first);
