@@ -6,7 +6,10 @@
 //! rate derived from those, on a timer that [`Progress::report`] checks — so a
 //! fast run stays quiet and a slow one is not left silent for minutes.
 
-use std::time::{Duration, Instant};
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 /// How often a run says something: short enough that a slow run is not left
 /// silent for long, long enough that a fast one does not fill the terminal.
@@ -169,13 +172,6 @@ impl Progress {
     }
 
     /// The totals, in the order they were first reported.
-    fn totals(&self) -> Vec<(Counter, u64)> {
-        self.seen
-            .iter()
-            .map(|c| (*c, self.counters[c.slot()]))
-            .collect()
-    }
-
     /// Whether enough time has passed to report.
     ///
     /// Always true for the first call, and false immediately after a report.
@@ -215,7 +211,7 @@ impl Progress {
             target: "lepatch::progress",
             "{} in progress: {}",
             self.what.name(),
-            describe(&self.totals(), elapsed)
+            describe(&self.seen, &self.counters, elapsed)
         );
 
         true
@@ -223,19 +219,39 @@ impl Progress {
 }
 
 /// Render the counters, with byte totals turned into a size and a rate.
-fn describe(counters: &[(Counter, u64)], elapsed: Duration) -> String {
+///
+/// Takes the two arrays the counters live in rather than a `Vec` of pairs, so
+/// building the line allocates nothing but the line itself. The pairs were
+/// collected into a fresh `Vec` on every tick to be iterated once immediately
+/// afterwards, which is what the plan called "2 strings per counter per tick" —
+/// three allocations per tick, in fact, since `totals` was one of them.
+///
+/// The magnitude is worth stating once so it does not get picked up again: a tick
+/// is [`INTERVAL`] apart, so this is about ten allocations a second on a backup
+/// that is doing thousands of chunk operations a second. It is not a throughput
+/// change and nothing here should be described as one. What it is: a hot loop that
+/// allocates to build a diagnostic string, and no longer does.
+///
+/// The rendering is not deferred to the subscriber, and it does not need to be.
+/// `tracing` checks the callsite before it evaluates its arguments, so with
+/// progress off — `--quiet`, or any subscriber that filters this target — none of
+/// this runs at all. That is the gate that already exists, and it is the right
+/// one; the allocations below only ever happened when the line was going to be
+/// written.
+fn describe(seen: &[Counter], counters: &[u64], elapsed: Duration) -> String {
     let mut out = String::new();
-    for (counter, total) in counters {
+    for counter in seen {
         if !out.is_empty() {
             out.push(' ');
         }
 
+        let total = counters[counter.slot()];
         let name = counter.name();
         if counter.is_bytes() {
-            let (whole, tenth) = mib_per_second_tenths(*total, elapsed);
+            let (whole, tenth) = mib_per_second_tenths(total, elapsed);
             let _ = std::fmt::Write::write_fmt(
                 &mut out,
-                format_args!("{name}={} ({whole}.{tenth} MiB/s)", human_bytes(*total)),
+                format_args!("{name}={} ({whole}.{tenth} MiB/s)", Bytes(total)),
             );
         } else {
             let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{name}={total}"));
@@ -243,6 +259,40 @@ fn describe(counters: &[(Counter, u64)], elapsed: Duration) -> String {
     }
 
     out
+}
+
+/// A byte count, rendered as a size.
+///
+/// A [`fmt::Display`] newtype rather than a `String`, so the caller writes it into
+/// a formatter it already has instead of building a temporary to hand over. Three
+/// per second is not a throughput argument, and the real one is that a function
+/// returning `String` from a `u64` is a heap allocation dressed up as a
+/// conversion.
+struct Bytes(u64);
+
+impl fmt::Display for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const UNITS: [(&str, u64); 4] = [
+            ("TiB", 1 << 40),
+            ("GiB", 1 << 30),
+            ("MiB", 1 << 20),
+            ("KiB", 1 << 10),
+        ];
+
+        for (unit, scale) in UNITS {
+            if self.0 >= scale {
+                // The remainder is under `scale`, so times ten cannot overflow.
+                return write!(
+                    f,
+                    "{}.{} {unit}",
+                    self.0 / scale,
+                    (self.0 % scale) * 10 / scale
+                );
+            }
+        }
+
+        write!(f, "{} B", self.0)
+    }
 }
 
 /// Bytes per second in tenths of a MiB/s, split into whole and tenths so it
@@ -262,29 +312,21 @@ fn mib_per_second_tenths(bytes: u64, elapsed: Duration) -> (u64, u64) {
     (tenths / 10, tenths % 10)
 }
 
-/// Bytes as something readable, choosing the unit by magnitude.
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 4] = [
-        ("TiB", 1 << 40),
-        ("GiB", 1 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-    ];
-
-    for (unit, scale) in UNITS {
-        if bytes >= scale {
-            // The remainder is under `scale`, so times ten cannot overflow.
-            return format!("{}.{} {unit}", bytes / scale, (bytes % scale) * 10 / scale);
-        }
-    }
-
-    format!("{bytes} B")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The counters and their totals as pairs, for asserting on.
+    ///
+    /// The rendering path takes the two arrays directly rather than a `Vec` of
+    /// pairs, so this is for tests only — nothing in the crate needs the pairs.
+    fn totals(progress: &Progress) -> Vec<(Counter, u64)> {
+        progress
+            .seen
+            .iter()
+            .map(|c| (*c, progress.counters[c.slot()]))
+            .collect()
+    }
     #[test]
     fn counters_accumulate() {
         let mut progress = Progress::new(Phase::Backup);
@@ -292,7 +334,7 @@ mod tests {
         progress.add(Counter::Files, 3);
         progress.set(Counter::Chunks, 10);
         assert_eq!(
-            progress.totals(),
+            totals(&progress),
             vec![(Counter::Files, 5), (Counter::Chunks, 10)],
             "totals should be in the order they were first reported"
         );
@@ -302,7 +344,7 @@ mod tests {
     fn a_counter_nothing_reported_has_no_line() {
         let mut progress = Progress::new(Phase::Restore);
         progress.add(Counter::Done, 1);
-        let rendered = describe(&progress.totals(), Duration::from_secs(1));
+        let rendered = describe(&progress.seen, &progress.counters, Duration::from_secs(1));
         assert_eq!(
             rendered, "done=1",
             "a restore has no chunk count to report, and should not invent a line for one"
@@ -311,7 +353,10 @@ mod tests {
 
     #[test]
     fn a_byte_total_is_rendered_with_a_rate() {
-        let rendered = describe(&[(Counter::Read, 10 * 1024 * 1024)], Duration::from_secs(2));
+        let seen = [Counter::Read];
+        let mut counters = [0u64; Counter::ALL.len()];
+        counters[Counter::Read.slot()] = 10 * 1024 * 1024;
+        let rendered = describe(&seen, &counters, Duration::from_secs(2));
         assert!(rendered.contains("10.0 MiB"), "{rendered}");
         assert!(rendered.contains("5.0 MiB/s"), "{rendered}");
     }
@@ -319,7 +364,10 @@ mod tests {
     #[test]
     fn a_count_is_left_as_a_plain_number() {
         // A rate on a count of chunks or files would be meaningless.
-        let rendered = describe(&[(Counter::Chunks, 1234)], Duration::from_secs(1));
+        let seen = [Counter::Chunks];
+        let mut counters = [0u64; Counter::ALL.len()];
+        counters[Counter::Chunks.slot()] = 1234;
+        let rendered = describe(&seen, &counters, Duration::from_secs(1));
         assert_eq!(rendered, "chunks=1234");
     }
 
@@ -340,7 +388,13 @@ mod tests {
         assert_eq!((whole, tenth), (1, 0), "one MiB in a second is one MiB/s");
 
         for counter in Counter::ALL {
-            let rendered = describe(&[(counter, 2048)], Duration::from_secs(1));
+            let mut counters = [0u64; Counter::ALL.len()];
+            counters[counter.slot()] = 2048;
+            let rendered = describe(
+                std::slice::from_ref(&counter),
+                &counters,
+                Duration::from_secs(1),
+            );
             if counter.is_bytes() {
                 assert!(
                     rendered.contains(" MiB/s)"),
@@ -362,9 +416,9 @@ mod tests {
 
     #[test]
     fn byte_units_scale() {
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(2048), "2.0 KiB");
-        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(Bytes(512).to_string(), "512 B");
+        assert_eq!(Bytes(2048).to_string(), "2.0 KiB");
+        assert_eq!(Bytes(5 * 1024 * 1024).to_string(), "5.0 MiB");
     }
 
     #[test]
