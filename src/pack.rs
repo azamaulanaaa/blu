@@ -519,18 +519,8 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
     Ok(out)
 }
 
-fn write_varint(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = u8::try_from(value & 0x7f).unwrap_or(0);
-        value >>= 7;
-
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-
-        out.push(byte | 0x80);
-    }
+fn write_varint(out: &mut Vec<u8>, value: u64) {
+    crate::varint::write(out, value);
 }
 
 /// A LEB128 number at `at`, and how many bytes it occupied.
@@ -538,39 +528,20 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
 /// # Errors
 ///
 /// Returns an error if the number runs past the end of `bytes`, is over ten
-/// bytes, or would overflow a `u64`.
+/// bytes, or would overflow a `u64`. Each is named, because a pack is a file a
+/// client downloaded and "it is not readable" is not something a person can act
+/// on.
 fn read_varint(bytes: &[u8], at: usize) -> io::Result<(u64, usize)> {
-    let mut out: u64 = 0;
-    let mut shift: u32 = 0;
-
-    for index in 0..10usize {
-        let byte = *bytes.get(at + index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "a pack index ends mid-number")
-        })?;
-
-        // The tenth byte can only contribute the last bit of a u64; more than
-        // that is an overlong encoding of something shorter.
-        if index == 9 && byte > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a pack index has an overlong number",
-            ));
-        }
-
-        out |= u64::from(byte & 0x7f).checked_shl(shift).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "a pack index number overflows")
-        })?;
-
-        if byte & 0x80 == 0 {
-            return Ok((out, index + 1));
-        }
-        shift += 7;
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "a pack index has an overlong number",
-    ))
+    crate::varint::read(bytes, at).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            match e {
+                crate::varint::Error::Truncated => "a pack index ends mid-number",
+                crate::varint::Error::Overlong => "a pack index has an overlong number",
+                crate::varint::Error::Overflow => "a pack index number overflows",
+            },
+        )
+    })
 }
 
 fn index_length(len: u64) -> [u8; 8] {

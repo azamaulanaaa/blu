@@ -118,30 +118,31 @@ impl<'a> Reader<'a> {
 
     /// An LEB128 unsigned integer: at most ten bytes, and the tenth may contribute
     /// only the last bit of a `u64`.
+    ///
+    /// A snapshot decoder is the security-relevant half of this module — the
+    /// blob it reads is named by the hash of its own bytes, so nothing upstream
+    /// vouched for its contents — which is why the tenth-byte rule lives in one
+    /// place now rather than in a copy per encoding.
+    ///
+    /// The bytes are gathered up to the terminator and then handed over, rather
+    /// than decoded in the loop: a number is self-delimiting, and reading a
+    /// fixed ten would consume whatever follows it.
     fn varint(&mut self) -> Result<u64> {
-        let mut out: u64 = 0;
-        let mut shift: u32 = 0;
+        let mut window = [0u8; crate::varint::MAX];
+        let mut taken = 0usize;
 
-        for index in 0..10 {
+        while taken < window.len() {
             let byte = self.u8()?;
-
-            // The tenth byte can contribute only the last bit of a u64.
-            if index == 9 && byte > 1 {
-                return Err(Malformed("a length in the snapshot is too large"));
-            }
-
-            out |= u64::from(byte & 0x7f)
-                .checked_shl(shift)
-                .ok_or(Malformed("a length in the snapshot is too large"))?;
-
+            window[taken] = byte;
+            taken += 1;
             if byte & 0x80 == 0 {
-                return Ok(out);
+                break;
             }
-
-            shift += 7;
         }
 
-        Err(Malformed("a length in the snapshot is too large"))
+        crate::varint::read(&window[..taken], 0)
+            .map(|(value, _)| value)
+            .map_err(|_| Malformed("a length in the snapshot is too large"))
     }
 
     /// A count, checked against what is left of the input before it is used.
@@ -227,18 +228,8 @@ impl Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn varint(&mut self, mut value: u64) {
-        loop {
-            let byte = u8::try_from(value & 0x7f).unwrap_or(0);
-            value >>= 7;
-
-            if value == 0 {
-                self.bytes.push(byte);
-                return;
-            }
-
-            self.bytes.push(byte | 0x80);
-        }
+    fn varint(&mut self, value: u64) {
+        crate::varint::write(&mut self.bytes, value);
     }
 
     fn count(&mut self, count: usize) {

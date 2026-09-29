@@ -1,0 +1,186 @@
+//! LEB128, the variable-width integer all three of this crate's encodings use.
+//!
+//! There are three of them — the store's record format, a pack's index, and the
+//! snapshot encoding — and they share this and almost nothing else. Their field
+//! orders, framing, trust postures and error models are unrelated, and their
+//! failure modes are deliberately different: a record decoder treats a bad
+//! number as the end of a torn tail and stops, a pack decoder has to name what
+//! went wrong to a person, and a snapshot decoder has to bound an allocation
+//! before it makes it. Merging the *formats* would blur exactly the distinction
+//! worth keeping.
+//!
+//! The *number* is not one of those distinctions, and having three copies of it
+//! meant three copies of the one piece of logic here that is security-relevant:
+//! a tenth byte may contribute only the last bit of a `u64`, and an encoding
+//! that says otherwise is either an overflow or a way to spend ten bytes
+//! saying zero.
+
+use std::fmt;
+
+/// Longest LEB128 encoding of a `u64`.
+///
+/// Ten groups of seven bits is sixty-four, and the tenth has one bit to spare.
+pub const MAX: usize = 10;
+
+/// Why a varint could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Error {
+    /// The bytes ran out before the number did.
+    Truncated,
+    /// More than [`MAX`] groups, or a tenth group contributing more than the one
+    /// bit a `u64` has left.
+    Overlong,
+    /// The groups did not fit in a `u64`.
+    Overflow,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = match self {
+            Self::Truncated => "it ends in the middle of a number",
+            Self::Overlong => "it is longer than a number can be",
+            Self::Overflow => "it is too large to be a number",
+        };
+        f.write_str(what)
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Append `value` to `out` as LEB128.
+pub fn write(out: &mut Vec<u8>, value: u64) {
+    let mut value = value;
+    loop {
+        // `value & 0x7f` is in 0..=127, so this cannot fail. It used to be a
+        // `u8::try_from(..).unwrap_or(0)`, which was both unreachable and the
+        // worst possible fallback: a wider mask would have written a zero-length
+        // number into a record header rather than refusing.
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+
+        out.push(byte | 0x80);
+    }
+}
+
+/// The LEB128 number at `at`, and how many bytes it occupied.
+///
+/// # Errors
+///
+/// Returns [`Error::Truncated`] if the bytes run out first, [`Error::Overlong`]
+/// if the encoding is longer than a `u64` can be, and [`Error::Overflow`] if the
+/// groups do not fit one.
+pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
+    let mut out: u64 = 0;
+    let mut shift: u32 = 0;
+
+    for index in 0..MAX {
+        let byte = *bytes.get(at + index).ok_or(Error::Truncated)?;
+
+        // The tenth group can contribute only the last bit of a u64; more than
+        // that is an overlong encoding of something shorter, and accepting it
+        // would let a caller believe a number it was never sent.
+        if index == MAX - 1 && byte > 1 {
+            return Err(Error::Overlong);
+        }
+
+        out |= u64::from(byte & 0x7f)
+            .checked_shl(shift)
+            .ok_or(Error::Overflow)?;
+
+        if byte & 0x80 == 0 {
+            return Ok((out, index + 1));
+        }
+
+        shift += 7;
+    }
+
+    // Ten groups and the last one still had its continuation bit set.
+    Err(Error::Overlong)
+}
+
+/// Bytes `value` occupies as LEB128.
+///
+/// The same count [`write`] produces, and checked against it: a disagreement
+/// between the two would mean a header sized one way and written another.
+#[must_use]
+pub fn len(value: u64) -> usize {
+    let mut value = value;
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, MAX, len, read, write};
+
+    #[test]
+    fn a_number_survives_a_round_trip_at_every_width() {
+        // One value per width, plus the boundaries, because a bug in the tenth
+        // group is invisible at every smaller one.
+        for shift in 0..64 {
+            let value = 1u64 << shift;
+            let mut out = Vec::new();
+            write(&mut out, value);
+            assert_eq!(out.len(), len(value), "width disagrees for {value}");
+            assert_eq!(read(&out, 0), Ok((value, out.len())));
+        }
+    }
+
+    #[test]
+    fn zero_and_the_boundaries_encode_to_what_they_should() {
+        for value in [0, 1, 127, 128, u64::from(u32::MAX), u64::MAX] {
+            let mut out = Vec::new();
+            write(&mut out, value);
+            assert_eq!(out.len(), len(value));
+            assert_eq!(read(&out, 0), Ok((value, out.len())));
+        }
+    }
+
+    #[test]
+    fn the_widest_number_is_ten_bytes_and_the_next_one_is_not_a_number() {
+        let mut out = Vec::new();
+        write(&mut out, u64::MAX);
+        assert_eq!(out.len(), MAX);
+
+        // A tenth group contributing more than the last bit of a u64.
+        let mut overlong = out.clone();
+        overlong[MAX - 1] |= 0x02;
+        assert_eq!(read(&overlong, 0), Err(Error::Overlong));
+    }
+
+    #[test]
+    fn a_number_that_never_ends_is_refused_rather_than_read() {
+        // Eleven continuation bytes: longer than any number, and the shape a
+        // reader of a damaged index meets.
+        let endless = [0x80u8; MAX + 1];
+        assert_eq!(read(&endless, 0), Err(Error::Overlong));
+
+        // Ten, with the last still asking for more.
+        let exactly_max = [0x80u8; MAX];
+        assert_eq!(read(&exactly_max, 0), Err(Error::Overlong));
+    }
+
+    #[test]
+    fn running_out_of_bytes_is_distinct_from_running_out_of_number() {
+        let mut out = Vec::new();
+        write(&mut out, 300);
+        assert_eq!(read(&out[..1], 0), Err(Error::Truncated));
+        assert_eq!(read(&out, out.len()), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn a_number_is_read_from_where_it_starts() {
+        let mut out = vec![0xaa, 0xbb];
+        write(&mut out, 42);
+        assert_eq!(read(&out, 2), Ok((42, 1)));
+    }
+}

@@ -66,9 +66,6 @@ const CHECK: usize = 8;
 /// Bytes in the smallest possible header: two one-byte lengths of zero.
 const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
 
-/// Longest LEB128 encoding of a `u64`.
-const MAX_VARINT: usize = 10;
-
 /// Bytes in the largest possible header: two varints at their widest.
 ///
 /// What a scan must have in hand before it tries to decode a header. Refilling
@@ -76,7 +73,7 @@ const MAX_VARINT: usize = 10;
 /// varints is 52 bytes against a 48-byte floor, so a record boundary in the last
 /// few bytes of the buffer fails to decode and a good segment is reported as
 /// damaged.
-const MAX_HEADER: usize = PREFIX + 2 * MAX_VARINT + HASH + CHECK;
+const MAX_HEADER: usize = PREFIX + 2 * crate::varint::MAX + HASH + CHECK;
 
 /// Bytes read at a time while scanning.
 ///
@@ -273,13 +270,8 @@ pub(super) fn decode_store_header(bytes: &[u8]) -> Result<u32, HeaderFault> {
 }
 
 /// Bytes `value` takes as a LEB128 integer.
-fn varint_len(mut value: u64) -> usize {
-    let mut len = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        len += 1;
-    }
-    len
+fn varint_len(value: u64) -> usize {
+    crate::varint::len(value)
 }
 
 /// Append the header for a record to `out`.
@@ -311,18 +303,8 @@ pub(super) fn encode_header(
     );
 }
 
-fn write_varint(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = u8::try_from(value & 0x7f).unwrap_or(0);
-        value >>= 7;
-
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-
-        out.push(byte | 0x80);
-    }
+fn write_varint(out: &mut Vec<u8>, value: u64) {
+    crate::varint::write(out, value);
 }
 
 fn check(header_without_check: &[u8]) -> [u8; CHECK] {
@@ -390,27 +372,13 @@ fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
 }
 
 /// Read a LEB128 integer, returning it and how many bytes it took.
+///
+/// A number that cannot be read is not an error here. A scan uses this to walk
+/// records it has not verified, and its whole contract is that a damaged tail
+/// and a tail that is simply the end of the file are the same thing: it stops
+/// and lets the caller decide. See the module doc.
 fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
-    let mut out: u64 = 0;
-    let mut shift: u32 = 0;
-
-    for (index, &byte) in bytes.iter().take(MAX_VARINT).enumerate() {
-        // The tenth byte can only contribute the last bit of a u64; more than
-        // that is an overlong encoding of something shorter.
-        if index == MAX_VARINT - 1 && byte > 1 {
-            return None;
-        }
-
-        out |= u64::from(byte & 0x7f).checked_shl(shift)?;
-
-        if byte & 0x80 == 0 {
-            return Some((out, index + 1));
-        }
-
-        shift += 7;
-    }
-
-    None
+    crate::varint::read(bytes, 0).ok()
 }
 
 /// Read one segment's records, and keep only the commit records among them.

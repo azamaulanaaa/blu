@@ -472,25 +472,22 @@ fn index_entries(index: &[u8]) -> Vec<usize> {
 }
 
 fn varint_len(bytes: &[u8], at: usize) -> usize {
-    bytes[at..]
-        .iter()
-        .position(|b| b & 0x80 == 0)
-        .map(|i| i + 1)
+    lepatch::varint::read(bytes, at)
+        .map(|(_, used)| used)
         .expect("a varint running off the end of the buffer")
 }
 
 /// Decode a little-endian base-128 varint, for the test's own assertions.
+///
+/// This was a hand-written copy of the crate's decoder, kept because the crate's
+/// was private. It had drifted: it had no ten-byte cap and no overflow check, so
+/// it accepted overlong encodings that all three production decoders refuse —
+/// which is to say the test was checking the pack's bytes with a reader more
+/// lenient than any reader that will ever see them. It now uses the real one.
 fn decode_varint(bytes: &[u8], at: usize) -> u64 {
-    let mut out = 0u64;
-    let mut shift = 0u32;
-    for byte in bytes.iter().skip(at) {
-        out |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return out;
-        }
-        shift += 7;
-    }
-    panic!("a varint running off the end of the buffer");
+    lepatch::varint::read(bytes, at)
+        .map(|(value, _)| value)
+        .expect("a varint running off the end of the buffer")
 }
 
 /// A pack in a format this build does not know is named as such, not misread.

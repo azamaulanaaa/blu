@@ -59,3 +59,4 @@ pub mod progress;
 pub mod reader;
 pub mod slice;
 pub mod storage;
+pub mod varint;
