@@ -1,10 +1,10 @@
 //! End-to-end tests that drive the `lepatch` binary as a subprocess.
 //!
 //! The library integration tests call `backup` and `restore` directly, which
-//! left `src/bin/mod.rs` at zero coverage: version selection, the cross-process
-//! write lock, the exclude list, argument parsing, exit codes and every error
-//! message the user sees were all untested. These tests go through the real
-//! binary so those paths are exercised as a user would meet them.
+//! left the binary itself at zero coverage: version selection, the
+//! cross-process write lock, the exclude list, argument parsing, exit codes and
+//! every error message the user sees were all untested. These tests go through
+//! the real binary so those paths are exercised as a user would meet them.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

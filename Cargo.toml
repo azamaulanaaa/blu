@@ -42,10 +42,6 @@ publish = false
 [package.metadata.dist]
 dist = true
 
-[[bin]]
-name = "lepatch"
-path = "src/bin/mod.rs"
-
 [dependencies]
 async-trait = "0.1.89"
 blake3 = { version = "1.8.2", features = ["traits-preview"] }
