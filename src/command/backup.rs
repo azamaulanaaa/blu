@@ -207,18 +207,18 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
     let mut snapshot = metadata::Snapshot::new();
     let mut inode_map: HashMap<FileId, PathBuf> = HashMap::new();
 
+    // `io::Error::from(WalkFailure(..))` rather than a `?` on an `io::Result`
+    // iterator: the walk has its own error type, and converting once here keeps
+    // the conversion next to the reason it exists.
     let entries = WalkDir::new(root)
         .sort_by_file_name()
         .into_iter()
-        .map(|entry| {
-            entry
-                .map(walkdir::DirEntry::into_path)
-                .map_err(|e| io::Error::other(format!("failed to walk backup root: {e}")))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+        .map(|entry| entry.map(walkdir::DirEntry::into_path).map_err(WalkFailure))
+        .collect::<Result<Vec<_>, WalkFailure>>()
+        .map_err(io::Error::from)?
+        .into_iter();
 
     let paths = entries
-        .into_iter()
         .filter(|path| !excluded.contains(&normalise(path)))
         .map(|path| {
             let meta = fs::symlink_metadata(&path)?;
@@ -332,6 +332,53 @@ pub(super) fn index_to_u32(index: usize) -> io::Result<u32> {
     })
 }
 
+/// A failure from walking the tree, with the walkdir error kept intact.
+///
+/// The flattening this replaces was `io::Error::other(format!("…: {e}"))`, which
+/// threw away everything about the failure except its text: the `ErrorKind` and
+/// the error itself. So an unreadable directory halfway down a tree came back as
+/// `ErrorKind::Other` when the real answer was `PermissionDenied`, and nothing
+/// could tell the two apart — including a caller of this library, which is not
+/// the CLI and does not have a person reading a message.
+///
+/// The kind is recovered from `walkdir::Error::io_error`, which is `Some` for an
+/// I/O failure and `None` for the one case that has no `io` error to speak of (a
+/// symlink loop). `walkdir` names the offending path in its own `Display`, so the
+/// message gains nothing by being longer.
+struct WalkFailure(walkdir::Error);
+
+impl std::fmt::Display for WalkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to walk backup root: {}", self.0)
+    }
+}
+
+impl std::fmt::Debug for WalkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for WalkFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl From<WalkFailure> for io::Error {
+    fn from(failure: WalkFailure) -> Self {
+        // The inner error, not the message, so `get_ref` hands back the walkdir
+        // error and `Display` still includes the path it names. The kind comes
+        // from the same place, and is `Other` only when walkdir had no `io` error
+        // to recover it from.
+        let kind = failure
+            .0
+            .io_error()
+            .map_or(io::ErrorKind::Other, io::Error::kind);
+        io::Error::new(kind, failure)
+    }
+}
+
 /// A file's identity on disk, for telling hard links apart.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 struct FileId {
@@ -369,5 +416,56 @@ impl FileId {
     #[cfg(all(windows, not(feature = "experimental")))]
     fn from_metadata(_meta: &fs::Metadata) -> Option<FileId> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WalkDir, WalkFailure};
+    use std::io;
+
+    /// A walk failure keeps its `ErrorKind` and its error.
+    ///
+    /// Tested on the conversion rather than through a real unreadable directory,
+    /// because provoking one needs a permission the test cannot take away from
+    /// itself — and this suite often runs as root, where `chmod 000` removes
+    /// nothing. A test that only works for a non-root user is a test that is
+    /// skipped in CI, silently.
+    ///
+    /// A path that is not there is a genuine walk failure and needs no special
+    /// anything: walkdir yields the `io::Error` underneath, and the question is
+    /// what comes out the other side.
+    #[test]
+    fn a_walk_failure_is_not_flattened_to_other() {
+        let missing = std::path::Path::new("/nonexistent-lepatch-walk-test");
+
+        let failure = WalkDir::new(missing)
+            .into_iter()
+            .next()
+            .expect("walking nothing should yield one error")
+            .expect_err("and it should be an error");
+
+        let error: io::Error = WalkFailure(failure).into();
+
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::NotFound,
+            "the kind should come from the error underneath, not default to Other: {error}"
+        );
+
+        // And the error itself survives, so `get_ref` is not `None` and
+        // `Display` still carries the path walkdir named.
+        assert!(
+            error.get_ref().is_some(),
+            "the walkdir error should still be reachable: {error}"
+        );
+        assert!(
+            error.to_string().contains("nonexistent-lepatch-walk-test"),
+            "and the path should still be in the message: {error}"
+        );
+        assert!(
+            error.to_string().starts_with("failed to walk backup root:"),
+            "with the context that says a walk is what failed: {error}"
+        );
     }
 }
