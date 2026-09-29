@@ -10,7 +10,7 @@ use std::{
     fmt::Debug,
     fs::File,
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -21,7 +21,15 @@ use tracing::instrument;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkSource {
     /// Path of the file, as it was passed to [`FileRegistry::new`].
-    pub path: PathBuf,
+    ///
+    /// Shared, not owned. There is one of these per *file slice a chunk
+    /// covers*, and a chunk spanning a file boundary has more than one, so a
+    /// backup built a `PathBuf` per chunk - a fresh allocation of the whole
+    /// path, bytes and all, to name a file the registry had already recorded
+    /// once. An [`Arc`] makes that a refcount bump. The allocation is not the
+    /// point; the copy of the path is, and it happened once per chunk rather
+    /// than once per file.
+    pub path: Arc<Path>,
     /// Byte offset of this slice within the file.
     pub offset: u64,
     /// Length of this slice in bytes.
@@ -57,7 +65,7 @@ impl Debug for Chunk {
 
 #[derive(Debug)]
 struct EntryFileRegistry {
-    path: PathBuf,
+    path: Arc<Path>,
     length: u64,
     global_offset: u64,
 }
@@ -84,7 +92,9 @@ impl FileRegistry {
                 let length = std::fs::metadata(&path_buf)?.len();
 
                 let entry = EntryFileRegistry {
-                    path: path_buf,
+                    // `into_boxed_path` then `Arc::from`, so the path bytes are moved
+                    // into the `Arc` rather than copied into it.
+                    path: Arc::from(path_buf.into_boxed_path()),
                     length,
                     global_offset,
                 };
@@ -134,7 +144,7 @@ impl FileRegistry {
                 let file_local_offset = overlap_start_global - entry.global_offset;
 
                 mappings.push(ChunkSource {
-                    path: entry.path.clone(),
+                    path: Arc::clone(&entry.path),
                     offset: file_local_offset,
                     length: overlap_len,
                 });
@@ -453,4 +463,82 @@ mod tests {
             "the error should say which way round they are, got: {error}"
         );
     }
+}
+
+/// Measure `resolve_chunk`, whose per-chunk work is one path clone.
+///
+/// The path in a [`ChunkSource`] is an [`Arc`] rather than a `PathBuf`, so building
+/// one is a refcount bump instead of an allocation plus a copy of the path. That
+/// is the only thing `resolve_chunk` does that touches memory beyond its output
+/// vector, which makes it measurable in a way an end-to-end backup is not: a
+/// backup spends its time on per-record filesystem calls, and a saved allocation
+/// per chunk does not show up there at all.
+///
+/// So this drives `resolve_chunk` directly, over a registry of enough files that a
+/// chunk lands inside one of them.
+///
+/// **It asserts that every call resolved something, and that assertion is the
+/// point.** The first version of this benchmark built a registry of *empty* files
+/// and reported 10ns per chunk for two milliseconds — the whole measurement was
+/// two hundred real resolutions and a hundred and ninety-nine thousand iterations
+/// that returned an empty vector because the global offset was past the end of the
+/// set. It looked like a working benchmark. Counting the sources is what makes the
+/// difference visible, so the count is checked on every run.
+///
+/// Ignored by default. Run it with:
+///
+/// ```text
+/// cargo test --release -- --ignored --nocapture resolve_chunk
+/// ```
+#[test]
+#[ignore = "builds a registry and takes a second; run it by hand"]
+fn resolve_chunk_cost() {
+    /// Files in the registry. Enough that a chunk lands in one of them, so the
+    /// clone is the per-chunk work rather than a special case.
+    const FILES: usize = 200;
+    /// Bytes per file, and per chunk, so a chunk lands inside one file rather than
+    /// spanning several. A registry of empty files resolves to nothing at all.
+    const FILE_BYTES: usize = 64 * 1024;
+    /// Resolutions per round, wrapping over the registry so every one of them is
+    /// a chunk that exists.
+    const CHUNKS: u32 = 200_000;
+
+    let dir = tempfile::tempdir().expect("a temp dir for the registry");
+    let paths: Vec<PathBuf> = (0..FILES)
+        .map(|i| {
+            let path = dir.path().join(format!("f{i}.bin"));
+            std::fs::write(&path, vec![0u8; FILE_BYTES]).expect("a file");
+            path
+        })
+        .collect();
+
+    let registry = FileRegistry::new(paths.into_iter()).expect("a registry");
+
+    let mut best = f64::MAX;
+    let mut sources = 0usize;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        sources = 0;
+        for n in 0..CHUNKS {
+            let file = u64::from(n % u32::try_from(FILES).expect("fits in u32"));
+            let at = file * u64::try_from(FILE_BYTES).expect("fits in u64");
+            sources += registry
+                .resolve_chunk(at, u32::try_from(FILE_BYTES).expect("fits in u32"))
+                .len();
+        }
+        best = best.min(started.elapsed().as_secs_f64());
+    }
+
+    assert_eq!(
+        sources,
+        usize::try_from(CHUNKS).expect("fits in usize"),
+        "only {sources} of {CHUNKS} calls resolved a file, so the rest measured an \
+         empty return — this benchmark is not measuring what it claims to"
+    );
+
+    println!(
+        "\n{FILES} files, {CHUNKS} chunks, {sources} sources: {:.1}ms ({:.0} ns/chunk)",
+        best * 1000.0,
+        best * 1e9 / f64::from(CHUNKS)
+    );
 }
