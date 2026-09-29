@@ -136,6 +136,93 @@ async fn seeking_before_the_start_is_refused() {
     assert!(error.to_string().contains("before the start"), "{error}");
 }
 
+/// Seeking past the end is refused rather than underflowing or wrapping.
+///
+/// The sibling type in the same module bounds its seek by its limit, and this one
+/// has to match: both are handed out by [`lepatch::storage::StorageGet`] as the
+/// reader for a blob, and `StorageGet::get` promises the stream is "bounded to
+/// the blob, so a blob cannot be used to read past itself". Only the sign of the
+/// target was checked, so a snapshot naming a `chunk_offset` past the end of the
+/// chunk it addresses made the subtraction below wrap.
+///
+/// A seek to a position beyond `usize::MAX` is the other half of the same gap,
+/// and it fails differently: `position` would not convert, and the fallback of 0
+/// silently rewound to the start of the payload and replayed it in full.
+#[tokio::test]
+async fn seeking_past_the_end_is_refused() {
+    let raw = payload(1_000);
+    let mut reader = DecompressReader::new(frame_of(&raw), 1_000).await.unwrap();
+
+    // One past the end. The end itself is in bounds and has its own test.
+    let error = reader
+        .seek(SeekFrom::Start(1_001))
+        .await
+        .expect_err("a seek one past the end should be refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error.to_string().contains("past the end"),
+        "the error should explain why: {error}"
+    );
+
+    let error = reader
+        .seek(SeekFrom::Start(1_000_000))
+        .await
+        .expect_err("a seek well past the end should be refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    // Relative seeks are bounded by the same rule, from either direction.
+    let error = reader
+        .seek(SeekFrom::End(1))
+        .await
+        .expect_err("a seek one past the end should be refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let error = reader
+        .seek(SeekFrom::Start(u64::MAX))
+        .await
+        .expect_err("a seek past the end should be refused, not rewound to zero");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+/// A refused seek leaves the reader where it was, still serving the right bytes.
+///
+/// The position is only assigned once the target is known to be in bounds, so a
+/// refusal cannot leave a reader mid-payload with a position that does not
+/// describe it.
+#[tokio::test]
+async fn a_refused_seek_does_not_move_the_reader() {
+    let raw = payload(1_000);
+    let mut reader = DecompressReader::new(frame_of(&raw), 1_000).await.unwrap();
+
+    reader.seek(SeekFrom::Start(400)).await.unwrap();
+    let _refused = reader.seek(SeekFrom::Start(5_000)).await;
+
+    assert_eq!(reader.stream_position().await.unwrap(), 400);
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail).await.unwrap();
+    assert_eq!(
+        tail,
+        &raw[400..],
+        "a refused seek should not disturb the payload"
+    );
+}
+
+/// Seeking to exactly the end is allowed, and reads as empty.
+///
+/// `len` is the first position with no byte behind it, so it is in bounds; only a
+/// position *past* it is not. Confining the bound to `>` rather than `>=` is what
+/// makes `write_file` able to seek to the end of a zero-length final slice.
+#[tokio::test]
+async fn seeking_to_the_end_is_allowed() {
+    let raw = payload(1_000);
+    let mut reader = DecompressReader::new(frame_of(&raw), 1_000).await.unwrap();
+
+    reader.seek(SeekFrom::Start(1_000)).await.unwrap();
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out).await.unwrap();
+    assert!(out.is_empty());
+}
+
 /// An empty payload is empty, not an error.
 ///
 /// A zero-length chunk is a real thing a chunker can produce, and a reader that

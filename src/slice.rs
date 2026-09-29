@@ -352,13 +352,17 @@ impl AsyncRead for DecompressReader {
         _cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let remaining = self.bytes.len() - usize::try_from(self.position).unwrap_or(0);
-        if remaining == 0 {
+        // `unwrap_or(self.bytes.len())` rather than `unwrap_or(0)`: a position
+        // this process cannot index is past the end by definition, so it reads
+        // as empty. Falling back to 0 would replay the payload from the start.
+        let Some(at) = usize::try_from(self.position)
+            .ok()
+            .filter(|at| *at < self.bytes.len())
+        else {
             return Poll::Ready(Ok(()));
-        }
+        };
 
-        let wanted = buf.remaining().min(remaining);
-        let at = usize::try_from(self.position).unwrap_or(0);
+        let wanted = buf.remaining().min(self.bytes.len() - at);
         buf.put_slice(&self.bytes[at..at + wanted]);
         self.position += u64::try_from(wanted).unwrap_or(0);
 
@@ -381,13 +385,30 @@ impl tokio::io::AsyncSeek for DecompressReader {
         };
 
         // The `i128` target makes a negative position impossible to convert, so
-        // the conversion is the bounds check.
-        self.position = u64::try_from(target).map_err(|_| {
+        // the conversion is the sign check. The upper bound is a separate
+        // question, and this reader is handed out by `StorageGet::get`, which
+        // promises a stream "bounded to the blob" — so a position past the
+        // payload is refused here rather than left to underflow in `poll_read`.
+        // `SliceAsyncReader` bounds its seek the same way, for the same reason.
+        let target = u64::try_from(target).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "cannot seek before the start of a payload",
             )
         })?;
+        if target > self.bytes.len() as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot seek to byte {target} of a {}-byte payload: it is past the end",
+                    self.bytes.len()
+                ),
+            ));
+        }
+
+        // Assigned only once known to be in bounds, so a refused seek leaves the
+        // reader exactly where it was.
+        self.position = target;
         Ok(())
     }
 
