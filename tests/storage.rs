@@ -6,7 +6,7 @@
 mod common;
 
 use lepatch::{
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet, StoragePut},
 };
 use std::fs;

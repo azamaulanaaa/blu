@@ -10,7 +10,7 @@
 //! # Layout
 //!
 //! A backup set is a sequence of numbered segment files, a per-version index file
-//! for each version, and a lock; see [`index::IndexSet`]. A segment is *sealed*
+//! for each version, and a lock; see [`layout::IndexSet`]. A segment is *sealed*
 //! once it is full and is never written to again, which is what makes a torn write
 //! possible only in the last one and corruption in the rest permanent and
 //! detectable.
@@ -58,7 +58,7 @@
 
 pub mod command;
 pub mod fsattr;
-pub mod index;
+pub mod layout;
 pub mod metadata;
 pub mod pack;
 pub mod progress;

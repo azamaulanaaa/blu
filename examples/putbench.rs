@@ -14,7 +14,7 @@ use std::io::Cursor;
 use std::time::Instant;
 
 use lepatch::{
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobStore, Compression, SegmentLimit, StoragePut},
 };
 

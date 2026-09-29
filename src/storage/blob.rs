@@ -59,7 +59,7 @@ use tracing::instrument;
 
 use super::record::{self, Kind, Placement, STORE_HEADER};
 use crate::{
-    index::IndexSet,
+    layout::IndexSet,
     slice::{DecompressReader, SliceAsyncReader},
     storage::{self, BlobId, Compression, SegmentLimit, StreamReadSeeker, VersionIndex},
 };
@@ -182,7 +182,7 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     ///
     /// The commit records are the answer; the index files are not consulted,
     /// because a version whose index write was abandoned still exists.
-    /// [`crate::index::IndexSet::indexed_versions`] is the file-name count, and
+    /// [`crate::layout::IndexSet::indexed_versions`] is the file-name count, and
     /// a lower bound on this.
     ///
     /// # Errors
@@ -800,14 +800,14 @@ impl BlobStore<true> {
         // into a segment no later run could read, taking a published version with
         // it, and the next `create_segment` would then fail `AlreadyExists` and
         // wedge the set. Refused here, where the message can name the cause.
-        if next > crate::index::MAX_SEGMENT {
+        if next > crate::layout::MAX_SEGMENT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "this set has reached {MAX_SEGMENT} segments, which is as many as the \
                      naming scheme can name; a run that fills segment {MAX_SEGMENT} cannot be \
                      completed, so nothing was written",
-                    MAX_SEGMENT = crate::index::MAX_SEGMENT
+                    MAX_SEGMENT = crate::layout::MAX_SEGMENT
                 ),
             ));
         }

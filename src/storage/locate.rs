@@ -29,7 +29,7 @@ use std::{
 };
 
 use crate::{
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobId, VersionIndex, record},
 };
 

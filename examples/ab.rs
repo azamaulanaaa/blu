@@ -82,7 +82,7 @@ use std::{fmt::Write as _, time::Instant};
 
 use lepatch::{
     command::{Options, backup},
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobStore, Compression, SegmentLimit},
 };
 

@@ -1,5 +1,14 @@
 //! On-disk layout of a versioned backup set.
 //!
+//! Named for what it is. This was `src/index.rs`, and it contains no index: the
+//! per-version index files are read by [`crate::storage::VersionIndex`] and
+//! checked by [`crate::storage::resolve`]. What is here is the *set* — the
+//! segments, the index file names, the lock, and the numbering that ties them
+//! together — which is the layout, and which the module's own first line has said
+//! all along. A module called `index` holding `IndexSet`, next to a `storage`
+//! module holding the actual `VersionIndex`, is the kind of thing a reader
+//! navigates around instead of through.
+//!
 //! A backup set is a sequence of numbered segments plus a lock, all named after a
 //! common base path:
 //!

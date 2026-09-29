@@ -19,7 +19,7 @@ use std::{
 use common::noisy;
 use lepatch::{
     command::PARTIAL_SUFFIX,
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobId, BlobStore, Codec, VersionIndex},
 };
 

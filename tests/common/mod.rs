@@ -15,7 +15,7 @@ use std::{
 
 use lepatch::{
     command::{Committed, Options, backup, restore},
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StreamReadSeeker},
 };
 

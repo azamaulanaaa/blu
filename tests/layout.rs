@@ -7,7 +7,7 @@
 //! the part that is still the set's own business — where its files go, how they
 //! are numbered, and how two writers are kept apart.
 
-use lepatch::index::{IndexSet, SEGMENT_DIGITS, SEGMENT_EXTENSION};
+use lepatch::layout::{IndexSet, SEGMENT_DIGITS, SEGMENT_EXTENSION};
 
 #[test]
 fn derived_paths_do_not_clobber_an_extension_in_the_base_name() {

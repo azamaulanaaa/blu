@@ -56,7 +56,7 @@ use std::{
 use criterion::{Criterion, Throughput};
 use lepatch::{
     command::{Options, backup, restore},
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobStore, Compression, SegmentLimit},
 };
 use tempfile::TempDir;

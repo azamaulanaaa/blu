@@ -8,7 +8,7 @@ use lepatch::{
         Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, backup, load_snapshot, lock_destination, restore,
         verify,
     },
-    index::IndexSet,
+    layout::IndexSet,
     storage,
 };
 use tracing::level_filters::LevelFilter;

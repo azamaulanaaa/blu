@@ -7,7 +7,7 @@ use std::fs;
 use common::noisy;
 use lepatch::{
     command::{Reason, Report, restore, verify},
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobId, BlobStore},
 };
 

@@ -24,7 +24,7 @@ mod common;
 use std::fs;
 
 use lepatch::{
-    index::IndexSet,
+    layout::IndexSet,
     storage::{BlobId, BlobStore, Compression, Resolved, SegmentLimit, VersionIndex, resolve},
 };
 

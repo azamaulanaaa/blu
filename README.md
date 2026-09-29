@@ -467,7 +467,7 @@ records, so `store.versions()` and `store.snapshot(n)` address them directly.
 
 `SegmentLimit` caps one file of the set; the default is 4 GiB and it can be changed
 between runs without rewriting anything. A set is `base.0000.bin`,
-`base.0001.bin` and so on, and `IndexSet::segments()` names them.
+`base.0001.bin` and so on, and `layout::IndexSet::segments()` names them.
 
 A read-only store takes no `SegmentLimit`, because a read never rolls over: the
 value a writer used is not needed to read what it wrote, and a parameter the
