@@ -369,6 +369,48 @@ pub enum Link {
     },
 }
 
+/// The platform attributes one entry carries, and a restore reapplies.
+///
+/// Permission bits and a modification time are the same kind of thing: something
+/// the platform may or may not have, recorded if it does and reapplied if it is
+/// there. They were two fields on every entry with two different conventions for
+/// "not there" — `mtime: Option<Timestamp>`, and `mode: u32` where `0` meant
+/// absent by convention and a documented no-op. A restore then took both and had
+/// to know which was which.
+///
+/// Now they are one struct, one `Option` for both, and [`fsattr::mode_of`]
+/// returns `Option<u32>` rather than inventing a `0`. "This platform has no
+/// permission bits" and "the permissions are the empty set" are different facts,
+/// and a `0` could not tell them apart.
+///
+/// The wire format is unchanged: a mode is written as a `u32` with `0` for absent,
+/// exactly as before, and read back the same way. A snapshot taken on a platform
+/// with no permission bits still encodes a `0` and still reapplies nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Attributes {
+    /// Permission bits, or `None` where the platform has none.
+    pub mode: Option<u32>,
+    /// Last modification time, or `None` where the platform reports none.
+    pub mtime: Option<Timestamp>,
+}
+
+impl Attributes {
+    /// Reapply both to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be found, or either attribute cannot
+    /// be applied — for instance because the caller does not own the file.
+    pub fn apply(&self, path: &std::path::Path) -> io::Result<()> {
+        crate::fsattr::set_mode(path, self.mode)?;
+        if let Some(mtime) = self.mtime {
+            crate::fsattr::set_mtime(path, mtime)?;
+        }
+
+        Ok(())
+    }
+}
+
 /// A regular file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
@@ -379,10 +421,8 @@ pub struct File {
     /// Restore creates the file at this length and truncates back to it at the
     /// end, so a gap in the recorded slices is zero-filled rather than detected.
     pub len: u64,
-    /// Platform permission bits, see [`crate::fsattr::mode_of`].
-    pub mode: u32,
-    /// Last modification time, if the platform reports one.
-    pub mtime: Option<Timestamp>,
+    /// The permissions and modification time to restore.
+    pub attrs: Attributes,
 }
 
 /// A directory.
@@ -390,10 +430,8 @@ pub struct File {
 pub struct Dir {
     /// Path relative to the backup root.
     pub path: PathBuf,
-    /// Platform permission bits, see [`crate::fsattr::mode_of`].
-    pub mode: u32,
-    /// Last modification time, if the platform reports one.
-    pub mtime: Option<Timestamp>,
+    /// The permissions and modification time to restore.
+    pub attrs: Attributes,
 }
 
 /// The placement of one chunk slice within one file: a chunk can be split across

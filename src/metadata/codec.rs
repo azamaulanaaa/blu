@@ -34,7 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Dir, File, FileChunk, Link, Snapshot, Timestamp};
+use super::{Attributes, Dir, File, FileChunk, Link, Snapshot, Timestamp};
 
 /// Refuse a count that cannot fit in the bytes left: every collection entry costs
 /// at least one byte on the wire, so a count above the remaining input is
@@ -321,15 +321,15 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
     for file in &snapshot.files {
         out.path(&file.path)?;
         out.u64(file.len);
-        out.u32(file.mode);
-        out.optional_timestamp(file.mtime);
+        out.u32(file.attrs.mode.unwrap_or(0));
+        out.optional_timestamp(file.attrs.mtime);
     }
 
     out.count(snapshot.dirs.len());
     for dir in &snapshot.dirs {
         out.path(&dir.path)?;
-        out.u32(dir.mode);
-        out.optional_timestamp(dir.mtime);
+        out.u32(dir.attrs.mode.unwrap_or(0));
+        out.optional_timestamp(dir.attrs.mtime);
     }
 
     out.count(snapshot.chunks.len());
@@ -369,21 +369,35 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
 
     let files = (0..reader.count()?)
         .map(|_| {
+            let path = reader.path()?;
+            let len = reader.u64()?;
+            // `0` on the wire means "no mode recorded", which is what a snapshot
+            // taken on a platform without permission bits has always encoded and
+            // what a restore has always declined to apply. The bytes are unchanged.
+            let mode = reader.u32()?;
+
             Ok(File {
-                path: reader.path()?,
-                len: reader.u64()?,
-                mode: reader.u32()?,
-                mtime: reader.optional_timestamp()?,
+                path,
+                len,
+                attrs: Attributes {
+                    mode: (mode != 0).then_some(mode),
+                    mtime: reader.optional_timestamp()?,
+                },
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
     let dirs = (0..reader.count()?)
         .map(|_| {
+            let path = reader.path()?;
+            let mode = reader.u32()?;
+
             Ok(Dir {
-                path: reader.path()?,
-                mode: reader.u32()?,
-                mtime: reader.optional_timestamp()?,
+                path,
+                attrs: Attributes {
+                    mode: (mode != 0).then_some(mode),
+                    mtime: reader.optional_timestamp()?,
+                },
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -455,14 +469,18 @@ mod tests {
         let mut snapshot = Snapshot::new();
         snapshot.dirs.push(Dir {
             path: PathBuf::from("a/b"),
-            mode: 0o755,
-            mtime: Some(Timestamp { secs: -5, nanos: 7 }),
+            attrs: Attributes {
+                mode: Some(0o755),
+                mtime: Some(Timestamp { secs: -5, nanos: 7 }),
+            },
         });
         snapshot.files.push(File {
             path: PathBuf::from("a/b/c.bin"),
             len: 300,
-            mode: 0o644,
-            mtime: None,
+            attrs: Attributes {
+                mode: Some(0o644),
+                mtime: None,
+            },
         });
         snapshot
             .chunks
@@ -565,8 +583,10 @@ mod tests {
             snapshot.files.push(File {
                 path: PathBuf::from(OsString::from_vec(vec![0xff, 0xfe, b'/'])),
                 len: 1,
-                mode: 0o644,
-                mtime: None,
+                attrs: Attributes {
+                    mode: Some(0o644),
+                    mtime: None,
+                },
             });
 
             let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");

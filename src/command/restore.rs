@@ -620,22 +620,12 @@ fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
 fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     for file in &snapshot.files {
         let path = resolve(root, &file.path, "a file")?;
-        apply(&path, file.mode, file.mtime)?;
+        file.attrs.apply(&path)?;
     }
 
     for dir in &snapshot.dirs {
         let path = resolve(root, &dir.path, "a directory")?;
-        apply(&path, dir.mode, dir.mtime)?;
-    }
-
-    Ok(())
-}
-
-/// Apply one entry's recorded mode and modification time.
-fn apply(path: &Path, mode: u32, mtime: Option<metadata::Timestamp>) -> io::Result<()> {
-    fsattr::set_mode(path, mode)?;
-    if let Some(mtime) = mtime {
-        fsattr::set_mtime(path, mtime)?;
+        dir.attrs.apply(&path)?;
     }
 
     Ok(())

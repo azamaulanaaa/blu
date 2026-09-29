@@ -1,7 +1,7 @@
 //! Tests for the snapshot encoding: framing, versioning and error reporting.
 
 use lepatch::{
-    metadata::{self, Error, Malformed, Snapshot},
+    metadata::{self, Attributes, Error, Malformed, Snapshot},
     storage::BlobId,
 };
 
@@ -10,8 +10,10 @@ fn sample() -> Snapshot {
     snapshot.files.push(metadata::File {
         path: "a/b.bin".into(),
         len: 10,
-        mode: 0o644,
-        mtime: None,
+        attrs: Attributes {
+            mode: Some(0o644),
+            mtime: None,
+        },
     });
     // A chunk is the BLAKE3 of its contents, and that is also how the store
     // finds it — so a snapshot records content identity and nothing about where

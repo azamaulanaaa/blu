@@ -21,7 +21,7 @@ use std::{
 
 use lepatch::{
     command::restore,
-    metadata::{Dir, File, FileChunk, Link, Snapshot},
+    metadata::{Attributes, Dir, File, FileChunk, Link, Snapshot},
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StoragePut},
 };
 
@@ -99,8 +99,10 @@ fn snapshot_with_file(path: &str) -> impl FnOnce(&mut Snapshot) {
         snapshot.files.push(File {
             path: PathBuf::from(&path),
             len: 6,
-            mode: 0o644,
-            mtime: None,
+            attrs: Attributes {
+                mode: Some(0o644),
+                mtime: None,
+            },
         });
         snapshot.file_chunks.push(FileChunk {
             chunk_index: 0,
@@ -171,8 +173,10 @@ async fn an_escaping_directory_path_is_refused() {
     let forged = Forged::new(|snapshot: &mut Snapshot| {
         snapshot.dirs.push(Dir {
             path: PathBuf::from("../../escaped-dir"),
-            mode: 0o755,
-            mtime: None,
+            attrs: Attributes {
+                mode: Some(0o755),
+                mtime: None,
+            },
         });
     })
     .await;
@@ -198,8 +202,10 @@ async fn an_escaping_hard_link_target_is_refused() {
         snapshot.files.push(File {
             path: PathBuf::from("innocent.txt"),
             len: 6,
-            mode: 0o644,
-            mtime: None,
+            attrs: Attributes {
+                mode: Some(0o644),
+                mtime: None,
+            },
         });
         snapshot.links.push(Link::Hard {
             path: PathBuf::from("sneaky.txt"),
@@ -320,8 +326,10 @@ async fn a_file_longer_than_its_chunks_is_refused() {
             path: PathBuf::from("a.bin"),
             // Six bytes are covered by the one slice below; this claims twenty.
             len: 20,
-            mode: 0o644,
-            mtime: None,
+            attrs: Attributes {
+                mode: Some(0o644),
+                mtime: None,
+            },
         });
         snapshot.file_chunks.push(FileChunk {
             chunk_index: 0,

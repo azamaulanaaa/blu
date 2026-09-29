@@ -38,7 +38,7 @@ use std::{hint::black_box, io::Cursor, path::PathBuf};
 
 use criterion::{Criterion, Throughput};
 use lepatch::{
-    metadata::{File, FileChunk, Snapshot},
+    metadata::{Attributes, File, FileChunk, Snapshot},
     reader::{Chunker, ChunkerConfig},
 };
 use tempfile::TempDir;
@@ -87,8 +87,10 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
     snapshot.files.push(File {
         path: PathBuf::from("dir/file.bin"),
         len: u64::try_from(FILE_BYTES).unwrap_or(0),
-        mode: 0o644,
-        mtime: None,
+        attrs: Attributes {
+            mode: Some(0o644),
+            mtime: None,
+        },
     });
 
     for i in 0..chunks {

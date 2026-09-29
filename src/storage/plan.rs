@@ -218,7 +218,7 @@ fn bad_index(snapshot: &Snapshot, slice: &FileChunk) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::Plan;
-    use crate::metadata::{File, FileChunk, Snapshot};
+    use crate::metadata::{Attributes, File, FileChunk, Snapshot};
     use crate::storage::{BlobId, Codec, Placement};
 
     fn chunk() -> BlobId {
@@ -244,8 +244,10 @@ mod tests {
         s.files.push(File {
             path: "a.bin".into(),
             len: 100,
-            mode: 0o644,
-            mtime: None,
+            attrs: Attributes {
+                mode: Some(0o644),
+                mtime: None,
+            },
         });
         s.chunks.push(chunk());
         s.chunks.push(BlobId::from_bytes([8u8; 32]));
@@ -300,8 +302,10 @@ mod tests {
         s.files.push(File {
             path: "a.bin".into(),
             len: 40,
-            mode: 0o644,
-            mtime: None,
+            attrs: Attributes {
+                mode: Some(0o644),
+                mtime: None,
+            },
         });
         s.chunks.push(chunk());
         s.file_chunks.push(FileChunk {

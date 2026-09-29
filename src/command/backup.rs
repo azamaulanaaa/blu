@@ -259,8 +259,10 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
             if meta.is_dir() {
                 snapshot.dirs.push(metadata::Dir {
                     path: relative_path,
-                    mode: fsattr::mode_of(&meta),
-                    mtime: fsattr::mtime_of(&meta),
+                    attrs: metadata::Attributes {
+                        mode: fsattr::mode_of(&meta),
+                        mtime: fsattr::mtime_of(&meta),
+                    },
                 });
                 return Ok(None);
             }
@@ -296,8 +298,10 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
             snapshot.files.push(metadata::File {
                 path: relative_path,
                 len: meta.len(),
-                mode: fsattr::mode_of(&meta),
-                mtime: fsattr::mtime_of(&meta),
+                attrs: metadata::Attributes {
+                    mode: fsattr::mode_of(&meta),
+                    mtime: fsattr::mtime_of(&meta),
+                },
             });
 
             Ok(Some(path))

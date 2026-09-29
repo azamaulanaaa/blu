@@ -10,20 +10,26 @@ use std::{fs, io, path::Path};
 
 use crate::metadata::Timestamp;
 
-/// Unix permission bits, or `0` on platforms without them.
+/// Unix permission bits, or `None` on a platform that has none.
+///
+/// `None` rather than `0`, because "this platform has no permission bits" and "the
+/// permissions are the empty set" are different facts and a restore acts on them
+/// differently — one is a no-op, the other is a set of permissions nobody has.
+/// A `0` could not say which, so it was a sentinel, and a sentinel in a public
+/// field is a thing every reader has to be told about.
 #[must_use]
-pub fn mode_of(meta: &fs::Metadata) -> u32 {
+pub fn mode_of(meta: &fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        meta.permissions().mode()
+        Some(meta.permissions().mode())
     }
 
     #[cfg(not(unix))]
     {
         let _ = meta;
-        0
+        None
     }
 }
 
@@ -49,22 +55,21 @@ pub fn mtime_of(meta: &fs::Metadata) -> Option<Timestamp> {
 
 /// Apply permission bits captured by [`mode_of`].
 ///
-/// A no-op where the platform has no equivalent, and where `mode` is `0` — which
-/// is what `mode_of` returns on such a platform, and what a non-unix snapshot
-/// records.
+/// A no-op where `mode` is `None` — which is what a platform without permission
+/// bits reports, and what a snapshot taken on one records.
 ///
 /// # Errors
 ///
 /// Returns an error if the path cannot be found, or its permissions cannot be
 /// changed — for instance because the caller does not own the file.
-pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+pub fn set_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        if mode == 0 {
+        let Some(mode) = mode else {
             return Ok(());
-        }
+        };
 
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
     }
