@@ -108,7 +108,6 @@ struct Reservation {
 /// `WRITE` is a const generic rather than two types so that a read-only handle
 /// cannot be used to write: the distinction is part of the type, so a restore
 /// path that only needs to read cannot accidentally append to the store.
-#[derive(Debug)]
 pub struct BlobStore<const WRITE: bool> {
     /// The set this store is, which is how its segments are named and found.
     set: IndexSet,
@@ -135,6 +134,32 @@ pub struct BlobStore<const WRITE: bool> {
     /// Not persisted: a run that wrote nothing has nothing to sync, and one that
     /// did has synced by the time it commits.
     dirty: Mutex<Vec<u32>>,
+}
+
+impl<const WRITE: bool> Debug for BlobStore<WRITE> {
+    /// Counts and paths, never the index.
+    ///
+    /// Hand-written because the derived version walks the whole in-memory
+    /// contents: a `{:?}` of a store with a million blobs is a line of a million
+    /// hashes, which is unreadable *and* slow to produce, and one stray `{:?}` in
+    /// a log is a multi-megabyte message about a backup. A count says everything
+    /// a diagnostic needs.
+    ///
+    /// The same reasoning `reader::Chunk` gives for its contents and
+    /// `reader::Chunker` for its upstream library — this is the third place, and
+    /// it is written down here because the alternative is a third derivation that
+    /// does not know about the other two.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let contents = Contents::lock(&self.contents);
+
+        f.debug_struct("BlobStore")
+            .field("write", &WRITE)
+            .field("set", &self.set)
+            .field("segments", &self.segments.len())
+            .field("blobs", &contents.blobs.len())
+            .field("commits", &contents.commits.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<const WRITE: bool> BlobStore<WRITE> {

@@ -9,6 +9,7 @@ use lepatch::{
     index::IndexSet,
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet, StoragePut},
 };
+use std::fs;
 use tokio::io::AsyncReadExt;
 
 /// `StreamReadSeeker` is not `Debug`, so `unwrap_err` is not available on
@@ -635,4 +636,79 @@ async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
             "blob {i} is wrong"
         );
     }
+}
+
+/// A store's `Debug` says how much it holds, not what.
+///
+/// The derived version walked the whole in-memory index, so a `{:?}` of a store
+/// with a few hundred blobs was a few hundred hashes on one line. That is a log
+/// line nobody can read, and it is produced at the moment something goes wrong —
+/// which is the only time anyone asks for it. The counts are what a diagnostic
+/// actually wants.
+///
+/// Two stores of very different sizes are formatted and the *length* compared, so
+/// the assertion is about the output not scaling with the store. A test that
+/// checked for one absence would pass on a store too small to trip it.
+#[tokio::test]
+async fn a_store_does_not_print_its_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    let blob = dir.path().join("store");
+
+    let few = {
+        fs::write(source.join("a.bin"), common::noisy(60_000)).unwrap();
+        common::run_backup(&source, &blob).await;
+        let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+            .await
+            .unwrap();
+        format!("{store:?}")
+    };
+
+    // A lot more of it.
+    for i in 0..40 {
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            common::untagged_stream(i, 90_000),
+        )
+        .unwrap();
+    }
+    common::run_backup(&source, &blob).await;
+    let many = {
+        let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+            .await
+            .unwrap();
+        format!("{store:?}")
+    };
+
+    assert!(
+        many.contains("blobs:") && many.contains("commits:"),
+        "a store should report what it holds: {many}"
+    );
+
+    // The point of the test: the output does not grow with the store. A derived
+    // `Debug` prints one entry per blob and a hash is 64 characters, so even this
+    // small a store would blow straight past a few hundred bytes.
+    let held = many
+        .split("blobs: ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    assert!(
+        held > 20,
+        "the fixture should hold a good many blobs for this to mean anything: {many}"
+    );
+
+    // Two stores, compared. Asserting only an upper bound would pass for a `Debug`
+    // that printed nothing at all; the second store is what makes "does not grow"
+    // a claim about growth rather than about brevity.
+    assert!(
+        many.len() < few.len() + 40,
+        "a store's Debug grew with the store: {} bytes for one blob against {held} blobs at {} \
+         bytes:\n{many}",
+        few.len(),
+        many.len(),
+    );
 }
