@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-use fastcdc::v2020::StreamCDC;
+use fastcdc::{ronomon, v2020::StreamCDC};
 use tracing::instrument;
 
 /// The part of one file that a chunk covers.
@@ -189,7 +189,7 @@ impl Read for GlobalStream {
 ///
 /// Boundaries come from the content, so inserting or removing bytes shifts only
 /// the chunks around the change rather than every chunk after it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkerConfig {
     /// No boundary is taken before this many bytes.
     pub min_size: u32,
@@ -197,6 +197,74 @@ pub struct ChunkerConfig {
     pub avg_size: u32,
     /// A boundary is forced once this many bytes have accumulated.
     pub max_size: u32,
+}
+
+impl ChunkerConfig {
+    /// Check these parameters are ones fastcdc will actually chunk with.
+    ///
+    /// fastcdc asserts its own bounds with `debug_assert!`, so they are **gone
+    /// from a release build**: a value it would refuse reaches the chunker and
+    /// produces chunks of a nonsense shape rather than an error. Validating here
+    /// is what makes a bad configuration a message instead of a corrupt backup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the bound that was not met, whether it is one of
+    /// fastcdc's own limits or the ordering the three sizes must satisfy.
+    pub fn validate(&self) -> io::Result<()> {
+        let (min, avg, max) = (
+            usize::try_from(self.min_size).unwrap_or(usize::MAX),
+            usize::try_from(self.avg_size).unwrap_or(usize::MAX),
+            usize::try_from(self.max_size).unwrap_or(usize::MAX),
+        );
+
+        let bounds = [
+            ("min_size", min, ronomon::MINIMUM_MIN, ronomon::MINIMUM_MAX),
+            ("avg_size", avg, ronomon::AVERAGE_MIN, ronomon::AVERAGE_MAX),
+            ("max_size", max, ronomon::MAXIMUM_MIN, ronomon::MAXIMUM_MAX),
+        ];
+
+        for (name, value, lowest, highest) in bounds {
+            if value < lowest || value > highest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{name} is {value} bytes, outside the {lowest}..={highest} that the \
+                         chunker accepts"
+                    ),
+                ));
+            }
+        }
+
+        // The ordering is not fastcdc's assertion but its algorithm's: a boundary
+        // is only looked for above `min`, and `avg` sets the masks the gear
+        // table is indexed with, so `avg <= min` chunks at `min` every time and
+        // `max < avg` can never reach the forced boundary. Both are silent, so
+        // both are refused.
+        if self.avg_size <= self.min_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "avg_size ({}) must be greater than min_size ({}), or every chunk comes out \
+                     the same length",
+                    self.avg_size, self.min_size
+                ),
+            ));
+        }
+
+        if self.max_size <= self.avg_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "max_size ({}) must be greater than avg_size ({}), or the forced boundary is \
+                     never reached",
+                    self.max_size, self.avg_size
+                ),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Splits a set of files into chunks, yielding each chunk's contents along with
@@ -220,9 +288,15 @@ impl Chunker {
     ///
     /// # Errors
     ///
-    /// Returns an error if any file cannot be stat'ed while being registered.
-    #[instrument(level = "trace", skip(paths), err)]
+    /// Returns an error if any file cannot be stat'ed while being registered, or
+    /// if `config` is not one the chunker can chunk with. The second check is
+    /// here rather than at the call site because it is the last point before the
+    /// parameters stop being checked at all: `fastcdc` asserts its bounds with
+    /// `debug_assert!`, which a release build does not contain.
+    #[instrument(level = "trace", skip(paths, config), err)]
     pub fn new(paths: Vec<PathBuf>, config: ChunkerConfig) -> io::Result<Self> {
+        config.validate()?;
+
         let registry = Arc::new(FileRegistry::new(paths.iter())?);
 
         // Bounds arrive as `u32` and are widened; a chunk longer than `u32::MAX` is
@@ -274,5 +348,87 @@ impl Iterator for Chunker {
             sources,
             data: cdc_chunk.data,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChunkerConfig;
+
+    /// A configuration the chunker accepts, for the cases that mutate one field.
+    fn good() -> ChunkerConfig {
+        ChunkerConfig {
+            min_size: 8 * 1024,
+            avg_size: 16 * 1024,
+            max_size: 64 * 1024,
+        }
+    }
+
+    /// A good configuration is accepted, so the cases below are testing the
+    /// checks rather than a configuration that was never valid.
+    #[test]
+    fn an_ordinary_configuration_validates() {
+        assert!(good().validate().is_ok());
+    }
+
+    /// Sizes below fastcdc's own floor are refused.
+    #[test]
+    fn a_min_size_below_the_floor_is_refused() {
+        let config = ChunkerConfig {
+            min_size: 1,
+            ..good()
+        };
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("min_size is 1 bytes"),
+            "the error should name the field and its value, got: {error}"
+        );
+    }
+
+    /// So are sizes above its ceiling.
+    #[test]
+    fn an_avg_size_above_the_ceiling_is_refused() {
+        let config = ChunkerConfig {
+            avg_size: 512 * 1024 * 1024,
+            max_size: 1024 * 1024 * 1024,
+            ..good()
+        };
+        assert_eq!(
+            config.validate().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// `avg <= min` is silent in fastcdc — every chunk comes out at `min` — so
+    /// it is refused rather than left to produce a uniform-chunked backup.
+    #[test]
+    fn an_avg_at_or_below_min_is_refused() {
+        let config = ChunkerConfig {
+            min_size: 32 * 1024,
+            avg_size: 32 * 1024,
+            ..good()
+        };
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("must be greater than min_size"),
+            "the error should say which way round they are, got: {error}"
+        );
+    }
+
+    /// Likewise `max <= avg`: the forced boundary is never reached, so `max`
+    /// does nothing and only the average is in play.
+    #[test]
+    fn a_max_at_or_below_avg_is_refused() {
+        let config = ChunkerConfig {
+            avg_size: 32 * 1024,
+            max_size: 32 * 1024,
+            ..good()
+        };
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("must be greater than avg_size"),
+            "the error should say which way round they are, got: {error}"
+        );
     }
 }
