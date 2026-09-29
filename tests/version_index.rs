@@ -25,14 +25,16 @@ use std::fs;
 
 use lepatch::{
     layout::IndexSet,
-    storage::{BlobId, BlobStore, Compression, Resolved, SegmentLimit, VersionIndex, resolve},
+    storage::{
+        BlobId, BlobStore, Compression, Read, Resolved, SegmentLimit, VersionIndex, resolve,
+    },
 };
 
 /// A set with `versions` versions in it, and a store handle for it.
 async fn set_with_versions(
     dir: &std::path::Path,
     versions: usize,
-) -> (std::path::PathBuf, BlobStore<false>) {
+) -> (std::path::PathBuf, BlobStore<Read>) {
     let source = common::source(dir);
     let blob = dir.join("store");
 

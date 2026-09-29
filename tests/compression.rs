@@ -25,7 +25,9 @@ use std::{fs, path::Path};
 
 use lepatch::{
     command::load_snapshot,
-    storage::{BlobStore, Codec, Compression, Plan, SegmentLimit, StorageGet, StoragePut},
+    storage::{
+        BlobStore, Codec, Compression, Plan, Read, SegmentLimit, StorageGet, StoragePut, Write,
+    },
 };
 
 /// Bytes that zstd cannot compress, so a frame is never smaller than the input.
@@ -51,13 +53,13 @@ fn compressible(len: usize) -> Vec<u8> {
 }
 
 /// A store opened for writing under one policy.
-async fn writable(blob: &Path, compression: Compression) -> BlobStore<true> {
+async fn writable(blob: &Path, compression: Compression) -> BlobStore<Write> {
     BlobStore::open_for_writing(blob, SegmentLimit::default(), compression)
         .await
         .unwrap()
 }
 
-async fn put(store: &BlobStore<true>, bytes: &[u8]) -> lepatch::storage::BlobId {
+async fn put(store: &BlobStore<Write>, bytes: &[u8]) -> lepatch::storage::BlobId {
     let id = common::id_of(bytes);
     store
         .put(&id, common::reader(bytes.to_vec()), common::len_of(bytes))
@@ -66,7 +68,7 @@ async fn put(store: &BlobStore<true>, bytes: &[u8]) -> lepatch::storage::BlobId 
     id
 }
 
-async fn read(store: &BlobStore<false>, id: &lepatch::storage::BlobId) -> Vec<u8> {
+async fn read(store: &BlobStore<Read>, id: &lepatch::storage::BlobId) -> Vec<u8> {
     use tokio::io::AsyncReadExt as _;
     let mut reader = store.get(id).await.unwrap();
     let mut out = Vec::new();

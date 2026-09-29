@@ -8,7 +8,7 @@ mod common;
 use lepatch::{
     command::load_snapshot,
     layout::IndexSet,
-    storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet, StoragePut},
+    storage::{BlobId, BlobStore, Compression, Read, SegmentLimit, StorageGet, StoragePut},
 };
 use std::fs;
 use tokio::io::AsyncReadExt;
@@ -24,7 +24,7 @@ fn expect_get_error(
     }
 }
 
-async fn read_all(store: &BlobStore<false>, id: &BlobId) -> std::io::Result<Vec<u8>> {
+async fn read_all(store: &BlobStore<Read>, id: &BlobId) -> std::io::Result<Vec<u8>> {
     let mut blob = store.get(id).await?;
     let mut buffer = Vec::new();
     blob.read_to_end(&mut buffer).await?;

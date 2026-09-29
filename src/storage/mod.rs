@@ -14,7 +14,7 @@ use std::{borrow::Cow, io, path::Path};
 
 use tokio::io::{AsyncRead, AsyncSeek};
 
-pub use blob::BlobStore;
+pub use blob::{BlobStore, Read, Write, WriteMode};
 pub use locate::{Resolved, resolve, resolve_with};
 pub use plan::{Plan, PlannedChunk};
 
@@ -383,6 +383,23 @@ const MIN_RECORD: u64 = record::MIN_HEADER as u64;
 /// A stream that is both [`AsyncRead`] and [`AsyncSeek`].
 ///
 /// Blanket-implemented, never by hand: use [`StreamReadSeeker`].
+///
+/// **This has to be `pub`, and the reason is the language rather than taste.** An
+/// audit proposed making it `pub(crate)`, on the grounds that nobody implements it
+/// by hand and so nobody needs to name it. The compiler disagrees, twice:
+///
+/// * A trait object may have only one *non-auto* trait as its principal trait, so
+///   the alias below cannot be written `Box<dyn AsyncRead + AsyncSeek + ..>` —
+///   that is E0225. This name is the only way to say "a stream that is both",
+///   which is what every caller of [`StorageGet::get`] receives.
+/// * And a `pub(crate)` trait in the signature of a `pub` one is E0446, because
+///   [`StorageGet`] is public and its `get` returns this.
+///
+/// So the trait is the minimum public surface that can express the type, rather
+/// than an interface left exposed by accident. A backend outside this crate does
+/// not need it: unsizing coercion is driven by the type being coerced *to*, so
+/// `Box::new(my_stream)` as a `StreamReadSeeker` needs no name for the trait —
+/// which is what the blanket impl is for.
 pub trait AsyncReadSeek: AsyncRead + AsyncSeek {}
 
 impl<T: AsyncRead + AsyncSeek + ?Sized> AsyncReadSeek for T {}

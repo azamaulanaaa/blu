@@ -14,7 +14,7 @@ use std::fs;
 
 use lepatch::{
     metadata::Snapshot,
-    storage::{BlobId, BlobStore, Plan, StorageGet},
+    storage::{BlobId, BlobStore, Plan, Read, StorageGet},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -26,7 +26,7 @@ async fn plan_of_latest(path: &std::path::Path) -> Plan {
 }
 
 /// The snapshot a store's latest version names.
-async fn latest_snapshot(store: &BlobStore<false>) -> Snapshot {
+async fn latest_snapshot(store: &BlobStore<Read>) -> Snapshot {
     use tokio::io::AsyncReadExt;
 
     let id = store.latest().expect("a committed version").1;

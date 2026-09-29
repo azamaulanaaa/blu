@@ -46,6 +46,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     io::{self, SeekFrom},
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
 };
@@ -102,12 +103,59 @@ struct Reservation {
     offset: u64,
 }
 
+/// Whether a handle may append to its store.
+///
+/// A marker trait rather than the `bool` it replaced, so the type says *which*
+/// instead of asking the reader to look up a convention. It carries the one
+/// derived fact the code needs — [`WriteMode::WRITES`], read in exactly one
+/// place, the hand-written `Debug` — and that is all it is for.
+///
+/// Not sealed, and deliberately. Nothing constructs a `BlobStore` except
+/// [`BlobStore::open_for_writing`] and [`BlobStore::open_for_reading`], and both
+/// fix the mode, so an implementation outside this crate cannot produce an
+/// instantiation that means anything. Sealing it would be a bound no caller could
+/// satisfy and a restriction nothing needed.
+pub trait WriteMode: Send + Sync + 'static {
+    /// Whether a handle with this mode may append to its store.
+    const WRITES: bool;
+}
+
+/// A store a run may append to. The yes to "may this handle write?".
+///
+/// Ask for one with [`BlobStore::open_for_writing`], which requires the write
+/// policies and so cannot be confused with the other constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Write;
+
+impl WriteMode for Write {
+    const WRITES: bool = true;
+}
+
+/// A store that may only be read. The no, and it is the type rather than a
+/// promise, so a restore path holding one cannot append and the mistake will not
+/// compile.
+///
+/// Ask for one with [`BlobStore::open_for_reading`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Read;
+
+impl WriteMode for Read {
+    const WRITES: bool = false;
+}
+
 /// A store of content-addressed blobs.
 ///
-/// `WRITE` is a const generic rather than two types so that a read-only handle
-/// cannot be used to write: the distinction is part of the type, so a restore
-/// path that only needs to read cannot accidentally append to the store.
-pub struct BlobStore<const WRITE: bool> {
+/// `W` is a [`WriteMode`] so that a read-only handle cannot be used to write: the
+/// distinction is part of the type, so a restore path that only needs to read
+/// cannot accidentally append to the store.
+///
+/// It was `BlobStore<true>` and `BlobStore<false>`, which is the same guarantee
+/// carrying no information — a `bool` in a type position has to be looked up in
+/// whatever doc comment is nearby, and `false` reads as "disabled" rather than
+/// "read-only". [`Read`] and [`Write`] say which. The enforcement is unchanged and
+/// is still structural: only `impl StoragePut for BlobStore<Write>` exists, so
+/// naming the mode and permitting the method are the same edit.
+pub struct BlobStore<W: WriteMode> {
     /// The set this store is, which is how its segments are named and found.
     set: IndexSet,
     /// Every segment on disk, in order. Fixed at open: the set only grows by
@@ -133,9 +181,17 @@ pub struct BlobStore<const WRITE: bool> {
     /// Not persisted: a run that wrote nothing has nothing to sync, and one that
     /// did has synced by the time it commits.
     dirty: Mutex<Vec<u32>>,
+    /// The mode, which selects the methods and so appears in no field.
+    ///
+    /// A `const WRITE: bool` parameter needs no such field, which is the one thing
+    /// the const generic was better at. `PhantomData<fn() -> W>` is the marker
+    /// that does not claim ownership and does not affect auto-trait derivation,
+    /// so `BlobStore<Write>` stays `Send` because its fields are, and a `W` that is
+    /// only ever a type parameter cannot make it `!Send` by existing.
+    mode: PhantomData<fn() -> W>,
 }
 
-impl<const WRITE: bool> Debug for BlobStore<WRITE> {
+impl<W: WriteMode> Debug for BlobStore<W> {
     /// Counts and paths, never the index.
     ///
     /// Hand-written because the derived version walks the whole in-memory
@@ -152,7 +208,7 @@ impl<const WRITE: bool> Debug for BlobStore<WRITE> {
         let contents = Contents::lock(&self.contents);
 
         f.debug_struct("BlobStore")
-            .field("write", &WRITE)
+            .field("write", &W::WRITES)
             .field("set", &self.set)
             .field("segments", &self.segments.len())
             .field("blobs", &contents.blobs.len())
@@ -161,7 +217,7 @@ impl<const WRITE: bool> Debug for BlobStore<WRITE> {
     }
 }
 
-impl<const WRITE: bool> BlobStore<WRITE> {
+impl<W: WriteMode> BlobStore<W> {
     /// The path of segment `segment`.
     ///
     /// Every segment but the last is sealed, so this names the only one a run
@@ -399,7 +455,7 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     }
 }
 
-impl BlobStore<true> {
+impl BlobStore<Write> {
     /// Open a set for writing, creating its first segment and recovering it if
     /// necessary.
     ///
@@ -450,11 +506,12 @@ impl BlobStore<true> {
             limit,
             compression,
             dirty: Mutex::new(Vec::new()),
+            mode: PhantomData,
         })
     }
 }
 
-impl BlobStore<false> {
+impl BlobStore<Read> {
     /// Open a set for reading.
     ///
     /// The set must already exist and must be a store: a path that is not one is
@@ -498,11 +555,12 @@ impl BlobStore<false> {
             limit: SegmentLimit::default(),
             compression: Compression::default(),
             dirty: Mutex::new(Vec::new()),
+            mode: PhantomData,
         })
     }
 }
 
-impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
+impl<W: WriteMode> storage::StorageGet for BlobStore<W> {
     /// Open the blob with this content hash.
     ///
     /// The stream yields the blob's **content**, decompressed if it is stored
@@ -579,7 +637,7 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
     }
 }
 
-impl storage::StoragePut for BlobStore<true> {
+impl storage::StoragePut for BlobStore<Write> {
     /// Store `len` bytes whose content hashes to `id`.
     ///
     /// A blob the store already holds is not written again, so the caller can hand
@@ -832,7 +890,7 @@ fn write_index(set: &IndexSet, index: VersionIndex) -> io::Result<()> {
     index.write_atomic(&set.index_path(index.version))
 }
 
-impl BlobStore<true> {
+impl BlobStore<Write> {
     /// Claim `total` bytes for a record, rolling into a new segment if it will not
     /// fit in the last one.
     ///
@@ -957,7 +1015,7 @@ impl BlobStore<true> {
     }
 }
 
-impl BlobStore<true> {
+impl BlobStore<Write> {
     /// Write an index file for every version this store holds.
     ///
     /// Everything here is derived from the commit records, so a set with no index
@@ -1047,7 +1105,7 @@ struct Scanned {
     /// not reachable and did not say what it meant: `write_into` was documented
     /// as "`u32::MAX`, and a reader never uses it", and the reader set it twice —
     /// once initialising the struct and once again at the end with a comment
-    /// explaining that the value was never read. A `BlobStore<false>` then held
+    /// explaining that the value was never read. A `BlobStore<Read>` then held
     /// a `Reservation` built from a segment number that does not exist, plus
     /// `SegmentLimit` and `Compression` fields defaulted to values it ignores.
     append: Option<Reservation>,

@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use lepatch::{
     layout::IndexSet,
-    storage::{BlobStore, Compression, SegmentLimit, StoragePut},
+    storage::{BlobStore, Compression, SegmentLimit, StoragePut, Write},
 };
 
 const CHUNK: usize = 64 * 1024;
@@ -26,7 +26,7 @@ fn payload(seed: u8) -> Vec<u8> {
     vec![seed; CHUNK]
 }
 
-async fn put_all(store: std::sync::Arc<BlobStore<true>>) -> f64 {
+async fn put_all(store: std::sync::Arc<BlobStore<Write>>) -> f64 {
     let start = Instant::now();
 
     let mut in_flight = Vec::new();

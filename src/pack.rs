@@ -169,7 +169,7 @@ impl Pack {
     ///
     /// Generic over [`StorageGet`] because that is the whole of what it needs, and
     /// because every sibling command already is. It was bound to a concrete
-    /// `&BlobStore<false>`, which meant `lepatch pack` was the one command that
+    /// `&BlobStore<Read>`, which meant `lepatch pack` was the one command that
     /// could not be pointed at any other backend — a read-only store over a
     /// directory, say, or a store held in memory. A pack is derived output, so
     /// there is no reason it should care where the bytes came from.

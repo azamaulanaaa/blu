@@ -351,7 +351,7 @@ fn interrupted() -> std::io::Error {
 /// exists if and only if the store holds the commit record that published it.
 fn select_version(
     set: &IndexSet,
-    store: &storage::BlobStore<false>,
+    store: &storage::BlobStore<storage::Read>,
     requested: Option<u32>,
 ) -> std::io::Result<(u32, storage::BlobId)> {
     match requested {
