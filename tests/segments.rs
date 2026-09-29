@@ -18,7 +18,10 @@ use std::{fs, path::Path};
 
 use lepatch::{
     layout::IndexSet,
-    storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet, StoragePut},
+    storage::{
+        BlobId, BlobStore, Compression, Resolved, SegmentLimit, StorageGet, StoragePut, resolve,
+        resolve_with,
+    },
 };
 
 /// A limit small enough that a few hand-placed blobs roll over.
@@ -577,4 +580,117 @@ fn a_gap_in_the_segments_is_refused() {
         message.contains("missing segment 1"),
         "the refusal should name the segment that is absent: {message}"
     );
+}
+
+/// The in-memory commit log and the one read from the file must agree.
+///
+/// `resolve_with` exists so a store can answer with the log it already has rather
+/// than re-reading a segment per version. That is only safe if the two agree for
+/// every version of a set, and the interesting cases are the ones where a naive
+/// offset calculation would not: a version in a *later* segment, so the slice has
+/// to start after another segment's records, and a set whose segments hold
+/// different numbers of commits.
+///
+/// `store.snapshot_via_index` goes through the in-memory path and
+/// [`resolve`] through the file, so comparing them across a rollover compares the
+/// two without reaching inside either.
+#[tokio::test]
+async fn an_in_memory_commit_log_agrees_with_the_one_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let blob = dir.path().join("store");
+
+    // A small limit, so the set really does roll over and the segments hold
+    // different numbers of commits.
+    let small = SegmentLimit::new(256 * 1024);
+    for i in 0..12 {
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            common::untagged_stream(u8::try_from(i).unwrap_or(0), 90_000),
+        )
+        .unwrap();
+        common::run_backup_limited(&source, &blob, small).await;
+    }
+
+    let set = IndexSet::new(&blob);
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    assert!(
+        store.segment_count() > 1,
+        "the set should have rolled over, or this is not testing the offset"
+    );
+
+    let versions = u32::try_from(store.versions().unwrap().len()).unwrap_or(0);
+    assert_eq!(versions, 12, "every backup should be a version");
+
+    for v in 1..=versions {
+        // The file path: reads the named segment and checks the record there.
+        let from_disk = resolve(&set, v, versions);
+
+        // The in-memory path: the same check against the list this store built
+        // when it opened.
+        let from_memory = resolve_with(&set, v, versions, |segment| {
+            let commits = store.segment_commits(segment);
+            (!commits.is_empty()).then_some(commits)
+        });
+
+        assert_eq!(
+            from_memory, from_disk,
+            "version {v}: the in-memory commit log and the one on disk disagree"
+        );
+        assert!(
+            matches!(from_disk, Resolved::Confirmed { .. }),
+            "version {v} should resolve from its own index file"
+        );
+    }
+}
+
+/// The check is made through the index file, not rescued by a fallback.
+///
+/// `snapshot_via_index` falls back to the store's own log when the index file
+/// will not do, so asking it for every version proves only that the set is
+/// readable. This compares the two paths directly, which is the property that
+/// matters: if the in-memory offset arithmetic were wrong, the two would differ
+/// for every version after the first segment — and a test that could not tell
+/// that apart from a working fallback would pass on the broken version.
+#[tokio::test]
+async fn every_version_resolves_the_same_way_from_memory_and_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let blob = dir.path().join("store");
+
+    let small = SegmentLimit::new(256 * 1024);
+    for i in 0..10 {
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            common::untagged_stream(u8::try_from(i).unwrap_or(0), 80_000),
+        )
+        .unwrap();
+        common::run_backup_limited(&source, &blob, small).await;
+    }
+
+    let set = IndexSet::new(&blob);
+    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let versions = u32::try_from(store.versions().unwrap().len()).unwrap_or(0);
+
+    assert!(
+        store.segment_count() > 1,
+        "the set should have rolled over, or the offsets being checked are all zero"
+    );
+
+    for v in 1..=versions {
+        let from_disk = resolve(&set, v, versions);
+        let from_memory = resolve_with(&set, v, versions, |segment| {
+            let commits = store.segment_commits(segment);
+            (!commits.is_empty()).then_some(commits)
+        });
+
+        assert_eq!(
+            from_memory, from_disk,
+            "version {v}: the in-memory log and the one on disk disagree"
+        );
+        assert!(
+            matches!(from_disk, Resolved::Confirmed { .. }),
+            "version {v} should be confirmed by its own index file"
+        );
+    }
 }

@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use blob::BlobStore;
-pub use locate::{Resolved, resolve};
+pub use locate::{Resolved, resolve, resolve_with};
 pub use plan::{Plan, Planned};
 
 pub use version_index::VersionIndex;

@@ -252,10 +252,98 @@ impl<const WRITE: bool> BlobStore<WRITE> {
     ///
     /// The error [`BlobStore::snapshot`] would give, so a caller cannot tell which
     /// path answered.
+    /// The snapshot hash of every commit record in `segment`, in log order.
+    ///
+    /// The in-memory twin of what [`resolve`](crate::storage::resolve) reads off
+    /// the disk, and the same list: this store's open already scanned for it, so
+    /// answering from here costs nothing where reading the file costs a walk of
+    /// every record header in the segment.
+    ///
+    /// Empty for a segment this store does not know, which is what
+    /// [`resolve_with`](crate::storage::resolve_with) treats as "no usable log".
+    ///
+    /// A `Vec` by value rather than a borrow, because the borrow would have to
+    /// outlive a `MutexGuard` and be handed to a caller that cannot hold one. A
+    /// segment's commit list is a handful of hashes, so the copy is not the thing
+    /// worth avoiding — the file read is.
+    #[must_use]
+    pub fn segment_commits(&self, segment: u32) -> Vec<BlobId> {
+        let contents = Contents::lock(&self.contents);
+
+        // A segment's records start after every earlier segment's. Counted rather
+        // than kept: `commits_per_segment` is what the scan built, and a second
+        // running offset would be a second thing to keep in step with it.
+        let start: u64 = contents
+            .commits_per_segment
+            .iter()
+            .filter(|(other, _)| **other < segment)
+            .map(|(_, count)| u64::from(*count))
+            .sum();
+
+        let Ok(first) = usize::try_from(start) else {
+            return Vec::new();
+        };
+        let count = usize::try_from(
+            contents
+                .commits_per_segment
+                .get(&segment)
+                .copied()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let Some(end) = first.checked_add(count) else {
+            return Vec::new();
+        };
+
+        contents
+            .commits
+            .get(first..end)
+            .map_or_else(Vec::new, <[BlobId]>::to_vec)
+    }
+
+    /// The snapshot a version names, via the per-version index file when it
+    /// verifies.
+    ///
+    /// The file is **checked, not believed**: a version this set holds, a segment
+    /// that exists, and a commit record there with the hash the file claims.
+    /// Anything else falls back to [`BlobStore::snapshot`], so a stale, edited or
+    /// copied index costs a scan rather than correctness.
+    ///
+    /// This is not the fast path for a restore: a restore needs every chunk a
+    /// snapshot names, and those live in the blob index a scan builds. What it
+    /// removes is the scan for the *version list* — and, since it answers the
+    /// check from [`BlobStore::segment_commits`], the read of the named segment
+    /// that the check used to make. Resolving N versions against one segment used
+    /// to read that segment N times, and `lepatch versions` resolves one version
+    /// at a time.
+    ///
+    /// The fallback is logged, because a caller asking this is trying to avoid a
+    /// scan and needs to know it did not get one: `debug` when no file exists, the
+    /// ordinary case for a version written before the set's last run, and `warn`
+    /// when one disagrees with the store.
+    ///
+    /// The error is the one [`BlobStore::snapshot`] would give, so a caller cannot
+    /// tell which path answered.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::NotFound`] if the store holds no such version, naming both
+    /// the version asked for and how many it does hold — which is the error the
+    /// fallback gives, and the only one this can give, since a version the set
+    /// does not hold is a version no index file can confirm.
     pub fn snapshot_via_index(&self, version: u32) -> io::Result<BlobId> {
         let versions = u32::try_from(Contents::lock(&self.contents).commits.len()).unwrap_or(0);
 
-        let resolved = storage::resolve(&self.set, version, versions);
+        // The lock is taken inside the callee rather than captured into the
+        // closure, and that is not a style preference: a captured guard would be
+        // held across `resolve_with`, which reads a file, so a concurrent `put`
+        // would block on I/O rather than on the short critical section it was
+        // written for.
+        let store = self;
+        let resolved = storage::resolve_with(&self.set, version, versions, move |segment| {
+            let commits = store.segment_commits(segment);
+            (!commits.is_empty()).then_some(commits)
+        });
         if let Some((_, snapshot)) = resolved.confirmed() {
             return Ok(snapshot);
         }

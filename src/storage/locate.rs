@@ -72,8 +72,48 @@ impl Resolved {
 ///
 /// No I/O proportional to the size of the set: one small file, and the commit
 /// records of the one segment it named.
+///
+/// **That last part is the expensive half, and a caller that already has the
+/// commit log should not pay for it again.** Reading a segment's commits walks
+/// every record header in it, so resolving N versions against one segment reads
+/// that segment N times — and `lepatch versions` resolves one version at a time
+/// through this function. [`BlobStore`](crate::storage::BlobStore) holds the whole
+/// log in memory already, because its own open scans for it, so it uses
+/// [`resolve_with`] and skips the file entirely.
 #[must_use]
 pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
+    resolve_with(set, version, versions, |segment| {
+        read_commits(&set.segment_path(segment), segment).ok()
+    })
+}
+
+/// [`resolve`], with the commit log supplied rather than read.
+///
+/// `commits` is called with the segment number the index named, and answers with
+/// that segment's commit records in order, or `None` if they cannot be had — a
+/// missing segment, an unreadable one, or one whose header does not name the
+/// number it was asked for. The first two are what the caller would otherwise
+/// have to check separately; they are checked *here* so that a caller supplying
+/// its own log cannot accidentally skip the checks that make an index
+/// trustworthy.
+///
+/// A closure rather than a `&[BlobId]` because the log a caller already has is
+/// usually a slice of a longer one — a store's commits are one sequence across
+/// every segment — and a slice parameter would make every caller do the offset
+/// arithmetic that the ordinal is defined in terms of.
+///
+/// # Panics
+///
+/// Never. A hostile index naming an enormous `ordinal` cannot overflow anything
+/// here: the position is used to index a slice, which returns `None` rather than
+/// wrapping.
+#[must_use]
+pub fn resolve_with(
+    set: &IndexSet,
+    version: u32,
+    versions: u32,
+    commits: impl Fn(u32) -> Option<Vec<BlobId>>,
+) -> Resolved {
     // Absent, truncated, wrong checksum and unreadable are all the same to a
     // caller with a slow path: no usable index.
     let Some(index) = VersionIndex::read(&set.index_path(version)) else {
@@ -84,12 +124,14 @@ pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
         return Resolved::Disagrees;
     }
 
-    let segment_path = set.segment_path(index.segment);
-    if !segment_path.is_file() {
+    // The segment has to be there. A caller supplying its own log has usually
+    // already established that, but "usually" is not a check, and the cost of
+    // this one is a `stat` against a file the caller is about to trust.
+    if !set.segment_path(index.segment).is_file() {
         return Resolved::Disagrees;
     }
 
-    let Ok(commits) = read_commits(&segment_path, index.segment) else {
+    let Some(commits) = commits(index.segment) else {
         return Resolved::Disagrees;
     };
 
