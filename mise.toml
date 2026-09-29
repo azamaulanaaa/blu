@@ -4,8 +4,18 @@
 #   mise install     # fetch the tools below
 #   mise run check   # everything
 #
-# Tasks mirror the CI jobs one-for-one, so anything CI enforces can be run
-# locally with the same name and the same arguments.
+# Tasks are named after the CI jobs that run the same check, so a failure in CI
+# is reproducible locally with `mise run <name>`. They are not identical, and the
+# differences are in the direction of being stricter locally:
+#
+#   * CI adds `--locked`, so a task can succeed against a Cargo.lock that CI would
+#     reject;
+#   * `lint` runs clippy bare, where CI runs it with `-D warnings` — which is what
+#     covers the lint *groups'* own warnings, and anything rustc emits that is not
+#     in the set declared under `[lints]` in Cargo.toml. A violation of a declared
+#     lint fails either way, because the levels live in the manifest.
+#
+# So a green `mise run check` is necessary and not sufficient; CI is the gate.
 
 [tools]
 rust = { version = "stable", components = "rust-analyzer" }

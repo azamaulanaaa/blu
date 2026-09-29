@@ -22,9 +22,12 @@
 #   1. the `checks` job, which runs the full CI suite and gates publishing on it
 #   2. `checks` added to the `needs:` of `build-local-artifacts`
 #
-# The `release-config` job in ci.yml runs `dist generate --check` and fails if
-# this file has drifted from `dist-workspace.toml`, so a regeneration that
-# forgets these edits is caught rather than silently dropping the gate.
+# The `release-config` job in ci.yml does *not* run `dist generate --check` —
+# this file is generated and then hand-edited, so its bytes cannot match a
+# regeneration. What that job does check is the part a regeneration would drop:
+# that this workflow still gates publishing on the `checks` job. So a
+# regeneration that forgets these edits is caught by a test of the gate, not by a
+# diff of the file.
 # ---------------------------------------------------------------------------
 
 name: Release

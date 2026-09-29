@@ -20,10 +20,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Three of the eight jobs compile cargo-llvm-cov or cargo-dist from source, and the
-# test matrix is three operating systems, so a superseded run is real minutes of
-# runner time. Without this, pushing a second commit while the first is still
-# running queues the entire suite again and both results are equally irrelevant.
+# The suite compiles cargo-llvm-cov and cargo-dist from source, and runs a
+# release-config check that installs cargo-dist, so a superseded run is real
+# minutes of runner time. Without this, pushing a second commit while the first
+# is still running queues the entire suite again and both results are equally
+# irrelevant.
 #
 # Not set for tag pushes: a release run must finish even if something is pushed
 # meanwhile, so it gets its own group that nothing cancels.
