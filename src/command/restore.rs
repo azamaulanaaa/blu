@@ -12,7 +12,7 @@ use crate::{
     metadata::{self, Snapshot},
     progress::Progress,
     slice,
-    storage::{self, StreamReadSeeker, hex},
+    storage::{self, StreamReadSeeker},
 };
 
 /// Files to write at once. Restore is almost entirely waiting, so several in
@@ -80,7 +80,10 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         .map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("refusing to restore snapshot {}: {e}", hex(&snapshot_id)),
+                format!(
+                    "refusing to restore snapshot {}: {e}",
+                    storage::Hex(&snapshot_id)
+                ),
             )
         })?;
 
@@ -89,7 +92,10 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     check_paths(&snapshot).map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("refusing to restore snapshot {}: {e}", hex(&snapshot_id)),
+            format!(
+                "refusing to restore snapshot {}: {e}",
+                storage::Hex(&snapshot_id)
+            ),
         )
     })?;
 
@@ -481,7 +487,7 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
                 io::ErrorKind::UnexpectedEof,
                 format!(
                     "chunk {} is shorter than the {length} bytes recorded for {}",
-                    hex(chunk),
+                    storage::Hex(chunk),
                     file.path.display()
                 ),
             ));

@@ -177,14 +177,22 @@ const MIN_RECORD: u64 = 6 + 2 + 32 + 8;
 
 /// A [`BlobId`] in lowercase hex, for messages a person can read off a screen
 /// and compare against a `blake3` sum they ran themselves.
-#[must_use]
-pub fn hex(id: &BlobId) -> String {
-    use std::fmt::Write as _;
+///
+/// A `Display` rather than a function returning a `String`, because every one of
+/// its seventeen call sites put the result straight into a `format!`, a
+/// `tracing` field or a line of stdout — so the sixty-four-byte `String` was
+/// allocated and then copied into a larger one, sixteen times over, to produce
+/// text nobody reads twice.
+#[derive(Debug, Clone, Copy)]
+pub struct Hex<'a>(pub &'a BlobId);
 
-    id.iter().fold(String::with_capacity(64), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
+impl std::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
 }
 
 /// A stream that is both [`AsyncRead`] and [`AsyncSeek`].

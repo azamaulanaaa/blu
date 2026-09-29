@@ -91,9 +91,9 @@ async fn a_payload_that_compresses_is_stored_compressed() {
     assert_eq!(placement.codec, Codec::Zstd);
     assert_eq!(placement.raw_len, common::len_of(&payload));
     assert!(
-        placement.len < placement.raw_len,
+        placement.stored_len < placement.raw_len,
         "a compressible payload was stored as {} bytes of {}",
-        placement.len,
+        placement.stored_len,
         placement.raw_len
     );
 
@@ -122,7 +122,7 @@ async fn a_payload_that_does_not_compress_is_stored_raw() {
         Codec::Raw,
         "incompressible content was wrapped in a frame that made it bigger"
     );
-    assert_eq!(placement.len, placement.raw_len);
+    assert_eq!(placement.stored_len, placement.raw_len);
 
     let reader = BlobStore::<false>::open(&blob).await.unwrap();
     assert_eq!(read(&reader, &id).await, payload);
@@ -395,7 +395,7 @@ async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
     // saving is. This asserts the two facts the design rests on, separately: the
     // plan is in content bytes, and the records behind it are smaller.
     let content: u64 = plan.chunks().iter().map(|c| c.length).sum();
-    let on_disk: u64 = plan.chunks().iter().map(|c| c.placement.len).sum();
+    let on_disk: u64 = plan.chunks().iter().map(|c| c.placement.stored_len).sum();
 
     assert_eq!(content, plan.total_bytes());
     assert!(

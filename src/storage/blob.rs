@@ -203,7 +203,7 @@ impl<const WRITE: bool> BlobStore<WRITE> {
                     io::ErrorKind::NotFound,
                     format!(
                         "this store does not hold a blob hashing to {}",
-                        storage::hex(id)
+                        storage::Hex(id)
                     ),
                 )
             })
@@ -415,9 +415,12 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
         //
         // This is the *stored* length: it is the span the record occupies on disk,
         // and a compressed record is shorter than its content.
-        let end = placement.offset.checked_add(placement.len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "a blob's range overflows")
-        })?;
+        let end = placement
+            .offset
+            .checked_add(placement.stored_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "a blob's range overflows")
+            })?;
 
         if end > len {
             return Err(io::Error::new(
@@ -444,7 +447,7 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
                 // stored length so a damaged record cannot pull in its neighbour,
                 // and the decode is told the expected size so a frame that does
                 // not produce it is refused rather than handed on short.
-                let mut frame = vec![0u8; usize::try_from(placement.len).unwrap_or(0)];
+                let mut frame = vec![0u8; usize::try_from(placement.stored_len).unwrap_or(0)];
                 file.read_exact(&mut frame).await?;
 
                 let reader = DecompressReader::new(frame, placement.raw_len).await?;
@@ -466,7 +469,7 @@ impl storage::StoragePut for BlobStore<true> {
     #[instrument(skip_all, err)]
     async fn put(&self, id: &BlobId, mut reader: StreamReadSeeker, len: u64) -> io::Result<()> {
         if Contents::lock(&self.contents).blobs.contains_key(id) {
-            tracing::trace!(already = %storage::hex(id), "already stored");
+            tracing::trace!(already = %storage::Hex(id), "already stored");
             return Ok(());
         }
 
@@ -511,7 +514,7 @@ impl storage::StoragePut for BlobStore<true> {
                 io::ErrorKind::InvalidData,
                 format!(
                     "the content does not hash to {}, so it was not stored",
-                    storage::hex(id)
+                    storage::Hex(id)
                 ),
             ));
         }
@@ -560,7 +563,10 @@ impl storage::StoragePut for BlobStore<true> {
             Placement {
                 segment: reservation.segment,
                 offset: payload_offset,
-                len: stored_len,
+                stored_len,
+                // `len` above is the *content* length, which is why the two
+                // fields are named for what they hold rather than for how Rust
+                // spells `Vec::len`.
                 raw_len: len,
                 codec,
             },

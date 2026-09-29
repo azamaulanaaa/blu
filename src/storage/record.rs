@@ -190,7 +190,12 @@ pub struct Placement {
     /// Bytes the payload occupies in the file, which is what a reader must skip
     /// and what bounds the bytes it reads. Not the content length for a compressed
     /// blob — that is [`Placement::raw_len`].
-    pub len: u64,
+    ///
+    /// Named for the length rather than `len`, because a store has two of them
+    /// and the shorter name was the one that got read as the other. The two are
+    /// equal for an uncompressed blob and different for every compressed one, so
+    /// nothing about the type distinguishes them; only the name does.
+    pub stored_len: u64,
     /// Bytes the payload is once decompressed.
     ///
     /// The one to compare against a length a snapshot recorded: a snapshot's
@@ -495,7 +500,7 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
                     Placement {
                         segment,
                         offset: header.payload_offset,
-                        len: header.stored_len,
+                        stored_len: header.stored_len,
                         raw_len: header.raw_len,
                         codec: header.codec,
                     },

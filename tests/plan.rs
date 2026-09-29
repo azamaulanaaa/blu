@@ -71,8 +71,15 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
 
     // Every planned chunk is readable at the place the plan says it is, and has
     // the length the plan claims.
+    //
+    // `raw_len`, not `stored_len`: a plan's `length` is in content bytes,
+    // because it describes a file rather than a payload, and for a compressed
+    // blob the content is *longer* than what is on disk. This asserted
+    // `length <= stored_len`, which is true for uncompressed content and false
+    // for compressed — so it only passed because this fixture happens to be
+    // incompressible.
     for chunk in plan.chunks() {
-        assert!(chunk.length <= chunk.placement.len);
+        assert!(chunk.length <= chunk.placement.raw_len);
         let mut reader = store.get(&chunk.id).await.unwrap();
         let mut buffer = vec![0u8; usize::try_from(chunk.length).unwrap()];
         reader.read_exact(&mut buffer).await.unwrap();
@@ -134,7 +141,7 @@ async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
     for pair in chunks.windows(2) {
         let (before, after) = (&pair[0], &pair[1]);
         if before.placement.segment == after.placement.segment
-            && before.placement.offset + before.placement.len == after.placement.offset
+            && before.placement.offset + before.placement.stored_len == after.placement.offset
         {
             touching += 1;
         }

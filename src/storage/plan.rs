@@ -97,7 +97,7 @@ impl Plan {
                     format!(
                         "a snapshot needs {} bytes of chunk {} but the store holds {held}",
                         length,
-                        crate::storage::hex(id)
+                        crate::storage::Hex(id)
                     ),
                 ));
             }
@@ -188,7 +188,7 @@ mod tests {
         Placement {
             segment: 0,
             offset,
-            len,
+            stored_len: len,
             // These tests are about a plan's ordering and coverage, which do not
             // depend on how a payload is stored, so every placement here is raw
             // and its raw length is its length on disk.
