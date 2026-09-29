@@ -352,13 +352,16 @@ fn commit_ready<S>(
                 .map_err(io::Error::other)?;
 
             let Some(&index) = pipeline.file_index.get(relative) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "chunk source {} is not a file in the snapshot",
-                        source.path.display()
-                    ),
-                ));
+                // `Error::other`, not `NotFound`. Nothing is missing from the
+                // filesystem: the walk handed back a path that is not in the
+                // snapshot, which is an inconsistency between two things this run
+                // built. Calling it `NotFound` claims a cause it does not have,
+                // and `NotFound` is a kind callers branch on — `run_versions`
+                // swallowed one until recently, and would have swallowed this.
+                return Err(io::Error::other(format!(
+                    "chunk source {} is not a file in the snapshot",
+                    source.path.display()
+                )));
             };
 
             snapshot.file_chunks.push(metadata::FileChunk {

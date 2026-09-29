@@ -332,6 +332,14 @@ async fn stop_signal() -> std::io::Error {
 /// The error a stopped run reports. Not a success and not a silent exit: the work
 /// was abandoned. What is guaranteed is that nothing was *published* — a backup's
 /// index is filled in only on completion, and a restore's claim is released.
+///
+/// `Interrupted` is worth the scrutiny because the crate is wary of naming a kind
+/// it does not mean: `NotFound` is what the operating system returns for a file
+/// that has gone, so a caller cannot tell one of ours from a real one, and that
+/// ambiguity has cost a swallowed error before. `Interrupted` has no such
+/// collision — `std` retries `EINTR` itself, so no filesystem call in this crate
+/// ever produces it. Whoever gets this error knows it means a deliberate stop and
+/// nothing else, which is exactly what the message says.
 fn interrupted() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Interrupted,
@@ -433,12 +441,19 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     // The hashes, which the file names cannot supply. Opened read-only, because
     // opening for writing truncates an unfinished run and listing must not be the
     // thing that discards it. A set with every segment but no committed version
-    // lists empty rather than erroring.
-    let store = match storage::BlobStore::<false>::open(set.base()).await {
-        Ok(store) => store,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    // lists empty rather than erroring, and that falls out: the open succeeds, the
+    // loop below has nothing to iterate, and nothing is printed.
+    //
+    // Which is why there is no arm for "no set here". This used to be
+    // `Err(e) if e.kind() == NotFound => return Ok(())`, and the kind was doing
+    // two jobs. The one it was meant for is unreachable — the check above already
+    // established that the set has segments, and that is the only condition which
+    // makes the open report `NotFound` — so it never fired on the case it was
+    // written for. The other job is the problem: `NotFound` is what the operating
+    // system returns for a file that has gone, so a segment removed between that
+    // check and the open would have been swallowed too, and `lepatch versions`
+    // would exit 0 having printed nothing about a set that was being deleted.
+    let store = storage::BlobStore::<false>::open(set.base()).await?;
 
     for version in versions {
         // Through the store, which checks the file against itself: an index that
