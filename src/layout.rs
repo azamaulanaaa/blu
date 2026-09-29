@@ -152,9 +152,33 @@ impl IndexSet {
     /// roll over past it.
     ///
     /// This was `blob_path`, which named a segment file as though it held one
+    /// This was `blob_path`, which named a segment file as though it held one
     /// blob. It does not: it holds whatever records the run wrote into it, and a
     /// segment boundary is a write policy rather than anything the content
     /// implies, so there is no "the blob" for such a path to belong to.
+    ///
+    /// **A `Segment` newtype is the safer signature and is not used here.** This
+    /// and [`IndexSet::index_path`] both take a `u32` and mean different things, so
+    /// `set.index_path(index.segment)` would name a real file in the wrong series
+    /// and nothing would object. A newtype would make that a compile error.
+    ///
+    /// It is declined on the arithmetic, which was counted: 78 call sites across
+    /// the crate and its tests, 164 once the `segment:` fields in
+    /// [`Placement`](crate::storage::Placement), `VersionIndex` and the test
+    /// fixtures are included. The mistake does not exist today — no caller passes a
+    /// version here — and the audit that proposed the newtype called its own item
+    /// "real, but low value-per-churn".
+    ///
+    /// The same reasoning retired `AsyncReadSeek`'s proposed `pub(crate)` and
+    /// `BlobStore<true>`'s proposed `Read`/`Write` in reverse: that one was 15
+    /// sites after `open_for_writing` removed the rest, and it was done. What is
+    /// left here is what it was before.
+    ///
+    /// So the argument is recorded on the two functions whose signatures are the
+    /// whole of it, in the expectation that the next person to want this will read
+    /// the count rather than re-derive it. 78 sites is a day's mechanical churn
+    /// with the compiler checking every one, and it is worth doing the day a caller
+    /// is caught mixing them.
     #[must_use]
     pub fn segment_path(&self, segment: u32) -> PathBuf {
         self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{SEGMENT_EXTENSION}"))
@@ -219,6 +243,12 @@ impl IndexSet {
     }
 
     /// Path of the index file for `version`.
+    ///
+    /// Takes the same `u32` [`IndexSet::segment_path`] does and means something
+    /// else, so it is the second half of the pair whose signatures a `Segment` and
+    /// a `Version` newtype would fix. The count and the reasoning are on that one;
+    /// this is here so neither signature can be changed without the other being
+    /// read.
     #[must_use]
     pub fn index_path(&self, version: u32) -> PathBuf {
         self.suffixed(&format!("v{version:0SEGMENT_DIGITS$}.{INDEX_EXTENSION}"))
