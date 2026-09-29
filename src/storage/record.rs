@@ -703,3 +703,261 @@ mod tests {
         );
     }
 }
+
+/// Every byte of a record header, pinned.
+///
+/// This is the only test that would notice a change to the record format, and it
+/// is here because nothing else could. `tests/pack.rs` has the equivalent for
+/// the pack format; the record format had nothing at all, and the one test that
+/// touched `encode_header` built its fixture *with* `encode_header` — so an
+/// encoding change was invisible to it by construction.
+///
+/// The bytes below are written out by hand, not captured. A captured golden
+/// pins a bug just as faithfully as a correct one, and nobody reading a captured
+/// blob can tell which it is. Each is annotated with what the field is and why it
+/// is there, so a change to any of them reads as a decision.
+///
+/// A change to this test is a change to the on-disk format. [`FORMAT_VERSION`]
+/// goes up, every existing set is either refused or unreadable, and that is
+/// written down in [`FORMAT_VERSION`] itself.
+#[cfg(test)]
+mod golden {
+    use super::{Codec, Kind, decode_header, encode_header, header_len};
+
+    /// A blob with an empty payload, so both lengths are at their one-byte
+    /// minimum and the header is exactly `MIN_HEADER`.
+    ///
+    /// ```text
+    /// 4c 50 42 31   "LPB1"          RECORD_MAGIC
+    /// 00            kind Blob       0
+    /// 00            codec Raw       0
+    /// 00            stored_len 0    LEB128
+    /// 00            raw_len 0       LEB128
+    /// 00 x 32       hash            BLAKE3 of the payload, which is nothing
+    /// 28 9d ae 86 ab e9 36 a5       check: BLAKE3 of the 40 bytes above
+    /// ```
+    const BLOB_EMPTY: &str = "4c504231000000000000000000000000000000000000000000000000000000000000000000000000289dae86abe936a5";
+
+    /// A commit record, which is the shape the scan looks for to find versions.
+    ///
+    /// ```text
+    /// 4c 50 42 31   "LPB1"
+    /// 01            kind Commit     1
+    /// 00            codec Raw       0 — always, or the scan would not find it
+    /// 20            stored_len 32   LEB128: 0x20 is 32 with the top bit clear
+    /// 20            raw_len 32      the same width: a commit holds only a hash
+    /// ab x 32       hash            the snapshot this version publishes
+    /// ce 68 48 cd 62 23 ad e8       check
+    /// ```
+    const COMMIT: &str = "4c50423101002020ababababababababababababababababababababababababababababababababce6848cd6223ade8";
+
+    /// A compressed blob, chosen so both varints are more than one byte — which
+    /// is the only way the two lengths and the `PREFIX`/`HASH`/`CHECK` offsets
+    /// are all exercised at once.
+    ///
+    /// ```text
+    /// 4c 50 42 31   "LPB1"
+    /// 00            kind Blob
+    /// 01            codec Zstd      1
+    /// ac 02         stored_len 300  LEB128: 300 = 0b10_0101100, 44|0x80 then 2
+    /// a0 8d 06      raw_len 100000  100000 = 0b1_1000_0110_1010_0000
+    ///                               -> 32|0x80, 13|0x80, 6
+    /// 11 x 32       hash            of the *content*, not of the zstd frame
+    /// d2 30 0c b8 99 05 7d c4       check
+    /// ```
+    ///
+    /// The two lengths differ by design, and a reader that mixed them up would
+    /// hand back a blob of the wrong size under the right name — which is why
+    /// `Codec` is in the header at all, and why this case is pinned rather than
+    /// just the easy uncompressed one.
+    const BLOB_COMPRESSED: &str = "4c5042310001ac02a08d061111111111111111111111111111111111111111111111111111111111111111d2300cb899057dc4";
+
+    fn hex(s: &str) -> Vec<u8> {
+        let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(clean.len() % 2, 0, "a hex literal has an even length");
+
+        clean
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).expect("hex is ascii");
+                u8::from_str_radix(text, 16).expect("hex literal")
+            })
+            .collect()
+    }
+
+    /// One header to encode, and the bytes it has to come out as.
+    struct Case {
+        /// What it is, for the failure message.
+        what: &'static str,
+        /// The bytes, written out above.
+        expected: &'static str,
+        kind: Kind,
+        codec: Codec,
+        hash: [u8; 32],
+        stored_len: u64,
+        raw_len: u64,
+    }
+
+    /// The literal bytes are the record.
+    #[test]
+    fn a_header_is_the_bytes_this_test_says_it_is() {
+        let cases = [
+            Case {
+                what: "an empty blob",
+                expected: BLOB_EMPTY,
+                kind: Kind::Blob,
+                codec: Codec::Raw,
+                hash: [0u8; 32],
+                stored_len: 0,
+                raw_len: 0,
+            },
+            Case {
+                what: "a commit",
+                expected: COMMIT,
+                kind: Kind::Commit,
+                codec: Codec::Raw,
+                hash: [0xab; 32],
+                stored_len: 32,
+                raw_len: 32,
+            },
+            Case {
+                what: "a compressed blob",
+                expected: BLOB_COMPRESSED,
+                kind: Kind::Blob,
+                codec: Codec::Zstd,
+                hash: [0x11; 32],
+                stored_len: 300,
+                raw_len: 100_000,
+            },
+        ];
+
+        for case in &cases {
+            let mut out = Vec::new();
+            encode_header(
+                &mut out,
+                case.kind,
+                case.codec,
+                &case.hash,
+                case.stored_len,
+                case.raw_len,
+            );
+
+            assert_eq!(
+                out,
+                hex(case.expected),
+                "the header for {} changed",
+                case.what
+            );
+            assert_eq!(
+                out.len(),
+                usize::try_from(header_len(case.stored_len, case.raw_len)).unwrap_or(0),
+                "and `header_len` agrees with what was written for {}",
+                case.what
+            );
+        }
+    }
+
+    /// The decoder reads back what the encoder wrote, field by field.
+    ///
+    /// Separate from the bytes above on purpose: that one says the format has
+    /// not moved, and this one says the two halves still agree. A change that
+    /// moved both together would pass the first and fail this.
+    #[test]
+    fn a_header_survives_its_own_round_trip() {
+        let cases = [
+            Case {
+                what: "an empty blob",
+                expected: "",
+                kind: Kind::Blob,
+                codec: Codec::Raw,
+                hash: [0u8; 32],
+                stored_len: 0,
+                raw_len: 0,
+            },
+            Case {
+                what: "a commit",
+                expected: "",
+                kind: Kind::Commit,
+                codec: Codec::Raw,
+                hash: [0xab; 32],
+                stored_len: 32,
+                raw_len: 32,
+            },
+            Case {
+                what: "a compressed blob",
+                expected: "",
+                kind: Kind::Blob,
+                codec: Codec::Zstd,
+                hash: [0x11; 32],
+                stored_len: 300,
+                raw_len: 100_000,
+            },
+            Case {
+                what: "the widest varints a u64 can hold",
+                expected: "",
+                kind: Kind::Blob,
+                codec: Codec::Raw,
+                hash: [0xff; 32],
+                stored_len: u64::MAX,
+                raw_len: u64::MAX,
+            },
+        ];
+
+        for case in &cases {
+            let mut encoded = Vec::new();
+            encode_header(
+                &mut encoded,
+                case.kind,
+                case.codec,
+                &case.hash,
+                case.stored_len,
+                case.raw_len,
+            );
+
+            let decoded = decode_header(&encoded, 0)
+                .unwrap_or_else(|| panic!("{} did not decode", case.what));
+
+            assert_eq!(decoded.kind, case.kind, "{}", case.what);
+            assert_eq!(decoded.codec, case.codec, "{}", case.what);
+            assert_eq!(decoded.hash, case.hash, "{}", case.what);
+            assert_eq!(decoded.stored_len, case.stored_len, "{}", case.what);
+            assert_eq!(decoded.raw_len, case.raw_len, "{}", case.what);
+            assert_eq!(
+                decoded.payload_offset,
+                u64::try_from(encoded.len()).unwrap_or(0),
+                "the payload of {} starts where its header ends",
+                case.what
+            );
+
+            // The widest header is `MAX_HEADER`, and the scan's refill guarantee
+            // rests on that number. Asserting it here means the two constants
+            // and the encoder cannot drift apart unnoticed.
+            if case.stored_len == u64::MAX {
+                assert_eq!(
+                    encoded.len(),
+                    super::MAX_HEADER,
+                    "two maximal varints are the widest header there is"
+                );
+            }
+        }
+    }
+
+    /// The two header bounds are the ones the format actually has.
+    ///
+    /// `MIN_HEADER` is also the floor `SegmentLimit::new` enforces, so it is not
+    /// only a header constant — getting it wrong does not produce a rejected
+    /// write, it produces a store that refuses to open itself.
+    #[test]
+    fn the_header_bounds_are_the_formats_own() {
+        // 6 (magic, kind, codec) + 2 (two one-byte lengths) + 32 + 8
+        assert_eq!(super::MIN_HEADER, 48);
+        // The same, with both varints at their ten-byte maximum.
+        assert_eq!(super::MAX_HEADER, 66);
+
+        // And the empty blob really is the smallest header there is.
+        let mut smallest = Vec::new();
+        encode_header(&mut smallest, Kind::Blob, Codec::Raw, &[0u8; 32], 0, 0);
+        assert_eq!(smallest.len(), super::MIN_HEADER);
+    }
+}
