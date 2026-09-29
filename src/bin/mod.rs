@@ -572,10 +572,10 @@ async fn run_restore(
 
     // Held for the whole run, so two restores into one destination cannot
     // interleave writes into the same tree.
-    let _claim = lock_destination(destination)?;
+    let claim = lock_destination(destination)?;
 
     if clean {
-        restore_atomically(destination, snapshot, store).await?;
+        restore_atomically(&claim, snapshot, store).await?;
     } else {
         let restored = restore(destination, snapshot, store).await?;
         report_restored(&restored);
@@ -595,13 +595,21 @@ async fn run_restore(
 /// Restore into a sibling directory, then swap it in, so a run that dies part-way
 /// leaves the destination exactly as it was rather than holding a prefix of the
 /// snapshot. Costs the disk space for two trees at once.
+///
+/// Takes the claim rather than the path, because "beside the destination" is
+/// resolved by the claim and must be asked of it. This used to re-derive the
+/// rule with its own `sibling`, which did not canonicalise — so restoring through
+/// a symlink staged the tree beside the *link* while the claim's cleanup removed
+/// things beside the *target*, and a failed run left a half-written tree behind
+/// that the claim could not reach. One definition, and it is the claim's.
 async fn restore_atomically<S: storage::StorageGet + 'static>(
-    destination: &std::path::Path,
+    claim: &lepatch::command::DestinationLock,
     snapshot: storage::BlobId,
     store: S,
 ) -> std::io::Result<()> {
-    let partial = sibling(destination, PARTIAL_SUFFIX);
-    let previous = sibling(destination, PREVIOUS_SUFFIX);
+    let destination = claim.resolved();
+    let partial = claim.scratch_dir(PARTIAL_SUFFIX);
+    let previous = claim.scratch_dir(PREVIOUS_SUFFIX);
 
     // Either a half-written restore that never became the destination, or a
     // superseded tree. Both are safe to clear.
@@ -655,15 +663,6 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
 
     report_restored(&restored);
     Ok(())
-}
-
-/// A path beside `path`, named for it and `suffix`.
-fn sibling(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-
-    path.with_file_name(format!("{name}.{suffix}"))
 }
 
 /// Log what a restore put into the destination.

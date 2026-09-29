@@ -227,13 +227,53 @@ pub const PREVIOUS_SUFFIX: &str = "lepatch-restore-previous";
 /// Its `Drop` removes the claim together with any `--clean` scratch directories,
 /// and a run killed rather than failing drops the work future, so an interrupted
 /// restore leaves no half-written tree.
+///
+/// **Which** directory that is depends on how the destination was spelled, and
+/// this type is the only place that decides. "Beside the destination" is resolved
+/// once, here, by [`DestinationLock::resolved`], and everything that needs a
+/// scratch path asks this type for it. It used to be decided twice — once here,
+/// canonicalising, and once in the binary's own `sibling`, which did not — so
+/// restoring through a symlink staged the tree beside the *link* while the claim
+/// watched beside the *target*. A failed clean restore then left a half-written
+/// tree on disk that the claim's own cleanup could not reach, which is the thing
+/// the sentence above promises never happens.
 #[derive(Debug)]
 pub struct DestinationLock {
     path: PathBuf,
+    /// The destination as this claim resolved it, which is what scratch paths are
+    /// named after.
+    resolved: PathBuf,
     /// Sibling directories this run may have created, removed on the way out.
     scratch: Vec<PathBuf>,
     /// Held open for the lifetime of the claim; dropping the `Lock` drops this.
     _file: fs::File,
+}
+
+impl DestinationLock {
+    /// The destination as this claim resolved it.
+    ///
+    /// The staging directory for a `--clean` restore is `self.scratch_dir` of
+    /// *this* value, and the swap is done against it. Passing the caller's own
+    /// spelling of the destination instead is what let the two disagree.
+    #[must_use]
+    pub fn resolved(&self) -> &Path {
+        &self.resolved
+    }
+
+    /// A path beside the destination, named for it and `suffix`.
+    ///
+    /// The same one this claim will clean up on the way out, because it is built
+    /// from the same resolution. The binary had its own copy of this rule and it
+    /// did not canonicalise, which is the bug this exists to end.
+    #[must_use]
+    pub fn scratch_dir(&self, suffix: &str) -> PathBuf {
+        let name = self
+            .resolved
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+
+        self.resolved.with_file_name(format!("{name}.{suffix}"))
+    }
 }
 
 impl Drop for DestinationLock {
@@ -277,8 +317,9 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
 
     let path = resolved.with_file_name(format!("{name}.{DESTINATION_LOCK}"));
 
-    // Registered before the claim is taken, so nothing can create them without
-    // also being covered by the cleanup.
+    // The same two paths `DestinationLock::scratch_dir` hands out, registered
+    // before the claim is taken so nothing can create one without also being
+    // covered by the cleanup.
     let scratch = [PARTIAL_SUFFIX, PREVIOUS_SUFFIX]
         .map(|suffix| resolved.with_file_name(format!("{name}.{suffix}")))
         .into();
@@ -322,6 +363,7 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
 
     Ok(DestinationLock {
         path,
+        resolved,
         scratch,
         _file: file,
     })

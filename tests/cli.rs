@@ -1624,3 +1624,154 @@ fn both_listing_modes_name_the_same_versions() {
         "a version the store does not hold must not be listed: {numbers}"
     );
 }
+
+/// The claim cleans up beside the *resolved* destination, and only there.
+///
+/// `DestinationLock` resolves "beside the destination" by canonicalising, and its
+/// `Drop` removes the two scratch paths built from that resolution. Its own doc
+/// says "an interrupted restore leaves no half-written tree". The binary had a
+/// second copy of the same rule and did not canonicalise, so a run staging
+/// through a symlink put the tree somewhere the claim's cleanup never looked:
+///
+/// ```text
+/// destination      /tmp/out/link  ->  /tmp/real
+/// staging tree     /tmp/out/link.lepatch-restore-partial     (the binary's rule)
+/// claim's cleanup  /tmp/real.lepatch-restore-partial          (the library's rule)
+/// ```
+///
+/// Testing the cleanup through the CLI means arranging a restore that fails
+/// *after* the staging directory exists, which is fiddly and mostly tests the
+/// test. So this asks the claim directly: take it, put something at the scratch
+/// paths it says it owns, drop it, and check they are gone. That is exactly the
+/// promise, with nothing else in the way.
+#[cfg(unix)]
+#[test]
+fn a_restore_claim_cleans_up_beside_the_resolved_destination() {
+    use lepatch::command::{PARTIAL_SUFFIX, PREVIOUS_SUFFIX, lock_destination};
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let claim = lock_destination(&link).expect("taking the claim");
+
+    // The claim resolved the link, so the destination it will swap into is the
+    // real directory. Everything the run does is named after *this*, not after
+    // the spelling the user typed.
+    assert_eq!(
+        std::fs::canonicalize(claim.resolved()).unwrap(),
+        std::fs::canonicalize(&real).unwrap(),
+        "a claim should name the directory the restore will actually reach"
+    );
+
+    // The scratch paths must be beside the resolved destination, never beside the
+    // link. This is the line that was wrong.
+    for suffix in [PARTIAL_SUFFIX, PREVIOUS_SUFFIX] {
+        let scratch = claim.scratch_dir(suffix);
+        assert_eq!(
+            scratch.parent().unwrap(),
+            dir.path(),
+            "{suffix} should be a sibling of the real destination, not of the link"
+        );
+        assert!(
+            !scratch.starts_with(&link),
+            "{suffix} should not be named after the link"
+        );
+
+        // Stand in for the half-written tree a killed run would leave.
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("leftover"), b"half a file").unwrap();
+    }
+
+    // Dropping is the whole cleanup: the claim is released however the run ends,
+    // including a kill.
+    drop(claim);
+
+    for suffix in [PARTIAL_SUFFIX, PREVIOUS_SUFFIX] {
+        let name = format!("real.{suffix}");
+        assert!(
+            !dir.path().join(&name).exists(),
+            "{name} should have been removed with the claim"
+        );
+    }
+    assert!(
+        !dir.path().join("link.lepatch-restore-partial").exists(),
+        "and nothing should be left beside the link either"
+    );
+}
+
+/// A clean restore through a symlink reaches the directory the link points at.
+///
+/// `restore_atomically` swaps by `rename`, and `rename` moves a symbolic link
+/// itself rather than what it points at. So a version that took the destination as
+/// written moved the *link* aside and put a plain directory in its place:
+///
+/// ```text
+/// before: link -> /tmp/real,  real empty
+/// $ lepatch restore link store --clean
+///   restore complete  files=1
+/// after:  link is a plain directory holding the snapshot,  real still empty
+/// ```
+///
+/// Reported as success, into a path the user did not name, having replaced a
+/// symlink with a directory. The destination is now whatever the resolve step
+/// decided it is, so the swap is done against that and the link is left alone.
+#[cfg(unix)]
+#[test]
+fn a_clean_restore_through_a_symlink_lands_in_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    for i in 0..4 {
+        fs::write(
+            dir.path().join("src").join(format!("f{i}.bin")),
+            common::noisy(120_000 + usize::try_from(i).unwrap_or(0) * 5_000),
+        )
+        .unwrap();
+    }
+    ok(dir.path(), &["backup", "src", "store"]);
+
+    let real = dir.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    ok(
+        dir.path(),
+        &["restore", link.to_str().unwrap(), "store", "--clean"],
+    );
+
+    for i in 0..4 {
+        let name = format!("f{i}.bin");
+        let restored = real.join(&name);
+        assert!(restored.is_file(), "{name} should be in the destination");
+        assert_eq!(
+            fs::read(&restored).unwrap(),
+            fs::read(dir.path().join("src").join(&name)).unwrap(),
+            "{name} should have come back byte-identically",
+        );
+    }
+
+    for name in [
+        "link.lepatch-restore-partial",
+        "real.lepatch-restore-partial",
+        "link.lepatch-restore-previous",
+        "real.lepatch-restore-previous",
+        "link.lepatch-restore-lock",
+    ] {
+        assert!(
+            !dir.path().join(name).exists(),
+            "{name} should not survive a successful clean restore",
+        );
+    }
+
+    // And the link is still a link. This is the half that used to change.
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a restore should not replace the destination's symbolic link with a directory"
+    );
+}
