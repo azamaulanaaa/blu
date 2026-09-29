@@ -1,6 +1,6 @@
 //! The `lepatch` command line interface.
 
-use std::{error::Error as _, process::ExitCode};
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use lepatch::{
@@ -124,14 +124,32 @@ async fn main() -> ExitCode {
     match run(args.command).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // The message and its cause chain, not the `Debug` form.
+            // The message, not the `Debug` form.
+            //
+            // There is no cause chain to walk. `lepatch` has one error type —
+            // `io::Error` — at all ninety-odd sites where it fails, and each of
+            // those messages is a complete sentence naming the file, the offset
+            // and the expectation, because that is what a user has to act on.
+            //
+            // This loop used to walk `source()` here and print `caused by:`
+            // lines. It never printed anything, and could not have:
+            //
+            // * nothing in the crate implements `std::error::Error::source`, so
+            //   the first `source()` call returned `None` at every one of them;
+            // * and `io::Error` cannot carry the chain in the first place. Its
+            //   `source()` returns the *source of* a wrapped custom error, not
+            //   the error itself, so `io::Error::new(kind, e)` drops `e` from
+            //   the walk even when `e` has a cause. The one site that wraps
+            //   another error — a snapshot that will not decode — loses it here
+            //   too, while `Display` still shows it, since `io::Error` delegates
+            //   to the wrapped error's `Display`.
+            //
+            // So the code was a promise the type system could not keep, and a
+            // contributor adding an error with a cause would reasonably assume
+            // the output was already wired up. If a future change introduces a
+            // bespoke error type with a live chain, this walk comes back with it
+            // — and then it has something to print.
             eprintln!("error: {e}");
-
-            let mut cause = e.source();
-            while let Some(error) = cause {
-                eprintln!("  caused by: {error}");
-                cause = error.source();
-            }
 
             // 130 for Ctrl-C, 143 for `kill`.
             let signal = STOP_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
