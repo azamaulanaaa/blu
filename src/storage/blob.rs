@@ -748,6 +748,25 @@ impl BlobStore<true> {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("a store cannot hold more than u32::MAX segments"))?;
 
+        // A segment's number is zero-padded to `SEGMENT_DIGITS`, which pads and
+        // never truncates. One past the width would be written as a five-digit
+        // name that `IndexSet::segment_number` rejects, so the file would exist
+        // while the set reported it missing: this run's commit record would go
+        // into a segment no later run could read, taking a published version with
+        // it, and the next `create_segment` would then fail `AlreadyExists` and
+        // wedge the set. Refused here, where the message can name the cause.
+        if next > crate::index::MAX_SEGMENT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "this set has reached {MAX_SEGMENT} segments, which is as many as the \
+                     naming scheme can name; a run that fills segment {MAX_SEGMENT} cannot be \
+                     completed, so nothing was written",
+                    MAX_SEGMENT = crate::index::MAX_SEGMENT
+                ),
+            ));
+        }
+
         // The file is created here, before any writer is told it may use it, so a
         // rollover cannot hand out an offset in a file that does not exist yet.
         create_segment(&self.segment_path(next), next)?;

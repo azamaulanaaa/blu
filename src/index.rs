@@ -65,9 +65,21 @@ pub const LOCK_EXTENSION: &str = "lock";
 
 /// Digits in a segment's number.
 ///
-/// The width both caps a set at 10,000 segments and makes lexical order over a
-/// directory listing the same as numeric order, so a listing is already in order.
+/// The width is what makes lexical order over a directory listing the same as
+/// numeric order, so a listing is already in order. It also means the naming
+/// scheme can only express so many segments: [`MAX_SEGMENT`] is the last one
+/// whose number fits, and a run that needs another is refused rather than
+/// writing a file that [`IndexSet::segments`] would not find.
 pub const SEGMENT_DIGITS: usize = 4;
+
+/// The highest segment number the naming scheme can express.
+///
+/// `10^SEGMENT_DIGITS - 1`. A segment's number is zero-padded to
+/// [`SEGMENT_DIGITS`], which pads but never truncates, so the number just past
+/// this one is *written* as a five-digit name and then *rejected* by
+/// [`IndexSet::segment_number`]: the file would exist, the set would not see it,
+/// and any commit record inside it would be invisible to every later run.
+pub const MAX_SEGMENT: u32 = 9_999;
 
 /// A backup set rooted at a base path.
 #[derive(Debug, Clone)]
@@ -90,7 +102,11 @@ impl IndexSet {
     /// Path of segment `segment` of the store.
     ///
     /// Zero-padded to [`SEGMENT_DIGITS`], so lexical order over the files in a
-    /// directory is numeric order over the segments.
+    /// directory is numeric order over the segments. Padding is not truncation:
+    /// a number wider than the width is named with its own digits, which no
+    /// longer sorts, and which [`IndexSet::segment_number`] will not read back.
+    /// Callers should hold `segment` to [`MAX_SEGMENT`]; the store refuses to
+    /// roll over past it.
     #[must_use]
     pub fn blob_path(&self, segment: u32) -> PathBuf {
         self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{BLOB_EXTENSION}"))

@@ -498,3 +498,86 @@ fn a_limit_too_small_to_hold_a_record_is_raised() {
         limit.bytes()
     );
 }
+
+/// The naming scheme's last segment is the last one the set can name.
+///
+/// A segment's number is zero-padded to `SEGMENT_DIGITS`, and padding is not
+/// truncation. The number just past the width is therefore *written* as a
+/// five-digit name and then *rejected* by the parser, which is the worst
+/// possible failure: the file exists, the set does not see it, and the commit
+/// record inside it is invisible to every later run. The store refuses to roll
+/// over past `MAX_SEGMENT` for exactly this reason.
+#[test]
+fn the_naming_scheme_names_exactly_its_own_width() {
+    use lepatch::index::{MAX_SEGMENT, SEGMENT_DIGITS};
+
+    let dir = tempfile::tempdir().unwrap();
+    let set = IndexSet::new(dir.path().join("photos"));
+
+    // The formatter pads to the width, up to and including the last segment the
+    // scheme can name, and not one further.
+    for segment in [0, 1, 999, MAX_SEGMENT] {
+        let name = set.blob_path(segment);
+        let digits: String = name
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .chars()
+            .skip("photos.".len())
+            .take_while(char::is_ascii_digit)
+            .collect();
+        assert_eq!(
+            digits.len(),
+            SEGMENT_DIGITS,
+            "segment {segment} should be named with {SEGMENT_DIGITS} digits, got {digits:?}"
+        );
+    }
+
+    // One past the width is the whole bug: a name the writer can produce and the
+    // reader will not accept. Pinned here so that a change to the formatter or
+    // to the parser that silently widens one of them is visible as a test
+    // failure rather than as a set that loses a version.
+    let past = set.blob_path(MAX_SEGMENT + 1);
+    let digits: String = past
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .chars()
+        .skip("photos.".len())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    assert_eq!(
+        digits.len(),
+        SEGMENT_DIGITS + 1,
+        "a segment past the width is named with more digits than the scheme can read back, \
+         which is why the store refuses to create one: {digits:?}"
+    );
+    assert_eq!(
+        MAX_SEGMENT + 1,
+        10_000,
+        "the boundary should be where four digits run out"
+    );
+}
+
+/// A set with a gap in its segments is refused, naming what is missing.
+///
+/// Not the case this file is otherwise about, but it is the check that stands
+/// between a naming-scheme mishap and a silently shorter set: without it, a
+/// segment the parser declined to recognise would look like the tail of the set.
+#[test]
+fn a_gap_in_the_segments_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = IndexSet::new(dir.path().join("photos"));
+
+    fs::write(set.blob_path(0), b"first").unwrap();
+    fs::write(set.blob_path(2), b"third").unwrap();
+
+    let error = set.segments().unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("missing segment 1"),
+        "the refusal should name the segment that is absent: {message}"
+    );
+}
