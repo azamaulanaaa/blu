@@ -843,6 +843,34 @@ impl BlobStore<true> {
     /// A record larger than the whole limit is an error rather than a segment that
     /// quietly grows past the cap, and the error names the cap so the caller can
     /// raise it deliberately.
+    ///
+    /// # Why the `fsync` in here stays on the runtime thread
+    ///
+    /// `create_segment` opens a file, writes six bytes to it and `fsync`s, and all
+    /// three are blocking. The audit flagged that for `spawn_blocking`, and it is
+    /// the right instinct — `open` and `open_for_reading` both send their *scan*
+    /// to a blocking thread, and the scan is what this module is careful about.
+    ///
+    /// It cannot be done here without giving up the property that makes this
+    /// function correct. The lock is held across `create_segment` on purpose: the
+    /// file has to exist before `reserved.segment` names it, or a rollover hands
+    /// out an offset in a file that does not exist yet. Awaiting needs the guard
+    /// dropped — a `std::sync::MutexGuard` held across an await is not `Send`, so
+    /// the compiler rejects it — and dropping it means two threads can both
+    /// decide to roll to segment *n*, both pick `offset = header`, and both write
+    /// there. Tolerating `AlreadyExists` on the create does not fix that, because
+    /// by then both have already chosen the same offset.
+    ///
+    /// What is left is to weigh it, and the weighing is arithmetic rather than a
+    /// guess: this runs **once per segment rollover**, so a run against the
+    /// default 4 GiB limit does it once per 4 GiB stored — a 150 MB backup does
+    /// it zero times. A `fsync` on a freshly created six-byte header is not free,
+    /// but it is not on any hot path either, and the alternative is losing the
+    /// guarantee that `tests/segments.rs::concurrent_writes_across_a_rollover_do_not_overlap`
+    /// exists to pin.
+    ///
+    /// A blocking pool and an async lock would make it both safe and off-thread,
+    /// and both cost more than the problem does.
     fn reserve(&self, total: u64) -> io::Result<Reservation> {
         let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
 
