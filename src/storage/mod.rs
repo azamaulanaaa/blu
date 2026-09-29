@@ -108,6 +108,31 @@ pub type BlobId = blake3::Hash;
 ///
 /// The default is 4 GiB, under what FAT32 and several older archive formats
 /// refuse, and small enough that no single file needs 64-bit offsets.
+/// A write policy, and the floor it cannot go below.
+///
+/// # Example
+///
+/// Runs, not `no_run`: `new` and `bytes` are pure, and an example that only
+/// compiles is an example whose arithmetic can be wrong.
+///
+/// ```
+/// # fn main() -> std::io::Result<()> {
+/// use lepatch::storage::SegmentLimit;
+///
+/// assert_eq!(SegmentLimit::default().bytes(), 4 * 1024 * 1024 * 1024);
+///
+/// // A smaller limit is honoured: a set of smaller segments reads back the same,
+/// // because where a boundary fell is not recorded anywhere.
+/// assert_eq!(SegmentLimit::new(64 * 1024 * 1024).bytes(), 64 * 1024 * 1024);
+///
+/// // A limit too small to hold a store header and one record is raised to that
+/// // floor rather than refused, because a segment that cannot hold a record
+/// // cannot be a segment. The floor is a property of the format rather than of
+/// // this policy, so `new` has no way to express anything below it.
+/// assert!(SegmentLimit::new(1).bytes() > 1, "clamped up to a usable segment");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SegmentLimit(u64);
 
@@ -142,6 +167,35 @@ impl Default for SegmentLimit {
 /// written at mixed levels — or with compression off — reads back and
 /// deduplicates correctly. The default is [`Compression::Zstd`] at level 1; the
 /// measurements behind that are in the README.
+/// A write policy, chosen per run and recorded per record.
+///
+/// # Example
+///
+/// `no_run`, unlike the examples elsewhere in this module: opening a store
+/// creates a segment on disk, so this one compiles but must not execute.
+///
+/// ```no_run
+/// # async fn example() -> std::io::Result<()> {
+/// use lepatch::storage::{BlobStore, Compression, SegmentLimit};
+///
+/// // The defaults: zstd level 1, four gibibytes per segment.
+/// let store = BlobStore::<true>::open(
+///     "photos",
+///     SegmentLimit::default(),
+///     Compression::default(),
+/// ).await?;
+///
+/// // Or not. Both are write policies, and a set written under one reads back
+/// // under the other: a compressed record says so in its own header, and which
+/// // records are compressed is a question each record answers for itself.
+/// let store = BlobStore::<true>::open(
+///     "photos",
+///     SegmentLimit::new(64 * 1024 * 1024),
+///     Compression::Off,
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     /// Store payloads as they are. What [`Compression::from_level`] returns for 0.

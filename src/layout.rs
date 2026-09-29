@@ -97,6 +97,34 @@ pub const SEGMENT_DIGITS: usize = 4;
 pub const MAX_SEGMENT: u32 = 9_999;
 
 /// A backup set rooted at a base path.
+///
+/// # Example
+///
+/// The names are the whole contract, so they are worth pinning in something that
+/// runs. The base path is treated as an opaque *prefix* rather than a stem, so a
+/// base of `photos.tar` yields `photos.tar.0000.bin` — losing the extension the
+/// way [`Path::with_extension`] would — and the `v` in `photos.v0001.idx` keeps
+/// the two kinds of file from ever naming the same thing in one directory.
+///
+/// This example is not `no_run`: it touches no disk outside a path that does not
+/// exist, so it runs and its assertions are checked.
+///
+/// ```
+/// # fn main() -> std::io::Result<()> {
+/// use lepatch::layout::IndexSet;
+///
+/// let set = IndexSet::new("/data/photos.tar");
+///
+/// assert_eq!(set.segment_path(0),    std::path::Path::new("/data/photos.tar.0000.bin"));
+/// assert_eq!(set.segment_path(1),    std::path::Path::new("/data/photos.tar.0001.bin"));
+/// assert_eq!(set.index_path(1),      std::path::Path::new("/data/photos.tar.v0001.idx"));
+/// assert_eq!(set.lock_path(),        std::path::Path::new("/data/photos.tar.lock"));
+///
+/// // Nothing exists yet, and that is an empty set rather than an error.
+/// assert!(set.segments()?.is_empty());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSet {
     base: PathBuf,
