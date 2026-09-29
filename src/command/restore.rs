@@ -115,8 +115,37 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
 
     restore_directories(root, &snapshot).await?;
     let written = restore_files(root, Arc::clone(&snapshot), Arc::clone(&storage)).await?;
-    restore_links(root, &snapshot)?;
-    restore_attributes(root, &snapshot)?;
+
+    // Off the runtime thread, and **in this order**. `restore_links` creates
+    // symbolic links, which changes the modification time of the directory
+    // holding them, so `restore_attributes` has to set that time afterwards or it
+    // sets one the links immediately invalidate. That is a real ordering
+    // constraint, not a habit — it is why these two are not run concurrently with
+    // each other, even though they touch disjoint sets of paths.
+    //
+    // What is safe is moving each of them off the runtime. Both are plain
+    // synchronous filesystem work in an async function, so every `symlink`,
+    // `link` and `set_permissions` they make blocks a worker thread that other
+    // tasks need — and `open` and `open_for_reading` already send their scans to
+    // `spawn_blocking` for the same reason this module is careful about
+    // elsewhere. A tree of many links is where that shows.
+    let for_links = root.to_path_buf();
+    tokio::task::spawn_blocking({
+        let root = for_links;
+        let snapshot = Arc::clone(&snapshot);
+        move || restore_links(&root, &snapshot)
+    })
+    .await
+    .map_err(|e| join_panic(&e))??;
+
+    let for_attributes = root.to_path_buf();
+    tokio::task::spawn_blocking({
+        let root = for_attributes;
+        let snapshot = Arc::clone(&snapshot);
+        move || restore_attributes(&root, &snapshot)
+    })
+    .await
+    .map_err(|e| join_panic(&e))??;
 
     Ok(Restored {
         files: u64::try_from(snapshot.files.len()).unwrap_or(0),
@@ -374,12 +403,57 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
 }
 
 /// Create every recorded directory, including ones that hold no files.
+///
+/// Concurrent, and the concurrency is the same cap `restore_files` uses rather
+/// than all of them at once. `create_dir_all` creates the whole chain above its
+/// argument, so these do not have to run parents-first: two tasks racing on
+/// `/a/b` and `/a/b/c` each create whatever is missing and neither fails, and the
+/// end state is the same set of directories whichever order they finish in. That
+/// makes the stage safe to parallelise, which matters because it is one syscall
+/// per directory done one after another — a tree of a million directories spent
+/// its whole restore waiting on a million sequential `mkdir` calls.
+///
+/// The containment check is still done first, in order, and still fails fast.
+/// Resolving every path before any directory is created is what makes a snapshot
+/// that escapes the root refused *before* the destination is touched at all, which
+/// is the property `tests/containment.rs` pins — so the parallelism is applied to
+/// the syscall and not to the check.
 async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+    let mut paths = Vec::with_capacity(snapshot.dirs.len());
     for dir in &snapshot.dirs {
-        fs_async::create_dir_all(resolve(root, &dir.path, "a directory")?).await?;
+        paths.push(resolve(root, &dir.path, "a directory")?);
+    }
+
+    let concurrency = restore_concurrency();
+    let mut creating = JoinSet::new();
+    let mut next = 0usize;
+
+    loop {
+        while next < paths.len() && creating.len() < concurrency {
+            let path = paths[next].clone();
+            next += 1;
+            creating.spawn(async move { fs_async::create_dir_all(path).await });
+        }
+
+        // The first error is the one to report, and joining in the order the
+        // directories were recorded is what makes "the first" mean something a
+        // caller can act on rather than whichever task happened to fail first.
+        let Some(joined) = creating.join_next().await else {
+            break;
+        };
+        joined.map_err(|e| join_panic(&e))??;
     }
 
     Ok(())
+}
+
+/// An `io::Error` for a task that did not return one.
+///
+/// A restore task can only stop by panicking, so there is no error to carry and
+/// the alternative is a second panic in the middle of reporting the first. Saying
+/// so is better than either.
+fn join_panic(join: &tokio::task::JoinError) -> io::Error {
+    io::Error::other(format!("a restore task did not finish: {join}"))
 }
 
 /// Create and fill every regular file, a few at a time.
