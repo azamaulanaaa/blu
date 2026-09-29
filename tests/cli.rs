@@ -759,7 +759,7 @@ async fn a_compression_level_outside_zero_to_nine_is_refused() {
     }
 
     // 0 stored the payload raw, which is what it claims to mean.
-    let store = BlobStore::<false>::open(dir.path().join("store0"))
+    let store = BlobStore::open_for_reading(dir.path().join("store0"))
         .await
         .unwrap();
     let id = store.latest().unwrap().1;

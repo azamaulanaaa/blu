@@ -107,9 +107,13 @@ async fn main() {
             let _ = std::fs::remove_file(IndexSet::new(&store_path).segment_path(segment));
         }
         let store = std::sync::Arc::new(
-            BlobStore::<true>::open(&store_path, SegmentLimit::default(), Compression::default())
-                .await
-                .expect("store"),
+            BlobStore::open_for_writing(
+                &store_path,
+                SegmentLimit::default(),
+                Compression::default(),
+            )
+            .await
+            .expect("store"),
         );
         put_all(store.clone()).await;
     }
@@ -123,9 +127,13 @@ async fn main() {
             let _ = std::fs::remove_file(IndexSet::new(&store_path).segment_path(segment));
         }
         let store = std::sync::Arc::new(
-            BlobStore::<true>::open(&store_path, SegmentLimit::default(), Compression::default())
-                .await
-                .expect("store"),
+            BlobStore::open_for_writing(
+                &store_path,
+                SegmentLimit::default(),
+                Compression::default(),
+            )
+            .await
+            .expect("store"),
         );
         store_times.push(put_all(store.clone()).await);
         plain_times.push(write_all_blocking(&plain_path));

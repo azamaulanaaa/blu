@@ -437,7 +437,7 @@ use lepatch::{
 let _claim = lock_destination(std::path::Path::new("docs-restored"))?;
 
 // First backup. Four gibibytes per segment and zstd level 1, both the defaults.
-let store = BlobStore::<true>::open(
+let store = BlobStore::open_for_writing(
     "docs",
     SegmentLimit::default(),
     Compression::default(),
@@ -447,7 +447,7 @@ let first = backup("~/Documents", Options::default(), store).await?;
 // Later backups need nothing passed to deduplicate: the store holds every
 // version it has ever been given, so a chunk it already has is not written
 // again however far back it was last seen.
-let store = BlobStore::<true>::open(
+let store = BlobStore::open_for_writing(
     "docs",
     SegmentLimit::default(),
     Compression::default(),
@@ -455,7 +455,7 @@ let store = BlobStore::<true>::open(
 backup("~/Documents", Options::default(), store).await?;
 
 // A read-only store takes no segment limit, because a read never rolls over.
-let store = BlobStore::<false>::open("docs").await?;
+let store = BlobStore::open_for_reading("docs").await?;
 restore("~/Documents-restored", first.snapshot, store).await?;
 # Ok(())
 # }
@@ -487,7 +487,7 @@ use lepatch::{
     storage::{BlobId, BlobStore, Plan},
 };
 
-let store = BlobStore::<false>::open("docs").await?;
+let store = BlobStore::open_for_reading("docs").await?;
 
 // The plan is a function of the snapshot, so it is the same every run.
 let snapshot = load_snapshot(&store, store.snapshot(2)?).await?;

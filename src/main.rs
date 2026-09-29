@@ -393,7 +393,7 @@ async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
 
     let _lock = set.lock()?;
 
-    let store = storage::BlobStore::<true>::open(
+    let store = storage::BlobStore::open_for_writing(
         set.base(),
         storage::SegmentLimit::default(),
         storage::Compression::default(),
@@ -453,7 +453,7 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     // system returns for a file that has gone, so a segment removed between that
     // check and the open would have been swallowed too, and `lepatch versions`
     // would exit 0 having printed nothing about a set that was being deleted.
-    let store = storage::BlobStore::<false>::open(set.base()).await?;
+    let store = storage::BlobStore::open_for_reading(set.base()).await?;
 
     for version in versions {
         // Through the store, which checks the file against itself: an index that
@@ -533,7 +533,7 @@ async fn run_backup(
     };
 
     // Opening discards a torn tail in the last segment: an unfinished run, not data.
-    let store = storage::BlobStore::<true>::open(set.base(), limit, compression).await?;
+    let store = storage::BlobStore::open_for_writing(set.base(), limit, compression).await?;
 
     if let Some(previous) = store.versions()?.last() {
         tracing::debug!(previous, name = %set.base().display(), "deduplicating against the store");
@@ -567,7 +567,7 @@ async fn run_restore(
     clean: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::<false>::open(set.base()).await?;
+    let store = storage::BlobStore::open_for_reading(set.base()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(
@@ -815,7 +815,7 @@ fn absolutise(path: &std::path::Path) -> std::path::PathBuf {
 /// Check a version's chunks against their recorded hashes.
 async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::<false>::open(set.base()).await?;
+    let store = storage::BlobStore::open_for_reading(set.base()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(name = %set.base().display(), version, "verifying");
@@ -853,7 +853,7 @@ async fn run_pack(
     version: Option<u32>,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::<false>::open(set.base()).await?;
+    let store = storage::BlobStore::open_for_reading(set.base()).await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(

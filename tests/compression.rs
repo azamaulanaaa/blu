@@ -52,7 +52,7 @@ fn compressible(len: usize) -> Vec<u8> {
 
 /// A store opened for writing under one policy.
 async fn writable(blob: &Path, compression: Compression) -> BlobStore<true> {
-    BlobStore::<true>::open(blob, SegmentLimit::default(), compression)
+    BlobStore::open_for_writing(blob, SegmentLimit::default(), compression)
         .await
         .unwrap()
 }
@@ -97,7 +97,7 @@ async fn a_payload_that_compresses_is_stored_compressed() {
         placement.raw_len
     );
 
-    let reader = BlobStore::<false>::open(&blob).await.unwrap();
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
     assert_eq!(read(&reader, &id).await, payload);
 }
 
@@ -124,7 +124,7 @@ async fn a_payload_that_does_not_compress_is_stored_raw() {
     );
     assert_eq!(placement.stored_len, placement.raw_len);
 
-    let reader = BlobStore::<false>::open(&blob).await.unwrap();
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
     assert_eq!(read(&reader, &id).await, payload);
 }
 
@@ -140,7 +140,7 @@ async fn compression_off_stores_everything_raw() {
 
     assert_eq!(store.locate(&id).unwrap().codec, Codec::Raw);
 
-    let reader = BlobStore::<false>::open(&blob).await.unwrap();
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
     assert_eq!(read(&reader, &id).await, payload);
 }
 
@@ -193,7 +193,7 @@ async fn deduplication_holds_across_different_codecs() {
     );
     assert_eq!(store.locate(&id).unwrap().codec, Codec::Raw);
 
-    let reader = BlobStore::<false>::open(&blob).await.unwrap();
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
     assert_eq!(read(&reader, &id).await, payload);
 }
 
@@ -225,7 +225,7 @@ async fn a_store_written_at_one_level_reads_at_another() {
     drop(store);
 
     // Reopened with a level it was not written with. Nothing carries over.
-    let reader = BlobStore::<false>::open(&blob).await.unwrap();
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
     for (id, payload) in ids.iter().zip(&payloads) {
         assert_eq!(
             &read(&reader, id).await,
@@ -268,7 +268,7 @@ async fn a_store_may_hold_records_written_under_several_policies() {
         common::run_backup_compressed(&source, &blob, *compression).await;
     }
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
     assert_eq!(
         store.versions().unwrap().len(),
         policies.len(),
@@ -325,7 +325,7 @@ async fn a_compressed_blob_reports_its_raw_length_to_a_plan() {
     let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
     let snapshot = load_snapshot(&store, store.latest().unwrap().1)
         .await
         .unwrap();
@@ -384,7 +384,7 @@ async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
     }
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
     let snapshot = load_snapshot(&store, store.latest().unwrap().1)
         .await
         .unwrap();

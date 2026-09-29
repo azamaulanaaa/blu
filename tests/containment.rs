@@ -39,7 +39,7 @@ impl Forged {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("store.bin");
         let storage =
-            BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+            BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
                 .await
                 .unwrap();
 
@@ -84,7 +84,7 @@ impl Forged {
 
     /// Restore into `dest`, and report the error if it refused.
     async fn restore_into(&self, dest: &Path) -> Result<(), String> {
-        let storage = BlobStore::<false>::open(&self.blob).await.unwrap();
+        let storage = BlobStore::open_for_reading(&self.blob).await.unwrap();
         match restore(dest, self.snapshot, storage).await {
             Ok(_) => Ok(()),
             Err(e) => Err(e.to_string()),

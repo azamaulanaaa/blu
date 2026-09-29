@@ -28,7 +28,7 @@ use tokio::io::AsyncReadExt;
 
 /// The BLAKE3 of a set's latest snapshot — what a pack of that version names.
 async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
-    let store = BlobStore::<false>::open(blob).await.unwrap();
+    let store = BlobStore::open_for_reading(blob).await.unwrap();
 
     let id = store.latest().unwrap().1;
     let mut reader = store.get(&id).await.unwrap();
@@ -40,7 +40,7 @@ async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
 
 /// The plan for a set's latest version, and the chunk hashes it names.
 async fn plan_of(blob: &Path) -> Plan {
-    let store = BlobStore::<false>::open(blob).await.unwrap();
+    let store = BlobStore::open_for_reading(blob).await.unwrap();
 
     let id = store.latest().unwrap().1;
     let mut reader = store.get(&id).await.unwrap();
@@ -66,7 +66,7 @@ struct Built {
 impl Built {
     /// Write a pack of this version to `at`, and return it.
     async fn pack(&self, at: &Path) -> Pack {
-        let store = BlobStore::<false>::open(&self.blob).await.unwrap();
+        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
         let snapshot = snapshot_id(&self.blob).await;
 
         Pack::write(&store, &self.plan, &snapshot, at)
@@ -77,7 +77,7 @@ impl Built {
 
 /// Pack a set's latest version to `at`.
 async fn pack(blob: &Path, at: &Path) -> Pack {
-    let store = BlobStore::<false>::open(blob).await.unwrap();
+    let store = BlobStore::open_for_reading(blob).await.unwrap();
     let plan = plan_of(blob).await;
     let snapshot = snapshot_id(blob).await;
 
@@ -118,7 +118,7 @@ async fn a_pack_holds_its_versions_chunks() {
     );
 
     // And the bytes are the chunks, in order, byte for byte.
-    let store = BlobStore::<false>::open(&built.blob).await.unwrap();
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let mut file = fs::File::open(&path).unwrap();
 
     for (i, chunk) in built.plan.iter().enumerate() {
@@ -251,7 +251,7 @@ async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
 
     let v2 = plan_of(&blob).await;
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
     let snapshot = snapshot_id(&blob).await;
     let pack = Pack::write(&store, &v2, &snapshot, &dir.path().join("v2.pack"))
         .await
@@ -772,7 +772,7 @@ async fn a_pack_of_an_empty_version_opens() {
     let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::<false>::open(&blob).await.unwrap();
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
     let plan = plan_of(&blob).await;
     assert!(plan.is_empty(), "an empty tree should plan to no chunks");
 

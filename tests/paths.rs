@@ -85,7 +85,7 @@ async fn a_path_this_platform_cannot_represent_is_refused() {
     fs::write(PathBuf::from(&source).join(&raw), b"payload").unwrap();
 
     let blob = dir.path().join("store");
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+    let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
 

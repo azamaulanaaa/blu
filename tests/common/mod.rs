@@ -200,9 +200,10 @@ pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
 /// Back up `source` with specific options, for tests that need to pin a knob the
 /// defaults would otherwise choose.
 pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
-    let storage = BlobStore::<true>::open(blob, SegmentLimit::default(), Compression::default())
-        .await
-        .unwrap();
+    let storage =
+        BlobStore::open_for_writing(blob, SegmentLimit::default(), Compression::default())
+            .await
+            .unwrap();
     backup(source, opts, storage).await.unwrap()
 }
 
@@ -216,7 +217,7 @@ pub(crate) async fn run_backup_limited(
     blob: &Path,
     limit: SegmentLimit,
 ) -> Committed {
-    let storage = BlobStore::<true>::open(blob, limit, Compression::default())
+    let storage = BlobStore::open_for_writing(blob, limit, Compression::default())
         .await
         .unwrap();
     backup(source, Options::default(), storage).await.unwrap()
@@ -224,7 +225,7 @@ pub(crate) async fn run_backup_limited(
 
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
 pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Path) {
-    let storage = BlobStore::<false>::open(blob).await.unwrap();
+    let storage = BlobStore::open_for_reading(blob).await.unwrap();
     restore(destination, snapshot, storage).await.unwrap();
 }
 
@@ -238,7 +239,7 @@ pub(crate) async fn run_backup_compressed(
     blob: &Path,
     compression: lepatch::storage::Compression,
 ) -> Committed {
-    let storage = BlobStore::<true>::open(blob, SegmentLimit::default(), compression)
+    let storage = BlobStore::open_for_writing(blob, SegmentLimit::default(), compression)
         .await
         .unwrap();
     backup(source, Options::default(), storage).await.unwrap()
@@ -246,7 +247,7 @@ pub(crate) async fn run_backup_compressed(
 
 /// Restore one specific version of a set.
 pub(crate) async fn run_restore_version(blob: &Path, destination: &Path, version: u32) {
-    let storage = BlobStore::<false>::open(blob).await.unwrap();
+    let storage = BlobStore::open_for_reading(blob).await.unwrap();
     let snapshot = storage.snapshot(version).unwrap();
     restore(destination, snapshot, storage).await.unwrap();
 }

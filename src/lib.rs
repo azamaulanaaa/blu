@@ -41,16 +41,16 @@
 //!
 //! // First backup. Four gibibytes per segment and zstd level 1, both the defaults.
 //! let store =
-//!     BlobStore::<true>::open("photos", SegmentLimit::default(), Compression::default()).await?;
+//!     BlobStore::open_for_writing("photos", SegmentLimit::default(), Compression::default()).await?;
 //! let first = backup("~/Pictures", Options::default(), store).await?;
 //!
 //! // Later backup. Nothing new to store means nothing is written.
 //! let store =
-//!     BlobStore::<true>::open("photos", SegmentLimit::default(), Compression::default()).await?;
+//!     BlobStore::open_for_writing("photos", SegmentLimit::default(), Compression::default()).await?;
 //! backup("~/Pictures", Options::default(), store).await?;
 //!
 //! // A read-only store takes no segment limit, because a read never rolls over.
-//! let store = BlobStore::<false>::open("photos").await?;
+//! let store = BlobStore::open_for_reading("photos").await?;
 //! restore("~/Pictures-restored", first.snapshot, store).await?;
 //! # Ok(())
 //! # }
@@ -70,7 +70,7 @@ pub mod varint;
 /// The README's code blocks, compiled as doctests.
 ///
 /// A README is not attached to anything, so nothing was checking it. Its library
-/// examples had drifted a long way: one called `BlobStore::open` with two
+/// examples had drifted a long way: one called `BlobStore::open_for_writing` with two
 /// arguments when it takes three, and the other called a `read_snapshot` that
 /// does not exist, passed a `BTreeSet` where the API now takes a `HashSet`, and
 /// referred to four names it never defined. A reader copying either got nothing

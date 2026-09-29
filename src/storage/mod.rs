@@ -251,7 +251,7 @@ impl Default for SegmentLimit {
 /// use lepatch::storage::{BlobStore, Compression, SegmentLimit};
 ///
 /// // The defaults: zstd level 1, four gibibytes per segment.
-/// let store = BlobStore::<true>::open(
+/// let store = BlobStore::open_for_writing(
 ///     "photos",
 ///     SegmentLimit::default(),
 ///     Compression::default(),
@@ -260,7 +260,7 @@ impl Default for SegmentLimit {
 /// // Or not. Both are write policies, and a set written under one reads back
 /// // under the other: a compressed record says so in its own header, and which
 /// // records are compressed is a question each record answers for itself.
-/// let store = BlobStore::<true>::open(
+/// let store = BlobStore::open_for_writing(
 ///     "photos",
 ///     SegmentLimit::new(64 * 1024 * 1024),
 ///     Compression::Off,

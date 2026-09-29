@@ -417,7 +417,7 @@ impl BlobStore<true> {
     /// in the middle; or if a *sealed* segment has a tail that does not verify,
     /// which is corruption and is never truncated.
     #[instrument(skip_all, err)]
-    pub async fn open<P: Into<PathBuf> + Debug>(
+    pub async fn open_for_writing<P: Into<PathBuf> + Debug>(
         path: P,
         limit: SegmentLimit,
         compression: Compression,
@@ -470,7 +470,7 @@ impl BlobStore<false> {
     /// Returns an error if the set does not exist, cannot be read, is missing a
     /// segment, or was written by an incompatible build.
     #[instrument(skip_all, err)]
-    pub async fn open<P: Into<PathBuf> + Debug>(path: P) -> io::Result<Self> {
+    pub async fn open_for_reading<P: Into<PathBuf> + Debug>(path: P) -> io::Result<Self> {
         let set = IndexSet::new(path.into());
 
         let scan_set = set.clone();

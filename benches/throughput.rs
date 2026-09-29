@@ -127,7 +127,7 @@ fn bench_backup(c: &mut Criterion) {
                                 std::fs::remove_file(IndexSet::new(&blob).segment_path(segment));
                         }
 
-                        let storage = BlobStore::<true>::open(
+                        let storage = BlobStore::open_for_writing(
                             &blob,
                             SegmentLimit::default(),
                             Compression::default(),
@@ -164,7 +164,7 @@ fn bench_restore(c: &mut Criterion) {
 
     let committed = rt.block_on(async {
         let storage =
-            BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+            BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
                 .await
                 .expect("store");
         backup(&src, Options::default(), storage)
@@ -184,7 +184,7 @@ fn bench_restore(c: &mut Criterion) {
                     let destination = dir.path().join("out");
                     let _ = std::fs::remove_dir_all(&destination);
 
-                    let storage = BlobStore::<false>::open(&blob).await.expect("store");
+                    let storage = BlobStore::open_for_reading(&blob).await.expect("store");
 
                     let started = Instant::now();
                     restore(&destination, committed.snapshot, storage)
@@ -215,7 +215,7 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
 
     let committed = rt.block_on(async {
         let storage =
-            BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+            BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
                 .await
                 .expect("store");
         backup(&src, Options::default(), storage)
@@ -224,7 +224,7 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
     });
 
     rt.block_on(async {
-        let storage = BlobStore::<false>::open(&blob).await.expect("store");
+        let storage = BlobStore::open_for_reading(&blob).await.expect("store");
         restore(&out, committed.snapshot, storage)
             .await
             .expect("restore");

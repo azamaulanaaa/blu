@@ -84,7 +84,7 @@ async fn a_backup_root_that_is_a_file_is_refused() {
     fs::write(&file, b"not a tree").unwrap();
 
     let blob = dir.path().join("store.bin");
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+    let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
 
@@ -120,7 +120,7 @@ async fn a_backup_root_that_is_a_symlink_to_a_directory_is_followed() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
     let blob = dir.path().join("store.bin");
-    let store = BlobStore::<true>::open(&blob, SegmentLimit::default(), Compression::default())
+    let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
     let committed = backup(&link, Options::default(), store)

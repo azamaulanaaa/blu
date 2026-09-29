@@ -260,9 +260,10 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
         let _ = std::fs::remove_file(store_segment(blob, segment));
     }
 
-    let storage = BlobStore::<true>::open(blob, SegmentLimit::default(), Compression::default())
-        .await
-        .expect("store");
+    let storage =
+        BlobStore::open_for_writing(blob, SegmentLimit::default(), Compression::default())
+            .await
+            .expect("store");
     let cpu_before = cpu_seconds();
     let started = Instant::now();
     backup(src, options, storage).await.expect("backup");

@@ -21,7 +21,7 @@ use lepatch::{
 async fn snapshot(blob: &std::path::Path, id: &BlobId) -> lepatch::metadata::Snapshot {
     use tokio::io::AsyncReadExt;
 
-    let storage = BlobStore::<false>::open(blob).await.unwrap();
+    let storage = BlobStore::open_for_reading(blob).await.unwrap();
     let mut reader = storage.get(id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
