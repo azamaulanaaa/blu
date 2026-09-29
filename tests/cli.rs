@@ -292,65 +292,88 @@ fn verify_reports_a_clean_store() {
     );
 }
 
-#[test]
-fn verify_fails_and_restore_refuses_on_a_damaged_store() {
-    let dir = tempfile::tempdir().unwrap();
-    build_tree(dir.path());
-    ok(dir.path(), &["backup", "src", "snap"]);
+/// A set with one byte flipped in the middle of its chunk data.
+///
+/// The three tests below each need this, and setting it up is six lines — enough
+/// that repeating it three times is worse than a name for it. Which is why the
+/// original was one test: it was written once, and then three unrelated claims
+/// ended up sharing it.
+fn damaged_store(dir: &std::path::Path) {
+    build_tree(dir);
+    ok(dir, &["backup", "src", "snap"]);
 
     // Flip a byte well inside the chunk data.
-    let store = dir.path().join("snap.0000.bin");
+    let store = dir.join("snap.0000.bin");
     let mut bytes = fs::read(&store).unwrap();
     let target = bytes.len() / 2;
     bytes[target] ^= 0xff;
     fs::write(&store, &bytes).unwrap();
+}
 
-    // The per-chunk detail and the final error go to stderr; the summary line
-    // goes to stdout, so both streams have to be read.
+/// `verify` reports the damage on stdout and exits non-zero.
+///
+/// The per-chunk detail goes to stderr and the summary line to stdout, so a test
+/// that reads only one stream reads half the answer — which is why these are
+/// separate tests and each says which stream it is looking at.
+#[test]
+fn verify_exits_non_zero_and_says_so_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    damaged_store(dir.path());
+
     let verify = lepatch(dir.path(), &["verify", "snap"]);
-    assert!(!verify.status.success());
+    assert!(
+        !verify.status.success(),
+        "a damaged store must not verify: exit {:?}",
+        verify.status.code()
+    );
 
     let summary = stdout(&verify);
     assert!(
         summary.contains("FAILED"),
         "the summary should report the failure: {summary}"
     );
+}
 
-    let detail = stderr(&verify);
-    // A chunk is named by the hash of what it should contain, and the bytes are
-    // reported as what they actually hash to — so two different hashes, and the
-    // message says which is which.
-    assert!(
-        detail.contains("actually hash to"),
-        "the detail should say what the bytes really hashed to: {detail}"
-    );
+/// The detail names the chunk and what its bytes really hashed to.
+///
+/// A chunk is addressed by the hash of what it should contain, so a mismatch is a
+/// report of two different hashes and which is which. The pair is found by
+/// collecting the 64-character hex tokens rather than by splitting the message on
+/// its wording: a test that parses prose fails when the prose is reworded, and
+/// passes when the diagnosis is wrong.
+#[test]
+fn verify_names_the_chunk_and_what_it_really_hashed_to() {
+    let dir = tempfile::tempdir().unwrap();
+    damaged_store(dir.path());
 
-    let named = detail
-        .split("actually hash to")
-        .next()
-        .and_then(|line| line.split("stored as chunk ").nth(1))
-        .map(|hash| {
-            hash.split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .unwrap_or_default();
-    let found = detail
-        .split("actually hash to")
-        .nth(1)
-        .map(|rest| {
-            rest.split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .unwrap_or_default();
+    let detail = stderr(&lepatch(dir.path(), &["verify", "snap"]));
+
+    let hashes: Vec<&str> = detail
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != 'a'))
+        .filter(|word| word.len() == 64 && word.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+
+    let mut distinct = hashes.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+
     assert!(
-        !named.is_empty() && !found.is_empty() && named != found,
-        "the detail should name the chunk and what it really hashed to, \
-         and those must differ: {detail}"
+        hashes.len() >= 2 && distinct.len() >= 2,
+        "the detail should name the chunk and the hash its bytes actually have, \
+         and those must differ:\n{detail}"
     );
+}
+
+/// A restore from a damaged store is refused, and writes nothing.
+///
+/// The refusal matters as much as the absence: "nothing was written" is also what
+/// a run that did nothing looks like. The message has to say it refused, and the
+/// destination has to be untouched.
+#[test]
+fn a_restore_from_a_damaged_store_is_refused_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    damaged_store(dir.path());
 
     let refused = fails(dir.path(), &["restore", "out", "snap"]);
     assert!(
