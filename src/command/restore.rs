@@ -93,6 +93,26 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         )
     })?;
 
+    // And that each file's recorded length is what its slices account for.
+    //
+    // This one is not about the store being damaged — `check` above covers that,
+    // and a short read is caught per slice. It is about `File::len` being a
+    // number in a blob that nothing downstream can check: each file is `set_len`ed
+    // to it after its slices are written, to close a gap *between* them, so a
+    // length longer than the slices does not fail. It zero-fills, the file comes
+    // out exactly the right size, and the restore reports success having lost
+    // the tail. The same arithmetic runs before a backup is committed, which is
+    // why it existed — on the side where the threat is a file changing rather
+    // than a lie.
+    snapshot
+        .verify_file_lengths("does not match its own chunks")
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("refusing to restore snapshot {snapshot_id}: {e}"),
+            )
+        })?;
+
     restore_directories(root, &snapshot).await?;
     let written = restore_files(root, Arc::clone(&snapshot), Arc::clone(&storage)).await?;
     restore_links(root, &snapshot)?;

@@ -152,7 +152,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     // The chunker stats each file when it is registered and reads it again later,
     // so a file that changed size in between would silently shift every
     // subsequent chunk into the wrong file.
-    verify_file_lengths(&snapshot)?;
+    snapshot.verify_file_lengths("changed while it was being backed up")?;
 
     let buffer = snapshot.to_bytes();
 
@@ -330,57 +330,6 @@ pub(super) fn index_to_u32(index: usize) -> io::Result<u32> {
             format!("the tree needs more than {} entries", u32::MAX),
         )
     })
-}
-
-/// Assert that every file's chunk slices add up to the length recorded during
-/// the walk, and that no slice claims space outside its file.
-fn verify_file_lengths(snapshot: &metadata::Snapshot) -> io::Result<()> {
-    let mut totals = vec![0u64; snapshot.files.len()];
-    let mut extents: Vec<Option<(u64, u64)>> = vec![None; snapshot.files.len()];
-
-    for slice in &snapshot.file_chunks {
-        let index = slice.file_index as usize;
-        let file = snapshot.files.get(index).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("chunk references file {index}, which the snapshot does not contain"),
-            )
-        })?;
-
-        let end = slice
-            .file_offset
-            .checked_add(slice.length.into())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("chunk range overflows in {}", file.path.display()),
-                )
-            })?;
-
-        totals[index] += u64::from(slice.length);
-
-        let extent = extents[index].get_or_insert((slice.file_offset, end));
-        extent.0 = extent.0.min(slice.file_offset);
-        extent.1 = extent.1.max(end);
-    }
-
-    for (index, file) in snapshot.files.iter().enumerate() {
-        let covered = extents[index].map_or(0, |(start, end)| end - start);
-
-        if totals[index] != file.len || covered != file.len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{} changed while it was being backed up: recorded {} bytes, chunked {} bytes covering {covered} bytes",
-                    file.path.display(),
-                    file.len,
-                    totals[index]
-                ),
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 /// A file's identity on disk, for telling hard links apart.

@@ -292,3 +292,62 @@ async fn an_ordinary_tree_still_restores() {
 
     assert_eq!(common::describe(&src), common::describe(&dest));
 }
+
+/// A snapshot whose recorded length is longer than its chunks is refused.
+///
+/// `File::len` is a number in a blob. Nothing about a snapshot is trusted until
+/// it has been checked, and a length that the chunk slices do not account for is
+/// the easiest thing in the format to get wrong — it is one field, and nothing
+/// downstream of it can notice.
+///
+/// Restore is the dangerous direction. It writes the recorded slices and then
+/// `set_len`s the file to the recorded length, which is what closes a gap
+/// between slices. A length longer than the slices therefore does not fail: it
+/// *zero-fills*, and the result is a file the right size, with a plausible
+/// amount of content, silently missing a tail. A restore that claims success has
+/// lost data.
+///
+/// `backup` has always checked this — `verify_file_lengths` is why a tree that
+/// changes mid-run is caught — but the check lived only on the writing side,
+/// where a hostile snapshot is not the threat. The same arithmetic, in the same
+/// terms, belongs wherever a snapshot is consumed.
+#[tokio::test]
+async fn a_file_longer_than_its_chunks_is_refused() {
+    let forged = Forged::new(|snapshot| {
+        snapshot.files.push(File {
+            path: PathBuf::from("a.bin"),
+            // Six bytes are covered by the one slice below; this claims twenty.
+            len: 20,
+            mode: 0o644,
+            mtime: None,
+        });
+        snapshot.file_chunks.push(FileChunk {
+            chunk_index: 0,
+            file_index: 0,
+            chunk_offset: 0,
+            file_offset: 0,
+            length: 6,
+        });
+    })
+    .await;
+
+    let dest = forged.dir.path().join("restore-here");
+    fs::create_dir_all(&dest).unwrap();
+
+    let error = forged
+        .restore_into(&dest)
+        .await
+        .expect_err("a length the chunks do not account for should be refused");
+
+    assert!(
+        error.contains("20")
+            && (error.contains("6 bytes") || error.contains("does not match its own chunks")),
+        "the error should say what was recorded and what the chunks cover: {error}"
+    );
+
+    // And nothing was written, rather than a zero-filled file being left behind.
+    assert!(
+        dest.read_dir().unwrap().next().is_none(),
+        "a refused restore should not leave a file that looks complete"
+    );
+}

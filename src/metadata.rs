@@ -16,7 +16,7 @@ mod codec;
 // agree about being public.
 pub use codec::Malformed;
 
-use std::{fmt, path::PathBuf};
+use std::{fmt, io, path::PathBuf};
 
 use crate::storage;
 
@@ -129,6 +129,100 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Assert that every file's chunk slices add up to its recorded length, and
+    /// that no slice claims space outside it.
+    ///
+    /// Both directions of the round trip need this, and for different reasons.
+    ///
+    /// A **backup** writes it, and a tree can change between being walked and
+    /// being read: the chunker stats each file when it registers it and reads it
+    /// again later, so a file that grew in between shifts every subsequent chunk
+    /// into the wrong one. The lengths recorded during the walk stop matching
+    /// what was chunked, and the snapshot would be internally consistent and
+    /// wrong.
+    ///
+    /// A **restore** reads a snapshot that is a blob in a store, and nothing
+    /// about it is trustworthy. `File::len` is one number, and if it is longer
+    /// than the slices then `set_len` at the end of each file — there to close a
+    /// gap *between* slices — zero-fills the tail instead. That does not fail.
+    /// The restore reports success and leaves a file of exactly the right size
+    /// with a plausible amount of content and a tail of nothing. A check that
+    /// exists only on the writing side, where a hostile snapshot is not the
+    /// threat, is a check in the wrong place.
+    ///
+    /// Both the total and the covered extent are required to match. The total
+    /// catches slices that are too long, or too short, or that overlap so the
+    /// sum overcounts; the extent catches slices that leave a gap at the start,
+    /// where the sum can be right and a hole is not.
+    ///
+    /// The extent is also what catches a slice reaching *past* the end of its
+    /// file, so there is deliberately no separate check for that. It looks like
+    /// the more direct thing to say, and it has a clearer message — but it fires
+    /// first, on the path a growing file takes during a backup, and it replaces
+    /// the one that has been telling a user their tree moved under them. Same
+    /// refusal, worse message.
+    ///
+    /// `what` is the clause that goes between the file and the numbers, and it is
+    /// the caller's because the two situations read differently. "Changed while
+    /// it was being backed up" is a diagnosis; "does not match its own chunks" is
+    /// a description, and a restore has no basis for the first. A clause rather
+    /// than an enum because neither side branches on it — it is a sentence, and
+    /// putting it in the message is the whole of what it is for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the file, its recorded length, how many bytes the
+    /// slices total, and how much of the file they cover — all four, because a
+    /// mismatch between any two of them is a different mistake.
+    pub fn verify_file_lengths(&self, what: &str) -> io::Result<()> {
+        let mut totals = vec![0u64; self.files.len()];
+        let mut extents: Vec<Option<(u64, u64)>> = vec![None; self.files.len()];
+
+        for slice in &self.file_chunks {
+            let index = slice.file_index as usize;
+            let file = self.files.get(index).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("chunk references file {index}, which the snapshot does not contain"),
+                )
+            })?;
+
+            let end = slice
+                .file_offset
+                .checked_add(slice.length.into())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("chunk range overflows in {}", file.path.display()),
+                    )
+                })?;
+
+            totals[index] += u64::from(slice.length);
+
+            let extent = extents[index].get_or_insert((slice.file_offset, end));
+            extent.0 = extent.0.min(slice.file_offset);
+            extent.1 = extent.1.max(end);
+        }
+
+        for (index, file) in self.files.iter().enumerate() {
+            let covered = extents[index].map_or(0, |(start, end)| end - start);
+            let (recorded, chunked) = (file.len, totals[index]);
+
+            if chunked != recorded || covered != recorded {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{path} {what}: recorded {recorded} bytes, chunked {chunked} bytes \
+                         covering {covered} bytes",
+                        path = file.path.display(),
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// An empty snapshot.
     ///
     /// There is no version field to stamp, and that is the point: the layout
