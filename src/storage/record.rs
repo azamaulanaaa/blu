@@ -69,13 +69,22 @@ const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
 /// Longest LEB128 encoding of a `u64`.
 const MAX_VARINT: usize = 10;
 
+/// Bytes in the largest possible header: two varints at their widest.
+///
+/// What a scan must have in hand before it tries to decode a header. Refilling
+/// against [`MIN_HEADER`] is not enough — a header carrying two three-byte
+/// varints is 52 bytes against a 48-byte floor, so a record boundary in the last
+/// few bytes of the buffer fails to decode and a good segment is reported as
+/// damaged.
+const MAX_HEADER: usize = PREFIX + 2 * MAX_VARINT + HASH + CHECK;
+
 /// Bytes read at a time while scanning.
 ///
 /// A record is skipped with a seek rather than read, so the scan is proportional
 /// to the number of records and not to the size of the store. This sets what it
 /// is proportional to in *reads*: the buffer is refilled only when the next
-/// header would not fit in what is left, and always holds at least
-/// [`MIN_HEADER`].
+/// header would not fit in what is left, and a refill therefore always leaves
+/// [`MAX_HEADER`] bytes available to decode one.
 const SCAN_BUFFER: usize = 1024 * 1024;
 
 /// What a record holds.
@@ -429,8 +438,11 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32) -> io::Result<Scan> {
 
     while position < file_len {
         // Refill only when the next header would not fit, so a run of small
-        // records costs one read per buffer rather than one read per record.
-        if position - base + MIN_HEADER as u64 > buffer.len() as u64 {
+        // records costs one read per buffer rather than one read per record. What
+        // has to fit is `MAX_HEADER`, not `MIN_HEADER`: a header is variable
+        // width, and the shortfall here would be read as damage rather than as a
+        // boundary to move past.
+        if position - base + MAX_HEADER as u64 > buffer.len() as u64 {
             file.seek(SeekFrom::Start(position))?;
             buffer.clear();
             buffer.resize(
@@ -537,4 +549,60 @@ fn read_exact_or_eof(file: &mut std::fs::File, buffer: &mut [u8]) -> io::Result<
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A segment whose records are sized so that a header lands in the last few
+    /// bytes of the scan buffer.
+    ///
+    /// `SCAN_BUFFER` is 1 MiB and the refill guarantees `MIN_HEADER` (48) bytes,
+    /// but a header carrying two three-byte varints is 52. A record boundary
+    /// falling in `[buffer.len() - 51, buffer.len() - 48]` therefore cannot be
+    /// decoded, and the scan stops there and reports the rest of a perfectly good
+    /// segment as damaged. Two records of 524 263 bytes put the third header
+    /// exactly at 1 048 526.
+    #[test]
+    fn a_header_in_the_last_bytes_of_the_scan_buffer_is_not_damage() {
+        const RECORD: u64 = 524_263;
+
+        let file = std::env::temp_dir().join(format!(
+            "lepatch-scan-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&file).ok();
+
+        let mut bytes = encode_store_header(0).to_vec();
+        for n in 0u8..4 {
+            let mut hash = [0u8; HASH];
+            hash[0] = n;
+            let payload = RECORD - header_len(RECORD, RECORD);
+            let mut header = Vec::new();
+            encode_header(&mut header, Kind::Blob, Codec::Raw, &hash, payload, payload);
+            let total = u64::try_from(header.len()).unwrap() + payload;
+            assert_eq!(
+                total, RECORD,
+                "the fixture must be exactly RECORD bytes per record"
+            );
+            bytes.extend_from_slice(&header);
+            bytes.extend(std::iter::repeat_n(0u8, usize::try_from(payload).unwrap()));
+        }
+
+        std::fs::write(&file, &bytes).unwrap();
+
+        let mut handle = std::fs::File::open(&file).unwrap();
+        let scan = scan(&mut handle, 0).unwrap();
+        drop(handle);
+        std::fs::remove_file(&file).ok();
+
+        assert_eq!(
+            scan.end,
+            u64::try_from(bytes.len()).unwrap(),
+            "the scan stopped early: a valid record boundary was read as damage"
+        );
+        assert_eq!(scan.blobs.len(), 4, "every record should be indexed");
+    }
 }
