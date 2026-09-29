@@ -46,15 +46,19 @@ pub struct Options {
     pub concurrency: usize,
 }
 
+/// The command line's defaults.
+///
+/// `Default` *is* the command line's configuration, not a stand-in for it: the
+/// binary exposes no flags for the chunker's sizes, so every backup it has ever
+/// written used [`reader::ChunkerConfig::default`]. A caller in a test that
+/// wants the same behaviour now says `Options::default()` and gets it by
+/// construction, rather than restating three numbers and hoping they still
+/// match.
 impl Default for Options {
     fn default() -> Self {
         Self {
             exclude: Vec::new(),
-            chunker: reader::ChunkerConfig {
-                min_size: 8 * 1024,
-                avg_size: 16 * 1024,
-                max_size: 64 * 1024,
-            },
+            chunker: reader::ChunkerConfig::default(),
             concurrency: default_concurrency(),
         }
     }

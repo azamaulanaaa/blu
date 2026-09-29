@@ -195,6 +195,12 @@ impl Read for GlobalStream {
 ///
 /// Boundaries come from the content, so inserting or removing bytes shifts only
 /// the chunks around the change rather than every chunk after it.
+///
+/// [`Default`] is what the command line uses. The three sizes are the whole
+/// public surface of the chunker's policy, and the binary exposes no flags for
+/// them, so the values in [`Default`] are the only ones any real backup has ever
+/// been written with. Keeping them here rather than at the call site means a
+/// second configuration cannot be a slightly different one by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkerConfig {
     /// No boundary is taken before this many bytes.
@@ -203,6 +209,16 @@ pub struct ChunkerConfig {
     pub avg_size: u32,
     /// A boundary is forced once this many bytes have accumulated.
     pub max_size: u32,
+}
+
+impl Default for ChunkerConfig {
+    fn default() -> Self {
+        Self {
+            min_size: 8 * 1024,
+            avg_size: 16 * 1024,
+            max_size: 64 * 1024,
+        }
+    }
 }
 
 impl ChunkerConfig {
