@@ -29,7 +29,7 @@ fn sample() -> Snapshot {
 
 #[test]
 fn snapshot_round_trips_through_the_framed_encoding() {
-    let encoded = sample().to_bytes();
+    let encoded = sample().to_bytes().expect("encodes");
 
     assert_eq!(&encoded[..metadata::MAGIC.len()], metadata::MAGIC);
 
@@ -48,7 +48,7 @@ fn snapshot_round_trips_through_the_framed_encoding() {
 /// than misread.
 #[test]
 fn the_frame_carries_this_builds_version() {
-    let encoded = sample().to_bytes();
+    let encoded = sample().to_bytes().expect("encodes");
     let at = metadata::MAGIC.len();
     let version = u32::from_le_bytes(encoded[at..at + 4].try_into().unwrap());
 
@@ -62,7 +62,7 @@ fn the_frame_carries_this_builds_version() {
 
 #[test]
 fn a_blob_without_the_magic_prefix_is_rejected() {
-    let mut encoded = sample().to_bytes();
+    let mut encoded = sample().to_bytes().expect("encodes");
     encoded[0] = b'X';
 
     match Snapshot::try_from(encoded.as_slice()) {
@@ -73,7 +73,7 @@ fn a_blob_without_the_magic_prefix_is_rejected() {
 
 #[test]
 fn an_unknown_format_version_is_reported_as_such() {
-    let mut encoded = sample().to_bytes();
+    let mut encoded = sample().to_bytes().expect("encodes");
     let version_at = metadata::MAGIC.len();
     encoded[version_at..version_at + 4].copy_from_slice(&999u32.to_le_bytes());
 
@@ -88,7 +88,7 @@ fn an_unknown_format_version_is_reported_as_such() {
 
 #[test]
 fn a_truncated_blob_is_rejected_rather_than_panicking() {
-    let encoded = sample().to_bytes();
+    let encoded = sample().to_bytes().expect("encodes");
 
     for len in 0..metadata::MAGIC.len() + 4 {
         match Snapshot::try_from(&encoded[..len]) {
@@ -100,7 +100,7 @@ fn a_truncated_blob_is_rejected_rather_than_panicking() {
 
 #[test]
 fn a_corrupt_body_is_reported_as_a_decode_error() {
-    let mut encoded = sample().to_bytes();
+    let mut encoded = sample().to_bytes().expect("encodes");
     let last = encoded.len() - 1;
     encoded[last] ^= 0xff;
 
@@ -119,7 +119,7 @@ fn a_corrupt_body_is_reported_as_a_decode_error() {
 
 #[test]
 fn trailing_bytes_after_a_snapshot_are_refused_rather_than_ignored() {
-    let mut encoded = sample().to_bytes();
+    let mut encoded = sample().to_bytes().expect("encodes");
     encoded.push(0);
 
     // The other half of the case above, and the reason it needed naming: two
@@ -181,7 +181,7 @@ fn an_extreme_timestamp_does_not_wrap_into_the_opposite_of_itself() {
 /// wrong one. This is the test that says it does not.
 #[test]
 fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
-    let mut encoded = sample().to_bytes();
+    let mut encoded = sample().to_bytes().expect("encodes");
     let header = lepatch::metadata::MAGIC.len();
 
     // Claim to be version 1, with a body that is not a version 1 body.
@@ -203,7 +203,7 @@ fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
 #[test]
 fn the_encoding_is_compact_for_small_numbers() {
     let snapshot = sample();
-    let encoded = snapshot.to_bytes();
+    let encoded = snapshot.to_bytes().expect("encodes");
 
     // A path, a count and a handful of small indices should cost tens of bytes,
     // not the ~150 a fixed-width encoding of the same values would.

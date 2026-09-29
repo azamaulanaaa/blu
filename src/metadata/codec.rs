@@ -240,18 +240,61 @@ impl Writer {
         self.varint(u64::try_from(count).unwrap_or(u64::MAX));
     }
 
-    fn path(&mut self, path: &Path) {
+    /// The bytes a path is stored as, or `None` if this platform cannot
+    /// represent it.
+    ///
+    /// Two arms, and they are not interchangeable.
+    ///
+    /// On unix a path is a byte string, so its bytes go in as they are. That is
+    /// the whole reason `tests/paths.rs` exists: a name that is not valid UTF-8 is
+    /// a legal file name, a tree can contain one, and a backup that refused the
+    /// tree over it would abandon the whole run. The decoder reads the same bytes
+    /// back, so the round trip is exact.
+    ///
+    /// Everywhere else a path *is* text, and the only portable way to get at it is
+    /// `to_str` — or `to_string_lossy`, which replaces what it cannot represent
+    /// with `U+FFFD`. That was the arm in use, and it is worse than it looks: it
+    /// does not fail, it silently succeeds with a *different path*. Two names that
+    /// differ only in an unrepresentable byte encode to the same bytes, and a
+    /// restore writes both at the same place, having recorded something that never
+    /// existed on disk.
+    ///
+    /// So the answer is `None` and the caller refuses. A tree the format cannot
+    /// represent is refused loudly at the point of encoding, which is where a
+    /// person is told, rather than being backed up into a state that cannot be
+    /// restored. `to_string_lossy` stays available on unix, where it is only a
+    /// *rendering* choice and nothing is written through it.
+    /// One signature for two arms, so the return is an `Option` even where it
+    /// cannot be `None`.
+    ///
+    /// Clippy is right that on unix this never returns `None` and wrong to have
+    /// it here: the caller has to be one piece of code for both platforms, and
+    /// making the unix arm return a bare `&[u8]` would mean two callers. The
+    /// allow is on the function and says so, rather than being a crate-wide
+    /// concession.
+    #[cfg_attr(unix, allow(clippy::unnecessary_wraps))]
+    fn path_bytes(path: &Path) -> Option<&[u8]> {
         #[cfg(unix)]
-        let bytes = {
+        {
             use std::os::unix::ffi::OsStrExt;
-            path.as_os_str().as_bytes()
-        };
+            Some(path.as_os_str().as_bytes())
+        }
 
         #[cfg(not(unix))]
-        let bytes = path.to_string_lossy().as_bytes();
+        {
+            path.to_str().map(str::as_bytes)
+        }
+    }
+
+    fn path(&mut self, path: &Path) -> Result<()> {
+        let bytes = Self::path_bytes(path).ok_or(Malformed(
+            "a path is not valid text on this platform, and a lossy encoding \
+             would record a name that does not exist",
+        ))?;
 
         self.varint(bytes.len() as u64);
         self.bytes.extend_from_slice(bytes);
+        Ok(())
     }
 
     fn optional_timestamp(&mut self, mtime: Option<Timestamp>) {
@@ -271,12 +314,12 @@ impl Writer {
 }
 
 /// Encode a snapshot's body, without the magic or version header.
-pub(crate) fn encode_body(snapshot: &Snapshot) -> Vec<u8> {
+pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
     let mut out = Writer::new();
 
     out.count(snapshot.files.len());
     for file in &snapshot.files {
-        out.path(&file.path);
+        out.path(&file.path)?;
         out.u64(file.len);
         out.u32(file.mode);
         out.optional_timestamp(file.mtime);
@@ -284,7 +327,7 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Vec<u8> {
 
     out.count(snapshot.dirs.len());
     for dir in &snapshot.dirs {
-        out.path(&dir.path);
+        out.path(&dir.path)?;
         out.u32(dir.mode);
         out.optional_timestamp(dir.mtime);
     }
@@ -312,12 +355,12 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Vec<u8> {
             Link::Symbolic { path, target } => (path, target, 1),
             Link::Hard { path, shares } => (path, shares, 0),
         };
-        out.path(path);
-        out.path(second);
+        out.path(path)?;
+        out.path(second)?;
         out.u8(kind);
     }
 
-    out.bytes
+    Ok(out.bytes)
 }
 
 /// Decode a snapshot's body, which must be the whole of `bytes`.
@@ -441,21 +484,21 @@ mod tests {
     #[test]
     fn a_snapshot_survives_a_round_trip() {
         let snapshot = sample();
-        let decoded = decode_body(&encode_body(&snapshot)).expect("decodes");
+        let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
         assert_eq!(decoded, snapshot);
     }
 
     #[test]
     fn an_empty_snapshot_survives_a_round_trip() {
         let snapshot = Snapshot::new();
-        let decoded = decode_body(&encode_body(&snapshot)).expect("decodes");
+        let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
         assert!(decoded.files.is_empty());
         assert!(decoded.links.is_empty());
     }
 
     #[test]
     fn a_truncated_body_is_refused() {
-        let bytes = encode_body(&sample());
+        let bytes = encode_body(&sample()).expect("encodes");
         for cut in 0..bytes.len() {
             assert!(
                 decode_body(&bytes[..cut]).is_err(),
@@ -467,7 +510,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_refused() {
-        let mut bytes = encode_body(&sample());
+        let mut bytes = encode_body(&sample()).expect("encodes");
         bytes.push(0);
         assert!(decode_body(&bytes).is_err(), "trailing bytes were accepted");
     }
@@ -501,7 +544,7 @@ mod tests {
     #[test]
     fn an_unknown_link_kind_is_refused() {
         let snapshot = sample();
-        let mut body = encode_body(&snapshot);
+        let mut body = encode_body(&snapshot).expect("encodes");
         // The kind byte is the last one written.
         let last = body.len() - 1;
         body[last] = 9;
@@ -526,7 +569,7 @@ mod tests {
                 mtime: None,
             });
 
-            let decoded = decode_body(&encode_body(&snapshot)).expect("decodes");
+            let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
             assert_eq!(decoded.files[0].path, snapshot.files[0].path);
         }
     }

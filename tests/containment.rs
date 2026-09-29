@@ -65,7 +65,7 @@ impl Forged {
             }
         }
 
-        let encoded = snapshot.to_bytes();
+        let encoded = snapshot.to_bytes().expect("encodes");
         let len = u64::try_from(encoded.len()).unwrap();
         let id = blake3::hash(&encoded);
         storage

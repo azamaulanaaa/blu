@@ -246,16 +246,27 @@ impl Snapshot {
     /// The version written is [`FORMAT_VERSION`], always. There is nothing for a
     /// caller to choose here: a snapshot is not "in" a version, it is written by
     /// a build that emits one.
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let body = codec::encode_body(self);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only where a path in this snapshot cannot be represented
+    /// on this platform. On unix that cannot happen — a path is a byte string, so
+    /// its bytes are written as they are and a name that is not valid UTF-8
+    /// round-trips exactly. Everywhere else a path is text, and a name the
+    /// platform's encoding cannot hold is **refused** rather than written with
+    /// replacement characters, which would record a path that does not exist and
+    /// collide two real ones. A tree the format cannot represent is refused here,
+    /// at the point where a person can be told, rather than being backed up into
+    /// a set that cannot be restored.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let body = codec::encode_body(self).map_err(Error::Decode)?;
 
         let mut out = Vec::with_capacity(MAGIC.len() + 4 + body.len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&body);
 
-        out
+        Ok(out)
     }
 
     fn parse(bytes: &[u8]) -> Result<Self, Error> {

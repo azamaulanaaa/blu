@@ -154,7 +154,16 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     // subsequent chunk into the wrong file.
     snapshot.verify_file_lengths("changed while it was being backed up")?;
 
-    let buffer = snapshot.to_bytes();
+    // Only fails where a path in the snapshot cannot be represented on this
+    // platform, which on unix cannot happen. Reported as invalid input rather
+    // than as damaged data: nothing about the snapshot is wrong, this build
+    // cannot write it.
+    let buffer = snapshot.to_bytes().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("this tree cannot be recorded on this platform: {e}"),
+        )
+    })?;
 
     // The snapshot is a blob like any other, addressed by the hash of its own
     // bytes — which is what the commit record names.
