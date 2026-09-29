@@ -82,6 +82,24 @@ pub struct Located {
 }
 
 /// A half-open byte range of a pack.
+///
+/// This is [`std::ops::Range<u64>`] with a `start`, an `end`, and two things that
+/// range does not have, and the suggestion to use the standard type — which is
+/// what an audit proposed — is declined here because both are lost.
+///
+/// **A `len()` that cannot panic.** `Range<u64>` has no `len()` at all, and that
+/// is not an oversight: it would be `end - start`, which panics under a debug
+/// assertion and wraps to a near-`u64::MAX` in release. Both fields are public and
+/// the type is part of the client protocol, so an inverted range is a value a
+/// caller can produce. `len` here saturates, and `needed_bytes` folds that rather
+/// than `sum()` for the same reason.
+///
+/// **`is_empty()` means "well-formed and covers nothing", not `end <= start`.**
+/// `Range<u64>::is_empty` is `start >= end`, so an inverted range would answer
+/// `true` — and an inverted range is not empty, it is *malformed*, and the two
+/// want different responses. `tests/pack.rs::an_inverted_range_covers_nothing`
+/// pins this deliberately: the same call must be able to say "no bytes" (via
+/// `len`) and "not a range" (via `is_empty`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
     /// First byte.
@@ -101,7 +119,12 @@ impl Range {
         self.end.saturating_sub(self.start)
     }
 
-    /// Whether the range covers nothing.
+    /// Whether the range covers nothing *and is well formed*.
+    ///
+    /// Not `end <= start`, which is what [`std::ops::Range::is_empty`] does and
+    /// which would report an inverted range as empty. An inverted range covers no
+    /// bytes — [`Range::len`] says so — but it is not empty, it is malformed, and
+    /// a caller acting on the two differently is the point.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.end == self.start

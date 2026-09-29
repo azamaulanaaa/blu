@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncSeek};
 
 pub use blob::BlobStore;
 pub use locate::{Resolved, resolve, resolve_with};
-pub use plan::{Plan, Planned};
+pub use plan::{Plan, PlannedChunk};
 
 pub use version_index::VersionIndex;
 
@@ -289,27 +289,40 @@ impl Default for Compression {
 }
 
 impl Compression {
+    /// zstd at `level`, clamped to 1..=[`MAX_COMPRESSION_LEVEL`].
+    ///
+    /// The only way to name a zstd policy. A level of 0 clamps to 1, not to
+    /// [`Compression::Off`], because the caller asked for zstd and the two are
+    /// different requests: `Off` is a decision to store payloads as they are, and
+    /// silently taking it would be a store written at a policy nobody chose.
+    /// [`Compression::from_level`] is how a user's 0 becomes `Off`, and it is a
+    /// separate function because that is a separate question.
+    #[must_use]
+    pub fn zstd(level: u8) -> Self {
+        Self::Zstd {
+            level: level.clamp(1, MAX_COMPRESSION_LEVEL),
+        }
+    }
+
     /// The policy for a level the way a user counts them: 0 stores payloads as they
     /// are, and 1 to 9 are zstd levels.
+    ///
+    /// The difference from [`Compression::zstd`] is the `0` arm and nothing else,
+    /// which is the whole reason they are two functions. One of them means "use
+    /// zstd at this level" and the other means "this is a level from a command
+    /// line, where 0 has always meant off". A single function would have to
+    /// answer both questions, and it would answer the first one wrongly for
+    /// anyone who passed 0 meaning zstd's floor.
     ///
     /// Out-of-range values are clamped rather than rejected, so a bad number gives
     /// a working policy rather than a panic. A command line rejects them instead,
     /// where the user can be told.
     #[must_use]
     pub fn from_level(level: u8) -> Self {
-        match level {
-            0 => Self::Off,
-            _ => Self::Zstd {
-                level: level.clamp(1, MAX_COMPRESSION_LEVEL),
-            },
-        }
-    }
-
-    /// zstd at `level`, clamped to 1..=[`MAX_COMPRESSION_LEVEL`].
-    #[must_use]
-    pub fn zstd(level: u8) -> Self {
-        Self::Zstd {
-            level: level.clamp(1, MAX_COMPRESSION_LEVEL),
+        if level == 0 {
+            Self::Off
+        } else {
+            Self::zstd(level)
         }
     }
 

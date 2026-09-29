@@ -29,7 +29,7 @@ use crate::storage::{BlobId, Placement};
 /// one spanning two files is stored whole and used in part, and one spanned by
 /// repeated content may be used at several offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Planned {
+pub struct PlannedChunk {
     /// The chunk's content hash, and its identity.
     pub id: BlobId,
     /// Where the chunk's payload sits in the store.
@@ -41,17 +41,17 @@ pub struct Planned {
 /// Every chunk a snapshot needs, in a deterministic order, with its location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
-    chunks: Vec<Planned>,
+    chunks: Vec<PlannedChunk>,
 }
 
 impl Plan {
     /// The chunks, in order.
     ///
-    /// [`Plan`] is also [`IntoIterator`] and [`AsRef<[Planned]>`], so
+    /// [`Plan`] is also [`IntoIterator`] and [`AsRef<[PlannedChunk]>`], so
     /// `for chunk in &plan` and `plan.as_ref().len()` both work and the
     /// `plan.chunks().iter()` double hop is not needed. Both spellings were in
     /// the tree, and the double hop reads like a mistake.
-    pub fn iter(&self) -> std::slice::Iter<'_, Planned> {
+    pub fn iter(&self) -> std::slice::Iter<'_, PlannedChunk> {
         self.chunks.iter()
     }
 
@@ -117,7 +117,7 @@ impl Plan {
                 ));
             }
 
-            chunks.push(Planned {
+            chunks.push(PlannedChunk {
                 id: *id,
                 placement,
                 length,
@@ -129,7 +129,7 @@ impl Plan {
 
     /// The chunks, in the snapshot's own chunk order.
     #[must_use]
-    pub fn chunks(&self) -> &[Planned] {
+    pub fn chunks(&self) -> &[PlannedChunk] {
         &self.chunks
     }
 
@@ -159,15 +159,15 @@ impl Plan {
     }
 }
 
-impl AsRef<[Planned]> for Plan {
-    fn as_ref(&self) -> &[Planned] {
+impl AsRef<[PlannedChunk]> for Plan {
+    fn as_ref(&self) -> &[PlannedChunk] {
         &self.chunks
     }
 }
 
 impl<'a> IntoIterator for &'a Plan {
-    type Item = &'a Planned;
-    type IntoIter = std::slice::Iter<'a, Planned>;
+    type Item = &'a PlannedChunk;
+    type IntoIter = std::slice::Iter<'a, PlannedChunk>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.chunks.iter()
@@ -175,8 +175,8 @@ impl<'a> IntoIterator for &'a Plan {
 }
 
 impl IntoIterator for Plan {
-    type Item = Planned;
-    type IntoIter = std::vec::IntoIter<Planned>;
+    type Item = PlannedChunk;
+    type IntoIter = std::vec::IntoIter<PlannedChunk>;
 
     /// Takes the chunks rather than copying them, which is what a caller
     /// assembling its own index wants.
