@@ -10,7 +10,7 @@
 //! against the one before it, and it is why the caller does not have to know
 //! what is already there.
 
-use std::io;
+use std::{io, path::Path};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncSeek};
@@ -36,6 +36,78 @@ pub(super) fn truncated_hash<const N: usize>(bytes: &[u8]) -> [u8; N] {
     let mut out = [0u8; N];
     out.copy_from_slice(&blake3::hash(bytes).as_bytes()[..N]);
     out
+}
+
+/// A filesystem call's error, naming the path and what was being done to it.
+///
+/// A bare `?` on `fs::File::open(path)` produces `No such file or directory (os
+/// error 2)`, which is a true sentence about a file the user has to find. The
+/// crate already has `not_a_store` and `not_a_pack` for the errors that mean
+/// "this is not a store" and "this is not a pack", and it has around forty of
+/// these — the calls where the operation failed for an ordinary reason and the
+/// message is whatever the operating system said.
+///
+/// The kind is carried through, which is the whole reason this is a function and
+/// not a `format!`. A bare `io::Error::new(Other, ...)` would be a lie about a
+/// permission problem, and a crate that hands `io::Error` to callers has already
+/// established that the kinds are the contract.
+///
+/// ```no_run
+/// # fn main() -> std::io::Result<()> {
+/// # let path = std::path::Path::new("photos.0000.bin");
+/// let file = lepatch::storage::at(path, "open", std::fs::File::open(path))?;
+/// # let _ = file;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// One construct rather than a `map_err` at each site, because a `map_err` needs
+/// the error and the path in the right order to be readable, and gets them the
+/// wrong way round about as often as not.
+///
+/// # Errors
+///
+/// Returns `Ok` for `Ok`, and otherwise the same error with `doing` and the path
+/// put in front of the operating system's own message. The [`io::ErrorKind`] is
+/// the one the error came in with, unchanged — that is the reason this is a
+/// function and not a `format!`.
+pub fn at<T>(path: &Path, doing: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not {doing} {}: {e}", path.display()),
+        )
+    })
+}
+
+/// [`at`], for a call that returns a future.
+///
+/// A second function rather than one overloaded on both, because a future is not
+/// an `io::Result` and a wrapper taking either would need a second type parameter
+/// to say which. Two names is the smaller cost.
+///
+/// ```no_run
+/// # async fn example() -> std::io::Result<()> {
+/// # let path = std::path::Path::new("photos.0000.bin");
+/// let file = lepatch::storage::at_async(
+///     path,
+///     "open",
+///     tokio::fs::File::open(path),
+/// ).await?;
+/// # let _ = file;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// The same as [`at`]: `Ok` for `Ok`, and otherwise the error with `doing` and
+/// the path in front of it, keeping its [`io::ErrorKind`].
+pub async fn at_async<T, F>(path: &Path, doing: &str, result: F) -> io::Result<T>
+where
+    F: std::future::Future<Output = io::Result<T>>,
+{
+    at(path, doing, result.await)
 }
 
 /// A zeroed buffer of exactly `bytes`, or an error saying what would not fit.

@@ -170,7 +170,7 @@ impl Pack {
         let header = encode_header(planned_count, planned_bytes, *snapshot);
         let payload_start = u64::try_from(header.len()).unwrap_or(u64::MAX);
 
-        let mut file = tfs::File::create(path).await?;
+        let mut file = crate::storage::at_async(path, "create", tfs::File::create(path)).await?;
         file.write_all(&header).await?;
 
         for planned in plan.chunks() {
@@ -245,7 +245,7 @@ impl Pack {
     /// disagrees with its own index — on the chunk count, or on where the
     /// payload ends — is refused rather than believed.
     pub fn open(path: &Path) -> io::Result<Self> {
-        let mut file = fs::File::open(path)?;
+        let mut file = crate::storage::at(path, "open", fs::File::open(path))?;
         let len = file.metadata()?.len();
 
         if len < u64::try_from(HEADER + TRAILER).unwrap_or(u64::MAX) {
@@ -690,7 +690,7 @@ fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io
 ///
 /// Returns an error if the file cannot be opened or read.
 pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
-    let mut file = tfs::File::open(path).await?;
+    let mut file = crate::storage::at_async(path, "open", tfs::File::open(path)).await?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 256 * 1024];
 

@@ -634,7 +634,11 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
                 path = %path.display(),
                 "removing a directory left by an earlier restore"
             );
-            std::fs::remove_dir_all(path)?;
+            storage::at(
+                path,
+                "remove the directory left by an earlier restore",
+                std::fs::remove_dir_all(path),
+            )?;
         }
     }
 
@@ -654,7 +658,11 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
     // Moved aside rather than deleted first, so a failure here can put it back.
     let had_previous = destination.exists();
     if had_previous {
-        std::fs::rename(destination, &previous)?;
+        storage::at(
+            &previous,
+            "move the old tree aside",
+            std::fs::rename(destination, &previous),
+        )?;
     }
 
     if let Err(e) = std::fs::rename(&partial, destination) {
@@ -673,7 +681,11 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
     }
 
     if had_previous {
-        std::fs::remove_dir_all(&previous)?;
+        storage::at(
+            &previous,
+            "remove the superseded tree",
+            std::fs::remove_dir_all(&previous),
+        )?;
     }
 
     report_restored(&restored);

@@ -712,3 +712,63 @@ async fn a_store_does_not_print_its_index() {
         many.len(),
     );
 }
+
+/// A filesystem failure names the path and keeps its kind.
+///
+/// A bare `?` on `File::open` gives `No such file or directory (os error 2)`,
+/// which is true and useless: a person reading it has a machine with many files
+/// and no idea which one. The kind is the other half — a crate that hands
+/// `io::Error` to callers has already made the kinds the contract, so a wrapper
+/// that flattened them to `Other` would be a quiet regression of the same kind
+/// the `NotFound` swallow was.
+///
+/// Runs as root, so it cannot provoke a real permission error; a missing file is
+/// a real one that needs no special anything.
+#[test]
+fn a_filesystem_failure_names_the_path_and_keeps_its_kind() {
+    let missing = std::path::Path::new("/nonexistent-lepatch/store.0000.bin");
+
+    // The bare form, for comparison. This is what the crate used to hand back.
+    let bare = std::fs::File::open(missing).unwrap_err();
+    assert_eq!(bare.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        !bare.to_string().contains("store.0000.bin"),
+        "the bare message is what this is fixing: {bare}"
+    );
+
+    let wrapped = lepatch::storage::at(missing, "open", std::fs::File::open(missing)).unwrap_err();
+
+    assert_eq!(
+        wrapped.kind(),
+        std::io::ErrorKind::NotFound,
+        "the kind must survive the wrapper, or a caller branching on it is guessing"
+    );
+    assert!(
+        wrapped.to_string().contains("store.0000.bin"),
+        "the message must name the file: {wrapped}"
+    );
+    assert!(
+        wrapped.to_string().contains("could not open"),
+        "and say what was being done to it: {wrapped}"
+    );
+    assert!(
+        wrapped.to_string().contains("No such file or directory"),
+        "and keep what the operating system said, rather than replacing it: {wrapped}"
+    );
+}
+
+/// The async wrapper is the same wrapper, awaited.
+#[tokio::test]
+async fn the_async_wrapper_behaves_the_same() {
+    let missing = std::path::Path::new("/nonexistent-lepatch/segment.bin");
+
+    let error = lepatch::storage::at_async(missing, "open", tokio::fs::File::open(missing))
+        .await
+        .expect_err("a missing file is still missing");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        error.to_string().contains("segment.bin"),
+        "the message must name the file: {error}"
+    );
+}

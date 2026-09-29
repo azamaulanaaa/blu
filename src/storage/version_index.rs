@@ -119,15 +119,15 @@ impl VersionIndex {
         let temporary = temporary_for(path);
 
         {
-            let mut file = fs::File::create(&temporary)?;
+            let mut file = super::at(&temporary, "create", fs::File::create(&temporary))?;
             file.write_all(&self.to_bytes())?;
             file.sync_all()?;
         }
 
-        fs::rename(&temporary, path)?;
+        super::at(path, "rename into place", fs::rename(&temporary, path))?;
 
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::File::open(parent)?.sync_all()?;
+            super::at(parent, "open to sync it", fs::File::open(parent))?.sync_all()?;
         }
 
         Ok(())

@@ -433,7 +433,7 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
             )
         })?;
 
-        let file = fs::File::open(segment).await?;
+        let file = super::at_async(segment, "open", fs::File::open(segment)).await?;
         let len = file.metadata().await?.len();
 
         // The index is built by a scan and cannot be wrong unless a segment has
