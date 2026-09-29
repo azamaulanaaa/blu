@@ -364,30 +364,41 @@ async fn restore_files<S: storage::StorageGet + 'static>(
             writing.spawn(write_file(job, Arc::clone(&storage)));
         }
 
-        if writing.is_empty() {
-            if next >= snapshot.files.len() {
-                break;
-            }
-            continue;
-        }
+        // The loop ends when there is nothing left to wait for.
+        //
+        // Getting here means the refill loop above stopped, so one of two
+        // things: `next` has reached the end of the file list, or `writing` is at
+        // capacity. `restore_concurrency` never returns less than one, so at
+        // capacity means non-empty, and `join_next` therefore blocks for a result
+        // rather than returning `None`. The only way to see `None` is both
+        // exhausted at once, which is the end of the run.
+        //
+        // This used to test `writing.is_empty()` and spell that same pair of
+        // conditions out by hand, with a `None` arm on the join below that could
+        // not be reached because the emptiness case was already handled. The
+        // version also had a `continue` for the case where neither condition
+        // held, which cannot occur: if `next` has not reached the end then the
+        // refill loop stopped at capacity, and capacity is at least one.
+        let Some(result) = writing.join_next().await else {
+            break;
+        };
 
         // The first failure ends the run. Files already written stay written:
         // a restore is not atomic, and pretending otherwise would be a bigger
         // change than making the loop concurrent.
-        match writing.join_next().await {
-            Some(Ok(Err(e))) => return Err(e),
-            Some(Err(join)) => {
+        match result {
+            Ok(Err(e)) => return Err(e),
+            Err(join) => {
                 return Err(io::Error::other(format!("a restore task failed: {join}")));
             }
             // A finished file reports the bytes it actually wrote, which is what
             // the rate is computed from.
-            Some(Ok(Ok(file_bytes))) => {
+            Ok(Ok(file_bytes)) => {
                 progress.add(Counter::Done, 1);
                 progress.add(Counter::Written, file_bytes);
                 progress.report();
                 written = written.saturating_add(file_bytes);
             }
-            None => {}
         }
     }
 

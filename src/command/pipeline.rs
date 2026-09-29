@@ -249,15 +249,32 @@ async fn commit<S: storage::StoragePut + 'static>(
             in_flight.spawn(store_chunk(pending, Arc::clone(&pipeline)));
         }
 
-        if in_flight.is_empty() {
-            if producer_finished {
-                break;
-            }
-            continue;
-        }
+        // The loop ends when there is nothing left to wait for.
+        //
+        // Getting here means the refill loop above stopped, so one of two
+        // things: the producer has closed the channel, or `in_flight` is at
+        // capacity. `concurrency` never returns less than one, so at capacity
+        // means non-empty, and `join_next` therefore blocks for a result rather
+        // than returning `None`. The only way to see `None` is both at once,
+        // which is the end of the run.
+        //
+        // This used to test `in_flight.is_empty()` and spell that pair of
+        // conditions out by hand, with a `None` arm on the join below that
+        // could not be reached because the emptiness case was already handled.
+        // There was also a `continue` for the case where neither held, which
+        // cannot occur: if the producer has not closed the channel then the
+        // refill loop stopped at capacity, and capacity is at least one.
+        //
+        // The dead arm was also wrong. It set `producer_finished = true` on
+        // `None`, which is a different claim — `None` says no stores remain,
+        // not that the producer has stopped. Here `None` is the exit it was
+        // always reaching for.
+        let Some(result) = in_flight.join_next().await else {
+            break;
+        };
 
-        match in_flight.join_next().await {
-            Some(Ok(Ok(stored))) => {
+        match result {
+            Ok(Ok(stored)) => {
                 ready.insert(stored.seq, stored);
 
                 let folding = Instant::now();
@@ -279,11 +296,10 @@ async fn commit<S: storage::StoragePut + 'static>(
             }
             // The first failure ends the run; the rest of the stores are dropped
             // with it, and the receiver goes with them.
-            Some(Ok(Err(e))) => return Err(e),
-            Some(Err(join)) => {
+            Ok(Err(e)) => return Err(e),
+            Err(join) => {
                 return Err(io::Error::other(format!("a store task failed: {join}")));
             }
-            None => producer_finished = true,
         }
     }
 
