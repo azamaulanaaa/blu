@@ -701,10 +701,23 @@ async fn a_compression_level_outside_zero_to_nine_is_refused() {
             !output.status.success(),
             "--compression-level {level} should be refused"
         );
+        // The range, and the number that was refused in it. Both, and only both.
+        //
+        // This was `contains("0..=9") || contains('0')`, and the second arm is
+        // satisfied by almost any message with a zero in it — this one, a
+        // timestamp, a byte count, the level the user typed. So the `||` made the
+        // test pass whether or not the range was ever named, which is the one
+        // thing it is checking. `clap` writes `11 is not in 0..=9`, so both
+        // substrings are in one sentence and asserting both is no more brittle
+        // than asserting one.
+        let refused = stderr(&output);
         assert!(
-            stderr(&output).contains("0..=9") || stderr(&output).contains('0'),
-            "the error should say the range, got: {}",
-            stderr(&output)
+            refused.contains("0..=9"),
+            "the error should say the range, got: {refused}"
+        );
+        assert!(
+            refused.contains(level),
+            "and it should quote the level that was refused, got: {refused}"
         );
     }
 
