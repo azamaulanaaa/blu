@@ -394,8 +394,8 @@ async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
     // What it writes is that content, end to end — and the *store* is where the
     // saving is. This asserts the two facts the design rests on, separately: the
     // plan is in content bytes, and the records behind it are smaller.
-    let content: u64 = plan.chunks().iter().map(|c| c.length).sum();
-    let on_disk: u64 = plan.chunks().iter().map(|c| c.placement.stored_len).sum();
+    let content: u64 = plan.iter().map(|c| c.length).sum();
+    let on_disk: u64 = plan.iter().map(|c| c.placement.stored_len).sum();
 
     assert_eq!(content, plan.total_bytes());
     assert!(

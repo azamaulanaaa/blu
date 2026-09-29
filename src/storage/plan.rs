@@ -45,6 +45,16 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The chunks, in order.
+    ///
+    /// [`Plan`] is also [`IntoIterator`] and [`AsRef<[Planned]>`], so
+    /// `for chunk in &plan` and `plan.as_ref().len()` both work and the
+    /// `plan.chunks().iter()` double hop is not needed. Both spellings were in
+    /// the tree, and the double hop reads like a mistake.
+    pub fn iter(&self) -> std::slice::Iter<'_, Planned> {
+        self.chunks.iter()
+    }
+
     /// Resolve `snapshot` against the placements `locate` reports.
     ///
     /// `locate` is given a chunk hash and returns where it is, or
@@ -139,6 +149,32 @@ impl Plan {
             .iter()
             .map(|c| c.length)
             .fold(0u64, u64::saturating_add)
+    }
+}
+
+impl AsRef<[Planned]> for Plan {
+    fn as_ref(&self) -> &[Planned] {
+        &self.chunks
+    }
+}
+
+impl<'a> IntoIterator for &'a Plan {
+    type Item = &'a Planned;
+    type IntoIter = std::slice::Iter<'a, Planned>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.chunks.iter()
+    }
+}
+
+impl IntoIterator for Plan {
+    type Item = Planned;
+    type IntoIter = std::vec::IntoIter<Planned>;
+
+    /// Takes the chunks rather than copying them, which is what a caller
+    /// assembling its own index wants.
+    fn into_iter(self) -> Self::IntoIter {
+        self.chunks.into_iter()
     }
 }
 

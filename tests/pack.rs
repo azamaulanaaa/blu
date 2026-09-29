@@ -53,7 +53,7 @@ async fn plan_of(blob: &Path) -> Plan {
 
 /// The chunk hashes a set's latest version names.
 async fn hashes_of(blob: &Path) -> HashSet<lepatch::storage::BlobId> {
-    plan_of(blob).await.chunks().iter().map(|c| c.id).collect()
+    plan_of(blob).await.iter().map(|c| c.id).collect()
 }
 
 /// A tree, backed up once, and the plan for it.
@@ -122,7 +122,7 @@ async fn a_pack_holds_its_versions_chunks() {
     let store = BlobStore::<false>::open(&built.blob).await.unwrap();
     let mut file = fs::File::open(&path).unwrap();
 
-    for (i, chunk) in built.plan.chunks().iter().enumerate() {
+    for (i, chunk) in built.plan.iter().enumerate() {
         let located = pack.locate(&chunk.id).unwrap();
 
         let mut from_store = store.get(&chunk.id).await.unwrap();
@@ -283,7 +283,7 @@ async fn a_client_holding_everything_needs_nothing() {
     let built = build(4, 150_000).await;
     let pack = built.pack(&built.dir.path().join("v1.pack")).await;
 
-    let have: HashSet<_> = built.plan.chunks().iter().map(|c| c.id).collect();
+    let have: HashSet<_> = built.plan.iter().map(|c| c.id).collect();
 
     assert!(pack.needed(&have).is_empty());
     assert_eq!(pack.needed_bytes(&have), 0);

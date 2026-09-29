@@ -351,6 +351,14 @@ impl Pack {
         &self.chunks
     }
 
+    /// The chunks, in pack order.
+    ///
+    /// [`Pack`] is also [`IntoIterator`] and [`AsRef<[Located]>`], so
+    /// `for chunk in &pack` works without the `pack.chunks().iter()` double hop.
+    pub fn iter(&self) -> std::slice::Iter<'_, Located> {
+        self.chunks.iter()
+    }
+
     /// How many chunks the pack holds.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -430,6 +438,31 @@ impl Pack {
     #[must_use]
     pub fn locate(&self, id: &BlobId) -> Option<Located> {
         self.chunks.iter().find(|c| c.id == *id).copied()
+    }
+}
+
+impl AsRef<[Located]> for Pack {
+    fn as_ref(&self) -> &[Located] {
+        &self.chunks
+    }
+}
+
+impl<'a> IntoIterator for &'a Pack {
+    type Item = &'a Located;
+    type IntoIter = std::slice::Iter<'a, Located>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.chunks.iter()
+    }
+}
+
+impl IntoIterator for Pack {
+    type Item = Located;
+    type IntoIter = std::vec::IntoIter<Located>;
+
+    /// Takes the index rather than copying it.
+    fn into_iter(self) -> Self::IntoIter {
+        self.chunks.into_iter()
     }
 }
 
