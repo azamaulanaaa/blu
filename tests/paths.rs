@@ -18,8 +18,7 @@ async fn round_trip_preserves_paths_that_are_not_valid_utf8() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
 
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     let raw_name = OsStr::from_bytes(b"invalid-\xff\xfe-name.bin");
     fs::write(PathBuf::from(&source).join(raw_name), b"payload").unwrap();

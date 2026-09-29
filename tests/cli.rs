@@ -751,8 +751,7 @@ fn a_run_says_that_it_is_making_progress() {
     // working backup from a hung one, and the first thing they would do about
     // that is kill it.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
     fs::write(source.join("b.bin"), noisy(200_000)).unwrap();
 
@@ -787,8 +786,7 @@ fn progress_reporting_can_be_turned_off() {
     // the running commentary is opt-out rather than something to filter out of
     // the whole log.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(100_000)).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_lepatch"))
@@ -816,8 +814,7 @@ fn a_restore_merges_by_default_and_says_so() {
     // destination to be exactly the snapshot should not have to diff two trees to
     // find out that it is not.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("kept.bin"), noisy(50_000)).unwrap();
 
     ok(dir.path(), &["backup", "source", "store"]);
@@ -841,8 +838,7 @@ fn a_restore_merges_by_default_and_says_so() {
 #[test]
 fn clean_gives_an_exact_copy() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("kept.bin"), noisy(50_000)).unwrap();
 
     ok(dir.path(), &["backup", "source", "store"]);
@@ -870,8 +866,7 @@ fn clean_refuses_a_destination_holding_the_backup_set() {
     // The one operation here that destroys data, so the obvious mistake has to
     // stop the run rather than empty the store it is about to read from.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(50_000)).unwrap();
 
     ok(dir.path(), &["backup", "source", "store"]);
@@ -899,8 +894,7 @@ fn a_second_restore_into_one_destination_is_refused() {
     // Two restores at once would interleave writes into the same tree, and
     // neither would end up with what it meant to produce.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
     ok(dir.path(), &["backup", "source", "store"]);
 
@@ -953,8 +947,7 @@ fn a_restore_creates_a_destination_whose_parent_is_missing() {
     // that is not there yet — and it failed the run with a bare ENOENT before
     // any of that happened.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(50_000)).unwrap();
     ok(dir.path(), &["backup", "source", "store"]);
 
@@ -1014,8 +1007,7 @@ fn being_asked_to_stop_does_not_leave_a_claim_behind() {
     // default action and kills the run outright, which looks exactly like the
     // bug being tested for.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     for i in 0..12 {
         fs::write(source.join(format!("f{i}.bin")), noisy(2_000_000)).unwrap();
     }
@@ -1069,8 +1061,7 @@ fn clean_restore_leaves_nothing_beside_the_destination() {
     // The swap works through a sibling directory. It must not survive a
     // successful run, or every subsequent restore has to clear it first.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(100_000)).unwrap();
     ok(dir.path(), &["backup", "source", "store"]);
 
@@ -1094,8 +1085,7 @@ fn a_failing_clean_restore_leaves_the_destination_alone() {
     // A damaged store is refused before anything is written, so a `--clean`
     // restore must not have emptied the destination on its way to finding out.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
     ok(dir.path(), &["backup", "source", "store"]);
 
@@ -1146,8 +1136,7 @@ fn a_clean_restore_is_never_left_partly_written() {
     // the machine decides. And the assertion states the invariant, so either side
     // of the race passes and only a genuinely mixed destination fails.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     for i in 0..10 {
         fs::write(source.join(format!("f{i}.bin")), noisy(2_000_000)).unwrap();
     }

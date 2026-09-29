@@ -652,8 +652,7 @@ async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
 #[tokio::test]
 async fn a_store_does_not_print_its_index() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     let blob = dir.path().join("store");
 
     let few = {

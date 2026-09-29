@@ -32,8 +32,7 @@ async fn snapshot(blob: &std::path::Path, id: &BlobId) -> lepatch::metadata::Sna
 #[tokio::test]
 async fn repeated_content_within_one_run_is_stored_once() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     // The same 64 KiB block in three files. Identical content at an identical
     // offset, so the chunker is guaranteed to cut it the same way each time.
@@ -74,8 +73,7 @@ async fn repeated_content_within_one_run_is_stored_once() {
 #[tokio::test]
 async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("stable.bin"), vec![0x11u8; 100_000]).unwrap();
 
     let blob = dir.path().join("store");
@@ -125,8 +123,7 @@ async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
 #[tokio::test]
 async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     let blob = dir.path().join("store");
     let stable = common::noisy(100_000);
@@ -185,8 +182,7 @@ async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
 #[tokio::test]
 async fn deduplication_does_not_change_the_restored_tree() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     for name in ["a.bin", "b.bin", "c.bin"] {
         fs::write(source.join(name), vec![0x5au8; 64 * 1024]).unwrap();
@@ -209,8 +205,7 @@ async fn chunks_are_deduplicated_however_many_are_in_flight() {
     // content reaching several stores at once, where a deduplication check that
     // only works in sequence would store a copy per worker.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     let shared = vec![0x5au8; 64 * 1024];
     for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
@@ -264,8 +259,7 @@ async fn concurrency_does_not_change_the_snapshot() {
     // backups of the same tree stop being comparable and the concurrency knob
     // stops being safe to touch.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     // Several distinct files plus shared content between them, so a run has
     // chunks to deduplicate as well as chunks to keep in order. The shared part
@@ -343,8 +337,7 @@ async fn no_two_stored_chunks_share_content() {
     // surfaced as a failed backup rather than as a wrong snapshot, so nothing
     // about the output would have given it away.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     // Constant content, so the chunker cuts at its maximum size and every file
     // is a single chunk. That maximises how many chunks collide on one hash.

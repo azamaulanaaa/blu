@@ -40,8 +40,7 @@ async fn latest_snapshot(store: &BlobStore<false>) -> Snapshot {
 #[tokio::test]
 async fn a_plan_covers_every_chunk_the_snapshot_reads() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), common::noisy(300_000)).unwrap();
     fs::write(source.join("b.bin"), common::noisy(120_000)).unwrap();
 
@@ -99,8 +98,7 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
 #[tokio::test]
 async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     for i in 0..8 {
         fs::write(
             source.join(format!("f{i}.bin")),
@@ -162,8 +160,7 @@ async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
 #[tokio::test]
 async fn two_backups_of_one_tree_produce_the_same_plan() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     for i in 0..6 {
         let mut bytes = common::noisy(40_000 + i * 3_000);
         // Shared content between files, so a run has chunks to deduplicate as
@@ -198,8 +195,7 @@ async fn two_backups_of_one_tree_produce_the_same_plan() {
 #[tokio::test]
 async fn a_plans_payloads_concatenate_into_the_files_it_describes() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     let body = common::noisy(200_000);
     fs::write(source.join("a.bin"), &body).unwrap();
 

@@ -182,8 +182,7 @@ async fn a_record_larger_than_the_limit_is_refused() {
 #[tokio::test]
 async fn a_set_built_across_several_segments_restores() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     // Big enough to need several segments, varied enough to produce many chunks.
     for i in 0..4 {
@@ -221,8 +220,7 @@ async fn a_set_built_across_several_segments_restores() {
 #[tokio::test]
 async fn a_version_committed_in_a_later_segment_is_reachable() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), common::noisy(50_000)).unwrap();
 
     let blob = dir.path().join("store");
@@ -305,8 +303,7 @@ async fn a_sealed_segment_with_a_damaged_tail_is_refused_not_truncated() {
 #[tokio::test]
 async fn the_last_segments_torn_tail_is_reclaimed_by_a_run() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("a.bin"), common::noisy(40_000)).unwrap();
 
     let blob = dir.path().join("store");

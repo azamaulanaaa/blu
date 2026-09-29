@@ -33,8 +33,7 @@ async fn round_trip_reproduces_nested_tree() {
 #[tokio::test]
 async fn round_trip_preserves_exact_bytes_across_chunk_boundaries() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     // Sizes straddling the 8 KiB minimum and 16 KiB average so that chunks
     // both fall inside a single file and span a file boundary.
@@ -48,8 +47,7 @@ async fn round_trip_preserves_exact_bytes_across_chunk_boundaries() {
 #[tokio::test]
 async fn round_trip_handles_files_larger_than_the_chunk_maximum() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     // 1 MiB of non-repeating data forces many chunks and exercises the
     // multi-chunk write path within a single file.

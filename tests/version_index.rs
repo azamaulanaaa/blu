@@ -33,8 +33,7 @@ async fn set_with_versions(
     dir: &std::path::Path,
     versions: usize,
 ) -> (std::path::PathBuf, BlobStore<false>) {
-    let source = dir.join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir);
     let blob = dir.join("store");
 
     for i in 0..versions {
@@ -316,8 +315,7 @@ async fn an_index_names_the_segment_the_snapshot_is_in() {
     // had to be told about explicitly with a `let _ = set;`. Every assertion here
     // is about the set with the small limit, and that is the only one there is.
     let rolled = dir.path().join("rolled");
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     for i in 0..4 {
         fs::write(source.join("a.bin"), common::noisy(200_000 + i * 11_000)).unwrap();
         common::run_backup_limited(&source, &rolled, small).await;
@@ -417,8 +415,7 @@ async fn the_index_files_can_all_be_deleted_and_rebuilt() {
 #[tokio::test]
 async fn a_rebuilt_index_resolves_to_the_right_commit() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     let blob = dir.path().join("store");
     let small = lepatch::storage::SegmentLimit::new(256 * 1024);
 

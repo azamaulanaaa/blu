@@ -19,6 +19,22 @@ use lepatch::{
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StreamReadSeeker},
 };
 
+/// An empty source tree inside `dir`, ready to be written into.
+///
+/// Fifty-one tests opened with the same two lines, and the pair is a unit: a
+/// directory that has not had its `source` subdirectory created is a thing every
+/// one of them then had to remember. Creating it here means a test that wants a
+/// tree cannot forget to, and a change to what a "source tree" is — a name, a
+/// pre-created subdirectory — is one edit rather than fifty-one.
+///
+/// Takes a path rather than a `TempDir`, because the tests that pass a fixture
+/// down to a helper have only a `&Path` by then.
+pub(crate) fn source(dir: &Path) -> PathBuf {
+    let source = dir.join("source");
+    fs::create_dir_all(&source).expect("a source directory in a fresh temp dir");
+    source
+}
+
 /// A reader over `bytes`, for handing a store something to put.
 pub(crate) fn reader(bytes: Vec<u8>) -> StreamReadSeeker {
     Box::new(Cursor::new(bytes))

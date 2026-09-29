@@ -86,8 +86,7 @@ async fn pack(blob: &Path, at: &Path) -> Pack {
 
 async fn build(files: usize, size: usize) -> Built {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     for i in 0..files {
         fs::write(
@@ -219,8 +218,7 @@ async fn a_client_holding_nothing_needs_one_range() {
 #[tokio::test]
 async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     let blob = dir.path().join("store");
 
     for (i, size) in [
@@ -328,8 +326,7 @@ async fn the_same_tree_packs_to_the_same_bytes() {
     // did — so identical packs prove the output depends on the tree and not on
     // how the store happened to be written.
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     for i in 0..5 {
         fs::write(
             source.join(format!("f{i}.bin")),
@@ -770,8 +767,7 @@ fn a_file_that_is_not_a_pack_is_refused() {
 #[tokio::test]
 async fn a_pack_of_an_empty_version_opens() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;

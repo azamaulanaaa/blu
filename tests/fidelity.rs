@@ -10,8 +10,7 @@ use common::assert_round_trip;
 #[tokio::test]
 async fn round_trip_recreates_empty_files() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::create_dir_all(source.join("nested")).unwrap();
     fs::write(source.join("empty"), b"").unwrap();
     fs::write(source.join("nested/also-empty"), b"").unwrap();
@@ -49,8 +48,7 @@ async fn round_trip_recreates_symbolic_links() {
 #[tokio::test]
 async fn round_trip_recreates_hard_links() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("original"), b"shared contents").unwrap();
 
     // Three names for one inode: the first carries the content, the rest must
@@ -141,8 +139,7 @@ async fn round_trip_preserves_permission_bits() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
 
     fs::write(source.join("private"), b"secret").unwrap();
     fs::set_permissions(source.join("private"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -158,8 +155,7 @@ async fn round_trip_preserves_permission_bits() {
 #[tokio::test]
 async fn restore_does_not_leave_trailing_bytes_from_a_previous_larger_file() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(source.join("shrunk"), b"short").unwrap();
 
     let blob = dir.path().join("store.bin");

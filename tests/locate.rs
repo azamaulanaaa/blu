@@ -31,8 +31,7 @@ use lepatch::{
 
 /// A set with `versions` versions in it.
 async fn set_with_versions(dir: &std::path::Path, versions: usize) -> std::path::PathBuf {
-    let source = dir.join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir);
     let blob = dir.join("store");
 
     for i in 0..versions {
@@ -142,8 +141,7 @@ async fn an_index_naming_the_wrong_ordinal_is_refused() {
 #[tokio::test]
 async fn a_segment_filed_under_the_wrong_number_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     let blob = dir.path().join("store");
 
     // A limit small enough that a handful of versions roll over into several
