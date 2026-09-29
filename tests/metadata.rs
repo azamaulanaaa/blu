@@ -150,11 +150,11 @@ fn an_extreme_timestamp_does_not_wrap_into_the_opposite_of_itself() {
 
 /// A blob written by a pre-release build must be reported, not misread.
 ///
-/// Version 1 was bincode — fixed-width little endian — and version 2 is the
-/// hand-written format. They share a magic prefix and nothing else, so a decoder
-/// that guessed rather than checked would turn an old backup set into a
-/// plausible-looking and completely wrong one. This is the test that says it
-/// does not.
+/// Version 1 was bincode — fixed-width little endian. Version 2 introduced the
+/// hand-written encoding, and version 3 changed what a chunk is named by. They
+/// share a magic prefix and nothing else, so a decoder that guessed rather than
+/// checked would turn an old backup set into a plausible-looking and completely
+/// wrong one. This is the test that says it does not.
 #[test]
 fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
     let mut encoded = sample().to_bytes();

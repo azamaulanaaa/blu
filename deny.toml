@@ -49,6 +49,18 @@ multiple-versions = "warn"
 # is not a reviewable decision and can change without a commit.
 wildcards = "deny"
 allow-wildcard-paths = false
+# `bitcode`, `serde` and `serde_json` sat in `[dependencies]` calling nothing for
+# the life of several `deny.toml` rewrites, and nothing in this file would have
+# said so: cargo-deny 0.20 has no unused-crate check — `[bans]` has no such key,
+# and adding one fails to deserialize — and `clippy::cargo` is manifest hygiene
+# rather than dependency analysis. rustc's `unused_crate_dependencies` does find
+# them, but it is a per-target lint and a package shares one `[dependencies]`
+# list across its library, its binary, nineteen test binaries, two benches and
+# two examples, so every one of those targets reports the others' dependencies as
+# unused. There is no version of the check that fits this package shape; a
+# dedicated tool would be the answer, and that is a decision about the toolchain
+# rather than about this file. Recorded here so the next person who greps
+# `deny.toml` for "unused" learns it rather than rediscovering it.
 
 [advisories]
 version = 2
@@ -66,7 +78,8 @@ yanked = "deny"
 # `compile_error!`. The snapshot encoding is now hand-written, in
 # `src/metadata/codec.rs`, which is where it belonged: it is the one thing in this
 # tool that has to keep working, and it should not be at the mercy of somebody
-# else's policy. `FORMAT_VERSION` moved to 2 because the encoding changed.
+# else's policy. The snapshot layout is now at `FORMAT_VERSION` 3; the version
+# number lives in `src/metadata.rs`, not here.
 ignore = []
 
 [sources]

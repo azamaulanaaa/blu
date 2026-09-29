@@ -53,7 +53,13 @@ description = "Known vulnerabilities and yanked releases in the resolved graph"
 
 [tasks.bans]
 run = "cargo deny check bans"
-description = "Wildcard dependencies, duplicate versions and unused crates"
+# No unused crates, despite it being the obvious thing to add to this line:
+# cargo-deny 0.20 has no such check, and rustc's `unused_crate_dependencies` is
+# a per-target lint that a package with one library, one binary and twenty-three
+# other targets cannot satisfy. See the note in `deny.toml` under `[bans]`. What
+# this does check, and what CI's identically-named job checks, is wildcards and
+# duplicate versions.
+description = "Wildcard dependencies and duplicate versions"
 
 [tasks.deps]
 depends = ["licenses", "advisories", "bans"]
