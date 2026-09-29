@@ -461,7 +461,22 @@ pub(super) fn scan_with_buffer(
     let file_len = file.metadata()?.len();
     let mut scan = Scan::default();
 
-    let mut buffer = Vec::new();
+    // The allocation and how much of it is valid are separate, deliberately.
+    //
+    // `resize(n, 0)` zeroes n bytes, and every one of them is then overwritten by
+    // the read that follows — so the old shape spent a megabyte of memset on every
+    // refill, doubling the memory traffic of the scan's inner loop to produce
+    // bytes nobody reads. Keeping the `Vec` at its full size and tracking the
+    // valid length separately means the allocation is zeroed once, when it grows,
+    // and never again.
+    //
+    // The cost of doing it this way is that `buffer` now holds stale bytes past
+    // the valid length, so *every* read from it has to be bounded by `filled`
+    // rather than by `buffer.len()`. That is the part to get right: a header read
+    // out of stale bytes could decode to something plausible, and the file's tail
+    // is the one place where fewer than `MAX_HEADER` bytes are available.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut filled = 0usize;
     let mut base = STORE_HEADER as u64;
     let mut position = base;
 
@@ -471,26 +486,24 @@ pub(super) fn scan_with_buffer(
         // has to fit is `MAX_HEADER`, not `MIN_HEADER`: a header is variable
         // width, and the shortfall here would be read as damage rather than as a
         // boundary to move past.
-        if position - base + MAX_HEADER as u64 > buffer.len() as u64 {
+        if position - base + MAX_HEADER as u64 > filled as u64 {
             file.seek(SeekFrom::Start(position))?;
-            buffer.clear();
-            buffer.resize(
-                usize::try_from((file_len - position).min(scan_buffer as u64))
-                    .unwrap_or(scan_buffer),
-                0,
-            );
-            let mut filled = 0;
-            while filled < buffer.len() {
+            let want = usize::try_from((file_len - position).min(scan_buffer as u64))
+                .unwrap_or(scan_buffer);
+            if buffer.len() < want {
+                buffer.resize(want, 0);
+            }
+            filled = 0;
+            while filled < want {
                 let read = file.read(&mut buffer[filled..])?;
                 if read == 0 {
                     break;
                 }
                 filled += read;
             }
-            buffer.truncate(filled);
             base = position;
 
-            if buffer.len() < MIN_HEADER {
+            if filled < MIN_HEADER {
                 break;
             }
         }
@@ -499,12 +512,18 @@ pub(super) fn scan_with_buffer(
         // buffer was just refilled. Give the header the slice that actually
         // starts at this record, and where that is in the file, so it can report
         // an absolute payload offset.
+        //
+        // Bounded by `filled`, not `buffer.len()`. A torn tail leaves fewer than
+        // `MAX_HEADER` bytes, and a slice reaching into the stale part of the
+        // buffer could hand the decoder a header that looks well formed — the one
+        // case where the buffer holds a plausible answer for a question the file
+        // cannot answer.
         let at = usize::try_from(position - base).ok();
-        let Some(at) = at.filter(|a| *a < buffer.len()) else {
+        let Some(at) = at.filter(|a| *a < filled) else {
             break;
         };
 
-        let Some(header) = decode_header(&buffer[at..], position) else {
+        let Some(header) = decode_header(&buffer[at..filled], position) else {
             break;
         };
 
@@ -545,7 +564,7 @@ pub(super) fn scan_with_buffer(
                 // is 32 bytes of content whatever it occupies on disk.
                 if header.raw_len == HASH as u64 && header.codec == Codec::Raw {
                     let start = usize::try_from(header.payload_offset - base).ok();
-                    let start = start.filter(|s| *s + HASH <= buffer.len());
+                    let start = start.filter(|s| *s + HASH <= filled);
 
                     if let Some(snapshot) = start.map(|s| {
                         let mut hash = [0u8; HASH];
@@ -1077,4 +1096,89 @@ fn scan_read_size() {
     }
 
     std::fs::remove_file(&file).ok();
+}
+
+/// A torn tail is never mistaken for a record, at any length.
+///
+/// The scan refills only when the next header would not fit in what it has read,
+/// and it sizes a refill by what is *left in the file*. At the end of a file that
+/// is less than a maximum header, so the read comes up short — and the iteration
+/// after that refills again, reads zero bytes, finds fewer than a minimum header
+/// and stops. The tail is therefore discarded without ever reaching
+/// `decode_header`, which is why a file ending in a complete, well-formed record
+/// header and half a payload still reports exactly the records that are whole.
+///
+/// Worth pinning because the other answer is silent. A header is small enough
+/// that a plausible-looking one at a buffer's edge could decode to a blob that
+/// nothing in the file contains, and the index would carry it as though the store
+/// held it. Probed across tail lengths from 0 to a full buffer to establish which
+/// branch this is, rather than assumed from reading the loop: every one of them
+/// reports the same count.
+#[test]
+fn a_torn_tail_is_never_taken_for_a_record() {
+    const PAYLOAD: usize = 512;
+    /// Small enough that the file takes several refills, so the tail is read into
+    /// a buffer that holds stale bytes from an earlier one.
+    const SCAN_BUFFER: usize = 4096;
+    const RECORDS: usize = 40;
+
+    let mut header = Vec::new();
+    let mut planted = [0u8; HASH];
+    planted[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    encode_header(
+        &mut header,
+        Kind::Blob,
+        Codec::Raw,
+        &planted,
+        u64::try_from(PAYLOAD).expect("fits in u64"),
+        u64::try_from(PAYLOAD).expect("fits in u64"),
+    );
+    let planted = BlobId::from_bytes(planted);
+
+    // From nothing at all, to a header cut mid-length, to the whole header and
+    // half its payload. Each is a shape a killed run can leave behind.
+    let tails: [(&str, &[u8]); 5] = [
+        ("no tail", &[]),
+        ("a bare magic", &header[..RECORD_MAGIC.len()]),
+        ("a header prefix", &header[..PREFIX + 2 + HASH]),
+        ("a header and half a payload", &header[..header.len() / 2]),
+        ("a whole header", &header[..header.len()]),
+    ];
+
+    for (what, tail) in tails {
+        let file = std::env::temp_dir().join(format!(
+            "lepatch-tail-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&file).ok();
+
+        let mut bytes = encode_store_header(0).to_vec();
+        for n in 0..RECORDS {
+            let mut hash = [0u8; HASH];
+            hash[..8].copy_from_slice(&u64::try_from(n).unwrap().to_le_bytes());
+            let payload = u64::try_from(PAYLOAD).expect("fits in u64");
+            encode_header(&mut bytes, Kind::Blob, Codec::Raw, &hash, payload, payload);
+            bytes.extend(std::iter::repeat_n(u8::try_from(n % 251).unwrap(), PAYLOAD));
+        }
+        bytes.extend_from_slice(tail);
+        std::fs::write(&file, &bytes).unwrap();
+
+        let mut handle = std::fs::File::open(&file).unwrap();
+        let scan = scan_with_buffer(&mut handle, 0, Blobs::Index, SCAN_BUFFER).unwrap();
+        drop(handle);
+        std::fs::remove_file(&file).ok();
+
+        assert_eq!(
+            scan.blobs.len(),
+            RECORDS,
+            "{what}: the scan must stop at the damage, finding only the {RECORDS} \
+             records that are whole"
+        );
+        assert!(
+            !scan.blobs.contains_key(&planted),
+            "{what}: the tail's own hash reached the index, so a record was read out \
+             of bytes that do not form one"
+        );
+    }
 }
