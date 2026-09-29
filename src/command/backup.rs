@@ -99,10 +99,13 @@ struct Walked {
 ///
 /// # Errors
 ///
-/// Returns an error if the tree cannot be walked, if a file changes while it is
-/// being read, if the store rejects a write, or if the run cannot be committed.
-/// A run that returns an error has written no commit record, so the store is
-/// left exactly as it was — the space is reclaimed by the next run's recovery.
+/// Returns an error if `root` is not a directory, if the tree cannot be walked,
+/// if a file changes while it is being read, if the store rejects a write, or if
+/// the run cannot be committed. A run that returns an error has written no commit
+/// record, so the store is left exactly as it was — the space is reclaimed by the
+/// next run's recovery. The directory check is deliberately first: a root that is
+/// not a directory would otherwise be recorded as an entry with an empty path,
+/// which commits and is then unrestorable.
 #[instrument(level = "info", skip(storage, options), err)]
 pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     root: P,
@@ -175,6 +178,28 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 
 /// Walk the tree, recording everything that is not file content.
 fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
+    // The walk records each entry relative to the root, so the root itself comes
+    // back with an empty relative path and is skipped below. That skip has to be
+    // unconditional, or anything that is not a directory falls through it and is
+    // recorded with an empty path — a version that commits and can then never be
+    // restored, since `restore` refuses an empty path before writing anything and
+    // no subcommand removes a version.
+    //
+    // `metadata` follows links, so a symlink to a directory passes, which is what
+    // a user who typed `~/current-photos` means and what a shell would do. The
+    // per-entry walk below still uses `symlink_metadata` and still records links
+    // without following them; only the root is resolved, because a tree rooted at
+    // a link has to be entered.
+    if !fs::metadata(root)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a directory; a backup is of a directory tree",
+                root.display()
+            ),
+        ));
+    }
+
     let mut snapshot = metadata::Snapshot::new();
     let mut inode_map: HashMap<FileId, PathBuf> = HashMap::new();
 
@@ -200,8 +225,10 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 .to_path_buf();
 
             // The backup root is the destination on restore, so it is never
-            // recorded as an entry of its own.
-            if relative_path.as_os_str().is_empty() && meta.is_dir() {
+            // recorded as an entry of its own. The root is known to be a
+            // directory by now, so the type test this used to carry is not
+            // needed to justify the skip.
+            if relative_path.as_os_str().is_empty() {
                 return Ok(None);
             }
 
