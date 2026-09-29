@@ -16,6 +16,13 @@
 //! plumbing              ~28%   (channel and task handoffs — not here)
 //! ```
 //!
+//! The "read + chunk" row is the `chunking/read_and_cut` benchmark, and it is a
+//! little more than its name: one iteration there includes building the
+//! `Chunker`, which stats every file in the tree before the first byte is read.
+//! That cannot be timed separately within one iteration — a `Chunker` is a stream
+//! that can only be consumed once — so `chunking/registering` measures that half
+//! on its own and the difference is the chunking.
+//!
 //! The split is indicative, and the third line is a plug rather than a
 //! measurement: it is the remainder once the other two are subtracted, which is
 //! why the parenthesis says "not here". These were taken on a 200 MiB tree,
@@ -102,9 +109,20 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
     snapshot
 }
 
-/// Reading a tree and cutting it into content-defined chunks, with no hashing
+/// Opening the tree and cutting it into content-defined chunks, with no hashing
 /// and no storage. This is the 46%: the one thread that cannot be parallelised,
 /// because each boundary is derived from the bytes before it.
+///
+/// One iteration is one whole pass over the fixture, and it includes building the
+/// `Chunker` — which is `64` × `stat` and a `Vec<PathBuf>` clone, not chunking.
+/// That cannot be hoisted out of the timed region: `Chunker::new` takes the paths
+/// by value and a `Chunker` is a stream that can only be consumed once, so the
+/// registry and the reading are one indivisible unit of work.
+///
+/// Which is why `registering` below measures the registry on its own. The
+/// difference between the two is the chunking, and the doc comment at the top of
+/// this file attributes a share of a *backup* to chunking, so the share of this
+/// number that is not chunking is worth being able to subtract.
 fn chunking(c: &mut Criterion) {
     let dir = TempDir::new().expect("tempdir");
     let paths = tree(&dir);
@@ -123,6 +141,18 @@ fn chunking(c: &mut Criterion) {
                 count += 1;
             }
             count
+        });
+    });
+
+    // The setup half, measured so the number above can be read as a difference
+    // rather than taken whole. `Chunker::new` stats every file before the first
+    // byte is read, so this is not nothing, and a reader told "46% of a backup is
+    // chunking" deserves to know how much of the measurement is bookkeeping.
+    group.throughput(Throughput::Elements(u64::try_from(FILES).unwrap_or(0)));
+    group.bench_function("registering", |b| {
+        b.iter(|| {
+            let chunker = Chunker::new(paths.clone(), config()).expect("chunker");
+            black_box(&chunker);
         });
     });
     group.finish();
