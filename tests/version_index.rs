@@ -307,29 +307,20 @@ async fn an_index_naming_a_missing_segment_is_refused() {
 #[tokio::test]
 async fn an_index_names_the_segment_the_snapshot_is_in() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
-    let blob = dir.path().join("store");
-
-    fs::write(source.join("a.bin"), common::noisy(200_000)).unwrap();
-    common::run_backup(&source, &blob).await;
-
-    // Enough versions to be sure the set has rolled over.
-    for i in 0..6 {
-        fs::write(source.join("a.bin"), common::noisy(200_000 + i * 11_000)).unwrap();
-        common::run_backup(&source, &blob).await;
-    }
-
-    let set = IndexSet::new(&blob);
     let small = lepatch::storage::SegmentLimit::new(256 * 1024);
 
-    // A second set with a small limit, so the segments genuinely differ.
+    // A set with a small limit, so the segments genuinely differ.
+    //
+    // This used to build a second, default-limit set first — seven backups, about
+    // 1.4 MB of chunking — and then assert nothing about it, which the compiler
+    // had to be told about explicitly with a `let _ = set;`. Every assertion here
+    // is about the set with the small limit, and that is the only one there is.
     let rolled = dir.path().join("rolled");
-    let source2 = dir.path().join("source2");
-    fs::create_dir_all(&source2).unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
     for i in 0..4 {
-        fs::write(source2.join("a.bin"), common::noisy(200_000 + i * 11_000)).unwrap();
-        common::run_backup_limited(&source2, &rolled, small).await;
+        fs::write(source.join("a.bin"), common::noisy(200_000 + i * 11_000)).unwrap();
+        common::run_backup_limited(&source, &rolled, small).await;
     }
 
     let store = BlobStore::<false>::open(&rolled).await.unwrap();
@@ -349,11 +340,24 @@ async fn an_index_names_the_segment_the_snapshot_is_in() {
     }
 
     // And the resolve is confirmed rather than falling back.
-    let _ = set;
+    //
+    // An equality, not a `matches!`. The pattern form throws away `segment` and
+    // `snapshot`, so an index resolving to the wrong segment passed — in the one
+    // test whose entire claim is that it resolves to the right one. What is
+    // asserted here is what each version's index already said, checked against
+    // where the store actually holds the snapshot.
     for v in 1..=4 {
-        assert!(
-            matches!(resolve(&rolled_set, v, 4), Resolved::Confirmed { .. }),
-            "version {v} should resolve from its index"
+        let index = VersionIndex::read(&rolled_set.index_path(v))
+            .unwrap_or_else(|| panic!("version {v} should have an index"));
+        let placement = store.locate(&index.snapshot).unwrap();
+
+        assert_eq!(
+            resolve(&rolled_set, v, 4),
+            Resolved::Confirmed {
+                segment: placement.segment,
+                snapshot: index.snapshot,
+            },
+            "version {v} should resolve from its index, to the segment the snapshot is in"
         );
     }
 }

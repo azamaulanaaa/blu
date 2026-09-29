@@ -11,19 +11,12 @@ use lepatch::{
     storage::BlobStore,
 };
 
-/// Non-uniform content, so the chunker finds real boundaries and the chunks
-/// differ from one another. A run of identical bytes would be deduplicated
-/// down to a single chunk.
-fn varied(len: usize) -> Vec<u8> {
-    noisy(len)
-}
-
 #[tokio::test]
 async fn an_intact_snapshot_verifies_clean() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("a.bin"), varied(200_000)).unwrap();
+    fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
 
     let blob = dir.path().join("store.bin");
     let committed = common::run_backup(&source, &blob).await;
@@ -41,7 +34,7 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("a.bin"), varied(200_000)).unwrap();
+    fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
 
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
@@ -76,7 +69,7 @@ async fn a_store_truncated_before_its_snapshot_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("a.bin"), varied(200_000)).unwrap();
+    fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
 
     let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;
@@ -99,7 +92,7 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("a.bin"), varied(200_000)).unwrap();
+    fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
 
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;

@@ -34,11 +34,6 @@ pub(crate) fn len_of(bytes: &[u8]) -> u64 {
     u64::try_from(bytes.len()).unwrap()
 }
 
-/// Default chunker configuration, mirroring the CLI defaults.
-pub(crate) fn options() -> Options {
-    Options::default()
-}
-
 /// Pseudo-random bytes with no long runs.
 ///
 /// Deliberately not a repeating pattern: content-defined chunking finds
