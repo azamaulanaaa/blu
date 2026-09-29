@@ -82,7 +82,15 @@ where
         // Bounded by `self.remaining()`, a `u64`, so the narrowing to `usize` is
         // exact on any target that can hold the limit.
         let offered = u64::try_from(buf.remaining()).unwrap_or(u64::MAX);
-        let wanted = usize::try_from(self.remaining().min(offered)).unwrap_or(0);
+        let wanted = self.remaining().min(offered);
+
+        // `usize::MAX`, not zero. The minimum is at most `offered`, which is a
+        // real `usize` widened, so the conversion cannot actually fail — but the
+        // fallback is what decides what happens if it ever did, and a zero here
+        // means `Ok(())` on the next line: a reader reporting end of stream while
+        // it still owes bytes. `usize::MAX` means "as much as you can take",
+        // which is what the scratch clamp below does with it anyway.
+        let wanted = usize::try_from(wanted).unwrap_or(usize::MAX);
 
         // The caller has no room. Polling the inner reader with an empty buffer
         // would make it report end of stream, and keep doing so, so the inner

@@ -450,7 +450,10 @@ impl<const WRITE: bool> storage::StorageGet for BlobStore<WRITE> {
                 // stored length so a damaged record cannot pull in its neighbour,
                 // and the decode is told the expected size so a frame that does
                 // not produce it is refused rather than handed on short.
-                let mut frame = vec![0u8; usize::try_from(placement.stored_len).unwrap_or(0)];
+                let mut frame = storage::zeroed(
+                    placement.stored_len,
+                    &format!("the compressed frame of chunk {id}"),
+                )?;
                 file.read_exact(&mut frame).await?;
 
                 let reader = DecompressReader::new(frame, placement.raw_len).await?;

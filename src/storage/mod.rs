@@ -38,6 +38,29 @@ pub(super) fn truncated_hash<const N: usize>(bytes: &[u8]) -> [u8; N] {
     out
 }
 
+/// A zeroed buffer of exactly `bytes`, or an error saying what would not fit.
+///
+/// Used wherever a length read out of a file becomes an allocation. The reason
+/// this is a function rather than three `map_err`s is that the tempting shortcut
+/// in every one of those cases is a zero, and **a zero-length buffer is not a
+/// small buffer**: `read_exact` into one succeeds, because there is nothing to
+/// read. So the failure is not caught later. It is passed on — an index that
+/// decodes as empty, a chunk that decompresses from nothing, a pack that is short
+/// by every chunk while its own index claims otherwise.
+///
+/// There is no fallback to choose between here. A length this platform cannot
+/// address is not a small length, and the alternative to an error is not a worse
+/// answer but a wrong one. `what` is the caller's description of the thing being
+/// sized, so the message says which one rather than "a length".
+pub(crate) fn zeroed(bytes: u64, what: &str) -> io::Result<Vec<u8>> {
+    usize::try_from(bytes).map(|n| vec![0u8; n]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{what} is {bytes} bytes, which this platform cannot address"),
+        )
+    })
+}
+
 /// Where a blob's payload sits in a store.
 ///
 /// A location in this file, an object key there: an implementation detail of

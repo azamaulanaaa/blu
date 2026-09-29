@@ -164,7 +164,26 @@ impl Pack {
         file.write_all(&header).await?;
 
         for planned in plan.chunks() {
-            let length = usize::try_from(planned.length).unwrap_or(0);
+            // A length that has to be exact, so a conversion that cannot be
+            // represented is an error rather than a zero.
+            //
+            // `unwrap_or(0)` here was the sanctioned way to satisfy `unwrap_used`
+            // and it is the shape the audit called a semantic bug factory: a
+            // zero-length buffer, `read_exact` into it succeeding trivially, and
+            // then `Located::len` recording `planned.length` anyway — so the pack
+            // would be short by every chunk, the index would claim otherwise, and
+            // `lepatch pack` would exit 0 having printed a checksum. `u32` into
+            // `usize` cannot actually fail on any supported target, which is
+            // exactly why the fallback was never going to be noticed.
+            let length = usize::try_from(planned.length).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "chunk {} claims {} bytes, which this platform cannot address",
+                        planned.id, planned.length
+                    ),
+                )
+            })?;
             let mut buffer = vec![0u8; length];
 
             let mut reader = store.get(&planned.id).await?;
@@ -242,7 +261,9 @@ impl Pack {
             .and_then(|e| e.checked_sub(index_len))
             .ok_or_else(|| not_a_pack(path, "its index length runs past the start of the file"))?;
 
-        let mut index = vec![0u8; usize::try_from(index_len).unwrap_or(0)];
+        // The index's length is a claim from the file, and a file can lie about
+        // it: a sparse file reports any length it likes.
+        let mut index = crate::storage::zeroed(index_len, &format!("{}'s index", path.display()))?;
         file.seek(SeekFrom::Start(index_start))?;
         file.read_exact(&mut index)?;
 
