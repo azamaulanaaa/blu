@@ -315,6 +315,12 @@ impl BlobStore<true> {
             .await
             .map_err(|join| io::Error::other(format!("the store scan failed: {join}")))??;
 
+        // A writing store always has an append point: `recover` creates segment 0
+        // for a set with none, so there is always a last segment to carry on in.
+        let reserved = scanned
+            .append
+            .ok_or_else(|| io::Error::other("a writing store has no segment to write into"))?;
+
         Ok(Self {
             set,
             segments: scanned.segments,
@@ -323,10 +329,7 @@ impl BlobStore<true> {
                 commits: scanned.commits,
                 commits_per_segment: scanned.commits_per_segment,
             }),
-            reserved: Mutex::new(Reservation {
-                segment: scanned.write_into,
-                offset: scanned.end,
-            }),
+            reserved: Mutex::new(reserved),
             limit,
             compression,
             dirty: Mutex::new(Vec::new()),
@@ -365,10 +368,13 @@ impl BlobStore<false> {
                 commits: scanned.commits,
                 commits_per_segment: scanned.commits_per_segment,
             }),
-            reserved: Mutex::new(Reservation {
-                segment: scanned.write_into,
-                offset: scanned.end,
-            }),
+            // A reader has no append point, and never had one to record. The
+            // scan says so rather than handing back a reservation built from a
+            // segment number that does not exist.
+            reserved: Mutex::new(scanned.append.unwrap_or(Reservation {
+                segment: u32::MAX,
+                offset: 0,
+            })),
             // Both fields are shared with the writing constructor, and only that
             // one consults them. Neither has a value worth recording on a read: a
             // read never rolls over, and never compresses anything.
@@ -888,14 +894,53 @@ struct Scanned {
     commits: Vec<BlobId>,
     /// How many commit records each segment holds, by segment number.
     commits_per_segment: HashMap<u32, u32>,
-    /// The segment a run writes into: the last one, which is the only one not
-    /// sealed.
+    /// Where the log carries on from. `None` for a store opened for reading,
+    /// which has nowhere to write.
     ///
-    /// Always a real index — segment 0 for a fresh set. A reader leaves it at
-    /// `u32::MAX` and never uses it, having nowhere to write.
-    write_into: u32,
-    /// First byte past the last valid record in `write_into`.
-    end: u64,
+    /// This is an `Option` rather than a sentinel because a sentinel here was
+    /// not reachable and did not say what it meant: `write_into` was documented
+    /// as "`u32::MAX`, and a reader never uses it", and the reader set it twice —
+    /// once initialising the struct and once again at the end with a comment
+    /// explaining that the value was never read. A `BlobStore<false>` then held
+    /// a `Reservation` built from a segment number that does not exist, plus
+    /// `SegmentLimit` and `Compression` fields defaulted to values it ignores.
+    append: Option<Reservation>,
+}
+
+/// What a scan is allowed to do to the set.
+///
+/// The two halves of this were, for a long time, the same sixty lines written
+/// twice, differing in four places. Those four are the whole of the difference
+/// and they are not cosmetic:
+///
+/// * a writer creates segment 0 for a fresh set, and a reader reports that
+///   there is no set;
+/// * a writer opens the last segment for writing, a reader opens every one
+///   read-only;
+/// * a writer *reclaims* an unverified tail from the last segment and refuses
+///   one in any other, and a reader refuses one anywhere, because a read does
+///   not repair a store;
+/// * only a writer has somewhere to carry on from.
+///
+/// The first two are ordinary. The third is the one that matters, and it is why
+/// this is a parameter rather than a boolean or a pair of flags: whether an
+/// unverified tail is damage or an unfinished run depends entirely on whether
+/// this run is going to write, and on nothing else. Spelling it out here means
+/// the two behaviours cannot drift — a reader that started repairing would be a
+/// reader that destroys evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// Opening for writing: repair what a run can safely repair.
+    Recover,
+    /// Opening for reading: change nothing.
+    Inspect,
+}
+
+impl Scan {
+    /// Whether this scan is going to write, and so may reclaim a tail.
+    const fn repairs(self) -> bool {
+        matches!(self, Self::Recover)
+    }
 }
 
 /// Open a set for writing: create the first segment if there is none, scan every
@@ -905,44 +950,72 @@ struct Scanned {
 /// sealed segment is never written again, so a tail that does not verify there is
 /// damage rather than a run that stopped.
 fn recover(set: &IndexSet) -> io::Result<Scanned> {
+    scan_set(set, Scan::Recover)
+}
+
+/// Open a set for reading, without writing to it.
+fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
+    scan_set(set, Scan::Inspect)
+}
+
+/// Scan every segment of a set. See [`Scan`] for what the two callers differ in.
+fn scan_set(set: &IndexSet, mode: Scan) -> io::Result<Scanned> {
     let mut segments = set.segments()?;
 
-    let created = segments.is_empty();
-    if created {
+    if segments.is_empty() {
+        if !mode.repairs() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no backup store at {}", set.base().display()),
+            ));
+        }
         let first = set.blob_path(0);
         create_segment(&first, 0)?;
         sync_parent(&first)?;
         segments.push(first);
     }
 
-    let last = u32::try_from(segments.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    let last = segments.len().saturating_sub(1);
     let mut out = Scanned {
         segments: segments.clone(),
         blobs: HashMap::new(),
         commits: Vec::new(),
         commits_per_segment: HashMap::new(),
-        write_into: u32::MAX,
-        end: 0,
+        append: None,
     };
 
     for (index, path) in segments.iter().enumerate() {
         let segment = u32::try_from(index).unwrap_or(u32::MAX);
-        let is_last = index == segments.len() - 1;
+        let is_last = index == last;
 
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(is_last)
-            .truncate(false)
-            .open(path)?;
+        let mut file = if mode.repairs() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(is_last)
+                .truncate(false)
+                .open(path)?
+        } else {
+            std::fs::File::open(path)?
+        };
 
         let claimed = check_store_header(&mut file, path)?;
         if claimed != segment {
             return Err(not_a_store(
                 path,
-                &format!(
-                    "its header says it is segment {claimed}, but it is named as segment {segment}, \
-                     so the set's segments have been moved around or renamed"
-                ),
+                // The longer message is the writer's: a renamed or reordered
+                // set is a recoverable misconfiguration for a read, and an
+                // unrecoverable one for a write, so only the write explains it.
+                &if mode.repairs() {
+                    format!(
+                        "its header says it is segment {claimed}, but it is named as segment \
+                         {segment}, so the set's segments have been moved around or renamed"
+                    )
+                } else {
+                    format!(
+                        "its header says it is segment {claimed}, but it is named as segment \
+                         {segment}"
+                    )
+                },
             ));
         }
 
@@ -956,6 +1029,18 @@ fn recover(set: &IndexSet) -> io::Result<Scanned> {
                     format!(
                         "{} is a sealed segment and has {} bytes that are not a valid record, so it \
                          is damaged rather than unfinished; nothing here was truncated",
+                        path.display(),
+                        len - scan.end
+                    ),
+                ));
+            }
+
+            if !mode.repairs() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} has {} bytes past its last valid record, so it is damaged; a read does \
+                         not repair a store",
                         path.display(),
                         len - scan.end
                     ),
@@ -986,76 +1071,12 @@ fn recover(set: &IndexSet) -> io::Result<Scanned> {
         if is_last {
             // Recording the last segment rather than how many are sealed is what
             // makes a fresh set use the same arithmetic as a set of a thousand.
-            out.write_into = last;
-            out.end = scan.end;
+            out.append = Some(Reservation {
+                segment,
+                offset: scan.end,
+            });
         }
     }
-
-    Ok(out)
-}
-
-/// Open a set for reading, without writing to it.
-fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
-    let segments = set.segments()?;
-    if segments.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no backup store at {}", set.base().display()),
-        ));
-    }
-
-    let mut out = Scanned {
-        segments: segments.clone(),
-        blobs: HashMap::new(),
-        commits: Vec::new(),
-        commits_per_segment: HashMap::new(),
-        write_into: u32::MAX,
-        end: 0,
-    };
-
-    for (index, path) in segments.iter().enumerate() {
-        let segment = u32::try_from(index).unwrap_or(u32::MAX);
-        let mut file = std::fs::File::open(path)?;
-        let claimed = check_store_header(&mut file, path)?;
-
-        if claimed != segment {
-            return Err(not_a_store(
-                path,
-                &format!(
-                    "its header says it is segment {claimed}, but it is named as segment {segment}"
-                ),
-            ));
-        }
-
-        // A read does not repair, so an unverified tail is reported rather than
-        // treated as an unfinished run.
-        let scan = record::scan(&mut file, segment, record::Blobs::Index)?;
-        let len = file.metadata()?.len();
-
-        if scan.end < len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{} has {} bytes past its last valid record, so it is damaged; a read does \
-                     not repair a store",
-                    path.display(),
-                    len - scan.end
-                ),
-            ));
-        }
-
-        out.blobs.extend(scan.blobs);
-        out.commits_per_segment.insert(
-            segment,
-            u32::try_from(scan.commits.len()).unwrap_or(u32::MAX),
-        );
-        out.commits.extend(scan.commits);
-    }
-
-    // A reader never writes, so it has no segment to write into and no end to
-    // carry on from.
-    out.write_into = u32::MAX;
-    out.end = 0;
 
     Ok(out)
 }
