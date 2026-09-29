@@ -19,7 +19,8 @@ use std::{
 use common::noisy;
 use lepatch::{
     command::PARTIAL_SUFFIX,
-    storage::{BlobStore, Codec},
+    index::IndexSet,
+    storage::{BlobStore, Codec, VersionIndex},
 };
 
 /// Run the binary in `dir` and return its output.
@@ -1489,5 +1490,137 @@ fn a_command_piped_into_something_that_stops_early_does_not_panic() {
     assert!(
         !reported.contains("101"),
         "the command should not have exited as a panic, got: {reported}"
+    );
+}
+
+/// A failed `verify` reports the failure and exits 1.
+///
+/// The summary `verify` prints to stdout is not the verdict — the verdict is
+/// `Report::into_result`, and it is computed *after* the summary is written.
+/// `say!` used to be able to terminate the process from inside the write, which
+/// meant the order of those two statements decided the exit code of a command
+/// whose whole job is to report one. This pins the outcome, and the ordering is
+/// now visible in the source rather than being an accident of it.
+///
+/// Note what this does *not* cover: the `EPIPE` path itself. A shell pipeline
+/// cannot be made to close its read end deterministically — bash holds it open
+/// for the life of the pipeline, and `dash` exposes no way to read a member's
+/// status out of one — so a test that piped this would pass whether or not the
+/// `say!` fix were present. The companion test above covers the reader-closed
+/// case for a command that can only succeed.
+#[test]
+fn a_failed_verify_reports_and_exits_one() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..4 {
+        fs::write(
+            dir.path().join(format!("f{i}.bin")),
+            noisy(40_000 + i * 5_000),
+        )
+        .unwrap();
+    }
+    ok(dir.path(), &["backup", ".", "store"]);
+
+    // Damage a chunk's *payload*, so verification finds a hash mismatch rather
+    // than a record it cannot parse. A damaged record is a different path: it
+    // fails the run before the summary is ever reached and prints nothing to
+    // stdout, which would make this test pass for the wrong reason.
+    let segments = IndexSet::new(dir.path().join("store"));
+    let paths = segments.segments().unwrap();
+    assert!(
+        !paths.is_empty(),
+        "the fixture should have written a segment"
+    );
+    let mut bytes = fs::read(&paths[0]).unwrap();
+    // Past the store header and the first record's, so this lands in a payload.
+    let in_payload = 200;
+    assert!(
+        in_payload < bytes.len(),
+        "the fixture's segment should be long enough to damage a payload"
+    );
+    bytes[in_payload] ^= 0xff;
+    fs::write(&paths[0], &bytes).unwrap();
+
+    let output = lepatch(dir.path(), &["verify", "store"]);
+    let noise = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.code() == Some(1),
+        "a verify that failed must exit 1, got {:?}\n{noise}",
+        output.status.code()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("FAILED"),
+        "the summary on stdout should say the run failed:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        noise.contains("error:"),
+        "the details should be on stderr, where a script will not capture them: {noise}"
+    );
+}
+
+/// Both listing modes name the same versions.
+///
+/// `--numbers-only` used to read each index file on its own, which checksums one
+/// file and never consults the store. A leftover index naming a version the set
+/// no longer holds was therefore printed by one mode and omitted by the other,
+/// from the same directory, in the same invocation pair. Both go through
+/// `storage::resolve` now, which cross-checks the index against the store's own
+/// commit log.
+#[test]
+fn both_listing_modes_name_the_same_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..4 {
+        fs::write(
+            dir.path().join(format!("f{i}.bin")),
+            noisy(40_000 + i * 5_000),
+        )
+        .unwrap();
+    }
+    ok(dir.path(), &["backup", ".", "store"]);
+    for i in 0..2 {
+        fs::write(dir.path().join("a.bin"), noisy(40_000 + i * 3_000)).unwrap();
+        ok(dir.path(), &["backup", ".", "store"]);
+    }
+
+    let full = ok(dir.path(), &["versions", "store"]);
+    let numbers = ok(dir.path(), &["versions", "store", "--numbers-only"]);
+
+    let from_full: Vec<&str> = full
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    let from_numbers: Vec<&str> = numbers.lines().map(str::trim).collect();
+
+    assert_eq!(
+        from_full, from_numbers,
+        "the two listing modes should agree on which versions exist"
+    );
+
+    // And with a stale index lying about a version the set no longer has.
+    let set = IndexSet::new(dir.path().join("store"));
+    let stale = set.index_path(999);
+    fs::write(
+        &stale,
+        VersionIndex {
+            version: 999,
+            segment: 0,
+            ordinal: 0,
+            snapshot: [7u8; 32],
+        }
+        .to_bytes(),
+    )
+    .unwrap();
+
+    let full = ok(dir.path(), &["versions", "store"]);
+    let numbers = ok(dir.path(), &["versions", "store", "--numbers-only"]);
+    assert_eq!(
+        full.lines().count(),
+        numbers.lines().count(),
+        "a stale index must not be named by one mode and omitted by the other:\n{full}\n{numbers}"
+    );
+    assert!(
+        !numbers.contains("999"),
+        "a version the store does not hold must not be listed: {numbers}"
     );
 }

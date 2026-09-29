@@ -169,12 +169,22 @@ fn init_tracing(verbose: bool, quiet: bool) {
 /// to report `128 + signal`.
 static STOP_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Print one line of a command's output to stdout.
+/// Print one line of a command's output to stdout, reporting whether it went.
 ///
 /// `println!` cannot be used: `SIGPIPE` is ignored at startup, so a write to a
 /// pipe whose reader has gone returns `EPIPE` and the print macros panic on a
-/// write error. `BrokenPipe` therefore exits 0 — the reader leaving is what
-/// `head` does on purpose — and any other write failure is an error.
+/// write error. That case is a *success* — the reader leaving is what `head`
+/// does on purpose — so it is `Ok(())` and the command carries on to its own
+/// result. Any other write failure is an error.
+///
+/// This deliberately does not decide the exit code. It used to call
+/// `process::exit` directly, which meant a command that printed its summary
+/// before computing its result could exit 0 with a result it had not looked at
+/// yet: `lepatch verify set | true` reported success on a store that had failed
+/// verification, because the write failed before `into_result` was ever called.
+/// It also skipped every `Drop` in scope, which is how a `Lock` or a
+/// `DestinationLock` releases its claim file, so any command that both held a
+/// claim and printed would have leaked it.
 macro_rules! say {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
@@ -182,12 +192,9 @@ macro_rules! say {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         match writeln!(out, $($arg)*) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
-            Err(e) => {
-                eprintln!("error: could not write output: {e}");
-                std::process::exit(1);
-            }
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(std::io::Error::other(format!("could not write output: {e}"))),
         }
     }};
 }
@@ -416,22 +423,26 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     };
 
     for version in versions {
-        // Through the store, which checks the file. One that does not verify is
-        // skipped rather than reported: a listing must not name a version the
-        // store cannot serve.
-        if numbers_only {
-            let path = set.index_path(version);
-            if storage::VersionIndex::read(&path).is_some() {
-                say!("{version}");
-            }
-            continue;
-        }
-
+        // Through the store, which checks the file against itself: an index that
+        // is stale, foreign or edited is a reason to fall back to a scan, never a
+        // reason to name the version. One that does not resolve is skipped rather
+        // than reported, because a listing must not name a version the store
+        // cannot serve.
+        //
+        // Both modes go through `resolve` for that reason. `--numbers-only` used
+        // to read the index file on its own, which checksums one file and never
+        // consults the store — so a leftover index in a set with fewer versions
+        // would be named by `versions --numbers-only` and omitted by `versions`,
+        // from the same directory, at the same moment.
         let Ok(snapshot) = store.snapshot_via_index(version) else {
             continue;
         };
 
-        say!("{version}  {}", storage::hex(&snapshot));
+        if numbers_only {
+            say!("{version}")?;
+        } else {
+            say!("{version}  {}", storage::hex(&snapshot))?;
+        }
     }
 
     Ok(())
@@ -780,8 +791,10 @@ async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Re
         } else {
             format!("{} chunks FAILED", report.failures.len())
         }
-    );
+    )?;
 
+    // After the summary, and not before it: the exit code is this, and a summary
+    // that could terminate the process first would be able to answer for it.
     report.into_result()
 }
 
@@ -825,13 +838,13 @@ async fn run_pack(
 
     // The content hash is the pack's name, so it goes to stdout for a script to
     // key a cache on.
-    say!("{}  {}", storage::hex(&content), out.display());
+    say!("{}  {}", storage::hex(&content), out.display())?;
     say!(
         "version {version}: {} chunks, {} bytes of payload, {} bytes on disk",
         pack.len(),
         pack.payload_len(),
         file_len
-    );
+    )?;
 
     Ok(())
 }
