@@ -7,6 +7,15 @@
 
 mod codec;
 
+// `Malformed` is the payload of `Error::Decode`, which is a public variant, so
+// it is already part of this module's public API whether or not it can be
+// named. A caller can write `Error::Decode(_)` and match on the outer error,
+// but cannot destructure the inner one, name it in a signature, or compare
+// against it — which is the only reason it was `pub` inside a private module in
+// the first place. Re-exported so the type and the variant that carries it
+// agree about being public.
+pub use codec::Malformed;
+
 use std::{fmt, path::PathBuf};
 
 use crate::storage;
@@ -26,7 +35,7 @@ pub const FORMAT_VERSION: u32 = 3;
 
 /// Reasons a snapshot blob could not be decoded. No encode variant, because
 /// encoding cannot fail: every field is a number, a byte string or a byte array.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// The body is malformed.
     Decode(codec::Malformed),

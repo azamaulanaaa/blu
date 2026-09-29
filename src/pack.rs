@@ -111,7 +111,7 @@ impl Range {
 }
 
 /// A pack on disk: the snapshot it holds, the payload region, and the index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pack {
     path: PathBuf,
     /// Where the payloads start.

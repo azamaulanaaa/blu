@@ -173,7 +173,15 @@ impl Compression {
 }
 
 /// The smallest record that can be written: a header and an empty payload.
-const MIN_RECORD: u64 = 6 + 2 + 32 + 8;
+///
+/// Derived from the record format's own constant rather than re-spelling its
+/// parts. It was `6 + 2 + 32 + 8`, one module over from the `PREFIX + 2 + HASH +
+/// CHECK` it is a copy of, with the `2` — two one-byte lengths of zero —
+/// documented in the original and here. A header that grew a field would move
+/// `MIN_HEADER` and leave this behind, and the only thing it would break is
+/// `SegmentLimit::new`'s floor, silently, on the way to a store that refuses its
+/// own records.
+const MIN_RECORD: u64 = record::MIN_HEADER as u64;
 
 /// A [`BlobId`] in lowercase hex, for messages a person can read off a screen
 /// and compare against a `blake3` sum they ran themselves.

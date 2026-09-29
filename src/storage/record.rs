@@ -64,7 +64,11 @@ const HASH: usize = 32;
 const CHECK: usize = 8;
 
 /// Bytes in the smallest possible header: two one-byte lengths of zero.
-const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
+///
+/// The `2` is those two lengths at their minimum. This is also the smallest
+/// record there is — a header with an empty payload — and `SegmentLimit::new`
+/// uses it as the floor, so it is not a header constant alone.
+pub(super) const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
 
 /// Bytes in the largest possible header: two varints at their widest.
 ///

@@ -82,7 +82,7 @@ pub const SEGMENT_DIGITS: usize = 4;
 pub const MAX_SEGMENT: u32 = 9_999;
 
 /// A backup set rooted at a base path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSet {
     base: PathBuf,
 }

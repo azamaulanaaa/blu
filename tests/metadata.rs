@@ -1,6 +1,6 @@
 //! Tests for the snapshot encoding: framing, versioning and error reporting.
 
-use lepatch::metadata::{self, Error, Snapshot};
+use lepatch::metadata::{self, Error, Malformed, Snapshot};
 
 fn sample() -> Snapshot {
     let mut snapshot = Snapshot::new();
@@ -101,10 +101,31 @@ fn a_corrupt_body_is_reported_as_a_decode_error() {
     let last = encoded.len() - 1;
     encoded[last] ^= 0xff;
 
-    assert!(matches!(
+    // An equality rather than a `matches!`, now that the error is comparable.
+    // Which it is worth knowing: flipping the last byte of a snapshot makes the
+    // final value's length run past the end, so this is a truncation and not the
+    // trailing-bytes case a reader would guess. A `matches!(.., Err(Decode(_)))`
+    // could not tell those apart, which is the whole reason for the change.
+    assert_eq!(
         Snapshot::from_bytes(&encoded),
-        Err(Error::Decode(_))
-    ));
+        Err(Error::Decode(Malformed(
+            "the snapshot ends in the middle of a value"
+        ))),
+    );
+}
+
+#[test]
+fn trailing_bytes_after_a_snapshot_are_refused_rather_than_ignored() {
+    let mut encoded = sample().to_bytes();
+    encoded.push(0);
+
+    // The other half of the case above, and the reason it needed naming: two
+    // different malformations that a caller would otherwise have to tell apart by
+    // reading the message.
+    assert_eq!(
+        Snapshot::from_bytes(&encoded),
+        Err(Error::Decode(Malformed("the snapshot has trailing bytes"))),
+    );
 }
 
 #[test]

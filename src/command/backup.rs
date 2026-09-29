@@ -27,7 +27,7 @@ const DEFAULT_CONCURRENCY: usize = 8;
 const MAX_CONCURRENCY: usize = 32;
 
 /// Knobs for a single [`backup`] run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Paths to leave out of the backup, compared after normalisation. The
     /// caller should exclude its own output artifacts: backing up a store that

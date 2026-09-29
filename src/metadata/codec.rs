@@ -54,7 +54,7 @@ struct Reader<'a> {
 /// Distinct from [`super::Error`] in that every case here means the input is
 /// malformed, and the message is written for whoever has to work out which blob
 /// is damaged.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Malformed(pub &'static str);
 
 impl std::fmt::Display for Malformed {

@@ -18,7 +18,7 @@ use fastcdc::{ronomon, v2020::StreamCDC};
 use tracing::instrument;
 
 /// The part of one file that a chunk covers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkSource {
     /// Path of the file, as it was passed to [`FileRegistry::new`].
     pub path: PathBuf,
@@ -29,6 +29,12 @@ pub struct ChunkSource {
 }
 
 /// One chunk of the concatenated stream, and where it came from.
+///
+/// `Debug` is hand-written and omits `data`: a debug log of a backup that
+/// printed every chunk would print the user's files. `PartialEq` is derived
+/// rather than hand-written because comparing the contents is exactly what a
+/// test of the chunker wants to do, and nothing in a log has to notice.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Chunk {
     /// The file slices this chunk covers, in stream order. More than one entry
     /// means the chunk spans a file boundary.
