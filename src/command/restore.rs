@@ -10,7 +10,7 @@ use tracing::instrument;
 use crate::{
     fsattr,
     metadata::{self, Snapshot},
-    progress::Progress,
+    progress::{Counter, Phase, Progress},
     slice,
     storage::{self, StreamReadSeeker},
 };
@@ -341,8 +341,8 @@ async fn restore_files<S: storage::StorageGet + 'static>(
     let total_files = u64::try_from(snapshot.files.len()).unwrap_or(0);
 
     // Unlike a backup, the total is known up front, so this reports a fraction.
-    let mut progress = Progress::new("restore");
-    progress.set("files", total_files);
+    let mut progress = Progress::new(Phase::Restore);
+    progress.set(Counter::Files, total_files);
     progress.report();
 
     let mut written: u64 = 0;
@@ -382,8 +382,8 @@ async fn restore_files<S: storage::StorageGet + 'static>(
             // A finished file reports the bytes it actually wrote, which is what
             // the rate is computed from.
             Some(Ok(Ok(file_bytes))) => {
-                progress.add("done", 1);
-                progress.add("written", file_bytes);
+                progress.add(Counter::Done, 1);
+                progress.add(Counter::Written, file_bytes);
                 progress.report();
                 written = written.saturating_add(file_bytes);
             }

@@ -14,7 +14,7 @@ use tracing::instrument;
 
 use crate::{
     metadata::Snapshot,
-    progress::Progress,
+    progress::{Counter, Phase, Progress},
     storage::{self, StorageGet},
 };
 
@@ -149,8 +149,11 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
 
     // The one long silent wait, and the one place a user is told nothing is being
     // written yet — so silence here is most likely to be read as a hang.
-    let mut progress = Progress::new("verify");
-    progress.set("chunks", u64::try_from(snapshot.chunks.len()).unwrap_or(0));
+    let mut progress = Progress::new(Phase::Verify);
+    progress.set(
+        Counter::Chunks,
+        u64::try_from(snapshot.chunks.len()).unwrap_or(0),
+    );
     progress.report();
 
     loop {
@@ -176,8 +179,8 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
         {
             // Read off `done` rather than the slot: the slot is still empty at
             // this point, and would report zero bytes for every chunk.
-            progress.add("checked", 1);
-            progress.add("read", done.bytes);
+            progress.add(Counter::Checked, 1);
+            progress.add(Counter::Read, done.bytes);
             progress.report();
             *slot = Some(done);
         }

@@ -24,7 +24,12 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::{command::backup::index_to_u32, metadata, progress::Progress, reader, storage};
+use crate::{
+    command::backup::index_to_u32,
+    metadata,
+    progress::{Counter, Phase, Progress},
+    reader, storage,
+};
 
 /// A chunk that has been read and hashed, waiting to be stored.
 struct Pending {
@@ -220,8 +225,8 @@ async fn commit<S: storage::StoragePut + 'static>(
     // can count them. The file count comes from the walk and is the only thing
     // known before any content has been read, so it is what the opening line
     // says.
-    let mut progress = Progress::new("backup");
-    progress.set("files", files);
+    let mut progress = Progress::new(Phase::Backup);
+    progress.set(Counter::Files, files);
     progress.report();
 
     let mut producer_finished = false;
@@ -234,8 +239,11 @@ async fn commit<S: storage::StoragePut + 'static>(
                 break;
             };
 
-            progress.add("chunks", 1);
-            progress.add("read", u64::try_from(pending.data.len()).unwrap_or(0));
+            progress.add(Counter::Chunks, 1);
+            progress.add(
+                Counter::Read,
+                u64::try_from(pending.data.len()).unwrap_or(0),
+            );
             progress.report();
 
             in_flight.spawn(store_chunk(pending, Arc::clone(&pipeline)));
@@ -265,7 +273,7 @@ async fn commit<S: storage::StoragePut + 'static>(
                 // Distinct content is what costs storage, so it is the number
                 // worth watching on a tree that deduplicates well.
                 progress.set(
-                    "distinct",
+                    Counter::Distinct,
                     u64::try_from(snapshot.chunks.len()).unwrap_or(0),
                 );
             }
