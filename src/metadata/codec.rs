@@ -392,8 +392,6 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
     }
 
     Ok(Snapshot {
-        // Set by the caller from the header, which has already checked it.
-        version: super::FORMAT_VERSION,
         files,
         dirs,
         chunks,
@@ -439,11 +437,7 @@ mod tests {
     fn a_snapshot_survives_a_round_trip() {
         let snapshot = sample();
         let decoded = decode_body(&encode_body(&snapshot)).expect("decodes");
-        assert_eq!(decoded.files, snapshot.files);
-        assert_eq!(decoded.dirs, snapshot.dirs);
-        assert_eq!(decoded.chunks, snapshot.chunks);
-        assert_eq!(decoded.file_chunks, snapshot.file_chunks);
-        assert_eq!(decoded.links, snapshot.links);
+        assert_eq!(decoded, snapshot);
     }
 
     #[test]

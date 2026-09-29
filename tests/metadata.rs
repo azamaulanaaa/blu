@@ -30,11 +30,31 @@ fn snapshot_round_trips_through_the_framed_encoding() {
 
     assert_eq!(&encoded[..metadata::MAGIC.len()], metadata::MAGIC);
 
+    // One comparison, not five. `Snapshot` could not be compared at all before,
+    // so this test compared its fields one at a time and would have silently
+    // stopped checking two of them the day a sixth was added.
     let decoded = Snapshot::from_bytes(&encoded).unwrap();
-    assert_eq!(decoded.version, metadata::FORMAT_VERSION);
-    assert_eq!(decoded.files, sample().files);
-    assert_eq!(decoded.chunks, sample().chunks);
-    assert_eq!(decoded.file_chunks, sample().file_chunks);
+    assert_eq!(decoded, sample());
+}
+
+/// The version in the frame is this build's, whatever the snapshot contains.
+///
+/// There is no field to set any more: the version belongs to the encoder. The
+/// frame still carries it, because that is the format, and `from_bytes` still
+/// checks it — so a blob written by another build's layout is refused rather
+/// than misread.
+#[test]
+fn the_frame_carries_this_builds_version() {
+    let encoded = sample().to_bytes();
+    let at = metadata::MAGIC.len();
+    let version = u32::from_le_bytes(encoded[at..at + 4].try_into().unwrap());
+
+    assert_eq!(
+        version,
+        metadata::FORMAT_VERSION,
+        "the frame should name the version this build writes"
+    );
+    assert!(Snapshot::from_bytes(&encoded).is_ok());
 }
 
 #[test]

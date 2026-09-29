@@ -104,10 +104,8 @@ impl From<Timestamp> for std::time::SystemTime {
 
 /// A complete description of one backup: the directory tree, the set of
 /// distinct chunk contents, and how the chunks map back onto the files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// Layout version of this snapshot, see [`FORMAT_VERSION`].
-    pub version: u32,
     /// Regular files, in the order they were chunked.
     pub files: Vec<File>,
     /// Directories, including ones that contain no files.
@@ -122,11 +120,15 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// An empty snapshot stamped with the current format version.
+    /// An empty snapshot.
+    ///
+    /// There is no version field to stamp, and that is the point: the layout
+    /// version is a property of the encoder, not of any one snapshot. A field
+    /// could be set to a value this build then refused to read back, and
+    /// nothing would catch it until the blob was decoded.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            version: FORMAT_VERSION,
             files: Vec::new(),
             dirs: Vec::new(),
             chunks: Vec::new(),
@@ -137,13 +139,17 @@ impl Snapshot {
 
     /// Serialise into the framed on-disk representation: [`MAGIC`], the version
     /// as a little-endian `u32`, then the body.
+    ///
+    /// The version written is [`FORMAT_VERSION`], always. There is nothing for a
+    /// caller to choose here: a snapshot is not "in" a version, it is written by
+    /// a build that emits one.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let body = codec::encode_body(self);
 
         let mut out = Vec::with_capacity(MAGIC.len() + 4 + body.len());
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&body);
 
         out
