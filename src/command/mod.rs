@@ -13,7 +13,7 @@ pub use backup::{Committed, Options, backup};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Restored, lock_destination, restore,
 };
-pub use verify::{Failure, Report, verify};
+pub use verify::{Failure, Reason, Report, verify};
 
 /// How many things to work on at once: the machine's parallelism, clamped into
 /// `1..=ceiling` so a platform reporting none cannot produce a concurrency of

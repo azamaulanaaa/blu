@@ -779,7 +779,7 @@ async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Re
     let report = verify(snapshot, store).await?;
 
     for failure in &report.failures {
-        eprintln!("error: {}", failure.detail);
+        eprintln!("error: {failure}");
     }
 
     say!(

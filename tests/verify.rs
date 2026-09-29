@@ -6,7 +6,7 @@ use std::fs;
 
 use common::noisy;
 use lepatch::{
-    command::{Report, restore, verify},
+    command::{Reason, Report, restore, verify},
     index::IndexSet,
     storage::{BlobId, BlobStore},
 };
@@ -50,10 +50,30 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     let report = verify(committed.snapshot, storage).await.unwrap();
 
     assert!(!report.is_ok(), "corruption went undetected");
+
+    // Matched, not substring-matched. This used to assert the message contains
+    // "actually hash to", which is a claim about prose: reword the sentence and
+    // the test fails, reword the *diagnosis* and it passes. The variant is the
+    // diagnosis.
     assert!(
-        report.failures[0].detail.contains("actually hash to"),
-        "the failure should say what the bytes really hashed to: {}",
-        report.failures[0].detail
+        matches!(report.failures[0].reason, Reason::Corrupt { .. }),
+        "a flipped byte is corruption, not a failure to read: {:?}",
+        report.failures[0].reason
+    );
+
+    // And the variant still carries the two facts a reader needs, which the
+    // string used to carry: what the bytes really hashed to, and how many there
+    // were.
+    let Reason::Corrupt { actual, bytes } = report.failures[0].reason else {
+        unreachable!("just asserted the variant");
+    };
+    assert_ne!(
+        actual, report.failures[0].location,
+        "it hashed to its own address"
+    );
+    assert!(
+        bytes > 0,
+        "some bytes were read, or the hash would be of nothing"
     );
 }
 
@@ -142,7 +162,10 @@ fn a_report_with_failures_summarises_them() {
         failures: (0..7)
             .map(|i| lepatch::command::Failure {
                 location: BlobId::from_bytes([u8::try_from(i).unwrap_or(0); 32]),
-                detail: format!("chunk {i} is corrupt"),
+                reason: Reason::Corrupt {
+                    actual: BlobId::from_bytes([u8::try_from(i + 1).unwrap_or(0); 32]),
+                    bytes: u64::from(u8::try_from(i).unwrap_or(0)) * 10,
+                },
             })
             .collect(),
     };
