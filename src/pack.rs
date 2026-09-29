@@ -46,6 +46,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::collections::HashSet;
+
 use tokio::{
     fs as tfs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -92,9 +94,13 @@ pub struct Range {
 
 impl Range {
     /// Bytes the range covers.
+    ///
+    /// Saturating, because both fields are public and a range a client built with
+    /// `end` below `start` is a value this type has to survive rather than
+    /// panic on: it covers nothing.
     #[must_use]
     pub fn len(&self) -> u64 {
-        self.end - self.start
+        self.end.saturating_sub(self.start)
     }
 
     /// Whether the range covers nothing.
@@ -307,6 +313,35 @@ impl Pack {
             ));
         }
 
+        // The index is a claim about where each chunk sits, and the only thing
+        // checked above is the payload's extent. A chunk may therefore name an
+        // offset and a length that reach past the payload, or wrap around it, and
+        // the arithmetic that combines them — `payload_start + offset + len` —
+        // would overflow rather than fail. Checking here means every later
+        // consumer can add those numbers without re-deriving whether they hold.
+        for chunk in &chunks {
+            let end = chunk.offset.checked_add(chunk.len).ok_or_else(|| {
+                not_a_pack(
+                    path,
+                    &format!(
+                        "its index places a chunk at {} for {} bytes, which is not a \
+                         position in any file",
+                        chunk.offset, chunk.len
+                    ),
+                )
+            })?;
+            if end > payload_len {
+                return Err(not_a_pack(
+                    path,
+                    &format!(
+                        "its index places a chunk at {} for {} bytes, past the {payload_len}-byte \
+                         payload",
+                        chunk.offset, chunk.len
+                    ),
+                ));
+            }
+        }
+
         Ok(Self {
             path: path.to_path_buf(),
             payload_start,
@@ -387,8 +422,11 @@ impl Pack {
                 continue;
             }
 
-            let start = self.payload_start + chunk.offset;
-            let end = start + chunk.len;
+            // Saturating for the same reason `open` checks it: these two sums
+            // are over numbers that came out of the index, and this type is what
+            // a client is told to add them up with.
+            let start = self.payload_start.saturating_add(chunk.offset);
+            let end = start.saturating_add(chunk.len);
 
             match ranges.last_mut() {
                 Some(last) if last.end == start => last.end = end,
@@ -402,7 +440,11 @@ impl Pack {
     /// Bytes a client already holding `have` still needs.
     #[must_use]
     pub fn needed_bytes(&self, have: &BTreeSet<BlobId>) -> u64 {
-        self.needed(have).iter().map(Range::len).sum()
+        // Folded rather than `sum()`, for the same reason: a total that wrapped
+        // would report a client needs fewer bytes than the ranges describe.
+        self.needed(have)
+            .iter()
+            .fold(0u64, |total, range| total.saturating_add(range.len()))
     }
 
     /// Where a chunk is, if the pack holds it.
@@ -445,6 +487,7 @@ fn encode_index(chunks: &[Located]) -> Vec<u8> {
 /// which would mean two chunks at one offset.
 fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     let mut at = 0usize;
 
     while at < bytes.len() {
@@ -459,6 +502,16 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
         at = at.checked_add(used).ok_or_else(truncated)?;
         let (len, used) = read_varint(bytes, at)?;
         at = at.checked_add(used).ok_or_else(truncated)?;
+
+        // Two entries for one hash would mean the same chunk at two places, and
+        // `locate` answers with the first — so a client asking for a chunk it
+        // already had would be told to fetch a different one.
+        if !seen.insert(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a pack index lists the same chunk twice",
+            ));
+        }
 
         out.push(Located { id, offset, len });
     }
@@ -544,8 +597,8 @@ pub fn chunks_covering(pack: &Pack, ranges: &[Range]) -> BTreeSet<BlobId> {
     let mut out = BTreeSet::new();
 
     for chunk in &pack.chunks {
-        let start = pack.payload_start + chunk.offset;
-        let end = start + chunk.len;
+        let start = pack.payload_start.saturating_add(chunk.offset);
+        let end = start.saturating_add(chunk.len);
 
         if ranges.iter().any(|r| r.start <= start && end <= r.end) {
             out.insert(chunk.id);

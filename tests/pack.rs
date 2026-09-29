@@ -20,7 +20,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use lepatch::{
     metadata::Snapshot,
-    pack::{Pack, chunks_covering, hash_file},
+    pack::{Pack, Range, chunks_covering, hash_file},
     storage::{BlobStore, Plan, StorageGet},
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -453,6 +453,24 @@ async fn a_header_that_contradicts_its_index_is_refused() {
 }
 
 /// How many bytes the varint at `at` occupies.
+/// The offsets, within a pack's index, where each entry's hash begins.
+///
+/// Walked rather than computed, because an entry is 32 bytes plus two varints
+/// and the varints' widths depend on the offsets the fixture happened to
+/// produce. A test that assumed a width would be asserting about its own
+/// fixture rather than about the pack.
+fn index_entries(index: &[u8]) -> Vec<usize> {
+    let mut at = 0usize;
+    let mut out = Vec::new();
+    while at < index.len() {
+        out.push(at);
+        at += 32;
+        at += varint_len(index, at);
+        at += varint_len(index, at);
+    }
+    out
+}
+
 fn varint_len(bytes: &[u8], at: usize) -> usize {
     bytes[at..]
         .iter()
@@ -573,6 +591,130 @@ async fn a_damaged_index_is_refused() {
     assert!(
         Pack::open(&path).is_err(),
         "an index that ends mid-entry was accepted"
+    );
+}
+
+/// A chunk the index places outside the payload is refused when the pack opens.
+///
+/// The header check bounds the *payload*; nothing bounded where each chunk sits
+/// within it. An offset and a length that reach past the end are numbers a client
+/// is told to add up — `needed` and `chunks_covering` both do
+/// `payload_start + offset + len` — so accepting them means the arithmetic that
+/// consumes a pack can overflow rather than fail.
+#[tokio::test]
+async fn a_chunk_outside_the_payload_is_refused() {
+    let built = build(4, 150_000).await;
+    let path = built.dir.path().join("v1.pack");
+    built.pack(&path).await;
+
+    let good = fs::read(&path).unwrap();
+    let mut length = [0u8; 8];
+    length.copy_from_slice(&good[good.len() - 12..good.len() - 4]);
+    let index_len = usize::try_from(u64::from_le_bytes(length)).unwrap();
+    let index_at = good.len() - 12 - index_len;
+    let index = &good[index_at..index_at + index_len];
+    let entries = index_entries(index);
+    assert!(entries.len() >= 2, "the fixture should have a second entry");
+
+    // The first entry's two numbers, and the width they occupy together. Filling
+    // exactly those bytes with continuation-then-terminator gives an offset far
+    // past the end of the payload, without moving the entry after it.
+    let first = entries[0];
+    let numbers_at = first + 32;
+    let numbers_len = entries[1] - numbers_at;
+    assert!(
+        numbers_len >= 2,
+        "the fixture's first entry has two varints"
+    );
+
+    let mut far = good.clone();
+    for byte in far
+        .iter_mut()
+        .skip(index_at + numbers_at)
+        .take(numbers_len - 1)
+    {
+        *byte = 0xff;
+    }
+    far[index_at + numbers_at + numbers_len - 1] = 0x01;
+    let path = built.dir.path().join("far-outside.pack");
+    fs::write(&path, &far).unwrap();
+    let err = Pack::open(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("past the"),
+        "a chunk placed past the payload was accepted: {err}"
+    );
+
+    // The same bytes as a number one past the type, so the offset and the length
+    // together cannot be represented at all. This is the case that panicked in
+    // `needed` rather than misbehaving quietly.
+    let mut wrapping = good.clone();
+    for byte in wrapping
+        .iter_mut()
+        .skip(index_at + numbers_at)
+        .take(numbers_len)
+    {
+        *byte = 0xff;
+    }
+    // The last byte keeps only the single bit a ten-byte varint has left, which
+    // is what stops the value overflowing the type and keeps it in range.
+    wrapping[index_at + numbers_at + numbers_len - 1] = 0x01;
+    let path = built.dir.path().join("wrapping.pack");
+    fs::write(&path, &wrapping).unwrap();
+    assert!(
+        Pack::open(&path).is_err(),
+        "a chunk whose offset and length cannot be added was accepted"
+    );
+}
+
+/// An index naming the same chunk twice is refused.
+///
+/// `locate` answers with the first match, so a repeated hash means a client that
+/// already holds the chunk is told to fetch a different one at a different
+/// offset. `decode_index` has always claimed to catch this.
+#[tokio::test]
+async fn a_chunk_listed_twice_is_refused() {
+    let built = build(4, 150_000).await;
+    let path = built.dir.path().join("v1.pack");
+    built.pack(&path).await;
+
+    let good = fs::read(&path).unwrap();
+    let mut length = [0u8; 8];
+    length.copy_from_slice(&good[good.len() - 12..good.len() - 4]);
+    let index_len = usize::try_from(u64::from_le_bytes(length)).unwrap();
+    let index_at = good.len() - 12 - index_len;
+    let entries = index_entries(&good[index_at..index_at + index_len]);
+    assert!(entries.len() >= 2, "the fixture should have a second entry");
+
+    // Copy the first entry's hash over the second's, leaving both entries'
+    // numbers alone — so the index still decodes and still describes a payload
+    // of the right size, and the only thing wrong with it is the repetition.
+    let mut doubled = good.clone();
+    let first_hash: [u8; 32] = good[index_at..index_at + 32].try_into().unwrap();
+    let second = index_at + entries[1];
+    doubled[second..second + 32].copy_from_slice(&first_hash);
+
+    let path = built.dir.path().join("doubled.pack");
+    fs::write(&path, &doubled).unwrap();
+    let err = Pack::open(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("twice"),
+        "an index naming one chunk twice was accepted: {err}"
+    );
+}
+
+/// A `Range` a client built with its ends the wrong way round covers nothing.
+///
+/// Both fields are public, and the type is part of the client protocol, so the
+/// inverted value is one a caller can produce. It used to panic in `len` under a
+/// debug assertion and wrap to a near-`u64::MAX` total in release.
+#[test]
+fn an_inverted_range_covers_nothing() {
+    let inverted = Range { start: 10, end: 0 };
+    assert_eq!(inverted.len(), 0, "an inverted range covers no bytes");
+    assert!(
+        !inverted.is_empty(),
+        "an inverted range is not a well-formed range, and saying so is what the \
+         is_empty pair is for"
     );
 }
 
