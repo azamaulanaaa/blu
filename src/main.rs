@@ -890,7 +890,7 @@ async fn run_pack(
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
-    let (version, snapshot) = select_version(&set, &store, version)?;
+    let (version, snapshot_id) = select_version(&set, &store, version)?;
 
     tracing::info!(
         name = %set.base().display(),
@@ -899,10 +899,12 @@ async fn run_pack(
         "packing"
     );
 
-    // A function of the snapshot, not of how the set laid its chunks out, so the
-    // pack is reproducible.
-    let decoded = load_snapshot(&store, snapshot).await?;
-    let plan = storage::Plan::from_snapshot(&decoded, |id| store.locate(id))?;
+    // A function of the tree, not of how the set laid its chunks out, so the pack
+    // is reproducible. The decoded snapshot is handed to the writer as well as
+    // resolved into a plan, because a pack carries its own file table and so is
+    // the version rather than a reference to it.
+    let snapshot = load_snapshot(&store, snapshot_id).await?;
+    let plan = storage::Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 
     let pack = lepatch::pack::Pack::write(&store, &plan, &snapshot, out).await?;
     let file_len = pack.file_len()?;
@@ -912,6 +914,7 @@ async fn run_pack(
         version,
         chunks = pack.len(),
         bytes = file_len,
+        snapshot = file_len.saturating_sub(pack.snapshot_len()),
         content = %&content,
         "wrote pack"
     );
@@ -920,9 +923,11 @@ async fn run_pack(
     // key a cache on.
     say!("{}  {}", &content, out.display())?;
     say!(
-        "version {version}: {} chunks, {} bytes of payload, {} bytes on disk",
+        "version {version}: {} chunks, {} bytes of payload, {} bytes of file table, \
+         {} bytes on disk",
         pack.len(),
         pack.payload_len(),
+        pack.snapshot_len(),
         file_len
     )?;
 

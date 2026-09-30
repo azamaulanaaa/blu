@@ -26,6 +26,17 @@ use lepatch::{
 use std::io::{Read, Seek, SeekFrom};
 use tokio::io::AsyncReadExt;
 
+/// A set's latest snapshot, read from the store and decoded.
+async fn snapshot_of(blob: &Path) -> Snapshot {
+    let store = BlobStore::open_for_reading(blob).await.unwrap();
+    let id = store.latest().unwrap().1;
+    let mut reader = store.get(&id).await.unwrap();
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).await.unwrap();
+
+    Snapshot::try_from(buffer.as_slice()).unwrap()
+}
+
 /// The BLAKE3 of a set's latest snapshot — what a pack of that version names.
 async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
@@ -42,11 +53,7 @@ async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
 async fn plan_of(blob: &Path) -> Plan {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
 
-    let id = store.latest().unwrap().1;
-    let mut reader = store.get(&id).await.unwrap();
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = snapshot_of(blob).await;
 
     Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap()
 }
@@ -67,7 +74,7 @@ impl Built {
     /// Write a pack of this version to `at`, and return it.
     async fn pack(&self, at: &Path) -> Pack {
         let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
-        let snapshot = snapshot_id(&self.blob).await;
+        let snapshot = snapshot_of(&self.blob).await;
 
         Pack::write(&store, &self.plan, &snapshot, at)
             .await
@@ -79,7 +86,7 @@ impl Built {
 async fn pack(blob: &Path, at: &Path) -> Pack {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
     let plan = plan_of(blob).await;
-    let snapshot = snapshot_id(blob).await;
+    let snapshot = snapshot_of(blob).await;
 
     Pack::write(&store, &plan, &snapshot, at).await.unwrap()
 }
@@ -153,31 +160,41 @@ async fn the_index_is_at_the_end() {
     let pack = built.pack(&path).await;
 
     let file_len = pack.file_len().unwrap();
+    let sections = sections(&fs::read(&path).unwrap());
+    let index_len = u64::try_from(sections.index_len).unwrap();
 
-    // Twelve bytes of trailer: an 8-byte index length and the magic.
-    let mut trailer = [0u8; 12];
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = fs::File::open(&path).unwrap();
-        file.seek(SeekFrom::Start(file_len - 12)).unwrap();
-        file.read_exact(&mut trailer).unwrap();
-    }
-
-    assert_eq!(&trailer[8..], b"LPK1", "a pack must end with its magic");
-
-    let index_len = u64::from_le_bytes(trailer[..8].try_into().unwrap());
-    assert!(index_len > 0, "the index should not be empty");
+    assert!(sections.index_len > 0, "the index should not be empty");
     assert!(
         index_len < file_len / 2,
         "the index is {index_len} of {file_len} bytes, so a client reading only \
          the tail reads a small fraction of the file"
     );
 
+    // The file table travels with the payload and is still small next to it: this
+    // is what makes a pack worth handing over as one file.
+    assert_eq!(sections.snapshot_len as u64, pack.snapshot_len());
+    assert!(
+        u64::try_from(sections.snapshot_len).unwrap() < pack.payload_len() / 8,
+        "the file table is {} bytes against {} of payload",
+        sections.snapshot_len,
+        pack.payload_len()
+    );
+
+    // The index length alone locates the index, so a client that only wants
+    // offsets never reads the snapshot — which is why it sits before the index
+    // rather than after it.
+    assert_eq!(
+        sections.snapshot_start as u64,
+        pack.snapshot_start(),
+        "the snapshot should begin where the index length says it does"
+    );
+    assert_eq!(u64::try_from(sections.file_len).unwrap(), file_len);
+
     // Opening costs the index and nothing else, and gives the same answer as the
     // pack that was just written.
     let reopened = Pack::open(&path).unwrap();
     assert_eq!(reopened.len(), pack.len());
-    assert_eq!(reopened.snapshot(), pack.snapshot());
+    assert_eq!(reopened.snapshot_id(), pack.snapshot_id());
     assert_eq!(reopened.payload_len(), pack.payload_len());
 }
 
@@ -252,7 +269,7 @@ async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
     let v2 = plan_of(&blob).await;
 
     let store = BlobStore::open_for_reading(&blob).await.unwrap();
-    let snapshot = snapshot_id(&blob).await;
+    let snapshot = snapshot_of(&blob).await;
     let pack = Pack::write(&store, &v2, &snapshot, &dir.path().join("v2.pack"))
         .await
         .unwrap();
@@ -449,7 +466,44 @@ async fn a_header_that_contradicts_its_index_is_refused() {
     );
 }
 
-/// How many bytes the varint at `at` occupies.
+/// Where a written pack's sections are, read from its trailer.
+///
+/// Every test that damages a pack needs to know where a section begins, and the
+/// answer is arithmetic over the trailer rather than a constant — a test that
+/// hard-coded the trailer's width would be asserting about the format it was
+/// written against, which is exactly what stops being true when the format moves.
+struct Sections {
+    file_len: usize,
+    snapshot_start: usize,
+    snapshot_len: usize,
+    index_start: usize,
+    index_len: usize,
+}
+
+/// Read a pack's trailer. Panics if the bytes are not a pack this crate wrote.
+fn sections(bytes: &[u8]) -> Sections {
+    const TRAILER: usize = 20;
+
+    let file_len = bytes.len();
+    assert!(file_len > TRAILER, "a pack is longer than its trailer");
+
+    let trailer = &bytes[file_len - TRAILER..];
+    assert_eq!(&trailer[16..], b"LPK1", "a pack must end with its magic");
+
+    let index_len = usize::try_from(u64::from_le_bytes(trailer[..8].try_into().unwrap())).unwrap();
+    let snapshot_len =
+        usize::try_from(u64::from_le_bytes(trailer[8..16].try_into().unwrap())).unwrap();
+    let index_start = file_len - TRAILER - index_len;
+
+    Sections {
+        file_len,
+        snapshot_start: index_start - snapshot_len,
+        snapshot_len,
+        index_start,
+        index_len,
+    }
+}
+
 /// The offsets, within a pack's index, where each entry's hash begins.
 ///
 /// Walked rather than computed, because an entry is 32 bytes plus two varints
@@ -524,22 +578,25 @@ async fn a_damaged_index_is_refused() {
     built.pack(&path).await;
 
     let good = fs::read(&path).unwrap();
+    let sections = sections(&good);
 
-    // Where the index starts: the file, less the trailer, less the index.
-    let mut length = [0u8; 8];
-    length.copy_from_slice(&good[good.len() - 12..good.len() - 4]);
-    let index_len = usize::try_from(u64::from_le_bytes(length)).unwrap();
-    let index_at = good.len() - 12 - index_len;
+    let index_at = sections.index_start;
+    let index_len = sections.index_len;
     assert!(index_len > 32, "the index should have room to damage");
 
     // The first entry's hash is 32 bytes, and its two numbers follow.
     let numbers_at = index_at + 32;
+    let numbers_end = index_at + index_len;
 
-    // Nothing but continuation bits, from the first number to the end of the index.
+    // Nothing but continuation bits, across the index's numbers and no further.
     // Every varint read then runs past what a u64 can hold, which must be refused
     // rather than read as a very large offset.
+    //
+    // Bounded to the index, because the snapshot and the trailer sit after it:
+    // running on to the end of the file would damage those instead and the pack
+    // would be refused for a reason that has nothing to do with the index.
     let mut endless = good.clone();
-    for byte in endless.iter_mut().skip(numbers_at) {
+    for byte in endless.iter_mut().take(numbers_end).skip(numbers_at) {
         *byte = 0x80;
     }
     let path = built.dir.path().join("endless.pack");
@@ -552,7 +609,7 @@ async fn a_damaged_index_is_refused() {
     // A continuation bit on the last byte of the tenth, where only the final bit of
     // a u64 is left to contribute: a value one past the type.
     let mut overlong = good.clone();
-    for byte in overlong.iter_mut().skip(numbers_at).take(9) {
+    for byte in overlong.iter_mut().take(numbers_at + 9).skip(numbers_at) {
         *byte = 0xff;
     }
     overlong[numbers_at + 9] = 0x02;
@@ -568,7 +625,7 @@ async fn a_damaged_index_is_refused() {
     // index is read, and it runs out in the middle of a value. Shortening the file
     // instead would be caught by the magic, which is the other test.
     let mut cut_number = good.clone();
-    let at = cut_number.len() - 12;
+    let at = sections.file_len - 20;
     cut_number[at..at + 8].copy_from_slice(&u64::try_from(index_len - 1).unwrap().to_le_bytes());
     let path = built.dir.path().join("cut-number.pack");
     fs::write(&path, &cut_number).unwrap();
@@ -602,10 +659,9 @@ async fn a_chunk_outside_the_payload_is_refused() {
     built.pack(&path).await;
 
     let good = fs::read(&path).unwrap();
-    let mut length = [0u8; 8];
-    length.copy_from_slice(&good[good.len() - 12..good.len() - 4]);
-    let index_len = usize::try_from(u64::from_le_bytes(length)).unwrap();
-    let index_at = good.len() - 12 - index_len;
+    let sections = sections(&good);
+    let index_at = sections.index_start;
+    let index_len = sections.index_len;
     let index = &good[index_at..index_at + index_len];
     let entries = index_entries(index);
     assert!(entries.len() >= 2, "the fixture should have a second entry");
@@ -672,10 +728,9 @@ async fn a_chunk_listed_twice_is_refused() {
     built.pack(&path).await;
 
     let good = fs::read(&path).unwrap();
-    let mut length = [0u8; 8];
-    length.copy_from_slice(&good[good.len() - 12..good.len() - 4]);
-    let index_len = usize::try_from(u64::from_le_bytes(length)).unwrap();
-    let index_at = good.len() - 12 - index_len;
+    let sections = sections(&good);
+    let index_at = sections.index_start;
+    let index_len = sections.index_len;
     let entries = index_entries(&good[index_at..index_at + index_len]);
     assert!(entries.len() >= 2, "the fixture should have a second entry");
 
@@ -777,7 +832,7 @@ async fn a_pack_of_an_empty_version_opens() {
     assert!(plan.is_empty(), "an empty tree should plan to no chunks");
 
     let path = dir.path().join("v1.pack");
-    Pack::write(&store, &plan, &snapshot_id(&blob).await, &path)
+    Pack::write(&store, &plan, &snapshot_of(&blob).await, &path)
         .await
         .unwrap();
 
@@ -787,15 +842,59 @@ async fn a_pack_of_an_empty_version_opens() {
     assert_eq!(pack.len(), 0);
 }
 
-/// The snapshot a pack names is the one it was built from.
+/// A pack carries the version it was built from, and names it correctly.
+///
+/// This is the property that makes a pack self-contained. Without the snapshot in
+/// the file, a client can locate every chunk in it and cannot put one of them
+/// anywhere — the file table is what says which slice of which chunk lands at
+/// which offset in which file, and it is not derivable from the payload.
 #[tokio::test]
-async fn a_pack_names_its_snapshot() {
+async fn a_pack_carries_the_version_it_was_built_from() {
     let built = build(3, 100_000).await;
-    let expected = snapshot_id(&built.blob).await;
+    let expected = snapshot_of(&built.blob).await;
     let pack = built.pack(&built.dir.path().join("v1.pack")).await;
 
-    assert_eq!(pack.snapshot(), expected);
-    assert_eq!(Pack::open(pack.path()).unwrap().snapshot(), expected);
+    assert_eq!(pack.snapshot().unwrap(), expected);
+
+    // The header's hash is over exactly the bytes that follow the payloads, so a
+    // client with its own copy of the snapshot can confirm the two go together
+    // without either having to be decoded.
+    assert_eq!(pack.snapshot_id(), snapshot_id(&built.blob).await);
+
+    let reopened = Pack::open(pack.path()).unwrap();
+    assert_eq!(reopened.snapshot().unwrap(), expected);
+}
+
+/// The file table is checked against the header's hash before it is parsed.
+///
+/// A pack is a file that was downloaded, and a damaged snapshot section would
+/// otherwise decode into a file table describing a different tree — one that
+/// writes real bytes to the wrong paths. Refused instead.
+#[tokio::test]
+async fn a_pack_refuses_a_snapshot_that_is_not_the_one_it_names() {
+    let built = build(3, 100_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+
+    // One byte inside the snapshot section. The index is left alone, so this
+    // isolates the hash check from everything `open` already refuses.
+    let mut damaged = fs::read(&path).unwrap();
+    let at = usize::try_from(pack.snapshot_start()).unwrap() + 16;
+    damaged[at] ^= 0x01;
+    fs::write(&path, &damaged).unwrap();
+
+    // The geometry is still sound, so opening it succeeds — and that is the point:
+    // the damage is invisible to a reader that only wants offsets.
+    let reopened = Pack::open(&path).unwrap();
+    assert_eq!(reopened.len(), pack.len());
+
+    let error = reopened.snapshot().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not hash to the one its header names"),
+        "a snapshot section that is not the named one should be refused, got: {error}"
+    );
 }
 
 /// `chunks_covering` reports what a range actually contains, not what it is near.
