@@ -9,7 +9,7 @@ use lepatch::{
         verify,
     },
     layout::IndexSet,
-    storage,
+    reader, storage,
 };
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -53,6 +53,16 @@ enum Command {
         /// not compress is stored raw at any level.
         #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(u8).range(0..=9))]
         compression_level: Option<u8>,
+        /// Which of the tuned chunk-size profiles to cut this tree with.
+        ///
+        /// `small` cuts finely, `large` coarsely, and `default` is what every
+        /// backup so far used. Only affects chunks written from now on, and never
+        /// rewrites what is already there: chunks are named by their contents, so
+        /// a set backed up at more than one profile is still one store and every
+        /// version restores — but a run stops deduplicating against chunks cut
+        /// under a different profile, so a set changed mid-life wants re-taking.
+        #[arg(long, value_name = "PROFILE")]
+        chunk_profile: Option<reader::ChunkerProfile>,
     },
     /// Rebuild the per-version index files from the store's commit records.
     ///
@@ -270,9 +280,11 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             name,
             segment_size,
             compression_level,
+            chunk_profile,
         } => {
             let compression = compression_policy(compression_level);
-            run_backup(&source, &name, segment_size, compression).await
+            let profile = chunk_profile.unwrap_or_default();
+            run_backup(&source, &name, segment_size, compression, profile).await
         }
         Command::Restore {
             destination,
@@ -494,11 +506,18 @@ fn compression_policy(level: Option<u8>) -> storage::Compression {
 }
 
 /// Snapshot a tree into a new version of the set at `name`.
+///
+/// The chunk profile is the run's own policy rather than the store's, like
+/// `--segment-size` and `--compression-level` it is a write policy for what
+/// comes next, and what is already there is never rewritten — so it is logged
+/// with the sizes it resolved to rather than only as the name that was typed,
+/// since the name is a shorthand for three numbers a user cannot see.
 async fn run_backup(
     source: &std::path::Path,
     name: &std::path::Path,
     segment_size: Option<u64>,
     compression: storage::Compression,
+    profile: reader::ChunkerProfile,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
@@ -527,8 +546,25 @@ async fn run_backup(
         exclude.push(set.segment_path(segment));
     }
 
+    let chunker = profile.config();
+
+    // The chunker's sizes are the only thing about this run that a later run will
+    // not be able to work out from the store, and the one whose consequences are
+    // not visible on disk: a set whose runs disagree about chunk sizes restores
+    // perfectly and deduplicates badly. Saying which profile cut this run is the
+    // only warning the user gets, so it goes in the run's own log line rather than
+    // behind `--verbose`.
+    tracing::info!(
+        profile = %profile,
+        min = chunker.min_size,
+        avg = chunker.avg_size,
+        max = chunker.max_size,
+        "chunking this tree"
+    );
+
     let options = Options {
         exclude,
+        chunker,
         ..Options::default()
     };
 

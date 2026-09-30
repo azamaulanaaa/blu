@@ -241,6 +241,47 @@ than one of them believed: the index is what locates chunks, so if the two disag
 one is wrong, and picking the wrong one produces a pack that reads as valid and hands
 out ranges covering the wrong bytes.
 
+### Chunk profiles
+
+How big a chunk should be is a trade, and the trade depends on the tree. Fine cuts
+deduplicate a *localised* edit better, because a boundary is more likely to land on
+the same content in both the old and the new copy; coarse cuts mean fewer records,
+less framing and less to read back, which is what matters once the content stops
+compressing at all. Almost nobody can place themselves on that curve for a tree
+they have not measured, and being wrong only shows up as a worse ratio weeks later,
+so the sizes are chosen for you and referred to by name:
+
+```console
+$ lepatch backup ~/Documents docs                            # default: 16 KiB average
+$ lepatch backup ~/src docs --chunk-profile small            # 4 KiB average
+$ lepatch backup ~/video docs --chunk-profile large          # 64 KiB average
+```
+
+| profile | minimum | average | maximum | for |
+|---|---|---|---|---|
+| `small` | 2 KiB | 4 KiB | 16 KiB | trees of many small files, where one file is smaller than a default chunk and an edit to it re-uploads all of it |
+| `default` | 8 KiB | 16 KiB | 64 KiB | everything else, and every version written so far |
+| `large` | 32 KiB | 64 KiB | 256 KiB | content that does not deduplicate anyway — video, archives of compressed files |
+
+**A name, not three numbers.** `--chunk-profile` takes one of those three names and
+nothing else. There is deliberately no flag for an average chunk size, for the same
+reason there is no `--no-compression`: two spellings of one policy are two ways to
+forget which is in force, and a number typed here would be one almost nobody can
+derive from their own data. A name the tool does not have is a usage error that quotes
+what was typed and names the profiles that would have worked, so it can never be
+quietly corrected into something nearby.
+
+**It is a write policy, not a format property.** Nothing about the profile is written
+into the store: chunks are named by their contents, so a set whose runs were cut at
+different profiles is still one store and every version of it restores, byte for
+byte — asserted in `tests/cli.rs`. What changes is deduplication, because a run stops
+matching chunks cut under another profile. So moving a set to a different profile is
+safe but costs a full rewrite the first time, and a worse ratio after that; a set that
+wants a different profile forever wants re-taking.
+
+Each run logs which profile cut it and the three sizes behind it, because that is the
+one thing about a run that cannot be worked out from the store afterwards.
+
 ### Compression
 
 Record payloads are stored as **zstd frames** by default, at level 1:

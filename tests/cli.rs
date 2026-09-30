@@ -18,7 +18,7 @@ use std::{
 
 use common::noisy;
 use lepatch::{
-    command::PARTIAL_SUFFIX,
+    command::{PARTIAL_SUFFIX, load_snapshot},
     layout::IndexSet,
     storage::{BlobId, BlobStore, Codec, VersionIndex},
 };
@@ -765,6 +765,163 @@ async fn a_compression_level_outside_zero_to_nine_is_refused() {
     let id = store.latest().unwrap().1;
     let placement = store.locate(&id).unwrap();
     assert_eq!(placement.codec, Codec::Raw);
+}
+
+/// A profile that does not exist is a usage error, and it says what does.
+///
+/// The same reasoning as `--compression-level`, one level up: the flag decides
+/// how finely the tree is cut, a set quietly cut at a size nobody asked for is
+/// invisible from the directory listing, and "unknown profile" on its own leaves
+/// the user to run `--help` to find out what the choices are. So the error names
+/// the profile that was refused *and* every profile that would have worked.
+#[test]
+fn a_chunk_profile_that_does_not_exist_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for name in ["fine", "big", "16k", "defaul"] {
+        // Not `fails`, which insists on exit 1: a flag that does not parse is a
+        // usage error, and clap exits 2 for those. The distinction is the one a
+        // script sees — exit 1 is a run that was asked for and could not be had.
+        let output = lepatch(
+            dir.path(),
+            &["backup", ".", "store", "--chunk-profile", name],
+        );
+        assert!(
+            !output.status.success(),
+            "--chunk-profile {name} should be refused"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "a flag that does not parse should exit 2, got {:?}\nstderr: {}",
+            output.status.code(),
+            stderr(&output)
+        );
+
+        let refused = stderr(&output);
+        assert!(
+            refused.contains(&format!("`{name}` is not a chunk profile")),
+            "the error should quote the name that was refused, got: {refused}"
+        );
+        for profile in ["small", "default", "large"] {
+            assert!(
+                refused.contains(profile),
+                "the error should offer {profile}, got: {refused}"
+            );
+        }
+    }
+
+    // And none of that created a set: a refused flag is refused before the run,
+    // not after it has written a version nobody asked for.
+    assert!(
+        !dir.path().join("store.0000.bin").exists(),
+        "a refused --chunk-profile should not have written a store"
+    );
+}
+
+/// The profile is what decides the chunking, and `default` decides exactly what
+/// no flag at all decides.
+///
+/// The first half is the flag working: a tree cut at three profiles is three
+/// different sets of chunks, so the counts have to differ and in the direction
+/// the names promise. The second half is the property that makes the flag safe to
+/// leave alone — `default` resolves to the configuration every backup so far
+/// used, so a run that passes it has to produce the *same* run, down to the
+/// snapshot's hash, and a store cannot come to depend on which spelling was used.
+#[tokio::test]
+async fn a_chunk_profile_is_the_chunking_and_default_is_the_flagless_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("a.bin"), noisy(128 * 1024)).unwrap();
+
+    // Back up into a fresh set and report what the run committed. The snapshot's
+    // hash is what says two runs cut the same tree the same way.
+    let backup_of = |name: &str, profile: Option<&str>| {
+        let mut args = vec!["backup", "source", name];
+        if let Some(profile) = profile {
+            args.push("--chunk-profile");
+            args.push(profile);
+        }
+        ok(dir.path(), &args);
+        ok(dir.path(), &["versions", name]).trim().to_string()
+    };
+
+    let bare = backup_of("bare", None);
+    let default = backup_of("default", Some("default"));
+    let small = backup_of("small", Some("small"));
+    let large = backup_of("large", Some("large"));
+
+    assert_eq!(
+        bare, default,
+        "--chunk-profile default should be the same run as no flag at all"
+    );
+    assert_ne!(
+        small, large,
+        "two profiles should not have produced the same snapshot"
+    );
+
+    let small_chunks = chunk_count(&dir.path().join("small")).await;
+    let default_chunks = chunk_count(&dir.path().join("default")).await;
+    let large_chunks = chunk_count(&dir.path().join("large")).await;
+
+    assert!(
+        small_chunks > default_chunks && default_chunks > large_chunks,
+        "small should cut more chunks than default, and default more than large: \
+         small={small_chunks}, default={default_chunks}, large={large_chunks}"
+    );
+}
+
+/// How many chunks the newest version of the set at `base` names.
+///
+/// Through the snapshot rather than by counting records in the store: a chunk is
+/// what the snapshot refers to, and a record is also the snapshot itself and every
+/// commit, so the file holds more records than the version has chunks.
+async fn chunk_count(base: &Path) -> usize {
+    let store = BlobStore::open_for_reading(base).await.unwrap();
+    let snapshot = load_snapshot(&store, store.latest().unwrap().1)
+        .await
+        .unwrap();
+    snapshot.chunks.len()
+}
+
+/// A set whose runs were cut at different profiles is still one store.
+///
+/// This is what the flag's own promise is: chunks are named by their contents and
+/// nothing about a profile is written into the format, so changing it mid-life
+/// costs deduplication and nothing else. Every version still restores, byte for
+/// byte, whichever profile cut it.
+#[test]
+fn a_set_survives_being_cut_at_more_than_one_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(
+        dir.path(),
+        &["backup", "src", "snap", "--chunk-profile", "small"],
+    );
+    ok(
+        dir.path(),
+        &["backup", "src", "snap", "--chunk-profile", "large"],
+    );
+
+    let expected = common::describe(&dir.path().join("src"));
+    for (version, profile) in [(1, "small"), (2, "large")] {
+        ok(
+            dir.path(),
+            &[
+                "restore",
+                &format!("out{version}"),
+                "snap",
+                "--version",
+                &version.to_string(),
+            ],
+        );
+        assert_eq!(
+            expected,
+            common::describe(&dir.path().join(format!("out{version}"))),
+            "version {version}, cut at the {profile} profile, did not restore the tree"
+        );
+    }
 }
 
 #[test]

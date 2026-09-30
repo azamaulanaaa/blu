@@ -49,11 +49,12 @@ pub struct Options {
 /// The command line's defaults.
 ///
 /// `Default` *is* the command line's configuration, not a stand-in for it: the
-/// binary exposes no flags for the chunker's sizes, so every backup it has ever
-/// written used [`reader::ChunkerConfig::default`]. A caller in a test that
-/// wants the same behaviour now says `Options::default()` and gets it by
-/// construction, rather than restating three numbers and hoping they still
-/// match.
+/// binary's `--chunk-profile` resolves to one of the named
+/// [`reader::ChunkerProfile`]s, and `default` — what a run gets without the flag —
+/// is exactly [`reader::ChunkerConfig::default`], which is what every backup it
+/// has ever written used. A caller in a test that wants the same behaviour now
+/// says `Options::default()` and gets it by construction, rather than restating
+/// three numbers and hoping they still match.
 impl Default for Options {
     fn default() -> Self {
         Self {

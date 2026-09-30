@@ -206,11 +206,11 @@ impl Read for GlobalStream {
 /// Boundaries come from the content, so inserting or removing bytes shifts only
 /// the chunks around the change rather than every chunk after it.
 ///
-/// [`Default`] is what the command line uses. The three sizes are the whole
-/// public surface of the chunker's policy, and the binary exposes no flags for
-/// them, so the values in [`Default`] are the only ones any real backup has ever
-/// been written with. Keeping them here rather than at the call site means a
-/// second configuration cannot be a slightly different one by accident.
+/// The three sizes are the whole public surface of the chunker's policy, and
+/// [`ChunkerProfile`] is how they are chosen: every backup the binary has written
+/// used [`Default`], which is also what `--chunk-profile default` resolves to.
+/// Keeping the values here rather than at the call site means a second
+/// configuration cannot be a slightly different one by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkerConfig {
     /// No boundary is taken before this many bytes.
@@ -296,6 +296,132 @@ impl ChunkerConfig {
         }
 
         Ok(())
+    }
+}
+
+/// A named [`ChunkerConfig`]: three chunk sizes that were chosen rather than
+/// calculated.
+///
+/// How big a chunk should be is a trade, and the trade depends on the tree.
+/// Finer cuts deduplicate a *localised* edit better, because a boundary is more
+/// likely to land on the same content in both the old and the new copy; coarser
+/// cuts mean fewer records, less framing and less to read back, which is what
+/// matters once the content stops compressing at all. Almost nobody can place
+/// themselves on that curve for a tree they have not measured, and being wrong is
+/// only visible as a worse ratio weeks later — so the sizes live here and the
+/// command line asks for one by name.
+///
+/// **A profile is not recorded in the store.** Chunks are named by their contents,
+/// so a set written at two different profiles is still one store and every version
+/// of it restores; what differs is how much a run deduplicates against the others.
+/// Moving a set to a different profile costs a full rewrite the first time, and
+/// nothing but a worse ratio afterwards.
+///
+/// [`ChunkerConfig`] remains the way to state sizes that no name covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkerProfile {
+    /// Fine cuts: 2 KiB minimum, 4 KiB average, 16 KiB maximum.
+    ///
+    /// For trees of many small files. A file shorter than one default chunk is a
+    /// file stored whole, and an edit to it re-uploads all of it; at this size it
+    /// costs the chunks around the edit instead. The price is records — four times
+    /// as many of them, each with its own header and index entry.
+    Small,
+    /// The default: 8 KiB minimum, 16 KiB average, 64 KiB maximum.
+    ///
+    /// What every `lepatch backup` has used so far, and the safest thing to leave
+    /// a set on: a profile nobody chose beats a profile chosen once and forgotten.
+    Default,
+    /// Coarse cuts: 32 KiB minimum, 64 KiB average, 256 KiB maximum.
+    ///
+    /// For content that does not deduplicate anyway — video, archives of already
+    /// compressed files — where a finer cut buys a marginally better match and
+    /// costs a record for every chunk of every version. It also gives a pack the
+    /// coarse ranges a client downloading a whole file wants.
+    Large,
+}
+
+impl ChunkerProfile {
+    /// Every profile, finest cut first, which is the order they are offered in.
+    pub const ALL: [Self; 3] = [Self::Small, Self::Default, Self::Large];
+
+    /// The name this profile is typed and written as.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Default => "default",
+            Self::Large => "large",
+        }
+    }
+
+    /// The chunker parameters this profile stands for.
+    ///
+    /// Each one validates: a profile that did not would be a bad backup rather
+    /// than an error, since `fastcdc` asserts its bounds with `debug_assert!` and
+    /// a release build does not contain them.
+    #[must_use]
+    pub fn config(self) -> ChunkerConfig {
+        match self {
+            // Not restated, deliberately. This profile *is* the default
+            // configuration, so naming it that way is what keeps the two from
+            // drifting into a pair of nearly equal answers.
+            Self::Default => ChunkerConfig::default(),
+            Self::Small => ChunkerConfig {
+                min_size: 2 * 1024,
+                avg_size: 4 * 1024,
+                max_size: 16 * 1024,
+            },
+            Self::Large => ChunkerConfig {
+                min_size: 32 * 1024,
+                avg_size: 64 * 1024,
+                max_size: 256 * 1024,
+            },
+        }
+    }
+
+    /// Every profile's name, comma-separated: what there was to choose from, for
+    /// an error that has to be actionable on its own.
+    #[must_use]
+    pub fn names() -> String {
+        Self::ALL.map(Self::name).join(", ")
+    }
+}
+
+impl Default for ChunkerProfile {
+    /// The profile a backup uses when nothing asks for another one.
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl std::fmt::Display for ChunkerProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ChunkerProfile {
+    type Err = String;
+
+    /// A profile name, in any case.
+    ///
+    /// The error is a [`String`] so that `clap`'s derived parser can turn it into
+    /// a usage error, quoting what was typed and what there was instead. Failing
+    /// the parse is the whole point: a backup cut at a size nobody asked for is
+    /// not a thing to discover from a storage ratio weeks later.
+    ///
+    /// [`String`]: std::string::String
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|profile| profile.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                format!(
+                    "`{name}` is not a chunk profile; use one of {}",
+                    Self::names()
+                )
+            })
     }
 }
 
@@ -385,7 +511,8 @@ impl Iterator for Chunker {
 
 #[cfg(test)]
 mod tests {
-    use super::ChunkerConfig;
+    use super::{ChunkerConfig, ChunkerProfile};
+    use std::str::FromStr as _;
 
     /// A configuration the chunker accepts, for the cases that mutate one field.
     fn good() -> ChunkerConfig {
@@ -462,6 +589,110 @@ mod tests {
             error.to_string().contains("must be greater than avg_size"),
             "the error should say which way round they are, got: {error}"
         );
+    }
+
+    /// Every profile the command line offers is one the chunker can chunk with.
+    ///
+    /// Checked here rather than trusted because a profile is a set of numbers
+    /// typed into a match arm, and fastcdc's bounds are `debug_assert!`s that a
+    /// release build does not contain: one out of range would be a bad backup
+    /// rather than a message. [`ChunkerProfile::ALL`] is what `--help` and the
+    /// parse error list, so anything not in it cannot be named at all.
+    #[test]
+    fn every_profile_is_a_configuration_the_chunker_accepts() {
+        for profile in ChunkerProfile::ALL {
+            profile
+                .config()
+                .validate()
+                .unwrap_or_else(|e| panic!("profile {profile} is not chunkable: {e}"));
+        }
+    }
+
+    /// The `default` profile is the default configuration, and cannot stop being
+    /// it.
+    ///
+    /// [`ChunkerConfig::default`] is what a library caller gets without asking, and
+    /// `--chunk-profile default` is what the binary gets without asking; they are
+    /// the same numbers, so a test that means "whatever the command line does"
+    /// means one thing. This is what pins them together — `config()` reads the
+    /// default rather than restating it, and this says why that is not a shortcut.
+    #[test]
+    fn the_default_profile_is_the_default_configuration() {
+        assert_eq!(
+            ChunkerProfile::default().config(),
+            ChunkerConfig::default(),
+            "the default profile and ChunkerConfig::default should be one configuration"
+        );
+        assert_eq!(
+            ChunkerProfile::default(),
+            ChunkerProfile::Default,
+            "and the profile that should be the default is the one named default"
+        );
+    }
+
+    /// The profiles are ordered by how finely they cut, and each says the same
+    /// thing as its name.
+    ///
+    /// The ordering is the point of `ALL`: it is what the flag's help and the
+    /// parse error present, and a list a reader cannot predict the order of is a
+    /// list they cannot choose from.
+    #[test]
+    fn the_profiles_run_from_finest_to_coarsest() {
+        let cuts: [ChunkerConfig; 3] = ChunkerProfile::ALL.map(ChunkerProfile::config);
+
+        for pair in cuts.windows(2) {
+            let (finer, coarser) = (&pair[0], &pair[1]);
+            assert!(
+                finer.avg_size < coarser.avg_size,
+                "{finer:?} should cut more finely than {coarser:?}"
+            );
+        }
+
+        for (profile, name) in ChunkerProfile::ALL.map(|p| (p, p.name())) {
+            assert_eq!(
+                profile.to_string(),
+                name,
+                "a profile should print as the name it is typed as"
+            );
+        }
+    }
+
+    /// A name that is not a profile says so, and says what there is instead.
+    ///
+    /// Both halves are the assertion: "unknown profile" alone leaves the user to
+    /// run `--help` to find out what profiles exist, and a message listing the
+    /// names without quoting the one that was refused cannot be matched against
+    /// what they typed.
+    #[test]
+    fn an_unknown_profile_name_names_the_alternatives() {
+        let error = ChunkerProfile::from_str("fine").unwrap_err();
+
+        assert!(
+            error.contains("`fine` is not a chunk profile"),
+            "the error should quote the name that was refused, got: {error}"
+        );
+        for name in ChunkerProfile::ALL.map(ChunkerProfile::name) {
+            assert!(
+                error.contains(name),
+                "the error should offer {name}, got: {error}"
+            );
+        }
+
+        // And the profiles themselves parse, in any case, because a name typed in
+        // caps is still the name.
+        for profile in ChunkerProfile::ALL {
+            let name = profile.name();
+            assert_eq!(
+                ChunkerProfile::from_str(name).unwrap(),
+                profile,
+                "{name} should parse as itself"
+            );
+            assert_eq!(
+                ChunkerProfile::from_str(&name.to_uppercase()).unwrap(),
+                profile,
+                "{name} should parse however it is capitalised"
+            );
+        }
     }
 }
 
