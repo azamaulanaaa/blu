@@ -6,6 +6,7 @@ use std::io;
 use crate::{metadata, storage};
 mod apply;
 mod backup;
+mod manifest;
 mod pipeline;
 mod probe;
 mod restore;
@@ -13,6 +14,7 @@ mod verify;
 
 pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{Committed, Options, backup};
+pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use probe::{Mislength, Mismatch, Probed, Unheld, probe};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Restored, lock_destination, restore,
