@@ -430,8 +430,14 @@ async fn a_header_that_contradicts_its_index_is_refused() {
     // Find the two counts by decoding the varints where the header puts them,
     // rather than assuming byte offsets — a test that hardcodes a layout breaks
     // when the layout changes, and breaks by being unreadable rather than by
-    // failing usefully.
-    let count_at = 4 + 4 + 32;
+    // failing usefully. The flag byte sits between the snapshot hash and the
+    // counts, and is clear for a full pack, so this is where they start.
+    let count_at = 4 + 4 + 32 + 1;
+    assert_eq!(
+        good[count_at - 1],
+        0,
+        "sanity: a full pack's flag byte is clear"
+    );
     let count_len = varint_len(&good, count_at);
     let len_at = count_at + count_len;
     let len_len = varint_len(&good, len_at);

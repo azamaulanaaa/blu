@@ -127,6 +127,67 @@ impl Plan {
         Ok(Self { chunks })
     }
 
+    /// The chunks a holder of `base` does not already have, per *placement*.
+    ///
+    /// A delta: what `target` needs that a holder of `base` does not. Deterministic,
+    /// because the surviving chunks keep `target`'s own chunk order rather than
+    /// acquiring one of their own — so two packs of the same delta are the same bytes,
+    /// which is the property a pack's content hash rests on.
+    ///
+    /// **Placements, not chunk sets.** The first version subtracted `base`'s chunk
+    /// hashes, and that is wrong in a way that only shows up with shared content: a
+    /// chunk the base holds *somewhere* is not thereby held *everywhere*. A tree where
+    /// every file happens to have identical bytes, or a new file whose content repeats
+    /// an existing one, produces a chunk that is in the base and absent from a file the
+    /// base knows nothing about. Subtracting by hash drops it, and the delta then
+    /// omits a file's only content — the client skips it, never creates it, and reports
+    /// success.
+    ///
+    /// So a chunk survives unless the base places *every* one of its slices identically:
+    /// same path, same offset in the file, same offset in the chunk, same length. That
+    /// is the only thing which can mean "the directory already has this", because the
+    /// directory holds bytes at paths, and a chunk is not a place.
+    ///
+    /// The consequence for a reader: a chunk absent from the delta is one every one of
+    /// the target's placements for it is already in place. That is what makes skipping
+    /// it sound, and it is a property of the *file*, not of the content.
+    #[must_use]
+    pub fn since(&self, target: &Snapshot, base: &Snapshot) -> Self {
+        let covered: std::collections::HashSet<Site<'_>> = base
+            .file_chunks
+            .iter()
+            .filter_map(|slice| placement_of(base, slice))
+            .collect();
+
+        Self {
+            chunks: self
+                .chunks
+                .iter()
+                .copied()
+                .filter(|chunk| {
+                    // Kept if *any* slice of it is not already placed. One uncovered
+                    // placement is enough to make the whole chunk necessary, because the
+                    // delta has to be able to supply that slice.
+                    target
+                        .chunks
+                        .iter()
+                        .position(|id| id == &chunk.id)
+                        .is_none_or(|index| {
+                            !target
+                                .file_chunks
+                                .iter()
+                                .filter(|slice| {
+                                    usize::try_from(slice.chunk_index).unwrap_or(usize::MAX)
+                                        == index
+                                })
+                                .filter_map(|slice| placement_of(target, slice))
+                                .all(|placement| covered.contains(&placement))
+                        })
+                })
+                .collect(),
+        }
+    }
+
     /// The chunks, in the snapshot's own chunk order.
     #[must_use]
     pub fn chunks(&self) -> &[PlannedChunk] {
@@ -213,6 +274,22 @@ fn bad_index(snapshot: &Snapshot, slice: &FileChunk) -> io::Error {
             snapshot.chunks.len(),
         ),
     )
+}
+
+/// Where a slice sits: the file, and the four numbers that make it the same bytes.
+type Site<'a> = (&'a std::path::Path, u64, u32, u32);
+
+/// A slice's placement, or `None` if it names a table the snapshot does not have.
+///
+/// Returning `None` rather than refusing is deliberate and matches
+/// [`Plan::from_snapshot`], which drops what it cannot resolve rather than failing:
+/// a chunk whose only slice is unresolvable is never read anywhere, so where it
+/// would have gone cannot matter.
+fn placement_of<'a>(snapshot: &'a Snapshot, slice: &FileChunk) -> Option<Site<'a>> {
+    let file = usize::try_from(slice.file_index).ok()?;
+    let path = snapshot.files.get(file)?.path.as_path();
+
+    Some((path, slice.file_offset, slice.chunk_offset, slice.length))
 }
 
 #[cfg(test)]
