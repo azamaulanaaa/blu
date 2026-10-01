@@ -43,6 +43,7 @@ fn snapshot(files: &[(&str, u64)]) -> Snapshot {
             path: path.into(),
             len: *len,
             attrs: Attributes {
+                owner: None,
                 mode: None,
                 mtime: Some(Timestamp {
                     secs: IMPOSED,

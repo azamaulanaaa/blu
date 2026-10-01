@@ -23,15 +23,34 @@ use crate::storage;
 /// Magic prefix identifying a lepatch snapshot blob.
 pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
 
-/// Snapshot layout version understood by this build.
+/// Snapshot layout version written by this build.
 ///
 /// Bump this whenever the shape of [`Snapshot`], or the encoding in `codec`,
 /// changes in a way that makes previously written blobs undecodable.
 ///
-/// This is 3. Version 2 recorded, per chunk, both its content hash and a storage
-/// key naming a byte offset; the store's own index answers "where is this
-/// content" now, so a chunk is a bare hash.
-pub const FORMAT_VERSION: u32 = 3;
+/// This is 4. Version 3 recorded a permission mode and a modification time per
+/// entry; version 4 adds the owning user and group, so every entry is nine bytes
+/// larger on a platform that has them. Version 2 recorded, per chunk, both its
+/// content hash and a storage key naming a byte offset; the store's own index
+/// answers "where is this content" now, so a chunk is a bare hash.
+pub const FORMAT_VERSION: u32 = 4;
+
+/// The first layout version that recorded an owner on every file and directory.
+///
+/// A decoder branches on this rather than on a try, because the field's width is
+/// not self-describing: reading an entry laid out for version 3 with a version-4
+/// reader would take the next entry's length as a uid and every field after it from
+/// the wrong offset, producing a snapshot that decodes cleanly into nonsense. A
+/// version 3 snapshot simply has no owner to read, which is a fact about it rather
+/// than a gap in what this build knows.
+pub const OWNER_SINCE: u32 = 4;
+
+/// The oldest layout version this build can still read.
+///
+/// Version 3 and later. Refusing the ones below is not leniency — they are layouts
+/// this code cannot decode, and a decoder that guessed at them would read a field
+/// from the wrong place rather than fail.
+pub const MIN_READABLE_VERSION: u32 = 3;
 
 /// Reasons a snapshot blob could not be decoded. No encode variant, because
 /// encoding cannot fail: every field is a number, a byte string or a byte array.
@@ -285,14 +304,19 @@ impl Snapshot {
         version.copy_from_slice(&bytes[MAGIC.len()..header]);
         let version = u32::from_le_bytes(version);
 
-        if version != FORMAT_VERSION {
+        // A range rather than an equality, because a version this build can read is
+        // not a version it would have written. Version 3 is readable and predates the
+        // owner field, which is exactly the case worth reading: a set taken before
+        // this build existed is still a set, and refusing it would cost a user every
+        // backup they had rather than costing them their ownership.
+        if !(MIN_READABLE_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(Error::UnsupportedVersion {
                 found: version,
                 supported: FORMAT_VERSION,
             });
         }
 
-        codec::decode_body(&bytes[header..]).map_err(Error::Decode)
+        codec::decode_body(&bytes[header..], version).map_err(Error::Decode)
     }
 }
 
@@ -368,40 +392,83 @@ pub enum Link {
         shares: PathBuf,
     },
 }
-
-/// The platform attributes one entry carries, and a restore reapplies.
+/// Everything this platform records about one entry, and a restore reapplies.
 ///
-/// Permission bits and a modification time are the same kind of thing: something
-/// the platform may or may not have, recorded if it does and reapplied if it is
-/// there. They were two fields on every entry with two different conventions for
-/// "not there" — `mtime: Option<Timestamp>`, and `mode: u32` where `0` meant
-/// absent by convention and a documented no-op. A restore then took both and had
-/// to know which was which.
+/// All of it is the same kind of thing: something the platform may or may not have,
+/// recorded if it does and reapplied if it is there. Each is an `Option`, and "this
+/// platform has no permission bits" and "the permissions are the empty set" are
+/// different facts a sentinel like `0` could not tell apart — a restore acts on them
+/// differently, one is a no-op and the other is a set of permissions nobody has.
 ///
-/// Now they are one struct, one `Option` for both, and [`fsattr::mode_of`](crate::fsattr::mode_of)
-/// returns `Option<u32>` rather than inventing a `0`. "This platform has no
-/// permission bits" and "the permissions are the empty set" are different facts,
-/// and a `0` could not tell them apart.
-///
-/// The wire format is unchanged: a mode is written as a `u32` with `0` for absent,
-/// exactly as before, and read back the same way. A snapshot taken on a platform
-/// with no permission bits still encodes a `0` and still reapplies nothing.
+/// `owner` is the user and group as one value, because they are one identity and come
+/// out of one `stat`. It is absent on a platform with no users, and absent in every
+/// snapshot taken before this field existed — which is a fact rather than a guess, as
+/// a snapshot that recorded nothing about ownership had none to record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Attributes {
+    /// User and group that own the entry, or `None` where the platform has neither.
+    pub owner: Option<Owner>,
     /// Permission bits, or `None` where the platform has none.
     pub mode: Option<u32>,
     /// Last modification time, or `None` where the platform reports none.
     pub mtime: Option<Timestamp>,
 }
 
+/// A user and a group, which are one identity rather than two numbers.
+///
+/// Ids and not names. A name means nothing on any machine but the one it was read
+/// from — uid 1000 is one person here and another there — so a name would be a
+/// portability bug stored alongside the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owner {
+    /// The owning user id.
+    pub uid: u32,
+    /// The owning group id.
+    pub gid: u32,
+}
+
+impl Owner {
+    /// The owner of what `meta` describes, or `None` where the platform has none.
+    #[must_use]
+    pub fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        crate::fsattr::owner_of(meta).map(|(uid, gid)| Self { uid, gid })
+    }
+}
+
 impl Attributes {
-    /// Reapply both to `path`.
+    /// Capture whatever this platform records about `meta`.
+    ///
+    /// One call rather than three, because the interesting case is missing one: a
+    /// backup that captured the mode and the time and forgot the owner would produce
+    /// snapshots that look complete and restore a tree nobody can read.
+    #[must_use]
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            owner: Owner::of(meta),
+            mode: crate::fsattr::mode_of(meta),
+            mtime: crate::fsattr::mtime_of(meta),
+        }
+    }
+
+    /// Reapply all of them to `path`, in the order that survives.
+    ///
+    /// **Owner first, and that is not a style preference.** Linux clears a file's
+    /// set-user-ID and set-group-ID bits when its owner changes, so setting the mode
+    /// first and the owner second silently strips setuid from everything restored. It
+    /// is silent in the worst way: the file is written, its bytes match, and the only
+    /// difference is a bit nobody was looking for.
+    ///
+    /// Modification time is last for a different reason: creating a link inside a
+    /// directory updates that directory's time, so a time set before the links would
+    /// be overwritten by them.
     ///
     /// # Errors
     ///
-    /// Returns an error if the path cannot be found, or either attribute cannot
-    /// be applied — for instance because the caller does not own the file.
-    pub fn apply(&self, path: &std::path::Path) -> io::Result<()> {
+    /// Returns an error if the path cannot be found, or any attribute cannot be
+    /// applied — for instance because the caller does not own the file, or cannot
+    /// change its owner.
+    pub fn apply(&self, path: &std::path::Path) -> std::io::Result<()> {
+        crate::fsattr::set_owner(path, self.owner.map(|owner| (owner.uid, owner.gid)))?;
         crate::fsattr::set_mode(path, self.mode)?;
         if let Some(mtime) = self.mtime {
             crate::fsattr::set_mtime(path, mtime)?;

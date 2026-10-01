@@ -11,6 +11,7 @@ fn sample() -> Snapshot {
         path: "a/b.bin".into(),
         len: 10,
         attrs: Attributes {
+            owner: None,
             mode: Some(0o644),
             mtime: None,
         },

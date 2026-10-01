@@ -88,6 +88,7 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
         path: PathBuf::from("dir/file.bin"),
         len: u64::try_from(FILE_BYTES).unwrap_or(0),
         attrs: Attributes {
+            owner: None,
             mode: Some(0o644),
             mtime: None,
         },

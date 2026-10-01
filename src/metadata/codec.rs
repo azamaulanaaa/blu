@@ -194,6 +194,28 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Read an owner written by [`Writer::owner`], or `None` for a layout that had
+    /// no such field.
+    ///
+    /// The `recorded` flag is the snapshot's version rather than the reader's
+    /// ability: before an owner was recorded there was nothing on the wire to read,
+    /// and reading a `u32` from the mode that follows would put every subsequent
+    /// field out by four bytes and produce a snapshot that decodes into nonsense.
+    fn owner(&mut self, recorded: bool) -> Result<Option<super::Owner>> {
+        if !recorded {
+            return Ok(None);
+        }
+
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(super::Owner {
+                uid: self.u32()?,
+                gid: self.u32()?,
+            })),
+            _ => Err(Malformed("an owner has an invalid presence tag")),
+        }
+    }
+
     fn hash(&mut self) -> Result<super::storage::BlobId> {
         let bytes = self.take(32)?;
         // The length is checked by `take`, so this cannot fail; a hash of the
@@ -308,6 +330,27 @@ impl Writer {
         }
     }
 
+    /// Write an owner, tagged for presence.
+    ///
+    /// A tag rather than `0` for absent, which is how a mode is written, because
+    /// `0` is the root user's id and also the root group's. A sentinel that is a
+    /// real value would make every root-owned file — which is most of `/etc` and
+    /// all of `/usr` — indistinguishable from a platform that has no users at all.
+    ///
+    /// One tag for the pair, not one each: they come from one `stat` and are
+    /// recorded together, so a byte each would be one byte wasted per entry on every
+    /// snapshot ever taken.
+    fn owner(&mut self, owner: Option<super::Owner>) {
+        match owner {
+            None => self.u8(0),
+            Some(o) => {
+                self.u8(1);
+                self.u32(o.uid);
+                self.u32(o.gid);
+            }
+        }
+    }
+
     fn hash(&mut self, hash: &super::storage::BlobId) {
         self.bytes.extend_from_slice(hash.as_bytes());
     }
@@ -323,6 +366,7 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
         out.u64(file.len);
         out.u32(file.attrs.mode.unwrap_or(0));
         out.optional_timestamp(file.attrs.mtime);
+        out.owner(file.attrs.owner);
     }
 
     out.count(snapshot.dirs.len());
@@ -330,6 +374,7 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
         out.path(&dir.path)?;
         out.u32(dir.attrs.mode.unwrap_or(0));
         out.optional_timestamp(dir.attrs.mtime);
+        out.owner(dir.attrs.owner);
     }
 
     out.count(snapshot.chunks.len());
@@ -364,8 +409,15 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
 }
 
 /// Decode a snapshot's body, which must be the whole of `bytes`.
-pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
+///
+/// `version` is the layout the bytes were written in, not the one this build
+/// prefers. It is needed because the owner was added partway through the format's
+/// life and every entry is variable width, so a reader that guessed would be reading
+/// the mode of the next file as an owner's user id and every field after it from the
+/// wrong place.
+pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
     let mut reader = Reader::new(bytes);
+    let with_owner = version >= super::OWNER_SINCE;
 
     let files = (0..reader.count()?)
         .map(|_| {
@@ -375,13 +427,16 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
             // taken on a platform without permission bits has always encoded and
             // what a restore has always declined to apply. The bytes are unchanged.
             let mode = reader.u32()?;
+            let mtime = reader.optional_timestamp()?;
+            let owner = reader.owner(with_owner)?;
 
             Ok(File {
                 path,
                 len,
                 attrs: Attributes {
+                    owner,
                     mode: (mode != 0).then_some(mode),
-                    mtime: reader.optional_timestamp()?,
+                    mtime,
                 },
             })
         })
@@ -391,12 +446,15 @@ pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
         .map(|_| {
             let path = reader.path()?;
             let mode = reader.u32()?;
+            let mtime = reader.optional_timestamp()?;
+            let owner = reader.owner(with_owner)?;
 
             Ok(Dir {
                 path,
                 attrs: Attributes {
+                    owner,
                     mode: (mode != 0).then_some(mode),
-                    mtime: reader.optional_timestamp()?,
+                    mtime,
                 },
             })
         })
@@ -470,6 +528,10 @@ mod tests {
         snapshot.dirs.push(Dir {
             path: PathBuf::from("a/b"),
             attrs: Attributes {
+                owner: Some(super::super::Owner {
+                    uid: 1000,
+                    gid: 100,
+                }),
                 mode: Some(0o755),
                 mtime: Some(Timestamp { secs: -5, nanos: 7 }),
             },
@@ -478,6 +540,7 @@ mod tests {
             path: PathBuf::from("a/b/c.bin"),
             len: 300,
             attrs: Attributes {
+                owner: None,
                 mode: Some(0o644),
                 mtime: None,
             },
@@ -502,14 +565,22 @@ mod tests {
     #[test]
     fn a_snapshot_survives_a_round_trip() {
         let snapshot = sample();
-        let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
+        let decoded = decode_body(
+            &encode_body(&snapshot).expect("encodes"),
+            super::super::FORMAT_VERSION,
+        )
+        .expect("decodes");
         assert_eq!(decoded, snapshot);
     }
 
     #[test]
     fn an_empty_snapshot_survives_a_round_trip() {
         let snapshot = Snapshot::new();
-        let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
+        let decoded = decode_body(
+            &encode_body(&snapshot).expect("encodes"),
+            super::super::FORMAT_VERSION,
+        )
+        .expect("decodes");
         assert!(decoded.files.is_empty());
         assert!(decoded.links.is_empty());
     }
@@ -519,7 +590,7 @@ mod tests {
         let bytes = encode_body(&sample()).expect("encodes");
         for cut in 0..bytes.len() {
             assert!(
-                decode_body(&bytes[..cut]).is_err(),
+                decode_body(&bytes[..cut], super::super::FORMAT_VERSION).is_err(),
                 "a body truncated to {cut} of {} bytes decoded",
                 bytes.len()
             );
@@ -530,7 +601,10 @@ mod tests {
     fn trailing_bytes_are_refused() {
         let mut bytes = encode_body(&sample()).expect("encodes");
         bytes.push(0);
-        assert!(decode_body(&bytes).is_err(), "trailing bytes were accepted");
+        assert!(
+            decode_body(&bytes, super::super::FORMAT_VERSION).is_err(),
+            "trailing bytes were accepted"
+        );
     }
 
     #[test]
@@ -540,7 +614,7 @@ mod tests {
         Writer::new().varint(0);
         body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
 
-        let decoded = decode_body(&body);
+        let decoded = decode_body(&body, super::super::FORMAT_VERSION);
         assert!(decoded.is_err(), "an impossible count decoded");
     }
 
@@ -548,7 +622,7 @@ mod tests {
     fn an_overlong_varint_is_refused() {
         // Eleven continuation bytes: more than any u64 needs.
         let body = vec![0x80u8; 11];
-        assert!(decode_body(&body).is_err());
+        assert!(decode_body(&body, super::super::FORMAT_VERSION).is_err());
     }
 
     #[test]
@@ -556,7 +630,7 @@ mod tests {
         // The tenth byte carries more than the one bit a u64 has left.
         let mut body = vec![0x80u8; 9];
         body.push(0x02);
-        assert!(decode_body(&body).is_err());
+        assert!(decode_body(&body, super::super::FORMAT_VERSION).is_err());
     }
 
     #[test]
@@ -567,7 +641,7 @@ mod tests {
         let last = body.len() - 1;
         body[last] = 9;
         assert!(
-            decode_body(&body).is_err(),
+            decode_body(&body, super::super::FORMAT_VERSION).is_err(),
             "an unknown link kind was accepted"
         );
     }
@@ -584,13 +658,188 @@ mod tests {
                 path: PathBuf::from(OsString::from_vec(vec![0xff, 0xfe, b'/'])),
                 len: 1,
                 attrs: Attributes {
+                    owner: None,
                     mode: Some(0o644),
                     mtime: None,
                 },
             });
 
-            let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
+            let decoded = decode_body(
+                &encode_body(&snapshot).expect("encodes"),
+                super::super::FORMAT_VERSION,
+            )
+            .expect("decodes");
             assert_eq!(decoded.files[0].path, snapshot.files[0].path);
         }
+    }
+
+    /// Root is uid 0, and root's files are most of a system backup, so an encoding
+    /// that used `0` for "no owner" would drop the identity of exactly the files
+    /// whose identity matters most — and would do it silently, decoding cleanly to a
+    /// platform with no users at all.
+    #[test]
+    fn root_is_an_owner_and_not_an_absence() {
+        let mut snapshot = Snapshot::new();
+        snapshot.files.push(File {
+            path: PathBuf::from("owned-by-root"),
+            len: 1,
+            attrs: Attributes {
+                owner: Some(super::super::Owner { uid: 0, gid: 0 }),
+                mode: Some(0o644),
+                mtime: None,
+            },
+        });
+        snapshot.dirs.push(Dir {
+            path: PathBuf::from("d"),
+            attrs: Attributes {
+                owner: None,
+                mode: Some(0o755),
+                mtime: None,
+            },
+        });
+
+        let decoded = decode_body(
+            &encode_body(&snapshot).expect("encodes"),
+            super::super::FORMAT_VERSION,
+        )
+        .expect("decodes");
+
+        assert_eq!(
+            decoded.files[0].attrs.owner,
+            Some(super::super::Owner { uid: 0, gid: 0 }),
+            "root is an owner, and must survive the round trip as itself"
+        );
+        assert_eq!(
+            decoded.dirs[0].attrs.owner, None,
+            "and an entry with no owner is still absent rather than becoming root"
+        );
+    }
+
+    /// A version-3 snapshot has no owner field at all, and reads back with none.
+    ///
+    /// Not a compat shim but an exact reading: a snapshot that recorded nothing
+    /// about ownership had none to record, so `None` is the truth rather than a gap.
+    ///
+    /// What this pins is the *reading*, and that is the part that can go wrong
+    /// silently. The field is not self-describing, so a decoder that read one from a
+    /// version 3 body would take the next entry's length as a uid and everything
+    /// after it from the wrong offset — and would still decode, because a wrong uid
+    /// is a valid uid.
+    #[test]
+    fn a_version_3_body_reads_with_no_owner() {
+        let snapshot = sample();
+        let body = encode_body_v3(&snapshot);
+
+        let decoded = decode_body(&body, super::super::MIN_READABLE_VERSION).expect("decodes");
+
+        assert!(
+            decoded.files.iter().all(|f| f.attrs.owner.is_none()),
+            "a version 3 snapshot recorded no owner, so none should be invented"
+        );
+        assert!(
+            decoded.dirs.iter().all(|d| d.attrs.owner.is_none()),
+            "for directories either"
+        );
+        assert_eq!(
+            decoded.files[0].attrs.mode, snapshot.files[0].attrs.mode,
+            "and the rest of the entry must still decode to the right values"
+        );
+        assert_eq!(
+            decoded.files[0].len, snapshot.files[0].len,
+            "including the length, which is the field a wrong offset would corrupt"
+        );
+        assert_eq!(
+            decoded.dirs[0].attrs.mtime, snapshot.dirs[0].attrs.mtime,
+            "and a timestamp, which sits after where the owner now does"
+        );
+        assert_eq!(
+            decoded.files[0].path, snapshot.files[0].path,
+            "and the path itself"
+        );
+        assert_eq!(
+            decoded.chunks, snapshot.chunks,
+            "and the chunk table, which is further along again"
+        );
+    }
+
+    /// A version-4 body is nine bytes longer per owned entry, so a decoder reading
+    /// one as version 3 must produce a different answer rather than the same one.
+    ///
+    /// The negative of the test above, and it is what makes that test meaningful: if
+    /// reading the wrong version happened to agree, pinning the right answer would
+    /// prove nothing.
+    #[test]
+    fn reading_a_version_4_body_as_version_3_does_not_agree() {
+        let snapshot = sample();
+        let modern = encode_body(&snapshot).expect("encodes");
+        let older = encode_body_v3(&snapshot);
+
+        assert_ne!(
+            modern, older,
+            "the two layouts must actually differ for this to be testing anything"
+        );
+
+        let wrong = decode_body(&modern, super::super::MIN_READABLE_VERSION);
+        assert!(
+            wrong.is_err() || wrong.as_ref().expect("decoded") != &snapshot,
+            "reading a version 4 body as version 3 produced the same snapshot, which \
+             means the version is not being consulted"
+        );
+    }
+
+    /// Encode a snapshot the way version 3 did: every field except the owner.
+    ///
+    /// Built from the same [`Writer`] primitives the real encoder uses, so the field
+    /// widths are the encoder's rather than something restated here — a hand-rolled
+    /// copy is how a test ends up agreeing with a layout change it should have caught.
+    fn encode_body_v3(snapshot: &Snapshot) -> Vec<u8> {
+        let mut out = Writer::new();
+
+        out.count(snapshot.files.len());
+        for file in &snapshot.files {
+            out.path(&file.path).expect("a path this platform can hold");
+            out.u64(file.len);
+            out.u32(file.attrs.mode.unwrap_or(0));
+            out.optional_timestamp(file.attrs.mtime);
+        }
+
+        out.count(snapshot.dirs.len());
+        for dir in &snapshot.dirs {
+            out.path(&dir.path).expect("a path this platform can hold");
+            out.u32(dir.attrs.mode.unwrap_or(0));
+            out.optional_timestamp(dir.attrs.mtime);
+        }
+
+        out.count(snapshot.chunks.len());
+        for chunk in &snapshot.chunks {
+            out.hash(chunk);
+        }
+
+        out.count(snapshot.file_chunks.len());
+        for slice in &snapshot.file_chunks {
+            out.varint(u64::from(slice.chunk_index));
+            out.varint(u64::from(slice.file_index));
+            out.varint(u64::from(slice.chunk_offset));
+            out.varint(slice.file_offset);
+            out.varint(u64::from(slice.length));
+        }
+
+        out.count(snapshot.links.len());
+        for link in &snapshot.links {
+            match link {
+                Link::Hard { path, shares } => {
+                    out.path(path).expect("a path this platform can hold");
+                    out.path(shares).expect("a path this platform can hold");
+                    out.u8(0);
+                }
+                Link::Symbolic { path, target } => {
+                    out.path(path).expect("a path this platform can hold");
+                    out.path(target).expect("a path this platform can hold");
+                    out.u8(1);
+                }
+            }
+        }
+
+        out.bytes
     }
 }

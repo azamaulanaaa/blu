@@ -100,6 +100,7 @@ fn snapshot_with_file(path: &str) -> impl FnOnce(&mut Snapshot) {
             path: PathBuf::from(&path),
             len: 6,
             attrs: Attributes {
+                owner: None,
                 mode: Some(0o644),
                 mtime: None,
             },
@@ -174,6 +175,7 @@ async fn an_escaping_directory_path_is_refused() {
         snapshot.dirs.push(Dir {
             path: PathBuf::from("../../escaped-dir"),
             attrs: Attributes {
+                owner: None,
                 mode: Some(0o755),
                 mtime: None,
             },
@@ -203,6 +205,7 @@ async fn an_escaping_hard_link_target_is_refused() {
             path: PathBuf::from("innocent.txt"),
             len: 6,
             attrs: Attributes {
+                owner: None,
                 mode: Some(0o644),
                 mtime: None,
             },
@@ -327,6 +330,7 @@ async fn a_file_longer_than_its_chunks_is_refused() {
             // Six bytes are covered by the one slice below; this claims twenty.
             len: 20,
             attrs: Attributes {
+                owner: None,
                 mode: Some(0o644),
                 mtime: None,
             },

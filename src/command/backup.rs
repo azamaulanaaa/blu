@@ -15,7 +15,7 @@ use std::{
 use tracing::instrument;
 use walkdir::WalkDir;
 
-use crate::{command::pipeline, fsattr, metadata, reader, storage};
+use crate::{command::pipeline, metadata, reader, storage};
 
 /// Uploads to run at once when the caller has not asked for a specific number.
 /// I/O bound, so a little oversubscription keeps them from stalling on round
@@ -260,10 +260,7 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
             if meta.is_dir() {
                 snapshot.dirs.push(metadata::Dir {
                     path: relative_path,
-                    attrs: metadata::Attributes {
-                        mode: fsattr::mode_of(&meta),
-                        mtime: fsattr::mtime_of(&meta),
-                    },
+                    attrs: metadata::Attributes::of(&meta),
                 });
                 return Ok(None);
             }
@@ -299,10 +296,7 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
             snapshot.files.push(metadata::File {
                 path: relative_path,
                 len: meta.len(),
-                attrs: metadata::Attributes {
-                    mode: fsattr::mode_of(&meta),
-                    mtime: fsattr::mtime_of(&meta),
-                },
+                attrs: metadata::Attributes::of(&meta),
             });
 
             Ok(Some(path))

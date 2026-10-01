@@ -289,6 +289,97 @@ fn whole_seconds_since_epoch(when: std::time::SystemTime) -> u64 {
         .as_secs()
 }
 
+/// The set-user-ID bit survives a restore that changes a file's owner.
+///
+/// The ordering constraint, pinned as an outcome rather than as a code reading.
+/// Linux clears setuid and setgid when a file's owner changes, so an `apply` that
+/// set the mode and *then* the owner would strip the bit from everything it
+/// restored — and it would look like a success: the bytes match, the lengths match,
+/// and the only thing wrong is a bit nobody was looking for.
+///
+/// The whole value of recording ownership is that a system restore brings back a
+/// working `su` and `passwd`; getting this order wrong quietly removes exactly that.
+///
+/// Root only, because it is the only caller that can change an owner and so the only
+/// one where the two orders differ. For anyone else both orders produce the same
+/// file, which is why the bug can sit unnoticed until someone restores `/usr` as
+/// root and finds `su` no longer works.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_setuid_bit_survives_a_restore_that_changes_the_owner() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let file = source.join("su");
+    fs::write(&file, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o4755)).unwrap();
+
+    assert_eq!(
+        fs::metadata(&file).unwrap().mode() & 0o4000,
+        0o4000,
+        "sanity: the source file is setuid before anything happens"
+    );
+
+    if fs::metadata(&file).unwrap().uid() != 0 {
+        // Not root: the owner cannot be changed, so both orders produce the same
+        // file and there is nothing here to distinguish. Skipped rather than passed,
+        // so a green run is not mistaken for the ordering having been checked.
+        eprintln!("skipped: changing an owner needs root");
+        return;
+    }
+
+    let blob = dir.path().join("store");
+    let committed = common::run_backup(&source, &blob).await;
+    common::run_restore(&blob, committed.snapshot, &dir.path().join("restored")).await;
+
+    let restored = dir.path().join("restored/su");
+    assert_eq!(
+        fs::metadata(&restored).unwrap().mode() & 0o4000,
+        0o4000,
+        "the restored file is still setuid, which it would not be if the mode were \
+         applied before the owner"
+    );
+}
+
+/// The owner of a file survives a restore, on a platform that records one.
+///
+/// Unix only, and root-gated for the same reason as the setuid case: an unprivileged
+/// restore cannot change an owner, so there is nothing for the assertion to be about.
+/// It skips rather than passing quietly, because "the tree matched" is true either
+/// way and would read as though ownership had been verified.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_owner_survives_a_restore() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let owned = source.join("owned");
+    fs::write(&owned, b"data").unwrap();
+
+    if fs::metadata(&owned).unwrap().uid() != 0 {
+        eprintln!("skipped: changing an owner needs root");
+        return;
+    }
+
+    // An owner nothing else in the tree has, so "the same owner" is not satisfied
+    // by the file simply having been created by the test process.
+    let wanted = 20_001;
+    std::os::unix::fs::chown(&owned, Some(wanted), None).unwrap();
+
+    let blob = dir.path().join("store");
+    let committed = common::run_backup(&source, &blob).await;
+    let restored = dir.path().join("restored");
+    common::run_restore(&blob, committed.snapshot, &restored).await;
+
+    assert_eq!(
+        fs::metadata(restored.join("owned")).unwrap().uid(),
+        wanted,
+        "the restored file should be owned by whoever the backup recorded"
+    );
+}
+
 /// The owner and group a file has, as the filesystem reports them.
 ///
 /// Unix only. A file's owner is the identity that created it, so there is nothing

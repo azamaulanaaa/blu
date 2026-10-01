@@ -322,6 +322,7 @@ mod tests {
             path: "a.bin".into(),
             len: 100,
             attrs: Attributes {
+                owner: None,
                 mode: Some(0o644),
                 mtime: None,
             },
@@ -380,6 +381,7 @@ mod tests {
             path: "a.bin".into(),
             len: 40,
             attrs: Attributes {
+                owner: None,
                 mode: Some(0o644),
                 mtime: None,
             },
