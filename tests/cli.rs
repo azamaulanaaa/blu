@@ -1776,78 +1776,6 @@ fn applying_a_pack_a_directory_already_holds_changes_nothing() {
     common::assert_same_tree(&source, &target);
 }
 
-/// `probe` reports what a directory holds, and `--ranges` what it would fetch.
-///
-/// Read-only, and the ranges are bare numbers on stdout so they can be piped
-/// somewhere. Both halves are checked, because a probe that could only answer one
-/// of them would not be worth a command.
-#[test]
-fn a_probe_reports_what_is_held_and_what_would_be_fetched() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
-    for i in 0..6 {
-        fs::write(source.join(format!("f{i}.bin")), noisy(200_000)).unwrap();
-    }
-    ok(dir.path(), &["backup", "source", "set"]);
-    ok(dir.path(), &["pack", "set", "v1.pack"]);
-
-    let target = dir.path().join("target");
-    ok(dir.path(), &["apply", "v1.pack", "target"]);
-
-    // Holding it: one line, no ranges to fetch.
-    let holding = ok(dir.path(), &["probe", "v1.pack", "target"]);
-    assert!(
-        holding.contains("holds this version"),
-        "a directory holding the version should say so, got: {holding}"
-    );
-
-    // Edit one file *in place*. `noisy(n)` is a prefix of `noisy(n + 1)`, so writing
-    // a longer one would only append and no chunk would change — this has to be a
-    // real edit for there to be anything to fetch.
-    let edited = target.join("f3.bin");
-    let mut bytes = fs::read(&edited).unwrap();
-    bytes[100_000] ^= 0xff;
-    fs::write(&edited, &bytes).unwrap();
-
-    // The count is on stdout because stdout is data; which file differs is on
-    // stderr, because a person is who wants that.
-    let output = lepatch(dir.path(), &["probe", "v1.pack", "target"]);
-    assert!(output.status.success());
-    assert!(
-        stdout(&output).contains("slice(s) and") && stdout(&output).contains("file(s) to write"),
-        "the summary belongs on stdout, got: {}",
-        stdout(&output)
-    );
-    assert!(
-        stderr(&output).contains("f3.bin"),
-        "the probe should name the file that differs, got: {}",
-        stderr(&output)
-    );
-
-    let output = lepatch(dir.path(), &["probe", "v1.pack", "target", "--ranges"]);
-    assert!(output.status.success());
-    let ranges = stdout(&output);
-    assert!(
-        !ranges.trim().is_empty(),
-        "an edited file should need at least one range"
-    );
-    for line in ranges.lines() {
-        let mut parts = line.split_whitespace();
-        let start: u64 = parts
-            .next()
-            .unwrap_or_else(|| panic!("`{line}` should start with an offset"))
-            .parse()
-            .unwrap_or_else(|_| panic!("`{line}` should start with a number"));
-        let end: u64 = parts
-            .next()
-            .unwrap_or_else(|| panic!("`{line}` should have an end offset"))
-            .parse()
-            .unwrap_or_else(|_| panic!("`{line}` should end with a number"));
-        assert!(end > start, "`{line}` should be a non-empty range");
-    }
-}
-
 /// A pack that is not a pack is refused by every command that takes one.
 ///
 /// `apply` writes to a directory, so accepting a file that is not a pack would mean
@@ -1877,11 +1805,46 @@ fn applying_something_that_is_not_a_pack_is_refused() {
         "the refusal should say what is wrong, got: {}",
         stderr(&output)
     );
+}
 
-    let probed = lepatch(dir.path(), &["probe", "garbage.pack", "target"]);
+/// `probe` is not a subcommand.
+///
+/// It was one, reporting what a directory holds and which ranges a fetch would
+/// need. That answer is the one an `apply` has to work out before it can write
+/// anything, so it is not a separate thing a user does — it is a step of the apply,
+/// and an `apply` that has just run has already reported it as its summary line. A
+/// command worth only running when the user already knows what they want is not a
+/// command.
+///
+/// The library keeps both halves. `probe` is what an apply uses to find the missing
+/// slices and `Pack::needed` is how those become ranges; `tests/probe.rs` and
+/// `tests/pack.rs` cover them.
+#[test]
+fn a_probe_is_not_a_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(40_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    let output = lepatch(dir.path(), &["probe", "v1.pack", "target"]);
     assert!(
-        !probed.status.success(),
-        "probing a file that is not a pack should fail too"
+        !output.status.success(),
+        "`probe` should no longer be a subcommand"
+    );
+    assert!(
+        !dir.path().join("target").exists(),
+        "and should not have touched the destination it named"
+    );
+
+    // The list a user reads should not offer it either.
+    let help = lepatch(dir.path(), &["--help"]);
+    assert!(help.status.success());
+    assert!(
+        !stdout(&help).contains("probe"),
+        "and `--help` should not advertise it, got:\n{}",
+        stdout(&help)
     );
 }
 

@@ -265,20 +265,22 @@ produces exactly that. Such a chunk is sent, even though the base has the bytes.
 
 **A delta records what it assumes, and `apply` checks it.** The header names the base
 version, and an apply refuses unless the directory's record says it is holding
-exactly that. The reason is structural: a probe verifies a slice by reading the
-chunk's bytes, and a delta holds precisely the chunks its reader is asserted to have,
-so nothing in the delta can confirm it. Refusing is the only honest answer —
-applying what it happens to contain would leave a directory that is neither version
-and report success.
+exactly that. The reason is structural: verifying a slice means reading the chunk's
+bytes, and a delta holds precisely the chunks its reader is asserted to have, so
+nothing in the delta can confirm it. Refusing is the only honest answer — applying
+what it happens to contain would leave a directory that is neither version and report
+success.
 
 The file-table side is unaffected: a delta carries the whole version's snapshot, so a
 client can lay out every file from the one file it was sent.
 
 #### Applying a pack
 
-`lepatch apply <pack> <directory>` brings a directory up to the version, and
-`lepatch probe <pack> <directory>` reports what it would need. Neither consults the
-backup set.
+`lepatch apply <pack> <directory>` brings a directory up to the version. It does
+not consult the backup set, and there is no `probe` command: what a directory holds
+is what an apply has to work out before it can write anything, so it is a step of the
+apply rather than something a user does separately. The apply's summary reports what
+the fetch would have cost.
 
 **An apply writes only what is missing.** A restore writes every byte a version
 needs, because its bytes come out of a store one chunk at a time and it cannot know
@@ -287,26 +289,22 @@ nothing to write is not opened at all — it keeps its inode, its timestamps and
 whatever the filesystem has cached about it. Applying version 1 and then version 2
 costs the delta, not a tree.
 
-**A probe answers two different questions, and does not conflate them.** The chunks
-a directory holds *correctly, at every place the version puts them* are the answer a
-delta needs, and are per chunk and all-or-nothing: a chunk spanning two files is held
-only if it is right in both. The *slices* that differ are per slice and are what gets
-written. The second is not derivable from the first — a file missing entirely has
-every slice reported absent even where its chunks are shared with another file that is
-perfectly correct — and judging that file by the first creates it empty.
+**Working out what is missing answers two questions, and does not conflate them.**
+The chunks a directory holds *correctly, at every place the version puts them* are
+the answer a delta needs, and are per chunk and all-or-nothing: a chunk spanning two
+files is held only if it is right in both. The *slices* that differ are per slice and
+are what gets written. The second is not derivable from the first — a file missing
+entirely has every slice reported absent even where its chunks are shared with another
+file that is perfectly correct — and judging that file by the first creates it empty.
 
 **A file that has grown is not the version, even though every slice of it is.**
 Appending leaves every recorded byte exactly where it was, so every slice verifies
 and every chunk is held. Slices cannot see past the end of a file, so lengths are
-reported separately; without that, a probe would answer "holds this version" about a
+checked separately; without that, an apply would answer "holds this version" about a
 file with somebody's data in it.
 
-`--ranges` prints the byte ranges a fetch needs as bare `start end` pairs on stdout,
-one per line, with the count on stderr — so they pipe straight into whatever issues
-the requests.
-
 **An apply is not atomic, and does not pretend to be.** A failure partway leaves a
-directory that is neither version. Because a probe is idempotent, running the same
+directory that is neither version. Because the check is idempotent, running the same
 apply again finishes the job.
 
 #### The record an apply leaves
@@ -658,7 +656,10 @@ gets the whole payload as a single range, and one holding everything gets none.
 same exchange. `Pack::write` streams, so its memory is one chunk rather than one
 version.
 
-A pack is also a store, and the consuming half of the feature comes from that:
+A pack is also a store, and the consuming half of the feature comes from that. There
+is no `probe` subcommand because this is the question an apply has to answer anyway;
+it is exposed as a function for anything that needs the answer *first*, such as a
+client deciding what to fetch over HTTP:
 
 ```rust
 # async fn example() -> std::io::Result<()> {
@@ -680,6 +681,11 @@ assert_eq!(pack.needed_bytes(&probed.held), applied.fetched);
 # Ok(())
 # }
 ```
+
+`apply` takes that same probe internally, so calling it as well as `apply` costs a
+second full read of the directory. A caller that only wants to write should call
+`apply` and read `fetched` and `ranges` off the result; `Applied` reports both from
+the probe it had to take anyway.
 
 The `WRITE` const generic on `BlobStore` is what stops a read-only restore from
 being handed something that can append to the store.

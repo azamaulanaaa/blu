@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use lepatch::{
     command::{
-        ApplyOptions, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Unheld, apply, backup,
-        load_snapshot, lock_destination, probe, restore, verify,
+        ApplyOptions, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, apply, backup, load_snapshot,
+        lock_destination, restore, verify,
     },
     layout::IndexSet,
     pack::Pack,
@@ -178,22 +178,6 @@ enum Command {
         /// by something that restores timestamps.
         #[arg(long)]
         recheck: bool,
-    },
-    /// Report what a directory already holds of the version a pack carries.
-    ///
-    /// Reads only. Useful before an `apply` — to see how much of a patch would
-    /// actually be sent — and on its own as the question a client has to answer
-    /// first: which ranges of this pack do I not have?
-    Probe {
-        /// The pack to compare the directory against.
-        pack: std::path::PathBuf,
-        /// Directory to inspect.
-        destination: std::path::PathBuf,
-        /// Print the ranges a fetch would need, one `start end` pair per line.
-        ///
-        /// On stdout, so it can be piped straight into whatever issues requests.
-        #[arg(long)]
-        ranges: bool,
     },
 }
 
@@ -378,11 +362,6 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             prune,
             recheck,
         } => run_apply(&pack, &destination, prune, recheck).await,
-        Command::Probe {
-            pack,
-            destination,
-            ranges,
-        } => run_probe(&pack, &destination, ranges).await,
         Command::Reindex { name } => run_reindex(&name).await,
         Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
     }
@@ -1142,99 +1121,6 @@ async fn run_apply(
             "removed {} unrecorded entr{}",
             applied.removed,
             if applied.removed == 1 { "y" } else { "ies" }
-        )?;
-    }
-
-    Ok(())
-}
-
-/// How a difference reads in a sentence.
-fn why(reason: Unheld) -> &'static str {
-    match reason {
-        Unheld::Absent => "is not present",
-        Unheld::Short => "ends before it should",
-        Unheld::Content => "holds different content",
-        Unheld::Long => "continues past the version",
-    }
-}
-
-/// Report what `destination` holds of `pack`, and optionally what it would need.
-async fn run_probe(
-    pack: &std::path::Path,
-    destination: &std::path::Path,
-    ranges: bool,
-) -> std::io::Result<()> {
-    let pack = Pack::open(pack)?;
-    let snapshot = pack.snapshot()?;
-
-    tracing::info!(
-        pack = %pack.path().display(),
-        destination = %destination.display(),
-        "probing"
-    );
-
-    let probed = probe(destination, &snapshot, pack.clone()).await?;
-    let needed = pack.needed(&probed.held);
-
-    if ranges {
-        // Bare numbers on stdout, so this pipes straight into whatever issues the
-        // requests. The count goes to stderr, because stdout is data.
-        for range in &needed {
-            say!("{} {}", range.start, range.end)?;
-        }
-        eprintln!(
-            "{} range(s) covering {} of {} bytes",
-            needed.len(),
-            pack.needed_bytes(&probed.held),
-            pack.payload_len()
-        );
-        return Ok(());
-    }
-
-    for mismatch in &probed.mismatched {
-        eprintln!(
-            "{} at offset {} for {} bytes {} (expected {})",
-            mismatch.path.display(),
-            mismatch.offset,
-            mismatch.length,
-            why(mismatch.reason),
-            mismatch.expected
-        );
-    }
-
-    // Lengths, because a file that has grown can hold every byte the version
-    // records and still not be it — a finding the slices above cannot make.
-    for length in &probed.mislengths {
-        let what = match length.reason {
-            Unheld::Absent => "is not present",
-            Unheld::Short => "is shorter than it should be",
-            _ => "is longer than it should be",
-        };
-        eprintln!(
-            "{} {what}: {} bytes on disk, {} recorded",
-            length.path.display(),
-            length.actual,
-            length.expected
-        );
-    }
-
-    for path in &probed.extra {
-        eprintln!("{} is not recorded by this version", path.display());
-    }
-
-    if probed.is_current() && probed.extra.is_empty() {
-        say!("holds this version: {} chunks", probed.held.len())?;
-    } else {
-        say!(
-            "holds {}/{} chunks; {} slice(s) and {} file(s) to write; {} range(s) covering \
-             {} of {} bytes would have to be fetched",
-            probed.held.len(),
-            snapshot.chunks.len(),
-            probed.mismatched.len(),
-            probed.mislengths.len(),
-            needed.len(),
-            pack.needed_bytes(&probed.held),
-            pack.payload_len(),
         )?;
     }
 
