@@ -897,6 +897,66 @@ async fn a_pack_refuses_a_snapshot_that_is_not_the_one_it_names() {
     );
 }
 
+/// A pack yields the same chunk bytes a store does, so it can stand in for one.
+///
+/// This is the property that makes a pack usable as a delivered artifact rather
+/// than only as an inspection format: `restore` takes a snapshot and a
+/// `StorageGet`, and a pack now satisfies the second. Without it a client would
+/// have to reassemble a tree out of ranges itself.
+#[tokio::test]
+async fn a_pack_yields_the_bytes_a_store_would() {
+    let built = build(4, 150_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+
+    for planned in built.plan.chunks() {
+        let mut from_pack = pack.get(&planned.id).await.unwrap();
+        let mut from_store = store.get(&planned.id).await.unwrap();
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        from_pack.read_to_end(&mut a).await.unwrap();
+        from_store.read_to_end(&mut b).await.unwrap();
+
+        assert_eq!(a, b, "chunk {} differs between pack and store", planned.id);
+        assert_eq!(
+            a.len() as u64,
+            planned.length,
+            "a pack holds the used prefix of a chunk, not the whole of it"
+        );
+    }
+}
+
+/// A chunk a pack does not hold is refused, not answered with the wrong bytes.
+///
+/// The stream is bounded to one chunk, so a caller that read past the end would
+/// otherwise be handed the next chunk's data — which is a plausible-looking
+/// stream, and the sort of thing that produces a tree nobody can account for.
+#[tokio::test]
+async fn a_pack_will_not_hand_out_a_chunk_it_does_not_hold() {
+    let built = build(3, 100_000).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+
+    let absent = lepatch::storage::BlobId::from_bytes([0xABu8; 32]);
+    // Matched rather than `unwrap_err`, which would need the stream type to be
+    // `Debug` — a boxed trait object with no useful representation either way.
+    let Err(error) = pack.get(&absent).await else {
+        panic!("a pack handed out a chunk it does not hold");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+    // And one it does hold reads back as exactly its own bytes: nothing past the
+    // end leaks into it.
+    let held = built.plan.chunks()[0].id;
+    let mut reader = pack.get(&held).await.unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes.len() as u64, pack.locate(&held).unwrap().len);
+    assert_eq!(blake3::hash(&bytes), held);
+}
+
 /// `chunks_covering` reports what a range actually contains, not what it is near.
 ///
 /// A range that covers part of a chunk is not that chunk, and recording it anyway

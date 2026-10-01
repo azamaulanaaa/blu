@@ -71,10 +71,11 @@ use std::{
 
 use tokio::{
     fs as tfs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
+use tracing::instrument;
 
-use crate::storage::{BlobId, Plan, StorageGet};
+use crate::storage::{BlobId, Plan, StorageGet, StreamReadSeeker};
 
 /// Magic at the start of a pack, and again at the very end.
 const MAGIC: [u8; 4] = *b"LPK1";
@@ -810,6 +811,66 @@ impl Pack {
         }
 
         out
+    }
+}
+
+/// A pack read as a store, so everything that consumes a store consumes a pack.
+///
+/// This is what lets the two halves of a backup meet. A restore takes a
+/// [`Snapshot`] and a [`StorageGet`], and had only ever been handed a
+/// [`crate::storage::BlobStore`] — so the bytes it needed were spread across a
+/// segment file's record headers, one read per chunk, and a pack, which holds
+/// exactly the same bytes laid end to end, could not be restored from at all.
+///
+/// Implementing the trait rather than adding a parallel `restore_from_pack` is
+/// the whole of the reuse: the restore verifies the snapshot, resolves every
+/// recorded path, checks the slices account for each file, and then orders its
+/// writes — none of which knows or cares that the bytes arrived from a different
+/// place, and all of which would have to be written twice otherwise.
+///
+/// [`Snapshot`]: crate::metadata::Snapshot
+impl StorageGet for Pack {
+    /// Open the chunk with this content hash, out of the payload region.
+    ///
+    /// The stream yields the chunk's bytes and is bounded to them, so a caller
+    /// comparing against a length the snapshot recorded is comparing like with
+    /// like, and one that reads past the end gets end of stream rather than the
+    /// next chunk's data. It is seekable within those bytes, which is what a
+    /// chunk that a file uses only part of needs — `restore` seeks to the slice's
+    /// offset within the chunk before reading.
+    ///
+    /// Bounded with the same [`SliceAsyncReader`](crate::slice::SliceAsyncReader)
+    /// a slice of a store blob uses, rather than by computing a length and trusting
+    /// it: a `Range` handed out by [`Pack::needed`] covers whole chunks by
+    /// construction, but a pack is a file that was downloaded and the bytes at an
+    /// offset it claims are not this crate's to vouch for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pack does not hold that chunk, or if the file cannot
+    /// be opened or seeked. The stream itself carries any read failure.
+    #[instrument(skip_all, err)]
+    async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
+        let located = self.locate(id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("this pack does not hold a chunk hashing to {id}"),
+            )
+        })?;
+
+        let mut file =
+            crate::storage::at_async(self.path(), "open", tfs::File::open(self.path())).await?;
+
+        // Saturating for the same reason `needed` saturates: these are two numbers
+        // out of an index, and `open` checked they add up, but the sum is still
+        // arithmetic on a claim.
+        let start = self.payload_start.saturating_add(located.offset);
+        file.seek(io::SeekFrom::Start(start)).await?;
+
+        Ok(Box::new(crate::slice::SliceAsyncReader::new(
+            file,
+            located.len,
+        )))
     }
 }
 
