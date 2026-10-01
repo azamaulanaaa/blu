@@ -805,6 +805,26 @@ fn report_restored(restored: &lepatch::command::Restored) {
         chunks = restored.chunks,
         "restore complete"
     );
+
+    if restored.unowned > 0 {
+        report_unowned(restored.unowned, "restore");
+    }
+}
+
+/// Say that some entries could not be given the owner the version records.
+///
+/// On stderr, and unconditionally, because the alternative is a tree that looks
+/// complete and has the wrong owner on part of it. A restore of a system tree as an
+/// unprivileged user always hits this — it is not an edge case to be phrased as one —
+/// so the wording says what is true (the files are right, the owners are not) and
+/// what would fix it, rather than leading with a failure the run did not have.
+fn report_unowned(count: u64, what: &str) {
+    eprintln!(
+        "note: {count} entr{} in this {what} recorded an owner this process could not set, \
+         which takes privilege; their contents, permissions and times are correct. \
+         Re-run as root to set them",
+        if count == 1 { "y" } else { "ies" },
+    );
 }
 
 /// Check that a destination is safe to empty, without touching it.
@@ -1122,6 +1142,10 @@ async fn run_apply(
             applied.removed,
             if applied.removed == 1 { "y" } else { "ies" }
         )?;
+    }
+
+    if applied.unowned > 0 {
+        report_unowned(applied.unowned, "apply");
     }
 
     Ok(())

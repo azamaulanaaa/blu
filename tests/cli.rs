@@ -1579,6 +1579,92 @@ fn an_update_fetches_a_delta_and_says_so() {
     );
 }
 
+/// An unprivileged restore finishes, and says which owners it could not set.
+///
+/// The case that decides whether recording an owner is worth anything. Restoring a
+/// tree containing files you do not own is ordinary — a home directory holds a few
+/// and `/etc` is nothing but — and an unprivileged restore of one has to finish with
+/// correct contents rather than stop partway.
+///
+/// It stopped partway. The file that failed was already on disk under the wrong
+/// owner, so there was nothing to retry and nothing to say it was wrong.
+#[cfg(unix)]
+#[test]
+fn an_unprivileged_restore_finishes_and_reports_its_owners() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("mine"), b"fine").unwrap();
+    fs::write(source.join("not-mine"), b"owned by someone else").unwrap();
+
+    if fs::metadata(source.join("not-mine")).unwrap().uid() != 0 {
+        // Making a file this process cannot own needs privilege, so the test cannot
+        // set up its own premise without it. Skipped rather than passed, because
+        // "the tree matched" is true either way and would read as though the
+        // unprivileged path had been exercised.
+        eprintln!("skipped: the test needs root to make a file this process cannot own");
+        return;
+    }
+    std::os::unix::fs::chown(source.join("not-mine"), Some(20_002), None).unwrap();
+
+    ok(dir.path(), &["backup", "source", "set"]);
+
+    // The store and the destination are readable and writable by anyone; nothing is
+    // chownable by the caller, which is the whole situation.
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    // The temp dir itself, because a restore's claim is a sibling of the
+    // destination and so lands here.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+    for path in fs::read_dir(dir.path()).unwrap() {
+        let path = path.unwrap().path();
+        let mode = if path.is_dir() { 0o777 } else { 0o666 };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    let output = std::os::unix::process::CommandExt::uid(
+        std::os::unix::process::CommandExt::gid(
+            Command::new(env!("CARGO_BIN_EXE_lepatch"))
+                .current_dir(dir.path())
+                .args(["restore", "out", "set"]),
+            65534,
+        ),
+        65534,
+    )
+    .output()
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "an unprivileged restore should finish, got: {}",
+        stderr(&output)
+    );
+
+    let said = stderr(&output);
+    assert!(
+        said.contains("recorded an owner this process could not set"),
+        "and it should say what it could not do, got: {said}"
+    );
+    assert!(
+        said.contains("Re-run as root"),
+        "naming what would fix it, got: {said}"
+    );
+
+    // The tree is right; only the owner is not. That is the whole claim.
+    assert_eq!(
+        fs::read(dest.join("not-mine")).unwrap(),
+        b"owned by someone else",
+        "a file whose owner could not be set should still have the right contents"
+    );
+    assert_eq!(
+        fs::metadata(dest.join("mine")).unwrap().mode() & 0o7777,
+        fs::metadata(source.join("mine")).unwrap().mode() & 0o7777,
+        "and every other file should be exactly right"
+    );
+}
+
 /// The fetch size in a report, which is the first number after `marker`.
 fn figure(report: &str, marker: &str) -> Option<u64> {
     let at = report.find(marker)? + marker.len();

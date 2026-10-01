@@ -41,6 +41,12 @@ pub struct Restored {
     pub chunks: u64,
     /// Bytes of file content written.
     pub bytes: u64,
+    /// Entries that recorded an owner this process could not set.
+    ///
+    /// Every one of them, for an unprivileged caller restoring a tree containing
+    /// files it does not own. Reported rather than refused because the alternative is
+    /// a half-written tree with the wrong owner already on disk.
+    pub unowned: u64,
 }
 
 /// Reassemble the snapshot identified by `key` under `root`.
@@ -139,7 +145,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     .map_err(|e| join_panic(&e))??;
 
     let for_attributes = root.to_path_buf();
-    tokio::task::spawn_blocking({
+    let unowned = tokio::task::spawn_blocking({
         let root = for_attributes;
         let snapshot = Arc::clone(&snapshot);
         move || restore_attributes(&root, &snapshot)
@@ -153,6 +159,7 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         links: u64::try_from(snapshot.links.len()).unwrap_or(0),
         chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
         bytes: written,
+        unowned,
     })
 }
 
@@ -703,24 +710,42 @@ pub(crate) fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> 
     Ok(())
 }
 
-/// Apply permission bits and modification times, files before directories.
+/// Apply owners, permission bits and modification times, files before directories.
 ///
 /// Shared with [`super::apply`] for the same reason [`restore_links`] is. It is
 /// also why an apply prunes *before* calling this: removing an entry updates the
 /// modification time of the directory that held it, so a directory's time can only
 /// be set once nothing else is going to change it.
-pub(crate) fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+///
+/// Returns how many entries recorded an owner that could not be set, which is
+/// every one of them for an unprivileged caller restoring a tree containing files
+/// it does not own. It is a count rather than an error because the alternative is
+/// worse than a wrong number in a report: stopping at the first one leaves a tree
+/// half written, with that file already on disk under the wrong owner and nothing to
+/// retry.
+///
+/// # Errors
+///
+/// Returns an error if a path escapes the root, or if a mode or modification time
+/// cannot be applied. Only the owner is permitted to fail without stopping the run.
+pub(crate) fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<u64> {
+    let mut unowned = 0u64;
+
     for file in &snapshot.files {
         let path = resolve(root, &file.path, "a file")?;
-        file.attrs.apply(&path)?;
+        if !file.attrs.apply_restoring(&path)? {
+            unowned = unowned.saturating_add(1);
+        }
     }
 
     for dir in &snapshot.dirs {
         let path = resolve(root, &dir.path, "a directory")?;
-        dir.attrs.apply(&path)?;
+        if !dir.attrs.apply_restoring(&path)? {
+            unowned = unowned.saturating_add(1);
+        }
     }
 
-    Ok(())
+    Ok(unowned)
 }
 
 /// Remove whatever currently occupies `path`, if anything.

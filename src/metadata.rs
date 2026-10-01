@@ -450,6 +450,12 @@ impl Attributes {
         }
     }
 
+    /// Whether this entry records an owner, and so has one to be set or not set.
+    #[must_use]
+    pub fn has_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+
     /// Reapply all of them to `path`, in the order that survives.
     ///
     /// **Owner first, and that is not a style preference.** Linux clears a file's
@@ -462,19 +468,67 @@ impl Attributes {
     /// directory updates that directory's time, so a time set before the links would
     /// be overwritten by them.
     ///
+    /// An owner that cannot be set is an error here. [`Self::apply_restoring`] is the
+    /// other policy, for a caller that would rather report it than stop.
+    ///
     /// # Errors
     ///
     /// Returns an error if the path cannot be found, or any attribute cannot be
     /// applied — for instance because the caller does not own the file, or cannot
     /// change its owner.
     pub fn apply(&self, path: &std::path::Path) -> std::io::Result<()> {
-        crate::fsattr::set_owner(path, self.owner.map(|owner| (owner.uid, owner.gid)))?;
+        self.apply_inner(path, true).map(|_| ())
+    }
+
+    /// Reapply all of them, treating an owner that cannot be set as a fact to report
+    /// rather than a failure.
+    ///
+    /// Returns whether the owner took, or `true` where there was none to set.
+    ///
+    /// Changing an owner takes privilege, and for an unprivileged caller that is the
+    /// ordinary case rather than an exceptional one: restoring a tree containing a
+    /// file you do not own is a normal thing to want. Stopping there would be the
+    /// wrong answer twice over — the tree is left half-written, and the file that
+    /// failed already exists with the wrong owner, so there is nothing to retry and
+    /// no record that it is wrong.
+    ///
+    /// Everything else is still applied. A file with the right contents and mode but
+    /// the wrong owner is a tree that is nearly right, which is a much better thing to
+    /// hand back than an aborted run and a partial directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be found, or if the mode or modification
+    /// time cannot be applied. Only the owner is allowed to fail quietly.
+    pub fn apply_restoring(&self, path: &std::path::Path) -> std::io::Result<bool> {
+        self.apply_inner(path, false)
+    }
+
+    /// The one place the order is decided, whichever policy is in force.
+    fn apply_inner(&self, path: &std::path::Path, owner_is_fatal: bool) -> std::io::Result<bool> {
+        let mut owner_applied = true;
+
+        if let Some(owner) = self.owner {
+            match crate::fsattr::set_owner(path, Some((owner.uid, owner.gid))) {
+                Ok(()) => {}
+                Err(e) if !owner_is_fatal => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not set an owner; leaving the one this process has"
+                    );
+                    owner_applied = false;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         crate::fsattr::set_mode(path, self.mode)?;
         if let Some(mtime) = self.mtime {
             crate::fsattr::set_mtime(path, mtime)?;
         }
 
-        Ok(())
+        Ok(owner_applied)
     }
 }
 

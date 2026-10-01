@@ -140,6 +140,13 @@ pub struct Applied {
 
     /// Entries the version does not record, whether or not they were removed.
     pub extra: u64,
+
+    /// Entries that recorded an owner this process could not set.
+    ///
+    /// Every one of them, for an unprivileged caller applying to files it does not
+    /// own. Their contents, modes and times are still correct; only the owner is not
+    /// what the version recorded.
+    pub unowned: u64,
 }
 
 /// Make `root` match the version `pack` carries, writing only what is missing.
@@ -231,7 +238,7 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
 
     let for_attrs = root.to_path_buf();
     let for_attrs_snapshot = snapshot.clone();
-    tokio::task::spawn_blocking(move || {
+    let unowned = tokio::task::spawn_blocking(move || {
         super::restore::restore_attributes(&for_attrs, &for_attrs_snapshot)
     })
     .await
@@ -259,6 +266,7 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
         bytes: written.bytes,
         removed,
         extra: probed.extra.len().try_into().unwrap_or(0),
+        unowned,
     })
 }
 
