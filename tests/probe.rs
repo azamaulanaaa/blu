@@ -20,7 +20,7 @@
 mod common;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::Path,
 };
@@ -105,11 +105,194 @@ impl Built {
         probe(root, &self.snapshot, store).await.unwrap()
     }
 
+    /// Probe `root`, trusting `trusted`, and count the chunks that were read.
+    ///
+    /// The count is the point. A trusted file is not merely skipped by the report —
+    /// the chunk backing it must not be opened from the source at all, or the
+    /// fast path saves nothing but arithmetic.
+    async fn probe_skipping_counting(
+        &self,
+        root: &Path,
+        skip: &BTreeSet<&Path>,
+    ) -> (lepatch::command::Probed, usize) {
+        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let counting = Counting {
+            inner: store,
+            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let reads = std::sync::Arc::clone(&counting.reads);
+        let probed = lepatch::command::probe_skipping(root, &self.snapshot, counting, skip)
+            .await
+            .unwrap();
+        (probed, reads.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Every file path the version records.
+    fn paths(&self) -> BTreeSet<&Path> {
+        self.snapshot
+            .files
+            .iter()
+            .map(|f| f.path.as_path())
+            .collect()
+    }
+
+    /// Every file path but the first: one file left to read, the rest skipped.
+    fn paths_except_first(&self) -> BTreeSet<&Path> {
+        self.snapshot
+            .files
+            .iter()
+            .map(|f| f.path.as_path())
+            .skip(1)
+            .collect()
+    }
+
+    /// Just the one file, which is what a caller reads when a stat says the rest
+    /// are where it left them.
+    fn only(&self, path: &Path) -> BTreeSet<&Path> {
+        self.snapshot
+            .files
+            .iter()
+            .map(|f| f.path.as_path())
+            .filter(|p| *p == path)
+            .collect()
+    }
+
     /// Probe `root` against this version, reading chunks from `pack`.
     ///
     /// The path a real client takes: everything it needs is in the one file.
     async fn probe_with_pack(&self, root: &Path, pack: &Pack) -> lepatch::command::Probed {
         probe(root, &self.snapshot, pack.clone()).await.unwrap()
+    }
+}
+
+/// A chunk every one of whose files is trusted is never read from the source.
+///
+/// The saving, asserted rather than described. Trusting a file has to mean the
+/// chunk backing it is not fetched, or the fast path costs the same read and saves
+/// only the comparison — and a test that counted findings instead of reads would
+/// pass either way.
+#[tokio::test]
+async fn a_chunk_whose_every_file_is_trusted_is_never_read() {
+    let built = tree(4, 150_000).await;
+    let client = built.client().await;
+
+    let (probed, reads) = built
+        .probe_skipping_counting(&client, &BTreeSet::new())
+        .await;
+
+    assert_eq!(
+        reads, 0,
+        "naming no file at all should mean the source is never opened"
+    );
+    assert!(
+        probed.mismatched.is_empty() && probed.mislengths.is_empty(),
+        "and nothing should be reported missing"
+    );
+    assert_eq!(
+        probed.held.len(),
+        built.all_chunks().len(),
+        "every chunk is held, because a skipped file is as good as one that was read"
+    );
+    assert!(probed.is_current(), "so the directory still is the version");
+}
+
+/// Skipping most files reads only the chunks the remaining ones need.
+///
+/// The partial case, which is the one that has to be right: a chunk spanning a
+/// skipped and an unskipped file must still be read, because one of its placements
+/// is unchecked. Skipping it would report a chunk as held when half of it is not.
+#[tokio::test]
+async fn a_chunk_spanning_a_skipped_and_an_unskipped_file_is_still_read() {
+    let built = tree(6, 200_000).await;
+    let client = built.client().await;
+
+    // The baseline: name every file and every chunk is read.
+    let (_, every_chunk_read) = built.probe_skipping_counting(&client, &built.paths()).await;
+
+    // Name none, and nothing is read at all.
+    let (nothing_read, no_chunk_read) = built
+        .probe_skipping_counting(&client, &BTreeSet::new())
+        .await;
+    assert_eq!(
+        no_chunk_read, 0,
+        "the baseline should read nothing when no file is named"
+    );
+
+    // Now name all but one, and count what the one costs.
+    let (probed, one_file_read) = built
+        .probe_skipping_counting(&client, &built.paths_except_first())
+        .await;
+
+    assert!(one_file_read > 0, "a named file must have its chunks read");
+    assert!(
+        one_file_read < every_chunk_read,
+        "but fewer than reading the whole tree, which was {every_chunk_read}"
+    );
+    assert!(
+        probed.is_current(),
+        "and the answer must be unchanged: the tree still holds the version"
+    );
+    assert_eq!(
+        probed.held, nothing_read.held,
+        "the same chunks are held either way, which is what skipping a file asserts"
+    );
+}
+
+/// An unskipped file is read and reported on, exactly as if nothing were skipped.
+#[tokio::test]
+async fn an_unskipped_file_is_checked_as_thoroughly_as_any_other() {
+    let built = tree(4, 150_000).await;
+    let client = built.client().await;
+
+    // Break one file where a stat cannot see it.
+    let victim = Path::new("f2.bin");
+    let on_disk = client.join(victim);
+    let before = fs::metadata(&on_disk).unwrap();
+    let mut bytes = fs::read(&on_disk).unwrap();
+    bytes[1_000] ^= 0xff;
+    fs::write(&on_disk, &bytes).unwrap();
+    filetime::set_file_mtime(
+        &on_disk,
+        filetime::FileTime::from_last_modification_time(&before),
+    )
+    .unwrap();
+
+    // Skip everything *except* the victim. This is what a caller that had been
+    // fooled by the stat would pass — and the point is that being fooled here costs
+    // nothing, because the file is still read properly.
+    let (probed, _) = built
+        .probe_skipping_counting(&client, &built.only(victim))
+        .await;
+
+    assert!(
+        probed.mismatched.iter().any(|m| m.path.ends_with("f2.bin")),
+        "the unskipped file's difference must still be reported, got {:?}",
+        probed.mismatched
+    );
+    assert!(
+        !probed.is_current(),
+        "so trusting its neighbours does not make the directory current"
+    );
+}
+
+/// A [`StorageGet`] that counts how many blobs it was asked to open.
+///
+/// The only way to tell that the trusted path saved a *read* rather than merely a
+/// comparison: a probe that counted the mismatches correctly while still fetching
+/// every chunk would pass every other test here and save nothing.
+struct Counting<S> {
+    inner: S,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: StorageGet> StorageGet for Counting<S> {
+    fn get(
+        &self,
+        id: &BlobId,
+    ) -> impl std::future::Future<Output = std::io::Result<lepatch::storage::StreamReadSeeker>> + Send
+    {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get(id)
     }
 }
 

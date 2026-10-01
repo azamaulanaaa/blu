@@ -46,7 +46,7 @@
 //! reported by default and removed only when asked.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -86,6 +86,13 @@ pub struct Options {
     /// those apart. A tool that deleted the first to satisfy the second would be
     /// destroying data on a guess.
     pub prune: bool,
+
+    /// Re-read every file, ignoring any manifest beside the destination.
+    ///
+    /// Off by default. On, the run is as slow as it would be without a manifest —
+    /// a full read of the tree — which is the honest cost of not believing a record
+    /// of a directory that has been changing since it was written.
+    pub recheck: bool,
 }
 
 /// What an [`apply`] run changed.
@@ -113,6 +120,14 @@ pub struct Applied {
 
     /// Files opened and written to.
     pub files: u64,
+
+    /// Files this run took on a manifest's word and did not read.
+    ///
+    /// The measure of the fast path, and of whether it engaged: zero means every
+    /// file was read, which is what `--recheck` asks for and what a first apply has
+    /// to do. A caller that sees `held` at its maximum and `written` at zero is
+    /// looking at a run that cost a stat per file.
+    pub trusted: u64,
 
     /// Distinct chunks read out of the pack and written.
     pub written: u64,
@@ -158,7 +173,17 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     super::restore::check_paths(&snapshot)?;
     snapshot.verify_file_lengths("does not match its own chunks")?;
 
-    let probed = super::probe::probe(root, &snapshot, pack.clone()).await?;
+    // Which files have to be read. A manifest records what a version imposed the last
+    // time one was applied here, and re-statting each file decides which of those
+    // are still where they were left; everything else is read. See the module docs
+    // on why the manifest is a cache and not an authority.
+    let must_read = if options.recheck {
+        every_file(&snapshot)
+    } else {
+        readable_from_manifest(root, pack.snapshot_id(), &snapshot)?
+    };
+
+    let probed = super::probe::probe_skipping(root, &snapshot, pack.clone(), &must_read).await?;
     let fetched = pack.needed_bytes(&probed.held);
     let ranges = pack.needed(&probed.held).len();
 
@@ -210,17 +235,97 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     .await
     .map_err(|e| io::Error::other(format!("an attribute task failed: {e}")))??;
 
+    // Last, and only on a run that got this far. A manifest describes what the tree
+    // is now, so writing one before the attribute stage would record lengths and
+    // times this apply is still about to change.
+    //
+    // A failure here is logged and not returned: the tree is correct, and a caller
+    // told its apply failed would be told something untrue. The cost of losing the
+    // manifest is one full read next time.
+    if let Err(e) = write_manifest(root, pack, &snapshot) {
+        tracing::warn!(%e, "could not record what this apply left; the next one will read the tree");
+    }
+
     Ok(Applied {
         held: u64::try_from(probed.held.len()).unwrap_or(0),
         chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
         fetched,
         ranges,
+        trusted: u64::try_from(snapshot.files.len())
+            .unwrap_or(0)
+            .saturating_sub(u64::try_from(must_read.len()).unwrap_or(0)),
         files: written.files,
         written: written.chunks.len().try_into().unwrap_or(0),
         bytes: written.bytes,
         removed,
         extra: probed.extra.len().try_into().unwrap_or(0),
     })
+}
+
+/// Record what this apply left, beside the destination.
+///
+/// Built from the version rather than from the filesystem: `file.len` and
+/// `file.attrs.mtime` are what the attribute stage has just imposed, so they are
+/// the tree's state by the time this runs.
+///
+/// # Errors
+///
+/// Returns an error if the manifest's path cannot be formed or written. Callers are
+/// expected to log and carry on — see the call site.
+fn write_manifest(root: &Path, pack: &Pack, snapshot: &metadata::Snapshot) -> io::Result<PathBuf> {
+    let manifest = super::manifest::Manifest::record(root, pack.snapshot_id(), snapshot)?;
+    manifest.save(root)
+}
+
+/// The files that have to be read, because a manifest cannot vouch for them.
+///
+/// The interesting cases are the ones that make this *large*, and none of them is
+/// an error: no manifest, a manifest naming another version, or one file having
+/// been touched since. Each leaves more to read, never a wrong answer.
+///
+/// Borrowed from the snapshot rather than from the manifest, so the set outlives
+/// this function without an allocation per file. The manifest's `untrusted` names
+/// recorded paths, so a version's file it does not name is never here — which is
+/// correct: a file the manifest never wrote about is read.
+fn readable_from_manifest<'a>(
+    root: &Path,
+    version: BlobId,
+    snapshot: &'a metadata::Snapshot,
+) -> io::Result<BTreeSet<&'a Path>> {
+    let Some(manifest) = super::manifest::Manifest::load(root)? else {
+        return Ok(every_file(snapshot));
+    };
+
+    if manifest.version != version {
+        // A manifest for another version describes chunk placement this one does
+        // not share, so its records say nothing about this one. The files may well
+        // be untouched, but nothing recorded here can tell, and the honest answer
+        // is to read them.
+        tracing::debug!(
+            recorded = %manifest.version,
+            applying = %version,
+            "manifest is for another version; reading the tree instead"
+        );
+        return Ok(every_file(snapshot));
+    }
+
+    let untrusted = manifest.untrusted(root, snapshot);
+
+    Ok(snapshot
+        .files
+        .iter()
+        .map(|file| file.path.as_path())
+        .filter(|path| untrusted.iter().any(|one| one == path))
+        .collect())
+}
+
+/// Every file in the version, for the cases where nothing can be taken on trust.
+fn every_file(snapshot: &metadata::Snapshot) -> BTreeSet<&Path> {
+    snapshot
+        .files
+        .iter()
+        .map(|file| file.path.as_path())
+        .collect()
 }
 
 /// Hash every chunk about to be written and refuse the run if one does not match.

@@ -57,7 +57,7 @@
 //! answers correctly for all three.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -214,8 +214,60 @@ where
     P: AsRef<Path>,
     S: StorageGet + 'static,
 {
+    probe_skipping(root, snapshot, source, &every_file(snapshot)).await
+}
+
+/// Every file path a version records, which is what [`probe`] reads.
+fn every_file(snapshot: &Snapshot) -> BTreeSet<&Path> {
+    snapshot
+        .files
+        .iter()
+        .map(|file| file.path.as_path())
+        .collect()
+}
+
+/// [`probe`], reading only the files named in `read`.
+///
+/// Every file *not* named is skipped. A caller has usually arrived at that set by
+/// eliminating files it has already established are where its last apply left them,
+/// so skipping one is not a claim this function checks — and it could not: the claim
+/// was made by a stat somewhere else, and re-deriving it here would cost exactly the
+/// read being skipped.
+///
+/// **Skipping is about the read, not the report.** A skipped file contributes no
+/// findings, because it was verified when it was written and nothing has touched it
+/// since. It also means a chunk whose every placement is skipped is never fetched
+/// from `source` at all, which is the actual saving.
+///
+/// Naming every file is [`probe`], and is what [`probe`] does.
+///
+/// `BTreeSet` rather than `HashSet` because nothing here depends on the order, so a
+/// caller should not have to name a hasher to pass a set of paths. Membership is
+/// the only operation performed on it.
+///
+/// # Errors
+///
+/// As [`probe`].
+#[instrument(level = "info", skip_all, err)]
+pub async fn probe_skipping<P, S>(
+    root: P,
+    snapshot: &Snapshot,
+    source: S,
+    read: &BTreeSet<&Path>,
+) -> std::io::Result<Probed>
+where
+    P: AsRef<Path>,
+    S: StorageGet + 'static,
+{
     let root = root.as_ref();
     let source = Arc::new(source);
+    let skipped: HashSet<&Path> = snapshot
+        .files
+        .iter()
+        .map(|file| file.path.as_path())
+        .filter(|path| !read.contains(path))
+        .collect();
+    let trusted = &skipped;
 
     // Before a byte is read, and for the same reason a restore checks first: the
     // whole point is to find out about a tree before touching it, and a path that
@@ -225,7 +277,7 @@ where
     // One task per *chunk*, not per slice: a chunk is read once and compared
     // against every slice placing it, which is both the cheap way round and the
     // only one that can decide "right everywhere" rather than "right somewhere".
-    let placed = placements(root, snapshot)?;
+    let placed = placements(root, snapshot, trusted)?;
 
     let concurrency = probe_concurrency();
     let mut held = HashSet::with_capacity(placed.len());
@@ -268,7 +320,7 @@ where
     mismatched.sort_by(|a, b| (&a.path, a.offset).cmp(&(&b.path, b.offset)));
 
     let seen: HashSet<&Path> = mismatched.iter().map(|m| m.path.as_path()).collect();
-    let mut mislengths = mislengths(root, snapshot, &seen)?;
+    let mut mislengths = mislengths(root, snapshot, &seen, trusted)?;
     mislengths.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(Probed {
@@ -300,10 +352,18 @@ fn mislengths(
     root: &Path,
     snapshot: &Snapshot,
     seen: &HashSet<&Path>,
+    trusted: &HashSet<&Path>,
 ) -> std::io::Result<Vec<Mislength>> {
     let mut out = Vec::new();
 
     for file in &snapshot.files {
+        // A trusted file's length was in the stat that trusted it. Re-deriving it
+        // here would be free but pointless, and a length that did not match would
+        // contradict the trust rather than reveal anything.
+        if trusted.contains(file.path.as_path()) {
+            continue;
+        }
+
         let actual = match std::fs::metadata(super::restore::resolve(root, &file.path, "a file")?) {
             Ok(meta) => meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -349,6 +409,14 @@ fn mislengths(
 struct Placement {
     /// The path as the version records it, which is what a report names.
     path: PathBuf,
+    /// Whether a caller said this file is where its last apply left it.
+    ///
+    /// A trusted placement is not read. It is also not a finding: the caller has
+    /// already established the file is unchanged by stat, and re-reading it would
+    /// cost the very read the stat was meant to avoid. Nothing here trusts a file
+    /// on its own account — `trusted` is empty unless a caller with a manifest
+    /// supplied it, and a plain probe reads everything.
+    trusted: bool,
     /// Where that lands, already checked to be inside the root.
     resolved: PathBuf,
     /// Where in the chunk these bytes are.
@@ -366,7 +434,11 @@ struct Placement {
 /// A chunk with no slice is not here at all: the version lists it but reads it
 /// nowhere, and a chunk nobody reads is not a thing a directory can be holding.
 /// Counting those as missing would make every version report itself as incomplete.
-fn placements(root: &Path, snapshot: &Snapshot) -> std::io::Result<Vec<Vec<Placement>>> {
+fn placements(
+    root: &Path,
+    snapshot: &Snapshot,
+    trusted: &HashSet<&Path>,
+) -> std::io::Result<Vec<Vec<Placement>>> {
     let mut out: Vec<Vec<Placement>> = vec![Vec::new(); snapshot.chunks.len()];
 
     for slice in &snapshot.file_chunks {
@@ -387,6 +459,7 @@ fn placements(root: &Path, snapshot: &Snapshot) -> std::io::Result<Vec<Vec<Place
 
         bucket.push(Placement {
             path: file.path.clone(),
+            trusted: trusted.contains(file.path.as_path()),
             resolved: super::restore::resolve(root, &file.path, "a file")?,
             chunk_offset: slice.chunk_offset,
             file_offset: slice.file_offset,
@@ -438,18 +511,34 @@ fn bad_index(
 /// it. Streaming instead would mean re-reading the chunk per slice, or a second
 /// pass per slice to seek, and the win buys nothing: the caller is reading this
 /// chunk from a store or a pack anyway and a restore buffers the same bytes.
+///
+/// **A chunk whose every placement is trusted is not read at all.** That is the
+/// whole point of the trusted set — the chunk's bytes are needed only to compare
+/// against a file, and a file nobody has touched does not need comparing. It is
+/// checked before the read rather than the placements being filtered afterwards,
+/// because a `get` on a delta pack whose chunk was deliberately omitted would fail
+/// for a chunk that turns out not to need reading.
 async fn check_chunk<S: StorageGet + ?Sized>(
     id: BlobId,
     slices: Vec<Placement>,
     source: &S,
 ) -> std::io::Result<Vec<Mismatch>> {
+    let mut findings = Vec::new();
+
+    if slices.iter().all(|slice| slice.trusted) {
+        return Ok(findings);
+    }
+
     let mut reader = source.get(&id).await?;
     let mut chunk = Vec::new();
     reader.read_to_end(&mut chunk).await?;
 
-    let mut findings = Vec::new();
-
     for slice in slices {
+        // Trusted placements are neither read nor reported. See the type.
+        if slice.trusted {
+            continue;
+        }
+
         let start = usize::try_from(slice.chunk_offset).unwrap_or(usize::MAX);
         let end = start.saturating_add(usize::try_from(slice.length).unwrap_or(usize::MAX));
 

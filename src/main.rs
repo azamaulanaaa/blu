@@ -146,6 +146,18 @@ enum Command {
         /// apart. Without this, such files are reported and left alone.
         #[arg(long)]
         prune: bool,
+        /// Re-read every file, ignoring the record of the last apply.
+        ///
+        /// Each apply leaves a note beside the directory saying which files it
+        /// wrote and what the filesystem said about them afterwards. The next one
+        /// stats those files and skips the ones that have not moved, which is what
+        /// makes a repeated apply cost nothing but a stat per file.
+        ///
+        /// With this, nothing is taken on that note's word. Slower — it reads the
+        /// whole tree — and it is the mode to use if the directory has been changed
+        /// by something that restores timestamps.
+        #[arg(long)]
+        recheck: bool,
     },
     /// Report what a directory already holds of the version a pack carries.
     ///
@@ -338,7 +350,8 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             pack,
             destination,
             prune,
-        } => run_apply(&pack, &destination, prune).await,
+            recheck,
+        } => run_apply(&pack, &destination, prune, recheck).await,
         Command::Probe {
             pack,
             destination,
@@ -993,6 +1006,7 @@ async fn run_apply(
     pack: &std::path::Path,
     destination: &std::path::Path,
     prune: bool,
+    recheck: bool,
 ) -> std::io::Result<()> {
     let _claim = lock_destination(destination)?;
 
@@ -1004,7 +1018,7 @@ async fn run_apply(
         "applying pack"
     );
 
-    let applied = apply(destination, &pack, ApplyOptions { prune }).await?;
+    let applied = apply(destination, &pack, ApplyOptions { prune, recheck }).await?;
 
     tracing::info!(
         held = applied.held,

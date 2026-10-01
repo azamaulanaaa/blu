@@ -29,7 +29,7 @@ mod common;
 use std::{collections::HashSet, fs, path::Path};
 
 use lepatch::{
-    command::{ApplyOptions, apply},
+    command::{ApplyOptions, Manifest, apply},
     metadata::Snapshot,
     pack::Pack,
     storage::{BlobId, BlobStore, Plan, StorageGet},
@@ -408,9 +408,16 @@ async fn unrecorded_entries_survive_unless_pruning_was_asked_for() {
         "an unrecorded entry must not be deleted on a guess"
     );
 
-    let pruned = apply(&target, &pack, ApplyOptions { prune: true })
-        .await
-        .unwrap();
+    let pruned = apply(
+        &target,
+        &pack,
+        ApplyOptions {
+            prune: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     assert_eq!(pruned.removed, 2);
     assert!(
@@ -482,9 +489,16 @@ async fn updating_a_version_costs_a_delta_and_not_a_tree() {
     );
 
     // Apply it.
-    let applied = apply(&client, &pack7, ApplyOptions { prune: true })
-        .await
-        .unwrap();
+    let applied = apply(
+        &client,
+        &pack7,
+        ApplyOptions {
+            prune: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     common::assert_same_tree(&versions.source, &client);
     assert!(
@@ -516,5 +530,310 @@ async fn a_file_the_version_dropped_stays_without_pruning() {
     assert!(
         client.join("f2.bin").exists(),
         "a file the version no longer records is the user's call, not this tool's"
+    );
+}
+
+/// A second apply trusts the first one's record and reads nothing.
+///
+/// The saving, measured. `trusted` is how many files were taken on the record's
+/// word. On a second run of an untouched tree it is every file and `written` is
+/// zero — so the pack was not read at all, because every chunk of it was covered by
+/// a file nobody opened.
+#[tokio::test]
+async fn a_second_apply_trusts_the_first_and_reads_nothing() {
+    let versions = Versions::new(4, 150_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    let first = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        first.written > 0,
+        "an empty directory has to be given everything"
+    );
+    assert!(
+        Manifest::path_for(&target).unwrap().exists(),
+        "an apply should leave a record of what it did"
+    );
+
+    let second = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second.written, 0,
+        "nothing should have been written the second time"
+    );
+    assert_eq!(
+        second.files, 0,
+        "and no file opened, which is the whole saving"
+    );
+    assert_eq!(
+        second.trusted, 4,
+        "every file should have been taken on the record's word"
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// A file edited after an apply is read, even though its neighbours are not.
+///
+/// The per-file fallback, and the reason it is per file. If the fast path were
+/// all-or-nothing, one edited file would send the whole tree back to being read; if
+/// it were trusted anyway, the edit would survive an apply reporting success.
+#[tokio::test]
+async fn an_edited_file_is_read_while_its_neighbours_are_trusted() {
+    let versions = Versions::new(5, 150_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    // One file rewritten, in place, same length.
+    let edited = target.join("f2.bin");
+    let mut bytes = fs::read(&edited).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at..at + 32].copy_from_slice(&common::untagged_stream(200, 32));
+    fs::write(&edited, &bytes).unwrap();
+
+    let second = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert!(
+        second.written > 0,
+        "the edited file must be read and rewritten"
+    );
+    assert_eq!(second.files, 1, "and only it, the others being untouched");
+    assert_eq!(
+        second.trusted, 4,
+        "the other four should still have been trusted"
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// `--recheck` trusts nothing, and agrees with the fast path about the tree.
+///
+/// The paranoid mode has to reach the same answer as the ordinary one, or it is not
+/// a mode — it is a different tool.
+#[tokio::test]
+async fn a_recheck_trusts_nothing_and_agrees() {
+    let versions = Versions::new(4, 150_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    // One byte changed, and the modification time put back to what the record
+    // holds. Length matches, time matches, and the content is wrong — the case the
+    // fast path provably cannot see, and the reason `--recheck` exists rather than
+    // being redundant. Only something that puts timestamps back produces it.
+    let victim = target.join("f1.bin");
+    let before = fs::metadata(&victim).unwrap();
+    let mut bytes = fs::read(&victim).unwrap();
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0xff;
+    fs::write(&victim, &bytes).unwrap();
+    filetime::set_file_mtime(
+        &victim,
+        filetime::FileTime::from_last_modification_time(&before),
+    )
+    .unwrap();
+
+    let fast = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        fast.written, 0,
+        "nothing the record holds distinguishes this from the right bytes"
+    );
+
+    let checked = apply(
+        &target,
+        &pack,
+        ApplyOptions {
+            recheck: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        checked.trusted, 0,
+        "--recheck should trust nothing by construction"
+    );
+    assert!(
+        checked.written > 0,
+        "and so it should find the change the fast path could not"
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// A file that has grown is still corrected with a record present.
+///
+/// Length is not the record's job — a stat is — so the fast path must not lose the
+/// check that catches this.
+#[tokio::test]
+async fn a_file_that_has_grown_is_truncated_with_a_record_present() {
+    let versions = Versions::new(3, 120_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    let grown = target.join("f0.bin");
+    let original = fs::metadata(&grown).unwrap().len();
+    let mut bytes = fs::read(&grown).unwrap();
+    bytes.extend_from_slice(b"somebody appended this");
+    fs::write(&grown, &bytes).unwrap();
+
+    let second = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(&grown).unwrap().len(),
+        original,
+        "the tail that is not the version's should be gone"
+    );
+    assert_eq!(
+        second.files, 1,
+        "and it should have been the only file opened"
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// A record naming another version is ignored rather than believed.
+///
+/// This is the case where the record does not describe a stale tree but a different
+/// chunk layout entirely. Reading is slower and correct; believing it would be
+/// faster and could not be.
+#[tokio::test]
+async fn a_record_naming_another_version_is_not_believed() {
+    let versions = Versions::new(3, 120_000).await;
+    let pack7 = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack7, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    // Change the tree and take another version.
+    fs::write(
+        versions.source.join("f0.bin"),
+        common::untagged_stream(9, 130_000),
+    )
+    .unwrap();
+    versions.commit().await;
+    let pack8 = versions.pack().await;
+
+    let second = apply(&target, &pack8, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second.trusted, 0,
+        "a record for another version can say nothing about this one"
+    );
+    assert!(
+        second.written > 0,
+        "so the changed file should have been read and rewritten"
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// A destination with no record is read in full, and still works.
+///
+/// The first apply, and the case where something deleted it. It must be an ordinary
+/// run rather than a failure.
+#[tokio::test]
+async fn a_destination_with_no_record_is_read_in_full() {
+    let versions = Versions::new(3, 120_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    Manifest::remove(&target).unwrap();
+
+    let second = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(second.trusted, 0, "nothing to trust");
+    assert_eq!(second.written, 0, "but nothing wrong either");
+    assert!(
+        Manifest::path_for(&target).unwrap().exists(),
+        "and the record should be written again"
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// A corrupt record is a cache miss, not a failure.
+#[tokio::test]
+async fn a_corrupt_record_is_a_cache_miss() {
+    let versions = Versions::new(3, 120_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    // Bytes that name chunks belonging to some other version, in a format of their
+    // own. Nothing here should be believed and nothing should fail.
+    fs::write(
+        Manifest::path_for(&target).unwrap(),
+        b"not a manifest at all, but present",
+    )
+    .unwrap();
+
+    let second = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second.trusted, 0,
+        "an undecodable record vouches for nothing"
+    );
+    assert_eq!(second.written, 0, "and the tree was still right");
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// The record lives beside the destination, so it is never backed up with it.
+///
+/// A record inside the tree would be part of the next version's snapshot, so every
+/// version would differ from the one before by a file neither the user nor the
+/// version has anything to say about.
+#[tokio::test]
+async fn the_record_is_beside_the_destination_and_not_inside_it() {
+    let versions = Versions::new(3, 120_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    let record = Manifest::path_for(&target).unwrap();
+    assert!(record.exists(), "it should have been written");
+    assert!(
+        record.parent() == Some(versions.dir.path()),
+        "and be a sibling of the destination, got {}",
+        record.display()
+    );
+    assert!(
+        !fs::read_dir(&target)
+            .unwrap()
+            .any(|entry| entry.unwrap().path() == record),
+        "and never appear inside the tree"
     );
 }

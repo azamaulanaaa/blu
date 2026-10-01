@@ -15,7 +15,7 @@ mod verify;
 pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{Committed, Options, backup};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
-pub use probe::{Mislength, Mismatch, Probed, Unheld, probe};
+pub use probe::{Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Restored, lock_destination, restore,
 };

@@ -286,6 +286,28 @@ the requests.
 directory that is neither version. Because a probe is idempotent, running the same
 apply again finishes the job.
 
+#### The record an apply leaves
+
+`apply` writes `<dir>.lepatch-state` beside the destination — never inside it, so it
+is not backed up as part of the tree. It records the version, and for each file the
+length and modification time that version imposed.
+
+The next apply stats those files and reads only the ones that have moved, which is
+what makes a repeated apply cost a stat per file instead of a full read of the tree.
+A chunk whose every file is untouched is not fetched from the pack at all.
+
+**The record is a cache, and never believed on sight.** A directory keeps changing
+after an apply writes it, so a record still claiming the old layout of an edited file
+would be worse than no record: an apply that trusted it would skip the file and
+leave the edit in place, reporting success. So every file is re-stat'd, and any that
+moved is read properly. The fallback is per file, because the whole saving is the
+one untouched file that need not be read.
+
+A file that changed but kept both its length and its modification time is invisible
+to this, and no stat-based scheme can see it. `apply --recheck` ignores the record
+and reads the tree, for when something else has been restoring timestamps. It is
+slower and reaches the same answer.
+
 **Pruning is opt-in.** An entry the version does not record is as likely to be the
 user's own work as a leftover from an older version, and nothing in the version can
 tell those apart. Without `--prune`, such entries are named on stderr and left alone.
