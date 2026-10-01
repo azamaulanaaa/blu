@@ -6,10 +6,12 @@ use std::io;
 use crate::{metadata, storage};
 mod backup;
 mod pipeline;
+mod probe;
 mod restore;
 mod verify;
 
 pub use backup::{Committed, Options, backup};
+pub use probe::{Mismatch, Probed, Unheld, probe};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Restored, lock_destination, restore,
 };

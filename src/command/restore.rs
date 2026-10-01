@@ -167,7 +167,11 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
 ///
 /// Only `..` and absolute paths are refused; `.` and repeated separators
 /// normalise to the same place.
-fn resolve(root: &Path, recorded: &Path, kind: &str) -> io::Result<PathBuf> {
+///
+/// Shared with [`super::apply`], which writes a snapshot into a tree the same way
+/// and has the same reason to refuse: a snapshot arriving inside a downloaded pack
+/// is no more trustworthy than one arriving from a store.
+pub(crate) fn resolve(root: &Path, recorded: &Path, kind: &str) -> io::Result<PathBuf> {
     if recorded.as_os_str().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -209,7 +213,10 @@ fn resolve(root: &Path, recorded: &Path, kind: &str) -> io::Result<PathBuf> {
 /// The whole snapshot is checked before a byte is written, so finding out that
 /// entry 900,001 of a million escapes the destination afterwards would leave a
 /// tree that is neither the old one nor the new one.
-fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
+///
+/// Shared with [`super::apply`] for the same reason [`resolve`] is: both write a
+/// snapshot into a tree, and a snapshot is untrusted input wherever it came from.
+pub(crate) fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
     let probe = Path::new(".");
 
     for dir in &snapshot.dirs {
