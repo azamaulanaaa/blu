@@ -288,3 +288,128 @@ fn whole_seconds_since_epoch(when: std::time::SystemTime) -> u64 {
         .expect("a timestamp after the epoch")
         .as_secs()
 }
+
+/// The owner and group a file has, as the filesystem reports them.
+///
+/// Unix only. A file's owner is the identity that created it, so there is nothing
+/// to compare against but what it already was — the point of these tests is that
+/// `owner_of` and `set_owner` agree about the same file, not that either agrees
+/// about some other one.
+///
+/// The `allow` is `tests/common/`'s, for the same reason: this is not inside a
+/// `#[test]`, so the exemption in `.clippy.toml` does not reach it.
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn owner_and_group(path: &std::path::Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = fs::metadata(path).unwrap();
+    (meta.uid(), meta.gid())
+}
+
+/// Reading a file's owner gives back what `stat` says.
+#[test]
+fn an_owner_is_read_from_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f");
+    fs::write(&file, b"x").unwrap();
+
+    let read = lepatch::fsattr::owner_of(&fs::metadata(&file).unwrap()).unwrap();
+    assert_eq!(
+        read,
+        owner_and_group(&file),
+        "what owner_of reports should be what the filesystem holds"
+    );
+}
+
+/// An owner can be put back, which is the whole point of recording one.
+#[test]
+#[cfg(unix)]
+fn an_owner_is_applied_to_a_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f");
+    fs::write(&file, b"x").unwrap();
+
+    if fs::metadata(&file).unwrap().uid() == 0 {
+        // Root can change the answer, which is the only way to check the call
+        // actually does something rather than merely not failing.
+        let (uid, gid) = (12_345, 23_456);
+        lepatch::fsattr::set_owner(&file, Some((uid, gid))).unwrap();
+
+        let after = fs::metadata(&file).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid()),
+            (uid, gid),
+            "a privileged caller should get the owner it asked for"
+        );
+        return;
+    }
+
+    // Unprivileged, setting the owner a file already has is the most a test can
+    // assert: it is a call the filesystem accepts without privilege, which is what
+    // makes an unprivileged restore of an unchanged tree work at all.
+    let before = owner_and_group(&file);
+    lepatch::fsattr::set_owner(&file, Some(before)).unwrap();
+
+    assert_eq!(
+        owner_and_group(&file),
+        before,
+        "setting the owner a file already has should leave it alone"
+    );
+}
+
+/// No owner recorded means nothing applied, on every platform.
+#[test]
+fn an_absent_owner_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f");
+    fs::write(&file, b"x").unwrap();
+
+    #[cfg(unix)]
+    let before = owner_and_group(&file);
+
+    lepatch::fsattr::set_owner(&file, None).unwrap();
+
+    #[cfg(unix)]
+    assert_eq!(
+        owner_and_group(&file),
+        before,
+        "a snapshot from a platform with no users should change nothing"
+    );
+}
+
+/// A symbolic link is skipped rather than followed.
+///
+/// Following one to set its destination's owner would be a claim about a file the
+/// snapshot does not describe — the link records a target, not a version of it, and
+/// the target is restored from its own recorded entry.
+#[test]
+#[cfg(unix)]
+fn an_owners_target_is_not_followed_for_a_symbolic_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    fs::write(&target, b"x").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let target_before = owner_and_group(&target);
+
+    // An owner the link itself could not have, so applying it to the target would be
+    // visible. `set_owner` skips the link either way.
+    lepatch::fsattr::set_owner(&link, Some((target_before.0 + 1, target_before.1))).unwrap();
+
+    assert_eq!(
+        owner_and_group(&target),
+        target_before,
+        "setting a link's owner must not reach its destination"
+    );
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "and the link is still a link"
+    );
+}

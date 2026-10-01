@@ -53,6 +53,75 @@ pub fn mtime_of(meta: &fs::Metadata) -> Option<Timestamp> {
     }
 }
 
+/// The user and group that own a file, or `None` where the platform has neither.
+///
+/// A pair rather than two functions, because they come from one `stat` and are
+/// recorded together or not at all: an entry that has an owner has a group, and
+/// splitting them would let a caller record one and not the other.
+///
+/// `None` on a platform with no users or groups, which is Windows. There is no
+/// sensible substitute — a made-up id would be a claim about the filesystem that
+/// the filesystem never made.
+#[must_use]
+pub fn owner_of(meta: &fs::Metadata) -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Some((meta.uid(), meta.gid()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Apply an owner and group captured by [`owner_of`].
+///
+/// A no-op where `owner` is `None`, which is what a platform without users reports
+/// and what a snapshot taken on one records.
+///
+/// **Order matters, and this has to come before the mode.** On Linux, changing a
+/// file's owner clears its set-user-ID and set-group-ID bits, so a caller that sets
+/// the mode first and the owner second silently strips setuid from everything it
+/// restores. [`Attributes::apply`](crate::metadata::Attributes::apply) is where that
+/// ordering is enforced; a caller applying attributes by hand is the risk.
+///
+/// Symbolic links are skipped, like [`set_mtime`]. Their owner is a property of the
+/// link itself and only `lchown` could set it, which is not what a backup restores
+/// — a snapshot records a link's *target*, and following the link to chown its
+/// destination would be a different and much larger claim.
+///
+/// # Errors
+///
+/// Returns an error if the path cannot be found, or the owner cannot be changed —
+/// which for an unprivileged caller is the ordinary case, and is not a problem with
+/// the path.
+pub fn set_owner(path: &Path, owner: Option<(u32, u32)>) -> io::Result<()> {
+    let Some((uid, gid)) = owner else {
+        return Ok(());
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::chown;
+
+        if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Ok(());
+        }
+
+        chown(path, Some(uid), Some(gid))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
+        Ok(())
+    }
+}
+
 /// Apply permission bits captured by [`mode_of`].
 ///
 /// A no-op where `mode` is `None` — which is what a platform without permission
