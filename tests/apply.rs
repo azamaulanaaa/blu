@@ -131,6 +131,12 @@ async fn an_empty_directory_becomes_the_version() {
     common::assert_same_tree(&versions.source, &target);
     assert_eq!(applied.held, 0, "an empty directory holds nothing");
     assert_eq!(applied.files, 4, "every file should have been written");
+    assert_eq!(
+        applied.fetched,
+        pack.payload_len(),
+        "an empty directory needs the whole payload"
+    );
+    assert_eq!(applied.ranges, 1, "and the whole payload is one range");
     assert!(applied.bytes > 0);
 }
 
@@ -156,7 +162,7 @@ async fn a_directory_already_holding_the_version_is_not_touched() {
 
     assert_eq!(applied.files, 0, "no file should have been written");
     assert_eq!(applied.bytes, 0);
-    assert_eq!(applied.chunks, 0);
+    assert_eq!(applied.written, 0);
 
     for (name, identity) in before {
         assert_eq!(
@@ -194,6 +200,22 @@ async fn one_edited_file_is_repaired_and_the_rest_are_left_alone() {
 
     common::assert_same_tree(&versions.source, &target);
     assert_eq!(applied.files, 1, "only the edited file should be written");
+    assert!(
+        applied.fetched > 0,
+        "the chunks around the edit were not held, so they had to be sent"
+    );
+    assert!(
+        applied.fetched < pack.payload_len() / 8,
+        "one edited file out of five should need well under an eighth of the \
+         payload, needs {} of {}",
+        applied.fetched,
+        pack.payload_len()
+    );
+    assert!(
+        applied.held > 0,
+        "and most of the tree was already held, {}",
+        applied.held
+    );
 
     for (name, identity) in untouched {
         assert_eq!(
@@ -355,7 +377,7 @@ async fn running_an_apply_twice_converges() {
         .await
         .unwrap();
     assert_eq!(again.files, 0, "a second run should find nothing to do");
-    assert_eq!(again.chunks, 0);
+    assert_eq!(again.written, 0);
     assert_eq!(again.bytes, 0);
     assert!(
         again.held > 0,

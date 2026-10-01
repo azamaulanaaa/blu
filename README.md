@@ -207,17 +207,27 @@ content that is not a special case.
 ```text
 magic | version | snapshot hash | chunk count | payload bytes
 ...payloads, end to end, in plan order...
+...the snapshot, encoded: the file table that gives the payload meaning...
 ...index: per chunk, hash | offset | length...
-index length | magic
+index length | snapshot length | magic
 ```
 
-**The index is at the end.** A client fetches the last twelve bytes, learns where the
+**The index is at the end.** A client fetches the last twenty bytes, learns where the
 index is and how long it is, fetches *that* range, and now knows every chunk's
 offset without having read a byte of payload. A header would be the wrong way round:
 it would have to be read before anything, including before it is known whether the
 pack is worth having at all. The trailing magic is what makes the reverse read
 reliable — a length alone is indistinguishable from payload bytes, and a truncated
 download would otherwise be read as a short index.
+
+**A pack carries its own file table.** The chunk hashes in the index say what the
+payload *is*; the snapshot says which bytes of which file each one belongs at. Both
+are needed to place a chunk, so the pack carries both rather than expecting the
+holder to have the store that produced it. That is what makes a single file
+sufficient to hand a version to someone: no set, no server, no second request. The
+snapshot sits between the payload and the index so the index length alone still
+locates the index — the one-request property above does not depend on knowing where
+the payload ends.
 
 **A pack is a function of the tree, so it is byte-identical every time.** The order
 is the snapshot's own chunk table, not the order chunks happened to be written, so
@@ -240,6 +250,50 @@ Where a header's counts and its own index could disagree, the pack is refused ra
 than one of them believed: the index is what locates chunks, so if the two disagree
 one is wrong, and picking the wrong one produces a pack that reads as valid and hands
 out ranges covering the wrong bytes.
+
+#### Applying a pack
+
+`lepatch apply <pack> <directory>` brings a directory up to the version, and
+`lepatch probe <pack> <directory>` reports what it would need. Neither consults the
+backup set.
+
+**An apply writes only what is missing.** A restore writes every byte a version
+needs, because its bytes come out of a store one chunk at a time and it cannot know
+which of them the destination already has. A pack can be asked, so a file with
+nothing to write is not opened at all — it keeps its inode, its timestamps and
+whatever the filesystem has cached about it. Applying version 1 and then version 2
+costs the delta, not a tree.
+
+**A probe answers two different questions, and does not conflate them.** The chunks
+a directory holds *correctly, at every place the version puts them* are the answer a
+delta needs, and are per chunk and all-or-nothing: a chunk spanning two files is held
+only if it is right in both. The *slices* that differ are per slice and are what gets
+written. The second is not derivable from the first — a file missing entirely has
+every slice reported absent even where its chunks are shared with another file that is
+perfectly correct — and judging that file by the first creates it empty.
+
+**A file that has grown is not the version, even though every slice of it is.**
+Appending leaves every recorded byte exactly where it was, so every slice verifies
+and every chunk is held. Slices cannot see past the end of a file, so lengths are
+reported separately; without that, a probe would answer "holds this version" about a
+file with somebody's data in it.
+
+`--ranges` prints the byte ranges a fetch needs as bare `start end` pairs on stdout,
+one per line, with the count on stderr — so they pipe straight into whatever issues
+the requests.
+
+**An apply is not atomic, and does not pretend to be.** A failure partway leaves a
+directory that is neither version. Because a probe is idempotent, running the same
+apply again finishes the job.
+
+**Pruning is opt-in.** An entry the version does not record is as likely to be the
+user's own work as a leftover from an older version, and nothing in the version can
+tell those apart. Without `--prune`, such entries are named on stderr and left alone.
+
+A corrupt pack must not reach the disk: every chunk about to be written is hashed
+against the hash it is addressed by before the first byte is stored, so a damaged
+pack makes everything look absent rather than overwriting a correct directory and
+reporting success.
 
 ### Chunk profiles
 
@@ -525,7 +579,7 @@ use std::collections::HashSet;
 use lepatch::{
     command::load_snapshot,
     pack::Pack,
-    storage::{BlobId, BlobStore, Plan},
+    storage::{BlobStore, Plan},
 };
 
 let store = BlobStore::open_for_reading("docs").await?;
@@ -534,18 +588,12 @@ let store = BlobStore::open_for_reading("docs").await?;
 let snapshot = load_snapshot(&store, store.snapshot(2)?).await?;
 let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 
-let pack = Pack::write(
-    &store,
-    &plan,
-    &store.snapshot(2)?,
-    std::path::Path::new("game.pack"),
-)
-.await?;
+let pack = Pack::write(&store, &plan, &snapshot, std::path::Path::new("game.pack")).await?;
 
 // What a client already holding some of it does not have, as byte ranges of the
 // pack. Adjacent ranges merge, which is the point of packing: a client needs one
 // range, not one per chunk.
-let already: HashSet<BlobId> = HashSet::new();
+let already: HashSet<_> = HashSet::new();
 let ranges = pack.needed(&already);
 
 // After fetching: record what those ranges covered, and re-asking returns nothing.
@@ -559,6 +607,29 @@ gets the whole payload as a single range, and one holding everything gets none.
 `chunks_covering` is its inverse, and both are methods — the two halves of the
 same exchange. `Pack::write` streams, so its memory is one chunk rather than one
 version.
+
+A pack is also a store, and the consuming half of the feature comes from that:
+
+```rust
+# async fn example() -> std::io::Result<()> {
+use lepatch::command::{ApplyOptions, apply, probe};
+
+let pack = lepatch::pack::Pack::open(std::path::Path::new("game.pack"))?;
+
+// What the directory holds, which decides both the ranges to fetch and the bytes
+// to write.
+let probed = probe("~/Games", &pack.snapshot()?, pack.clone()).await?;
+let ranges = pack.needed(&probed.held);
+
+// Writes only what is missing. `Applied::fetched` is what the fetch above would
+// have cost, measured before the apply rather than after — afterwards the
+// directory holds the version by construction and would report nothing.
+let applied = apply("~/Games", &pack, ApplyOptions::default()).await?;
+assert_eq!(ranges.len(), applied.ranges);
+assert_eq!(pack.needed_bytes(&probed.held), applied.fetched);
+# Ok(())
+# }
+```
 
 The `WRITE` const generic on `BlobStore` is what stops a read-only restore from
 being handed something that can append to the store.

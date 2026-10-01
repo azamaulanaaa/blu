@@ -5,10 +5,11 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use lepatch::{
     command::{
-        Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, backup, load_snapshot, lock_destination, restore,
-        verify,
+        ApplyOptions, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Unheld, apply, backup,
+        load_snapshot, lock_destination, probe, restore, verify,
     },
     layout::IndexSet,
+    pack::Pack,
     reader, storage,
 };
 use tracing::level_filters::LevelFilter;
@@ -122,6 +123,45 @@ enum Command {
         /// Version to pack, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
+    },
+    /// Bring a directory up to the version a pack carries, writing only what is
+    /// missing.
+    ///
+    /// The other half of `pack`. Nothing else is needed: a pack carries its own
+    /// file table, so no backup set is consulted.
+    ///
+    /// A file with nothing to write is not opened, so a directory that is already
+    /// the version keeps every inode and timestamp it had. Not atomic — a run that
+    /// is interrupted leaves a directory that is neither version, and running it
+    /// again finishes the job.
+    Apply {
+        /// The pack to apply.
+        pack: std::path::PathBuf,
+        /// Directory to bring up to the version.
+        destination: std::path::PathBuf,
+        /// Remove entries the version does not record.
+        ///
+        /// Off by default: a file here is as likely to be the user's own work as a
+        /// leftover from an older version, and nothing in the version can tell those
+        /// apart. Without this, such files are reported and left alone.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Report what a directory already holds of the version a pack carries.
+    ///
+    /// Reads only. Useful before an `apply` — to see how much of a patch would
+    /// actually be sent — and on its own as the question a client has to answer
+    /// first: which ranges of this pack do I not have?
+    Probe {
+        /// The pack to compare the directory against.
+        pack: std::path::PathBuf,
+        /// Directory to inspect.
+        destination: std::path::PathBuf,
+        /// Print the ranges a fetch would need, one `start end` pair per line.
+        ///
+        /// On stdout, so it can be piped straight into whatever issues requests.
+        #[arg(long)]
+        ranges: bool,
     },
 }
 
@@ -294,6 +334,16 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
         } => run_restore(&destination, &name, version, clean).await,
         Command::Verify { name, version } => run_verify(&name, version).await,
         Command::Pack { name, out, version } => run_pack(&name, &out, version).await,
+        Command::Apply {
+            pack,
+            destination,
+            prune,
+        } => run_apply(&pack, &destination, prune).await,
+        Command::Probe {
+            pack,
+            destination,
+            ranges,
+        } => run_probe(&pack, &destination, ranges).await,
         Command::Reindex { name } => run_reindex(&name).await,
         Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
     }
@@ -930,6 +980,166 @@ async fn run_pack(
         pack.snapshot_len(),
         file_len
     )?;
+
+    Ok(())
+}
+
+/// Bring `destination` up to the version `pack` carries.
+///
+/// The destination is claimed for the length of the run, on the same terms a
+/// restore claims one: two applies into one directory would interleave, and the
+/// claim is a file *beside* it so it never appears in the result.
+async fn run_apply(
+    pack: &std::path::Path,
+    destination: &std::path::Path,
+    prune: bool,
+) -> std::io::Result<()> {
+    let _claim = lock_destination(destination)?;
+
+    let pack = Pack::open(pack)?;
+    tracing::info!(
+        pack = %pack.path().display(),
+        destination = %destination.display(),
+        chunks = pack.len(),
+        "applying pack"
+    );
+
+    let applied = apply(destination, &pack, ApplyOptions { prune }).await?;
+
+    tracing::info!(
+        held = applied.held,
+        files = applied.files,
+        written = applied.written,
+        bytes = applied.bytes,
+        removed = applied.removed,
+        "applied pack"
+    );
+
+    // The bytes a fetch would have needed, which is the number that says whether
+    // this was an update or a whole tree.
+    say!(
+        "fetched {} of {} bytes in {} range(s); {} of {} chunks were already held, \
+         {} chunks written into {} file(s)",
+        applied.fetched,
+        pack.payload_len(),
+        applied.ranges,
+        applied.held,
+        applied.chunks,
+        applied.written,
+        applied.files,
+    )?;
+
+    // Named on stderr, because stdout is data. Left in place unless `--prune`, and
+    // said so either way: silence here would read as "nothing there".
+    if applied.extra > 0 {
+        eprintln!(
+            "note: {} unrecorded entr{} under {} left alone; pass --prune to remove them",
+            applied.extra,
+            if applied.extra == 1 { "y" } else { "ies" },
+            destination.display(),
+        );
+    }
+
+    if applied.removed > 0 {
+        say!(
+            "removed {} unrecorded entr{}",
+            applied.removed,
+            if applied.removed == 1 { "y" } else { "ies" }
+        )?;
+    }
+
+    Ok(())
+}
+
+/// How a difference reads in a sentence.
+fn why(reason: Unheld) -> &'static str {
+    match reason {
+        Unheld::Absent => "is not present",
+        Unheld::Short => "ends before it should",
+        Unheld::Content => "holds different content",
+        Unheld::Long => "continues past the version",
+    }
+}
+
+/// Report what `destination` holds of `pack`, and optionally what it would need.
+async fn run_probe(
+    pack: &std::path::Path,
+    destination: &std::path::Path,
+    ranges: bool,
+) -> std::io::Result<()> {
+    let pack = Pack::open(pack)?;
+    let snapshot = pack.snapshot()?;
+
+    tracing::info!(
+        pack = %pack.path().display(),
+        destination = %destination.display(),
+        "probing"
+    );
+
+    let probed = probe(destination, &snapshot, pack.clone()).await?;
+    let needed = pack.needed(&probed.held);
+
+    if ranges {
+        // Bare numbers on stdout, so this pipes straight into whatever issues the
+        // requests. The count goes to stderr, because stdout is data.
+        for range in &needed {
+            say!("{} {}", range.start, range.end)?;
+        }
+        eprintln!(
+            "{} range(s) covering {} of {} bytes",
+            needed.len(),
+            pack.needed_bytes(&probed.held),
+            pack.payload_len()
+        );
+        return Ok(());
+    }
+
+    for mismatch in &probed.mismatched {
+        eprintln!(
+            "{} at offset {} for {} bytes {} (expected {})",
+            mismatch.path.display(),
+            mismatch.offset,
+            mismatch.length,
+            why(mismatch.reason),
+            mismatch.expected
+        );
+    }
+
+    // Lengths, because a file that has grown can hold every byte the version
+    // records and still not be it — a finding the slices above cannot make.
+    for length in &probed.mislengths {
+        let what = match length.reason {
+            Unheld::Absent => "is not present",
+            Unheld::Short => "is shorter than it should be",
+            _ => "is longer than it should be",
+        };
+        eprintln!(
+            "{} {what}: {} bytes on disk, {} recorded",
+            length.path.display(),
+            length.actual,
+            length.expected
+        );
+    }
+
+    for path in &probed.extra {
+        eprintln!("{} is not recorded by this version", path.display());
+    }
+
+    if probed.is_current() && probed.extra.is_empty() {
+        say!("holds this version: {} chunks", probed.held.len())?;
+    } else {
+        say!(
+            "holds {}/{} chunks; {} slice(s) and {} file(s) to write; {} range(s) covering \
+             {} of {} bytes would have to be fetched",
+            probed.held.len(),
+            snapshot.chunks.len(),
+            probed.mismatched.len(),
+            probed.mislengths.len(),
+            needed.len(),
+            pack.needed_bytes(&probed.held),
+            pack.payload_len(),
+        )?;
+    }
 
     Ok(())
 }

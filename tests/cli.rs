@@ -1486,6 +1486,281 @@ fn packing_a_version_that_does_not_exist_is_refused() {
     );
 }
 
+/// The whole round trip, through the command line and nothing else.
+///
+/// `pack` then `apply`, with no set consulted at apply time — which is the point
+/// of a pack carrying its own file table. If a client needed the set as well as
+/// the file, this would fail the moment the set was moved or deleted, which is the
+/// situation sharing a patch is for.
+#[test]
+fn a_pack_applied_to_an_empty_directory_produces_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..5 {
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            noisy(180_000 + i * 20_000),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(source.join("nested/deep")).unwrap();
+    fs::write(source.join("nested/deep/leaf.bin"), noisy(40_000)).unwrap();
+
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    // Move the set aside: the apply must not need it.
+    fs::rename(
+        dir.path().join("set.0000.bin"),
+        dir.path().join("moved.bin"),
+    )
+    .unwrap();
+    fs::remove_file(dir.path().join("set.lock")).ok();
+
+    let target = dir.path().join("target");
+    let report = ok(dir.path(), &["apply", "v1.pack", "target"]);
+
+    assert!(
+        report.contains("fetched"),
+        "an apply should say what it fetched, got: {report}"
+    );
+    common::assert_same_tree(&source, &target);
+}
+
+/// Applying an update writes what changed and says how little that was.
+///
+/// This is the property the whole feature exists for, checked through the command
+/// line: the report has to name a figure small enough to be a delta, because a
+/// tool that quietly re-sent the tree would still produce a correct directory.
+#[test]
+fn an_update_fetches_a_delta_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..8 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(250_000)).unwrap();
+    }
+
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    // The client takes version 1.
+    let target = dir.path().join("target");
+    ok(dir.path(), &["apply", "v1.pack", "target"]);
+    common::assert_same_tree(&source, &target);
+
+    // Version 2: one file rewritten, one added, one dropped.
+    fs::write(source.join("f5.bin"), noisy(280_000)).unwrap();
+    fs::write(source.join("fresh.bin"), noisy(30_000)).unwrap();
+    fs::remove_file(source.join("f7.bin")).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v2.pack"]);
+
+    let report = ok(dir.path(), &["apply", "v2.pack", "target", "--prune"]);
+
+    // The added and dropped files are only handled with pruning.
+    assert!(
+        target.join("fresh.bin").exists(),
+        "a new file should have been written"
+    );
+    assert!(
+        !target.join("f7.bin").exists(),
+        "a dropped file should have been pruned"
+    );
+    common::assert_same_tree(&source, &target);
+
+    let fetched = figure(&report, "fetched ").expect("the report should name a fetch size");
+    let total = figure(&report, " of ").expect("and the size of the pack");
+    assert!(
+        fetched * 2 < total,
+        "one rewritten file out of eight should need well under half the payload, \
+         but the report says {fetched} of {total}"
+    );
+}
+
+/// The fetch size in a report, which is the first number after `marker`.
+fn figure(report: &str, marker: &str) -> Option<u64> {
+    let at = report.find(marker)? + marker.len();
+    let digits: String = report[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// Re-applying a pack a directory already holds changes nothing.
+#[test]
+fn applying_a_pack_a_directory_already_holds_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..4 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(120_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    let target = dir.path().join("target");
+    ok(dir.path(), &["apply", "v1.pack", "target"]);
+
+    let second = ok(dir.path(), &["apply", "v1.pack", "target"]);
+    assert_eq!(
+        figure(&second, "fetched "),
+        Some(0),
+        "a directory already holding the version needs nothing, got: {second}"
+    );
+    common::assert_same_tree(&source, &target);
+}
+
+/// `probe` reports what a directory holds, and `--ranges` what it would fetch.
+///
+/// Read-only, and the ranges are bare numbers on stdout so they can be piped
+/// somewhere. Both halves are checked, because a probe that could only answer one
+/// of them would not be worth a command.
+#[test]
+fn a_probe_reports_what_is_held_and_what_would_be_fetched() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..6 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(200_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    let target = dir.path().join("target");
+    ok(dir.path(), &["apply", "v1.pack", "target"]);
+
+    // Holding it: one line, no ranges to fetch.
+    let holding = ok(dir.path(), &["probe", "v1.pack", "target"]);
+    assert!(
+        holding.contains("holds this version"),
+        "a directory holding the version should say so, got: {holding}"
+    );
+
+    // Edit one file *in place*. `noisy(n)` is a prefix of `noisy(n + 1)`, so writing
+    // a longer one would only append and no chunk would change — this has to be a
+    // real edit for there to be anything to fetch.
+    let edited = target.join("f3.bin");
+    let mut bytes = fs::read(&edited).unwrap();
+    bytes[100_000] ^= 0xff;
+    fs::write(&edited, &bytes).unwrap();
+
+    // The count is on stdout because stdout is data; which file differs is on
+    // stderr, because a person is who wants that.
+    let output = lepatch(dir.path(), &["probe", "v1.pack", "target"]);
+    assert!(output.status.success());
+    assert!(
+        stdout(&output).contains("slice(s) and") && stdout(&output).contains("file(s) to write"),
+        "the summary belongs on stdout, got: {}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("f3.bin"),
+        "the probe should name the file that differs, got: {}",
+        stderr(&output)
+    );
+
+    let output = lepatch(dir.path(), &["probe", "v1.pack", "target", "--ranges"]);
+    assert!(output.status.success());
+    let ranges = stdout(&output);
+    assert!(
+        !ranges.trim().is_empty(),
+        "an edited file should need at least one range"
+    );
+    for line in ranges.lines() {
+        let mut parts = line.split_whitespace();
+        let start: u64 = parts
+            .next()
+            .unwrap_or_else(|| panic!("`{line}` should start with an offset"))
+            .parse()
+            .unwrap_or_else(|_| panic!("`{line}` should start with a number"));
+        let end: u64 = parts
+            .next()
+            .unwrap_or_else(|| panic!("`{line}` should have an end offset"))
+            .parse()
+            .unwrap_or_else(|_| panic!("`{line}` should end with a number"));
+        assert!(end > start, "`{line}` should be a non-empty range");
+    }
+}
+
+/// A pack that is not a pack is refused by every command that takes one.
+///
+/// `apply` writes to a directory, so accepting a file that is not a pack would mean
+/// writing a version nobody verified. The refusal has to happen before any of it.
+#[test]
+fn applying_something_that_is_not_a_pack_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(50_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    fs::write(dir.path().join("garbage.pack"), b"not a pack at all").unwrap();
+
+    let output = lepatch(dir.path(), &["apply", "garbage.pack", "target"]);
+    assert!(
+        !output.status.success(),
+        "applying a file that is not a pack should fail"
+    );
+    assert!(
+        !dir.path().join("target").exists(),
+        "and it should have been refused before creating a destination"
+    );
+    assert!(
+        stderr(&output).contains("not a pack"),
+        "the refusal should say what is wrong, got: {}",
+        stderr(&output)
+    );
+
+    let probed = lepatch(dir.path(), &["probe", "garbage.pack", "target"]);
+    assert!(
+        !probed.status.success(),
+        "probing a file that is not a pack should fail too"
+    );
+}
+
+/// Unrecorded entries are named and left alone unless pruning was asked for.
+///
+/// The default is the decision this command makes on the user's behalf, so it is
+/// worth a test that says so from the outside: the note is on stderr and the file
+/// is still there.
+#[test]
+fn an_unrecorded_entry_is_named_and_kept_until_prune_is_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(60_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    let target = dir.path().join("target");
+    ok(dir.path(), &["apply", "v1.pack", "target"]);
+
+    fs::write(target.join("scratch.txt"), b"mine").unwrap();
+
+    let output = lepatch(dir.path(), &["apply", "v1.pack", "target"]);
+    assert!(output.status.success());
+    assert!(
+        stderr(&output).contains("--prune"),
+        "an apply should point at --prune when it left something behind, got: {}",
+        stderr(&output)
+    );
+    assert!(
+        target.join("scratch.txt").exists(),
+        "an unrecorded file must not be deleted on a guess"
+    );
+
+    let pruned = lepatch(dir.path(), &["apply", "v1.pack", "target", "--prune"]);
+    assert!(pruned.status.success());
+    assert!(
+        !target.join("scratch.txt").exists(),
+        "--prune should have removed it"
+    );
+}
+
 /// A mistyped set name is an error, not an empty answer.
 ///
 /// The store's own rule is that reading a path which is not a store is an error

@@ -91,14 +91,31 @@ pub struct Options {
 /// What an [`apply`] run changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Chunks the destination already held correctly, and were not sent.
+    /// Chunks the destination already held correctly, and did not have to be sent.
     pub held: u64,
+
+    /// Distinct chunks the version needs.
+    pub chunks: u64,
+
+    /// Bytes of the pack a fetch would have needed to reach this version.
+    ///
+    /// Measured by the probe this run took, which is why it is reported here rather
+    /// than by a caller probing again afterwards — by then the destination holds the
+    /// version by construction and would report a figure of nothing. This is the
+    /// number that says whether a run was an update or a whole tree.
+    pub fetched: u64,
+
+    /// How many range requests [`Self::fetched`] would have been.
+    ///
+    /// Separate from the byte count because the *count* is the property packing
+    /// exists for: one request, not one per chunk, however small the payload.
+    pub ranges: usize,
 
     /// Files opened and written to.
     pub files: u64,
 
     /// Distinct chunks read out of the pack and written.
-    pub chunks: u64,
+    pub written: u64,
 
     /// Bytes of file content written.
     pub bytes: u64,
@@ -142,6 +159,8 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     snapshot.verify_file_lengths("does not match its own chunks")?;
 
     let probed = super::probe::probe(root, &snapshot, pack.clone()).await?;
+    let fetched = pack.needed_bytes(&probed.held);
+    let ranges = pack.needed(&probed.held).len();
 
     // Before the first byte. See the module docs: a damaged pack would otherwise
     // be written over a correct directory, because a probe against a damaged pack
@@ -193,8 +212,11 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
 
     Ok(Applied {
         held: u64::try_from(probed.held.len()).unwrap_or(0),
+        chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
+        fetched,
+        ranges,
         files: written.files,
-        chunks: written.chunks.len().try_into().unwrap_or(0),
+        written: written.chunks.len().try_into().unwrap_or(0),
         bytes: written.bytes,
         removed,
         extra: probed.extra.len().try_into().unwrap_or(0),
