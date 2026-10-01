@@ -26,7 +26,7 @@ use std::{
 };
 
 use lepatch::{
-    command::{Unheld, probe},
+    command::{Mislength, Unheld, probe},
     metadata::Snapshot,
     pack::Pack,
     storage::{BlobId, BlobStore, Plan, StorageGet},
@@ -501,4 +501,115 @@ async fn the_ranges_a_probe_implies_cover_exactly_what_it_says_is_missing() {
             },
         );
     }
+}
+
+/// A file that has grown is not the version, even though every slice of it is.
+///
+/// The finding no slice can make. Appending to a file leaves every byte the
+/// version records exactly where it was, so every slice verifies and every chunk
+/// is held — and the directory is not the version. A probe that could only answer
+/// about slices would report "holds this version" here, and a client would fetch
+/// nothing and leave the tail in place.
+#[tokio::test]
+async fn a_file_that_has_grown_is_reported_though_its_slices_are_right() {
+    let built = tree(3, 150_000).await;
+    let client = built.client().await;
+
+    // Append, so no recorded byte moves and no chunk changes.
+    let path = client.join("f2.bin");
+    let before = fs::metadata(&path).unwrap().len();
+    let mut bytes = fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"appended by somebody");
+    fs::write(&path, &bytes).unwrap();
+
+    let probed = built.probe(&client).await;
+
+    assert!(
+        probed.mismatched.is_empty(),
+        "appending moves no recorded byte, so no slice should differ: {:?}",
+        probed.mismatched
+    );
+    assert!(
+        !probed.is_current(),
+        "but the directory is still not the version"
+    );
+
+    let reported: Vec<_> = probed
+        .mislengths
+        .iter()
+        .filter(|m| m.path.ends_with("f2.bin"))
+        .collect();
+    assert_eq!(
+        reported.len(),
+        1,
+        "the grown file should be reported exactly once, got {:?}",
+        probed.mislengths
+    );
+    assert_eq!(reported[0].reason, Unheld::Long);
+    assert_eq!(reported[0].expected, before);
+    assert_eq!(
+        reported[0].actual,
+        before + "appended by somebody".len() as u64
+    );
+}
+
+/// A file that has shrunk is reported by its slices, and not a second time.
+///
+/// The other half of the same pair. Repeating it once per file would make the
+/// report longer without making it more useful, and the slice already says which
+/// bytes are missing rather than only that the file is the wrong size.
+#[tokio::test]
+async fn a_file_that_has_shrunk_is_not_reported_twice() {
+    let built = tree(3, 150_000).await;
+    let client = built.client().await;
+
+    let path = client.join("f2.bin");
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+    let probed = built.probe(&client).await;
+
+    assert!(
+        probed.mismatched.iter().any(|m| m.reason == Unheld::Short),
+        "the slices should say so"
+    );
+    assert!(
+        probed.mislengths.is_empty(),
+        "and the file should not be reported again on top of them: {:?}",
+        probed.mislengths
+    );
+}
+
+/// A file recorded as empty and missing is reported, because nothing else would be.
+///
+/// An empty file has no slices at all, so every length finding about it has to come
+/// from the length pass or not come from anywhere.
+#[tokio::test]
+async fn an_empty_file_that_is_missing_is_reported_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("empty.bin"), b"").unwrap();
+    fs::write(source.join("data.bin"), common::untagged_stream(1, 40_000)).unwrap();
+
+    let built = built(dir, source).await;
+    let client = built.client().await;
+    std::fs::remove_file(client.join("empty.bin")).unwrap();
+
+    let probed = built.probe(&client).await;
+
+    assert!(
+        probed.mismatched.is_empty(),
+        "an empty file has no slices, so no slice can report it: {:?}",
+        probed.mismatched
+    );
+    assert_eq!(
+        probed.mislengths,
+        vec![Mislength {
+            path: Path::new("empty.bin").to_path_buf(),
+            expected: 0,
+            actual: 0,
+            reason: Unheld::Absent,
+        }],
+        "so the missing empty file is a finding only the length pass can make"
+    );
 }

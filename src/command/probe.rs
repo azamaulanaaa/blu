@@ -97,6 +97,14 @@ pub enum Unheld {
     /// The file ends before the slice does.
     Short,
 
+    /// The file continues past the last slice the version records.
+    ///
+    /// The one difference no slice can see. Every recorded slice of a file that
+    /// has grown can verify perfectly while a tail that is not the version's sits
+    /// past the end of them — and a probe that could not see that would answer
+    /// "holds this version" about a file with somebody else's data in it.
+    Long,
+
     /// The bytes there hash to something else.
     ///
     /// Not necessarily corruption: this is also what a file the *user* edited
@@ -120,6 +128,24 @@ pub struct Mismatch {
     pub reason: Unheld,
 }
 
+/// A file whose length is not the version's, for a reason no slice reported.
+///
+/// Reported only where a slice could not have. A file *shorter* than the version is
+/// already reported slice by slice as [`Unheld::Short`], and saying it again once
+/// per file would be one finding three times over; a file *longer* is reported here
+/// and nowhere else, because there is no slice out past the end of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mislength {
+    /// The recorded path, relative to the root.
+    pub path: PathBuf,
+    /// The length the version records.
+    pub expected: u64,
+    /// The length on disk.
+    pub actual: u64,
+    /// Why it differs.
+    pub reason: Unheld,
+}
+
 /// What a target directory holds of a version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probed {
@@ -133,6 +159,12 @@ pub struct Probed {
     /// Slices that are not right, in the order the version records them.
     pub mismatched: Vec<Mismatch>,
 
+    /// Files whose length is not the version's and whose slices could not say so.
+    ///
+    /// In practice: files that have *grown*. A file that has shrunk is reported
+    /// slice by slice, and a file that has not changed is not here.
+    pub mislengths: Vec<Mislength>,
+
     /// Entries the target has that the version does not record.
     ///
     /// Reported, never removed. A file here is as likely to be the user's own work
@@ -144,10 +176,14 @@ pub struct Probed {
 }
 
 impl Probed {
-    /// Whether every chunk the version needs was already there.
+    /// Whether the target *is* this version: every slice right, every length right.
+    ///
+    /// Content alone, in other words — it says nothing about
+    /// [`Probed::extra`], because a directory with a stray file in it still holds
+    /// the version even though it is not equal to it.
     #[must_use]
     pub fn is_current(&self) -> bool {
-        self.mismatched.is_empty()
+        self.mismatched.is_empty() && self.mislengths.is_empty()
     }
 }
 
@@ -231,11 +267,81 @@ where
     // report nobody can diff.
     mismatched.sort_by(|a, b| (&a.path, a.offset).cmp(&(&b.path, b.offset)));
 
+    let seen: HashSet<&Path> = mismatched.iter().map(|m| m.path.as_path()).collect();
+    let mut mislengths = mislengths(root, snapshot, &seen)?;
+    mislengths.sort_by(|a, b| a.path.cmp(&b.path));
+
     Ok(Probed {
         held,
         mismatched,
+        mislengths,
         extra: extra_entries(root, snapshot),
     })
+}
+
+/// Files whose length is not the version's, where no slice already said so.
+///
+/// `seen` is the files the slice pass reported, and it is what keeps this from
+/// repeating a finding. The two directions are treated differently on purpose:
+///
+/// * **Too long** is only ever reported here. Every recorded slice can verify
+///   perfectly while an extra tail sits past the end of them, so no slice can see
+///   it, and a probe that missed it would report a directory holding ten kilobytes
+///   of somebody's data as *this version*.
+///
+/// * **Too short** is skipped when a slice already reported it, because the slice
+///   is the more specific finding — it says *which* bytes are missing, not just
+///   that the file is the wrong size. A file with no slices at all has nothing to
+///   report it, so it is reported here.
+///
+/// * **Missing** likewise, and only for a file with no slices: a file that exists
+///   in no slice but not on disk is a finding nothing else would make.
+fn mislengths(
+    root: &Path,
+    snapshot: &Snapshot,
+    seen: &HashSet<&Path>,
+) -> std::io::Result<Vec<Mislength>> {
+    let mut out = Vec::new();
+
+    for file in &snapshot.files {
+        let actual = match std::fs::metadata(super::restore::resolve(root, &file.path, "a file")?) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !seen.contains(file.path.as_path()) {
+                    out.push(Mislength {
+                        path: file.path.clone(),
+                        expected: file.len,
+                        actual: 0,
+                        reason: Unheld::Absent,
+                    });
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        if actual == file.len {
+            continue;
+        }
+
+        let reason = if actual > file.len {
+            Unheld::Long
+        } else if seen.contains(file.path.as_path()) {
+            // Already reported, slice by slice, with more to say.
+            continue;
+        } else {
+            Unheld::Short
+        };
+
+        out.push(Mislength {
+            path: file.path.clone(),
+            expected: file.len,
+            actual,
+            reason,
+        });
+    }
+
+    Ok(out)
 }
 
 /// One recorded placement of one chunk, resolved against the root.
