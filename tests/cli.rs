@@ -1589,6 +1589,169 @@ fn figure(report: &str, marker: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// `pack --from N` writes a delta, and it is smaller and it still works.
+///
+/// The whole claim through the command line: a smaller artifact for a client known
+/// to be on version 1, applied from nothing but that artifact and the directory
+/// version 1 left behind.
+#[test]
+fn a_delta_pack_is_written_and_applied_through_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..6 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(200_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack", "--version", "1"]);
+
+    // The client takes version 1, which is what leaves the record the delta will be
+    // checked against.
+    let target = dir.path().join("target");
+    ok(dir.path(), &["apply", "v1.pack", "target"]);
+    common::assert_same_tree(&source, &target);
+
+    // One file changed, one added.
+    fs::write(source.join("f2.bin"), noisy(240_000)).unwrap();
+    fs::write(source.join("fresh.bin"), noisy(30_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+
+    ok(dir.path(), &["pack", "set", "v2.pack", "--version", "2"]);
+    let delta = ok(
+        dir.path(),
+        &["pack", "set", "v2.delta", "--version", "2", "--from", "1"],
+    );
+
+    assert!(
+        delta.contains("since 1"),
+        "a delta should say what it is a delta against, got: {delta}"
+    );
+
+    let delta_size = fs::metadata(dir.path().join("v2.delta")).unwrap().len();
+    let whole_size = fs::metadata(dir.path().join("v2.pack")).unwrap().len();
+    assert!(
+        delta_size < whole_size,
+        "one changed file out of six should be smaller: {delta_size} of {whole_size}"
+    );
+
+    ok(dir.path(), &["apply", "v2.delta", "target"]);
+    common::assert_same_tree(&source, &target);
+}
+
+/// A delta pack is refused for a client that is not on the version it names.
+///
+/// Through the command line, because the refusal is a thing a user has to read. A
+/// delta omits the chunks its assumed holder has, so applying one to the wrong
+/// client would leave a directory that is neither version and report success.
+#[test]
+fn a_delta_pack_is_refused_for_a_client_on_another_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..5 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(180_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack", "--version", "1"]);
+
+    // Move the client to version 2.
+    fs::write(source.join("f0.bin"), noisy(220_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v2.pack", "--version", "2"]);
+    let target = dir.path().join("target");
+    ok(dir.path(), &["apply", "v2.pack", "target"]);
+
+    // Version 3, and a delta for a client on version 1.
+    fs::write(source.join("f1.bin"), noisy(230_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(
+        dir.path(),
+        &["pack", "set", "v3.delta", "--version", "3", "--from", "1"],
+    );
+
+    let output = lepatch(dir.path(), &["apply", "v3.delta", "target"]);
+    assert!(
+        !output.status.success(),
+        "a delta for the wrong base version should be refused"
+    );
+    let said = stderr(&output);
+    assert!(
+        said.contains("is a delta") && said.contains("apply the full pack instead"),
+        "and the refusal should say what to do instead, got: {said}"
+    );
+
+    // Nothing was written on the way to refusing.
+    assert!(
+        !target.join("fresh.bin").exists(),
+        "the refused apply should not have created version 3's new file"
+    );
+}
+
+/// `--full` wins over `--from`, and says so.
+///
+/// Two flags that contradict, in a script that has both. `--full` is the promise
+/// that the artifact suits any client, so a stale `--from` narrowing it silently
+/// would break that promise with nothing in the output to show.
+#[test]
+fn a_full_flag_overrides_a_from_and_says_it_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..4 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(150_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack", "--version", "1"]);
+
+    fs::write(source.join("f0.bin"), noisy(170_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+
+    let output = lepatch(
+        dir.path(),
+        &[
+            "pack",
+            "set",
+            "v2.pack",
+            "--version",
+            "2",
+            "--from",
+            "1",
+            "--full",
+        ],
+    );
+    assert!(output.status.success(), "got: {}", stderr(&output));
+
+    let report = stdout(&output);
+    assert!(
+        !report.contains("since 1"),
+        "with --full the pack should not name a base, got: {report}"
+    );
+
+    // And it really is the whole thing: it applies to a directory holding nothing.
+    ok(dir.path(), &["apply", "v2.pack", "fresh"]);
+    common::assert_same_tree(&source, &dir.path().join("fresh"));
+}
+
+/// Packing against a version the set does not hold is refused.
+#[test]
+fn a_delta_from_a_version_that_does_not_exist_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), noisy(40_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+
+    let output = lepatch(dir.path(), &["pack", "set", "out.delta", "--from", "9"]);
+    assert!(
+        !output.status.success(),
+        "a delta against a version the set does not hold should fail"
+    );
+    assert!(
+        !dir.path().join("out.delta").exists(),
+        "and it should not leave a file behind"
+    );
+}
+
 /// Re-applying a pack a directory already holds changes nothing.
 #[test]
 fn applying_a_pack_a_directory_already_holds_changes_nothing() {

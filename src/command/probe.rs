@@ -214,36 +214,43 @@ where
     P: AsRef<Path>,
     S: StorageGet + 'static,
 {
-    probe_skipping(root, snapshot, source, &every_file(snapshot)).await
+    probe_skipping(root, snapshot, source, &Established::default()).await
 }
 
-/// Every file path a version records, which is what [`probe`] reads.
-fn every_file(snapshot: &Snapshot) -> BTreeSet<&Path> {
-    snapshot
-        .files
-        .iter()
-        .map(|file| file.path.as_path())
-        .collect()
+/// What a caller has already established about a directory, and so need not be read.
+///
+/// Both fields are claims this function does not check and could not: re-deriving
+/// either is the work being skipped. So there is no way to fill one in by accident,
+/// and the only way to get one wrong is to do so deliberately.
+///
+/// `BTreeSet` rather than `HashSet` because nothing here depends on order, so a
+/// caller should not have to name a hasher to pass a set.
+#[derive(Debug, Clone, Default)]
+pub struct Established<'a> {
+    /// Files whose bytes are known right, so their slices are neither read nor
+    /// reported.
+    ///
+    /// From a record of a last apply plus a stat: the file is where it was left.
+    pub files: BTreeSet<&'a Path>,
+
+    /// Chunks the directory holds correctly that `source` cannot supply.
+    ///
+    /// For a delta pack: the ones it deliberately left out. It is not read from the
+    /// pack *because* it is not in the pack, so nothing can be compared against it —
+    /// which is what makes the base version the only thing standing between a delta
+    /// and a wrong answer. A caller may only fill this in having established the
+    /// directory holds the base, and `apply` establishes that from a manifest or
+    /// refuses.
+    pub chunks: HashSet<&'a BlobId>,
 }
 
-/// [`probe`], reading only the files named in `read`.
+/// [`probe`], reading only what `established` does not already account for.
 ///
-/// Every file *not* named is skipped. A caller has usually arrived at that set by
-/// eliminating files it has already established are where its last apply left them,
-/// so skipping one is not a claim this function checks — and it could not: the claim
-/// was made by a stat somewhere else, and re-deriving it here would cost exactly the
-/// read being skipped.
+/// A file in [`Established::files`] is neither read nor reported. A chunk in
+/// [`Established::chunks`] is not read from `source` — it may not be there — and its
+/// placements are reported as held, because the caller has said the directory has it.
 ///
-/// **Skipping is about the read, not the report.** A skipped file contributes no
-/// findings, because it was verified when it was written and nothing has touched it
-/// since. It also means a chunk whose every placement is skipped is never fetched
-/// from `source` at all, which is the actual saving.
-///
-/// Naming every file is [`probe`], and is what [`probe`] does.
-///
-/// `BTreeSet` rather than `HashSet` because nothing here depends on the order, so a
-/// caller should not have to name a hasher to pass a set of paths. Membership is
-/// the only operation performed on it.
+/// Naming every file and no chunks is [`probe`], and is what [`probe`] does.
 ///
 /// # Errors
 ///
@@ -253,7 +260,7 @@ pub async fn probe_skipping<P, S>(
     root: P,
     snapshot: &Snapshot,
     source: S,
-    read: &BTreeSet<&Path>,
+    established: &Established<'_>,
 ) -> std::io::Result<Probed>
 where
     P: AsRef<Path>,
@@ -261,13 +268,6 @@ where
 {
     let root = root.as_ref();
     let source = Arc::new(source);
-    let skipped: HashSet<&Path> = snapshot
-        .files
-        .iter()
-        .map(|file| file.path.as_path())
-        .filter(|path| !read.contains(path))
-        .collect();
-    let trusted = &skipped;
 
     // Before a byte is read, and for the same reason a restore checks first: the
     // whole point is to find out about a tree before touching it, and a path that
@@ -277,7 +277,7 @@ where
     // One task per *chunk*, not per slice: a chunk is read once and compared
     // against every slice placing it, which is both the cheap way round and the
     // only one that can decide "right everywhere" rather than "right somewhere".
-    let placed = placements(root, snapshot, trusted)?;
+    let placed = placements(root, snapshot, established)?;
 
     let concurrency = probe_concurrency();
     let mut held = HashSet::with_capacity(placed.len());
@@ -292,6 +292,19 @@ where
             next += 1;
 
             let id = snapshot.chunks[index];
+
+            // A chunk the caller has already accounted for is neither read nor
+            // reported, and is held — because the caller has said the directory has
+            // it. A delta pack omits exactly these, and cannot be asked for them:
+            // `get` would fail on a chunk that is not there by design, so the check
+            // has to come before the read rather than be handled after it.
+            if established.chunks.contains(&id) {
+                if !placed[index].is_empty() {
+                    held.insert(id);
+                }
+                continue;
+            }
+
             let slices = placed[index].clone();
             checking.spawn({
                 let source = Arc::clone(&source);
@@ -320,7 +333,7 @@ where
     mismatched.sort_by(|a, b| (&a.path, a.offset).cmp(&(&b.path, b.offset)));
 
     let seen: HashSet<&Path> = mismatched.iter().map(|m| m.path.as_path()).collect();
-    let mut mislengths = mislengths(root, snapshot, &seen, trusted)?;
+    let mut mislengths = mislengths(root, snapshot, &seen, established)?;
     mislengths.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(Probed {
@@ -352,7 +365,7 @@ fn mislengths(
     root: &Path,
     snapshot: &Snapshot,
     seen: &HashSet<&Path>,
-    trusted: &HashSet<&Path>,
+    established: &Established<'_>,
 ) -> std::io::Result<Vec<Mislength>> {
     let mut out = Vec::new();
 
@@ -360,7 +373,7 @@ fn mislengths(
         // A trusted file's length was in the stat that trusted it. Re-deriving it
         // here would be free but pointless, and a length that did not match would
         // contradict the trust rather than reveal anything.
-        if trusted.contains(file.path.as_path()) {
+        if established.files.contains(file.path.as_path()) {
             continue;
         }
 
@@ -437,7 +450,7 @@ struct Placement {
 fn placements(
     root: &Path,
     snapshot: &Snapshot,
-    trusted: &HashSet<&Path>,
+    established: &Established<'_>,
 ) -> std::io::Result<Vec<Vec<Placement>>> {
     let mut out: Vec<Vec<Placement>> = vec![Vec::new(); snapshot.chunks.len()];
 
@@ -459,7 +472,7 @@ fn placements(
 
         bucket.push(Placement {
             path: file.path.clone(),
-            trusted: trusted.contains(file.path.as_path()),
+            trusted: established.files.contains(file.path.as_path()),
             resolved: super::restore::resolve(root, &file.path, "a file")?,
             chunk_offset: slice.chunk_offset,
             file_offset: slice.file_offset,

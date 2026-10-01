@@ -19,7 +19,7 @@ mod common;
 use std::{collections::HashSet, fs, path::Path};
 
 use lepatch::{
-    metadata::Snapshot,
+    metadata::{Attributes, File, FileChunk, Snapshot},
     pack::{Pack, Range, hash_file},
     storage::{BlobStore, Plan, StorageGet},
 };
@@ -989,4 +989,442 @@ async fn a_partial_range_records_nothing() {
         end: start + first.len,
     };
     assert_eq!(pack.chunks_covering(&[whole]).len(), 1);
+}
+
+/// A placement for a chunk a plan does not have to locate.
+///
+/// These two tests are about set arithmetic on the chunk table, so where the chunks
+/// live is noise. Every placement is raw and at offset zero, which is not a real
+/// arrangement and never read.
+fn placed() -> lepatch::storage::Placement {
+    lepatch::storage::Placement {
+        segment: 0,
+        offset: 0,
+        stored_len: 10,
+        raw_len: 10,
+        codec: lepatch::storage::Codec::Raw,
+    }
+}
+
+/// A snapshot of one file holding `chunks` back to back, ten bytes each.
+///
+/// Built with real slices because `Plan::from_snapshot` drops any chunk no slice
+/// reaches — a chunk table alone plans to nothing, which is correct (a version
+/// listing a chunk it never reads has nothing to read it for) and would have made
+/// both tests above vacuous.
+fn one_file(chunks: &[lepatch::storage::BlobId]) -> Snapshot {
+    let mut snapshot = Snapshot {
+        chunks: chunks.to_vec(),
+        ..Snapshot::new()
+    };
+
+    snapshot.files.push(lepatch::metadata::File {
+        path: "one.bin".into(),
+        len: chunks.len() as u64 * 10,
+        attrs: lepatch::metadata::Attributes::default(),
+    });
+
+    for (index, _) in chunks.iter().enumerate() {
+        snapshot.file_chunks.push(lepatch::metadata::FileChunk {
+            chunk_index: u32::try_from(index).unwrap(),
+            file_index: 0,
+            chunk_offset: 0,
+            file_offset: index as u64 * 10,
+            length: 10,
+        });
+    }
+
+    snapshot
+}
+
+/// A snapshot of one ten-byte file per entry, each holding that entry's chunk.
+///
+/// Distinct chunks are listed once, in the order they are first seen — the same
+/// rule a real snapshot's chunk table follows, and the one `Plan::from_snapshot`
+/// assumes when it flattens slices to one entry per chunk.
+fn tree(files: &[(&str, lepatch::storage::BlobId)]) -> Snapshot {
+    let mut snapshot = Snapshot::new();
+    let mut chunks: Vec<lepatch::storage::BlobId> = Vec::new();
+
+    for (index, (path, id)) in files.iter().enumerate() {
+        snapshot.files.push(File {
+            path: (*path).into(),
+            len: 10,
+            attrs: Attributes::default(),
+        });
+
+        let chunk_index = if let Some(seen) = chunks.iter().position(|held| held == id) {
+            seen
+        } else {
+            chunks.push(*id);
+            chunks.len() - 1
+        };
+
+        snapshot.file_chunks.push(FileChunk {
+            chunk_index: u32::try_from(chunk_index).unwrap(),
+            file_index: u32::try_from(index).unwrap(),
+            chunk_offset: 0,
+            file_offset: 0,
+            length: 10,
+        });
+    }
+
+    snapshot.chunks = chunks;
+    snapshot
+}
+
+/// A delta plan is what the target places that the base does not already place.
+///
+/// The whole of `Plan::since`, apart from any file. Determinism is the part worth
+/// pinning: a delta that reordered itself between runs would not be the same bytes
+/// twice, and a pack's content hash is that property.
+#[test]
+fn a_delta_plan_is_what_the_base_does_not_already_place() {
+    let a = blake3::hash(b"a");
+    let b = blake3::hash(b"b");
+    let c = blake3::hash(b"c");
+
+    let base = tree(&[("x.bin", a), ("y.bin", b)]);
+    let target = tree(&[("x.bin", a), ("y.bin", b), ("z.bin", c)]);
+
+    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let full = Plan::from_snapshot(&target, store).unwrap();
+    assert_eq!(full.len(), 3, "the whole version needs all three");
+
+    let delta = full.since(&target, &base);
+
+    assert_eq!(delta.len(), 1, "only c is new to a holder of a and b");
+    assert_eq!(delta.chunks()[0].id, c);
+
+    // From nothing, everything.
+    assert_eq!(full.since(&target, &Snapshot::new()).len(), 3);
+}
+
+/// A chunk the base holds in one file is still sent for another.
+///
+/// The bug a chunk-set subtraction has and a placement comparison does not. The same
+/// bytes appear in two files; the base has one of them, so the delta must carry the
+/// chunk — or the second file is never written and the apply reports success on a
+/// tree missing a file.
+///
+/// Not a contrived shape: a tree of identical files, or a new file whose content
+/// happens to repeat something already there, both produce it. It is how this was
+/// found.
+#[test]
+fn a_chunk_the_base_holds_in_one_place_is_still_sent_for_another() {
+    let shared = blake3::hash(b"same bytes in two files");
+
+    let base = tree(&[("old.bin", shared)]);
+    let target = tree(&[("old.bin", shared), ("new.bin", shared)]);
+
+    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let full = Plan::from_snapshot(&target, store).unwrap();
+    assert_eq!(
+        full.len(),
+        1,
+        "both files hold the one chunk, so the whole version needs one chunk"
+    );
+
+    let delta = full.since(&target, &base);
+
+    assert_eq!(
+        delta.len(),
+        1,
+        "the base places it in old.bin but not new.bin, so it has to be sent"
+    );
+}
+
+/// A chunk the base places identically in every place it is needed is omitted.
+///
+/// The other half, and the case the omission is sound for: if the base already has
+/// these exact bytes at these exact offsets, the directory is right there.
+#[test]
+fn a_chunk_the_base_places_identically_is_left_out() {
+    let shared = blake3::hash(b"same bytes in two files");
+    let snapshot = tree(&[("a.bin", shared), ("b.bin", shared)]);
+
+    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let full = Plan::from_snapshot(&snapshot, store).unwrap();
+
+    assert!(
+        full.since(&snapshot, &snapshot).is_empty(),
+        "a version against itself needs nothing sent"
+    );
+}
+
+/// A delta of a tree with nothing in common is the whole thing.
+///
+/// Not an optimisation to detect: a delta against an unrelated base *is* the whole
+/// version, and saying so is more useful than refusing.
+#[test]
+fn a_delta_from_an_unrelated_base_is_the_whole_version() {
+    let x = blake3::hash(b"x");
+    let y = blake3::hash(b"y");
+    let z = blake3::hash(b"z");
+
+    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let target = one_file(&[x, y]);
+    let full = Plan::from_snapshot(&target, store).unwrap();
+    let unrelated = Snapshot {
+        chunks: vec![z],
+        ..Snapshot::new()
+    };
+
+    assert_eq!(full.since(&target, &unrelated).len(), 2);
+    assert!(!full.since(&target, &unrelated).is_empty());
+}
+
+/// A delta pack is a pack of fewer chunks, and applies to its holder.
+///
+/// The end-to-end claim: `--from 7` writes something smaller that a client on
+/// version 7 can actually use, and the result is the same tree either way. The
+/// bytes come from two different packs, and nothing downstream should be able to
+/// tell.
+#[tokio::test]
+async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
+    let built = build(6, 200_000).await;
+    let source = built.dir.path().join("source");
+    let client = built.dir.path().join("client");
+
+    // The base pack is written *before* the update, because `snapshot_of` reads the
+    // newest version and after a later backup that would be the other one.
+    let first = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let v1 = snapshot_of(&built.blob).await;
+    let v1_full = Plan::from_snapshot(&v1, |id| first.locate(id)).unwrap();
+    let v1_pack = Pack::write(&first, &v1_full, &v1, &built.dir.path().join("v1.pack"))
+        .await
+        .unwrap();
+
+    // The client takes version 1, which is what leaves the record the delta will
+    // be checked against.
+    lepatch::command::apply(&client, &v1_pack, lepatch::command::ApplyOptions::default())
+        .await
+        .unwrap();
+
+    // Change one file and take version 2.
+    fs::write(source.join("f2.bin"), common::untagged_stream(99, 260_000)).unwrap();
+    common::run_backup(&source, &built.blob).await;
+
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let v2 = snapshot_of(&built.blob).await;
+    let full = Plan::from_snapshot(&v2, |id| store.locate(id)).unwrap();
+    let delta = full.since(&v2, &v1);
+
+    let at = built.dir.path().join("delta.pack");
+    let packed = Pack::write_delta(&store, &delta, &v2, v1_pack.snapshot_id(), &at)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        packed.len(),
+        delta.len(),
+        "the pack should hold exactly the delta's chunks"
+    );
+    assert!(
+        packed.payload_len() < full.total_bytes(),
+        "and be smaller than the whole version: {} of {}",
+        packed.payload_len(),
+        full.total_bytes()
+    );
+    assert!(
+        delta.len() < full.len(),
+        "one rewritten file out of six should not need every chunk"
+    );
+
+    // It names the version it assumes, which is the only thing that makes it safe to
+    // omit the rest.
+    assert_eq!(
+        packed.base(),
+        Some(v1_pack.snapshot_id()),
+        "a delta must record the version whose chunks it left out"
+    );
+
+    // It still carries the whole version's file table, which is what makes it
+    // self-contained: a client can lay out every file from this one file.
+    assert_eq!(
+        packed.snapshot().unwrap().chunks,
+        v2.chunks,
+        "the file table must be the whole version, not just the delta"
+    );
+
+    let applied =
+        lepatch::command::apply(&client, &packed, lepatch::command::ApplyOptions::default())
+            .await
+            .unwrap();
+
+    assert!(
+        applied.written > 0,
+        "the delta should have supplied the changed file's chunks"
+    );
+    common::assert_same_tree(&source, &client);
+}
+
+/// A delta pack will not apply to a client that is not on the version it names.
+///
+/// The failure the whole feature rests on, stated as a test. A delta omits the
+/// chunks its assumed holder has, and nothing in it can tell whether they are there
+/// — the bytes that would prove it are the bytes it left out. So a client on a
+/// different version must be **refused**, before anything is written, rather than
+/// having the delta applied to whatever it happens to hold.
+#[tokio::test]
+async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
+    let built = build(5, 200_000).await;
+    let source = built.dir.path().join("source");
+    let client = built.dir.path().join("client");
+
+    let first = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let v1 = snapshot_of(&built.blob).await;
+    let v1_pack = Pack::write(
+        &first,
+        &Plan::from_snapshot(&v1, |id| first.locate(id)).unwrap(),
+        &v1,
+        &built.dir.path().join("v1.pack"),
+    )
+    .await
+    .unwrap();
+
+    // Move the client to version 2 — one update past the delta's base.
+    fs::write(source.join("f0.bin"), common::untagged_stream(11, 240_000)).unwrap();
+    common::run_backup(&source, &built.blob).await;
+    let second = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let v2 = snapshot_of(&built.blob).await;
+    let v2_pack = Pack::write(
+        &second,
+        &Plan::from_snapshot(&v2, |id| second.locate(id)).unwrap(),
+        &v2,
+        &built.dir.path().join("v2.pack"),
+    )
+    .await
+    .unwrap();
+    lepatch::command::apply(&client, &v2_pack, lepatch::command::ApplyOptions::default())
+        .await
+        .unwrap();
+
+    // What version 2's version of the file version 3 changes looks like, so the
+    // refusal can be checked to have left it alone.
+    let before = fs::read(client.join("f1.bin")).unwrap();
+
+    // Version 3, and a delta for a client on version 1.
+    fs::write(source.join("f1.bin"), common::untagged_stream(12, 250_000)).unwrap();
+    common::run_backup(&source, &built.blob).await;
+    let third = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let v3 = snapshot_of(&built.blob).await;
+    let full = Plan::from_snapshot(&v3, |id| third.locate(id)).unwrap();
+    let delta = full.since(&v2, &v1);
+    assert!(delta.len() < full.len(), "the delta should be smaller");
+
+    let packed = Pack::write_delta(
+        &third,
+        &delta,
+        &v3,
+        v1_pack.snapshot_id(),
+        &built.dir.path().join("v3-from-v1.pack"),
+    )
+    .await
+    .unwrap();
+
+    let result =
+        lepatch::command::apply(&client, &packed, lepatch::command::ApplyOptions::default()).await;
+
+    let error = match result {
+        Err(e) => e,
+        Ok(applied) => panic!(
+            "a delta pack applied to a client one version past its base, writing \
+             {} chunks and reporting success — the tree is now neither version",
+            applied.written
+        ),
+    };
+
+    assert!(
+        error.to_string().contains("is a delta"),
+        "the refusal should say what kind of pack this is, got: {error}"
+    );
+    assert!(
+        error.to_string().contains("apply the full pack instead"),
+        "and what to do instead, got: {error}"
+    );
+
+    // And the tree is untouched: the refusal came before the first write, so the
+    // client is still exactly version 2 and nothing partial was left behind.
+    assert_eq!(
+        fs::read(client.join("f1.bin")).unwrap(),
+        before,
+        "the file version 3 changes must not have been touched at all"
+    );
+    assert_eq!(
+        fs::read(client.join("f0.bin")).unwrap(),
+        fs::read(source.join("f0.bin")).unwrap(),
+        "and the rest of the tree should still be version 2"
+    );
+}
+
+/// A delta needs the base, and a full pack does not.
+///
+/// The two are told apart by the header rather than by payload length, because a
+/// delta's payload is short for the ordinary reason that it holds fewer chunks — a
+/// small full pack is not a delta, and a delta is not a small full pack.
+#[tokio::test]
+async fn a_full_pack_names_no_base_and_a_delta_names_one() {
+    let built = build(4, 150_000).await;
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let snapshot = snapshot_of(&built.blob).await;
+    let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
+
+    let full = Pack::write(
+        &store,
+        &plan,
+        &snapshot,
+        &built.dir.path().join("full.pack"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(full.base(), None, "a full pack assumes nothing");
+
+    let some = common::id_of(&[42u8; 32]);
+    let delta = Pack::write_delta(
+        &store,
+        &plan,
+        &snapshot,
+        some,
+        &built.dir.path().join("delta.pack"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        delta.base(),
+        Some(some),
+        "and a delta names what it assumes"
+    );
+}
+
+/// A delta of a delta from the same base is the same delta.
+#[tokio::test]
+async fn a_delta_is_a_function_of_the_two_versions() {
+    let built = build(4, 150_000).await;
+    let source = built.dir.path().join("source");
+    let v1 = snapshot_of(&built.blob).await;
+
+    fs::write(source.join("f1.bin"), common::untagged_stream(31, 190_000)).unwrap();
+    common::run_backup(&source, &built.blob).await;
+
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let v2 = snapshot_of(&built.blob).await;
+    let full = Plan::from_snapshot(&v2, |id| store.locate(id)).unwrap();
+
+    let first = built.dir.path().join("a.pack");
+    let second = built.dir.path().join("b.pack");
+
+    for at in [&first, &second] {
+        let delta = full.since(&v2, &v1);
+        Pack::write_delta(&store, &delta, &v2, v2.chunks[0], at)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        hash_file(&first).await.unwrap(),
+        hash_file(&second).await.unwrap(),
+        "the same two versions must delta to the same bytes, or a client cannot \
+         verify what it was sent"
+    );
 }

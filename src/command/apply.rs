@@ -46,7 +46,7 @@
 //! reported by default and removed only when asked.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -173,17 +173,19 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     super::restore::check_paths(&snapshot)?;
     snapshot.verify_file_lengths("does not match its own chunks")?;
 
-    // Which files have to be read. A manifest records what a version imposed the last
-    // time one was applied here, and re-statting each file decides which of those
-    // are still where they were left; everything else is read. See the module docs
-    // on why the manifest is a cache and not an authority.
-    let must_read = if options.recheck {
-        every_file(&snapshot)
+    // What is already accounted for, and so need not be read. Two sources, and they
+    // are independent: a manifest covers *files* by stat, and a delta pack's base
+    // covers *chunks* it left out. See `readable_from_manifest` and
+    // `establish_base` for why neither is taken on trust.
+    let mut established = if options.recheck {
+        super::probe::Established::default()
     } else {
         readable_from_manifest(root, pack.snapshot_id(), &snapshot)?
     };
 
-    let probed = super::probe::probe_skipping(root, &snapshot, pack.clone(), &must_read).await?;
+    establish_base(root, pack, &snapshot, &mut established)?;
+
+    let probed = super::probe::probe_skipping(root, &snapshot, pack.clone(), &established).await?;
     let fetched = pack.needed_bytes(&probed.held);
     let ranges = pack.needed(&probed.held).len();
 
@@ -251,9 +253,7 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
         chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
         fetched,
         ranges,
-        trusted: u64::try_from(snapshot.files.len())
-            .unwrap_or(0)
-            .saturating_sub(u64::try_from(must_read.len()).unwrap_or(0)),
+        trusted: u64::try_from(established.files.len()).unwrap_or(0),
         files: written.files,
         written: written.chunks.len().try_into().unwrap_or(0),
         bytes: written.bytes,
@@ -277,23 +277,25 @@ fn write_manifest(root: &Path, pack: &Pack, snapshot: &metadata::Snapshot) -> io
     manifest.save(root)
 }
 
-/// The files that have to be read, because a manifest cannot vouch for them.
+/// What a manifest lets this run skip.
 ///
-/// The interesting cases are the ones that make this *large*, and none of them is
-/// an error: no manifest, a manifest naming another version, or one file having
-/// been touched since. Each leaves more to read, never a wrong answer.
+/// The interesting cases are the ones that make this *empty*, and none of them is an
+/// error: no manifest, a manifest naming another version, or one file having been
+/// touched since. Each leaves more to read, never a wrong answer.
 ///
 /// Borrowed from the snapshot rather than from the manifest, so the set outlives
 /// this function without an allocation per file. The manifest's `untrusted` names
-/// recorded paths, so a version's file it does not name is never here — which is
+/// recorded paths, so a version's file it does not name is never skipped — which is
 /// correct: a file the manifest never wrote about is read.
 fn readable_from_manifest<'a>(
     root: &Path,
     version: BlobId,
     snapshot: &'a metadata::Snapshot,
-) -> io::Result<BTreeSet<&'a Path>> {
+) -> io::Result<super::probe::Established<'a>> {
+    let empty = super::probe::Established::default();
+
     let Some(manifest) = super::manifest::Manifest::load(root)? else {
-        return Ok(every_file(snapshot));
+        return Ok(empty);
     };
 
     if manifest.version != version {
@@ -306,26 +308,91 @@ fn readable_from_manifest<'a>(
             applying = %version,
             "manifest is for another version; reading the tree instead"
         );
-        return Ok(every_file(snapshot));
+        return Ok(empty);
     }
 
     let untrusted = manifest.untrusted(root, snapshot);
 
-    Ok(snapshot
-        .files
-        .iter()
-        .map(|file| file.path.as_path())
-        .filter(|path| untrusted.iter().any(|one| one == path))
-        .collect())
+    Ok(super::probe::Established {
+        files: snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_path())
+            .filter(|path| !untrusted.iter().any(|one| one == path))
+            .collect(),
+        ..empty
+    })
 }
 
-/// Every file in the version, for the cases where nothing can be taken on trust.
-fn every_file(snapshot: &metadata::Snapshot) -> BTreeSet<&Path> {
-    snapshot
-        .files
+/// Account for the chunks a delta pack left out, or refuse the run.
+///
+/// **This is the only thing making a delta pack safe, and it is a refusal.** A delta
+/// holds the chunks its reader is asserted to have; the bytes that would prove it
+/// has them are exactly the bytes the delta left out, so nothing can be verified.
+/// Reading them is what a probe does normally, and a delta exists to avoid it.
+///
+/// So the assertion has to come from somewhere else, and the only somewhere is the
+/// reader: a manifest naming exactly the base version says the directory *is* that
+/// version, because that is what the last apply left and nothing since has moved a
+/// byte of it. When the manifest says otherwise — no manifest, or a different
+/// version — the run is refused.
+///
+/// The alternative is to apply what the delta happens to contain and report success,
+/// which is the worst thing this crate can do: a directory that is neither version,
+/// with nothing in the output to say so.
+///
+/// # Errors
+///
+/// Returns an error when the pack is a delta and the destination cannot account for
+/// its base, before anything is read or written.
+fn establish_base<'a>(
+    root: &Path,
+    pack: &Pack,
+    snapshot: &'a metadata::Snapshot,
+    established: &mut super::probe::Established<'a>,
+) -> io::Result<()> {
+    let Some(base) = pack.base() else {
+        return Ok(());
+    };
+
+    let manifest = super::manifest::Manifest::load(root)?;
+
+    if manifest.as_ref().is_none_or(|m| m.version != base) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to apply: this pack is a delta for a client already holding \
+                 version {base}, and {} does not record holding it. A delta omits the \
+                 chunks that version has, so nothing here could tell you were \
+                 missing them — apply the full pack instead, or apply the base \
+                 version first",
+                manifest.as_ref().map_or_else(
+                    || format!("{}", root.display()),
+                    |m| format!("{} records version {}", root.display(), m.version),
+                )
+            ),
+        ));
+    }
+
+    // The manifest says the directory is the base, so every chunk the delta left out
+    // is in it. The manifest itself does not list chunks — the base's snapshot does,
+    // and the delta carries that as its own file table is the *target's*, so the
+    // omitted set is computed by difference against what the delta does hold.
+    let held: HashSet<&BlobId> = pack.chunks().iter().map(|chunk| &chunk.id).collect();
+
+    established.chunks = snapshot
+        .chunks
         .iter()
-        .map(|file| file.path.as_path())
-        .collect()
+        .filter(|id| !held.contains(id))
+        .collect();
+
+    tracing::debug!(
+        base = %base,
+        chunks = established.chunks.len(),
+        "delta pack: the manifest accounts for the chunks it omits"
+    );
+
+    Ok(())
 }
 
 /// Hash every chunk about to be written and refuse the run if one does not match.

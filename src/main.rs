@@ -123,6 +123,26 @@ enum Command {
         /// Version to pack, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
+        /// Pack only what this version's holder is missing, instead of the whole
+        /// version.
+        ///
+        /// `--from 7` writes a pack carrying version 8's file table and only the
+        /// chunks version 7 does not already have. Smaller, and built once for
+        /// everyone on version 7 — no per-client anything.
+        ///
+        /// A delta pack holds only what its holder already has *elsewhere*, so it is
+        /// for a client known to be on that version. Anything else — version 4, or a
+        /// half-applied tree — is missing chunks the pack omits, and `apply` fails
+        /// partway rather than producing a wrong directory. Use `--full` for a pack
+        /// that suits any client.
+        #[arg(long, value_name = "VERSION")]
+        from: Option<u32>,
+        /// Pack the whole version, ignoring `--from`.
+        ///
+        /// The default when no `--from` is given. One artifact, one content hash,
+        /// and correct for any client — which is what makes it the one worth caching.
+        #[arg(long)]
+        full: bool,
     },
     /// Bring a directory up to the version a pack carries, writing only what is
     /// missing.
@@ -345,7 +365,13 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             clean,
         } => run_restore(&destination, &name, version, clean).await,
         Command::Verify { name, version } => run_verify(&name, version).await,
-        Command::Pack { name, out, version } => run_pack(&name, &out, version).await,
+        Command::Pack {
+            name,
+            out,
+            version,
+            from,
+            full,
+        } => run_pack(&name, &out, version, effective_from(from, full)).await,
         Command::Apply {
             pack,
             destination,
@@ -941,6 +967,22 @@ async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Re
     report.into_result()
 }
 
+/// The base version a pack should omit, with `--full` overriding `--from`.
+///
+/// Two flags that contradict each other, and resolving it here rather than in clap
+/// so the message is ours: `--full` is the promise that the artifact suits any
+/// client, and letting a stale `--from` in a script quietly narrow it would break
+/// that promise without anyone noticing.
+fn effective_from(from: Option<u32>, full: bool) -> Option<u32> {
+    if full {
+        if let Some(from) = from {
+            say!("note: --full overrides --from {from}; packing the whole version").ok();
+        }
+        return None;
+    }
+    from
+}
+
 /// Write one version's chunks to a single file.
 ///
 /// Opened for reading and no lock taken: a pack does not touch the set. The
@@ -950,6 +992,7 @@ async fn run_pack(
     name: &std::path::Path,
     out: &std::path::Path,
     version: Option<u32>,
+    from: Option<u32>,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
@@ -958,6 +1001,7 @@ async fn run_pack(
     tracing::info!(
         name = %set.base().display(),
         version,
+        from,
         out = %out.display(),
         "packing"
     );
@@ -967,15 +1011,41 @@ async fn run_pack(
     // resolved into a plan, because a pack carries its own file table and so is
     // the version rather than a reference to it.
     let snapshot = load_snapshot(&store, snapshot_id).await?;
-    let plan = storage::Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
+    let whole = storage::Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 
-    let pack = lepatch::pack::Pack::write(&store, &plan, &snapshot, out).await?;
+    // A delta is the same pack with fewer chunks in it. No format change and no new
+    // code path downstream: the snapshot still travels with it, so an apply can
+    // still find every file's bytes, and the chunks that are not here are exactly
+    // the ones a holder of `from` already has.
+    let (base, plan) = match from {
+        None => (None, whole.clone()),
+        Some(base_version) => {
+            let base_id = select_version(&set, &store, Some(base_version))?.1;
+            let base_snapshot = load_snapshot(&store, base_id).await?;
+            (
+                Some((base_version, base_id)),
+                whole.since(&snapshot, &base_snapshot),
+            )
+        }
+    };
+
+    let pack = match base {
+        // `write_delta`, not `write` over a filtered plan, because the header has
+        // to say what the delta assumes — that is what lets an apply refuse rather
+        // than apply what it happens to hold.
+        Some((_, base_id)) => {
+            lepatch::pack::Pack::write_delta(&store, &plan, &snapshot, base_id, out).await?
+        }
+        None => lepatch::pack::Pack::write(&store, &plan, &snapshot, out).await?,
+    };
     let file_len = pack.file_len()?;
     let content = lepatch::pack::hash_file(out).await?;
 
     tracing::info!(
         version,
+        base = base.map(|(v, _)| v),
         chunks = pack.len(),
+        of = whole.len(),
         bytes = file_len,
         snapshot = file_len.saturating_sub(pack.snapshot_len()),
         content = %&content,
@@ -985,14 +1055,27 @@ async fn run_pack(
     // The content hash is the pack's name, so it goes to stdout for a script to
     // key a cache on.
     say!("{}  {}", &content, out.display())?;
-    say!(
-        "version {version}: {} chunks, {} bytes of payload, {} bytes of file table, \
-         {} bytes on disk",
-        pack.len(),
-        pack.payload_len(),
-        pack.snapshot_len(),
-        file_len
-    )?;
+    match base {
+        // Both figures, because the fraction is fixture-dependent and the
+        // request count is not: the whole version is one range either way.
+        Some((base_version, _)) => say!(
+            "version {version} since {base_version}: {} of {} chunks, {} bytes of \
+             payload, {} bytes of file table, {} bytes on disk",
+            pack.len(),
+            whole.len(),
+            pack.payload_len(),
+            pack.snapshot_len(),
+            file_len
+        )?,
+        None => say!(
+            "version {version}: {} chunks, {} bytes of payload, {} bytes of file table, \
+             {} bytes on disk",
+            pack.len(),
+            pack.payload_len(),
+            pack.snapshot_len(),
+            file_len
+        )?,
+    }
 
     Ok(())
 }

@@ -105,15 +105,15 @@ impl Built {
         probe(root, &self.snapshot, store).await.unwrap()
     }
 
-    /// Probe `root`, trusting `trusted`, and count the chunks that were read.
+    /// Probe `root` with `established`, and count the chunks that were read.
     ///
-    /// The count is the point. A trusted file is not merely skipped by the report —
-    /// the chunk backing it must not be opened from the source at all, or the
-    /// fast path saves nothing but arithmetic.
+    /// The count is the point. An accounted-for file is not merely left out of the
+    /// report — the chunk backing it must not be opened from the source at all, or
+    /// the fast path saves nothing but arithmetic.
     async fn probe_skipping_counting(
         &self,
         root: &Path,
-        skip: &BTreeSet<&Path>,
+        established: &lepatch::command::Established<'_>,
     ) -> (lepatch::command::Probed, usize) {
         let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
         let counting = Counting {
@@ -121,7 +121,7 @@ impl Built {
             reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let reads = std::sync::Arc::clone(&counting.reads);
-        let probed = lepatch::command::probe_skipping(root, &self.snapshot, counting, skip)
+        let probed = lepatch::command::probe_skipping(root, &self.snapshot, counting, established)
             .await
             .unwrap();
         (probed, reads.load(std::sync::atomic::Ordering::SeqCst))
@@ -136,25 +136,26 @@ impl Built {
             .collect()
     }
 
-    /// Every file path but the first: one file left to read, the rest skipped.
-    fn paths_except_first(&self) -> BTreeSet<&Path> {
-        self.snapshot
-            .files
-            .iter()
-            .map(|f| f.path.as_path())
-            .skip(1)
-            .collect()
+    /// Every file accounted for, so nothing is read at all.
+    fn all_skipped(&self) -> lepatch::command::Established<'_> {
+        lepatch::command::Established {
+            files: self.paths(),
+            ..Default::default()
+        }
     }
 
-    /// Just the one file, which is what a caller reads when a stat says the rest
-    /// are where it left them.
-    fn only(&self, path: &Path) -> BTreeSet<&Path> {
-        self.snapshot
-            .files
-            .iter()
-            .map(|f| f.path.as_path())
-            .filter(|p| *p == path)
-            .collect()
+    /// Every file accounted for but `keep`, which is then read.
+    fn all_skipped_but(&self, keep: &Path) -> lepatch::command::Established<'_> {
+        lepatch::command::Established {
+            files: self
+                .snapshot
+                .files
+                .iter()
+                .map(|f| f.path.as_path())
+                .filter(|p| *p != keep)
+                .collect(),
+            ..Default::default()
+        }
     }
 
     /// Probe `root` against this version, reading chunks from `pack`.
@@ -165,9 +166,9 @@ impl Built {
     }
 }
 
-/// A chunk every one of whose files is trusted is never read from the source.
+/// A chunk every one of whose files is accounted for is never read from the source.
 ///
-/// The saving, asserted rather than described. Trusting a file has to mean the
+/// The saving, asserted rather than described. Accounting for a file has to mean the
 /// chunk backing it is not fetched, or the fast path costs the same read and saves
 /// only the comparison — and a test that counted findings instead of reads would
 /// pass either way.
@@ -177,12 +178,12 @@ async fn a_chunk_whose_every_file_is_trusted_is_never_read() {
     let client = built.client().await;
 
     let (probed, reads) = built
-        .probe_skipping_counting(&client, &BTreeSet::new())
+        .probe_skipping_counting(&client, &built.all_skipped())
         .await;
 
     assert_eq!(
         reads, 0,
-        "naming no file at all should mean the source is never opened"
+        "accounting for every file should mean the source is never opened"
     );
     assert!(
         probed.mismatched.is_empty() && probed.mislengths.is_empty(),
@@ -206,24 +207,30 @@ async fn a_chunk_spanning_a_skipped_and_an_unskipped_file_is_still_read() {
     let built = tree(6, 200_000).await;
     let client = built.client().await;
 
-    // The baseline: name every file and every chunk is read.
-    let (_, every_chunk_read) = built.probe_skipping_counting(&client, &built.paths()).await;
+    // The baseline: account for nothing and every chunk is read.
+    let (_, every_chunk_read) = built
+        .probe_skipping_counting(&client, &lepatch::command::Established::default())
+        .await;
 
-    // Name none, and nothing is read at all.
+    // Account for all of them, and nothing is read at all.
     let (nothing_read, no_chunk_read) = built
-        .probe_skipping_counting(&client, &BTreeSet::new())
+        .probe_skipping_counting(&client, &built.all_skipped())
         .await;
     assert_eq!(
         no_chunk_read, 0,
-        "the baseline should read nothing when no file is named"
+        "the baseline should read nothing when every file is accounted for"
     );
 
-    // Now name all but one, and count what the one costs.
+    // Now account for all but one, and count what reading that one costs.
+    let first = built.snapshot.files[0].path.as_path();
     let (probed, one_file_read) = built
-        .probe_skipping_counting(&client, &built.paths_except_first())
+        .probe_skipping_counting(&client, &built.all_skipped_but(first))
         .await;
 
-    assert!(one_file_read > 0, "a named file must have its chunks read");
+    assert!(
+        one_file_read > 0,
+        "an unaccounted file must have its chunks read"
+    );
     assert!(
         one_file_read < every_chunk_read,
         "but fewer than reading the whole tree, which was {every_chunk_read}"
@@ -257,22 +264,67 @@ async fn an_unskipped_file_is_checked_as_thoroughly_as_any_other() {
     )
     .unwrap();
 
-    // Skip everything *except* the victim. This is what a caller that had been
-    // fooled by the stat would pass — and the point is that being fooled here costs
+    // Account for everything *except* the victim. This is what a caller whose stat had
+    // been fooled would pass — and the point is that being fooled here costs
     // nothing, because the file is still read properly.
     let (probed, _) = built
-        .probe_skipping_counting(&client, &built.only(victim))
+        .probe_skipping_counting(&client, &built.all_skipped_but(victim))
         .await;
 
     assert!(
         probed.mismatched.iter().any(|m| m.path.ends_with("f2.bin")),
-        "the unskipped file's difference must still be reported, got {:?}",
+        "the unaccounted file's difference must still be reported, got {:?}",
         probed.mismatched
     );
     assert!(
         !probed.is_current(),
-        "so trusting its neighbours does not make the directory current"
+        "so accounting for its neighbours does not make the directory current"
     );
+}
+
+/// A chunk the source cannot supply is held when the caller has accounted for it.
+///
+/// The delta pack's case, and the only reason a delta can be applied at all. A probe
+/// verifies a slice by reading the chunk, so a chunk the source does not hold cannot
+/// be verified — and a delta omits exactly those. So it is never asked for, and is
+/// reported as held on the strength of the caller's claim.
+#[tokio::test]
+async fn a_chunk_the_source_lacks_is_held_when_accounted_for() {
+    let built = tree(4, 150_000).await;
+    let client = built.client().await;
+    let pack = built.pack().await;
+
+    // Every chunk the version needs.
+    let all = built.paths();
+
+    // Two chunks the source will not be able to supply, as a delta pack's would not
+    // be. Taken by reference out of the snapshot so the set borrows rather than
+    // copies, which is what `Established::chunks` holds.
+    let missing: HashSet<&BlobId> = built.snapshot.chunks[..2].iter().collect();
+
+    let established = lepatch::command::Established {
+        files: all,
+        chunks: missing.iter().copied().collect(),
+    };
+
+    let (probed, reads) = built.probe_skipping_counting(&client, &established).await;
+
+    // Files are accounted for, so nothing is read from the source at all.
+    assert_eq!(reads, 0, "an accounted-for file is never read");
+    assert!(
+        probed.is_current(),
+        "and the tree is the version, so nothing is reported"
+    );
+    assert!(
+        !pack.is_empty(),
+        "sanity: the pack has chunks, so this is not vacuous"
+    );
+    for id in &missing {
+        assert!(
+            probed.held.contains(*id),
+            "a chunk accounted for but not read must be held, not merely absent"
+        );
+    }
 }
 
 /// A [`StorageGet`] that counts how many blobs it was asked to open.
