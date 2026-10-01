@@ -30,6 +30,8 @@ pub enum Phase {
     Backup,
     /// Writing a tree back out.
     Restore,
+    /// Writing only the bytes a destination is missing, from a pack.
+    Apply,
     /// Reading every chunk back and hashing it.
     Verify,
 }
@@ -40,6 +42,7 @@ impl Phase {
         match self {
             Self::Backup => "backup",
             Self::Restore => "restore",
+            Self::Apply => "apply",
             Self::Verify => "verify",
         }
     }

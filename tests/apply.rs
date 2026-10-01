@@ -1,0 +1,498 @@
+//! An apply: bringing a directory up to the version a pack carries.
+//!
+//! A restore writes every byte a version needs. An apply writes only the bytes the
+//! destination lacks, and the tests are about that difference being real rather
+//! than cosmetic:
+//!
+//! * the tree ends up equal to the version — the same assertion a round trip
+//!   makes, reached a different way;
+//! * a file with nothing to write is *not opened*, so it keeps its inode and its
+//!   timestamps;
+//! * a **missing file whose chunks are shared with an intact one** is still
+//!   created in full. This is the bug the two answers are separated to prevent: a
+//!   chunk the destination holds elsewhere must not make the destination's own copy
+//!   of it look present;
+//! * a pack that does not hash to its own contents is refused before a byte is
+//!   written, rather than being written over a correct directory;
+//! * an interrupted apply is finished by running it again, because a probe is
+//!   idempotent;
+//! * entries the version does not record are left alone unless pruning was asked
+//!   for, and pruning takes them deepest-first.
+//!
+//! And the one that is the point of all of it: version 6 → 7 over a real change is
+//! a handful of ranges, not a whole tree.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
+
+mod common;
+
+use std::{collections::HashSet, fs, path::Path};
+
+use lepatch::{
+    command::{ApplyOptions, apply},
+    metadata::Snapshot,
+    pack::Pack,
+    storage::{BlobId, BlobStore, Plan, StorageGet},
+};
+use tokio::io::AsyncReadExt;
+
+/// A tree and the versions taken of it.
+struct Versions {
+    dir: tempfile::TempDir,
+    source: std::path::PathBuf,
+    blob: std::path::PathBuf,
+}
+
+impl Versions {
+    /// The source tree, with `files` distinct files.
+    async fn new(files: usize, size: usize) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let source = common::source(dir.path());
+
+        for i in 0..files {
+            fs::write(
+                source.join(format!("f{i}.bin")),
+                common::untagged_stream(u8::try_from(i).unwrap_or(u8::MAX), size + i * 1_000),
+            )
+            .unwrap();
+        }
+
+        let blob = dir.path().join("store");
+        common::run_backup(&source, &blob).await;
+
+        Self { dir, source, blob }
+    }
+
+    /// A pack of the newest version, written into the temp dir.
+    async fn pack(&self) -> Pack {
+        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let (version, id) = store.latest().unwrap();
+        let _ = version;
+
+        let snapshot = read_snapshot(&store, id).await;
+        let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
+
+        Pack::write(
+            &store,
+            &plan,
+            &snapshot,
+            &self.dir.path().join("latest.pack"),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A fresh directory holding the newest version, as a client would have it.
+    async fn client(&self) -> std::path::PathBuf {
+        let client = self.dir.path().join("client");
+        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        common::run_restore(&self.blob, store.latest().unwrap().1, &client).await;
+        client
+    }
+
+    /// Take another version of the current source tree.
+    async fn commit(&self) {
+        common::run_backup(&self.source, &self.blob).await;
+    }
+}
+
+async fn read_snapshot(store: &BlobStore<lepatch::storage::Read>, id: BlobId) -> Snapshot {
+    let mut reader = store.get(&id).await.unwrap();
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).await.unwrap();
+    Snapshot::try_from(buffer.as_slice()).unwrap()
+}
+
+/// The identity of an inode, so "was this file touched" is answerable.
+#[cfg(unix)]
+fn inode(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = fs::metadata(path)?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn inode(_path: &Path) -> std::io::Result<(u64, u64)> {
+    Ok((0, 0))
+}
+
+/// An empty directory becomes the version.
+#[tokio::test]
+async fn an_empty_directory_becomes_the_version() {
+    let versions = Versions::new(4, 120_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+
+    let applied = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    common::assert_same_tree(&versions.source, &target);
+    assert_eq!(applied.held, 0, "an empty directory holds nothing");
+    assert_eq!(applied.files, 4, "every file should have been written");
+    assert!(applied.bytes > 0);
+}
+
+/// A directory already holding the version is left exactly as it is.
+///
+/// Not "ends up the same" — *untouched*. No file is opened, so no inode changes
+/// and no timestamp moves. That is more than a smaller download: it is the
+/// difference between updating a tree someone is working in and rewriting it.
+#[tokio::test]
+async fn a_directory_already_holding_the_version_is_not_touched() {
+    let versions = Versions::new(4, 120_000).await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+
+    let before: Vec<_> = ["f0.bin", "f1.bin", "f2.bin", "f3.bin"]
+        .iter()
+        .map(|name| (name, inode(&target.join(name)).unwrap()))
+        .collect();
+
+    let applied = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(applied.files, 0, "no file should have been written");
+    assert_eq!(applied.bytes, 0);
+    assert_eq!(applied.chunks, 0);
+
+    for (name, identity) in before {
+        assert_eq!(
+            inode(&target.join(name)).unwrap(),
+            identity,
+            "{name} was opened despite having nothing to write"
+        );
+    }
+}
+
+/// One edited file is repaired, and the others keep their inodes.
+///
+/// The property that makes an apply worth having over a restore: the cost is
+/// proportional to what changed, and the blast radius is too.
+#[tokio::test]
+async fn one_edited_file_is_repaired_and_the_rest_are_left_alone() {
+    let versions = Versions::new(5, 150_000).await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+
+    let untouched = ["f0.bin", "f1.bin", "f3.bin", "f4.bin"]
+        .iter()
+        .map(|name| (name, inode(&target.join(name)).unwrap()))
+        .collect::<Vec<_>>();
+
+    let path = target.join("f2.bin");
+    let mut bytes = fs::read(&path).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at..at + 96].copy_from_slice(&common::untagged_stream(77, 96));
+    fs::write(&path, &bytes).unwrap();
+
+    let applied = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    common::assert_same_tree(&versions.source, &target);
+    assert_eq!(applied.files, 1, "only the edited file should be written");
+
+    for (name, identity) in untouched {
+        assert_eq!(
+            inode(&target.join(name)).unwrap(),
+            identity,
+            "{name} was rewritten although it was already correct"
+        );
+    }
+}
+
+/// A file that is missing is created in full, even where its chunks are held
+/// elsewhere.
+///
+/// This is the trap the two probe answers are separated to avoid. `held` is per
+/// chunk and exists to decide what a *fetch* needs — and a chunk the destination
+/// holds correctly in `a.bin` is in it, because the destination does hold it. But
+/// `b.bin` is a *different file* and has none of those bytes. Judge `b.bin` by
+/// `held` and every one of its slices is skipped, and the file is created empty.
+#[tokio::test]
+async fn a_missing_file_is_created_even_where_its_chunks_are_held_elsewhere() {
+    let versions = Versions::new(3, 150_000).await;
+
+    // Two files of identical content, so every chunk of one is held correctly in
+    // the other.
+    fs::write(
+        versions.source.join("dup.bin"),
+        common::untagged_stream(5, 180_000),
+    )
+    .unwrap();
+    fs::write(
+        versions.source.join("twin.bin"),
+        common::untagged_stream(5, 180_000),
+    )
+    .unwrap();
+    versions.commit().await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+
+    // The shared chunks are genuinely held.
+    let store = BlobStore::open_for_reading(&versions.blob).await.unwrap();
+    let snapshot = read_snapshot(&store, store.latest().unwrap().1).await;
+    let probed = lepatch::command::probe(&target, &snapshot, store)
+        .await
+        .unwrap();
+    assert!(
+        probed.held.len() > 5,
+        "the two identical files should share a lot, held {}",
+        probed.held.len()
+    );
+
+    // Now delete one of them. Every chunk it needs is still held — in the other.
+    fs::remove_file(target.join("twin.bin")).unwrap();
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    common::assert_same_tree(&versions.source, &target);
+    assert_eq!(
+        fs::metadata(target.join("twin.bin")).unwrap().len(),
+        versions.source.join("twin.bin").metadata().unwrap().len(),
+        "twin.bin was created but not filled"
+    );
+}
+
+/// A file longer than the version is truncated to it.
+///
+/// A file whose slices all verify but whose length does not match is one whose tail
+/// is not the version's. Leaving it would mean the directory still is not the
+/// version while every probe reports it as held.
+#[tokio::test]
+async fn a_file_longer_than_the_version_is_truncated() {
+    let versions = Versions::new(2, 100_000).await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+
+    let path = target.join("f0.bin");
+    let original = fs::metadata(&path).unwrap().len();
+    fs::write(
+        &path,
+        vec![0xABu8; usize::try_from(original).unwrap() + 4_096],
+    )
+    .unwrap();
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    common::assert_same_tree(&versions.source, &target);
+    assert_eq!(fs::metadata(&path).unwrap().len(), original);
+}
+
+/// A pack whose bytes do not hash to its own contents is refused, before any write.
+///
+/// The probe compares the destination against the chunk's bytes *as the pack gives
+/// them*. So a damaged pack makes every slice look absent — and without this
+/// check, applying one would write its damage straight over a correct directory,
+/// and report success.
+#[tokio::test]
+async fn a_corrupt_pack_is_refused_and_nothing_is_written() {
+    let versions = Versions::new(3, 150_000).await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+
+    // The target already holds the version, so there is nothing to write and the
+    // run should be a no-op... which means the corruption has to be found anyway.
+    // Delete a file so there *is* work, then damage a chunk that filling it needs.
+    let path = target.join("f1.bin");
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+    let at = pack.path().to_path_buf();
+    let mut damaged = fs::read(&at).unwrap();
+    let start = usize::try_from(pack.payload_start()).unwrap() + 64;
+    damaged[start] ^= 0xff;
+    fs::write(&at, &damaged).unwrap();
+
+    let before = common::describe(&target);
+    let broken = Pack::open(&at).unwrap();
+
+    let error = apply(&target, &broken, ApplyOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("do not hash to it"),
+        "a chunk that does not hash to itself should be refused, got: {error}"
+    );
+    assert_eq!(
+        common::describe(&target),
+        before,
+        "a refused apply must leave the destination exactly as it was"
+    );
+}
+
+/// An interrupted apply is finished by running it again.
+///
+/// Not atomic, and not pretending to be: the recovery is that a probe answers the
+/// same way twice, so the second run finds the first run's work and only does what
+/// is left.
+#[tokio::test]
+async fn running_an_apply_twice_converges() {
+    let versions = Versions::new(4, 150_000).await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+
+    let path = target.join("f0.bin");
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 3]).unwrap();
+
+    // A first run that is interrupted partway: emulate it by applying to a
+    // destination holding *part* of the change, then the whole of it.
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    common::assert_same_tree(&versions.source, &target);
+
+    let again = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(again.files, 0, "a second run should find nothing to do");
+    assert_eq!(again.chunks, 0);
+    assert_eq!(again.bytes, 0);
+    assert!(
+        again.held > 0,
+        "and it should now be holding every chunk, holds {}",
+        again.held
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// Entries the version does not record survive, and pruning is what removes them.
+#[tokio::test]
+async fn unrecorded_entries_survive_unless_pruning_was_asked_for() {
+    let versions = Versions::new(3, 100_000).await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+
+    let stray = target.join("scratch");
+    fs::create_dir_all(&stray).unwrap();
+    fs::write(stray.join("notes.txt"), b"mine").unwrap();
+
+    let applied = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(applied.extra, 2, "the file and the directory holding it");
+    assert_eq!(applied.removed, 0);
+    assert!(
+        target.join("scratch/notes.txt").exists(),
+        "an unrecorded entry must not be deleted on a guess"
+    );
+
+    let pruned = apply(&target, &pack, ApplyOptions { prune: true })
+        .await
+        .unwrap();
+
+    assert_eq!(pruned.removed, 2);
+    assert!(
+        !target.join("scratch").exists(),
+        "pruning should have removed the directory too"
+    );
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// Links and directories are laid down the same way a restore lays them.
+///
+/// Reusing the restore's own stages rather than writing an apply-specific copy is
+/// the point: an apply that created links its own way would be a second
+/// implementation to keep in step with the first.
+#[tokio::test]
+async fn directories_and_links_come_out_the_same_as_a_restores() {
+    let versions = Versions::new(2, 80_000).await;
+
+    let nested = versions.source.join("deep/nested/tree");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("leaf.bin"), common::noisy(30_000)).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../../f0.bin", versions.source.join("deep/link")).unwrap();
+    versions.commit().await;
+
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    common::assert_same_tree(&versions.source, &target);
+}
+
+/// The point of all of it: version 6 to 7 costs a delta, not a tree.
+#[tokio::test]
+async fn updating_a_version_costs_a_delta_and_not_a_tree() {
+    let versions = Versions::new(8, 250_000).await;
+
+    // Version 6, as the client has it.
+    let client = versions.client().await;
+    let pack6 = versions.pack().await;
+
+    // Version 7: one file genuinely rewritten, one deleted, one added.
+    fs::write(
+        versions.source.join("f5.bin"),
+        common::untagged_stream(200, 300_000),
+    )
+    .unwrap();
+    fs::remove_file(versions.source.join("f7.bin")).unwrap();
+    fs::write(
+        versions.source.join("new.bin"),
+        common::untagged_stream(201, 20_000),
+    )
+    .unwrap();
+    versions.commit().await;
+
+    let pack7 = versions.pack().await;
+
+    // What a client holding version 6 would have to fetch.
+    let held6: HashSet<BlobId> = pack6.iter().map(|c| c.id).collect();
+    let transfer = pack7.needed_bytes(&held6);
+    assert!(
+        transfer < pack7.payload_len() / 2,
+        "one rewritten file should need well under half the new payload, needs \
+         {transfer} of {}",
+        pack7.payload_len()
+    );
+
+    // Apply it.
+    let applied = apply(&client, &pack7, ApplyOptions { prune: true })
+        .await
+        .unwrap();
+
+    common::assert_same_tree(&versions.source, &client);
+    assert!(
+        applied.bytes < pack7.payload_len(),
+        "an apply writes less than the pack holds, since some was already there"
+    );
+    assert!(
+        !client.join("f7.bin").exists(),
+        "pruning should have removed the file version 7 dropped"
+    );
+    assert_eq!(applied.removed, 1);
+}
+
+/// A file the version dropped stays, without pruning — and that is the right
+/// default, stated as a test.
+#[tokio::test]
+async fn a_file_the_version_dropped_stays_without_pruning() {
+    let versions = Versions::new(3, 100_000).await;
+    let client = versions.client().await;
+
+    fs::remove_file(versions.source.join("f2.bin")).unwrap();
+    versions.commit().await;
+    let pack = versions.pack().await;
+
+    apply(&client, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+
+    assert!(
+        client.join("f2.bin").exists(),
+        "a file the version no longer records is the user's call, not this tool's"
+    );
+}

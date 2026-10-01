@@ -252,17 +252,14 @@ pub(crate) async fn run_restore_version(blob: &Path, destination: &Path, version
     restore(destination, snapshot, storage).await.unwrap();
 }
 
-/// Back up `source`, restore it, and assert the two trees are identical.
-pub(crate) async fn assert_round_trip(source: &Path) {
-    let dir = tempfile::tempdir().unwrap();
-    let blob = dir.path().join("store.bin");
-    let committed = run_backup(source, &blob).await;
-    let destination = dir.path().join("restored");
-
-    run_restore(&blob, committed.snapshot, &destination).await;
-
-    let before = describe(source);
-    let after = describe(&destination);
+/// Assert that two trees are identical, naming every difference.
+///
+/// Shared by the round-trip tests and the apply tests, which assert the same thing
+/// by different routes: `assert_round_trip` is "back this up and get it back",
+/// and an apply test is "bring this directory up to that version". Both end here.
+pub(crate) fn assert_same_tree(left: &Path, right: &Path) {
+    let before = describe(left);
+    let after = describe(right);
 
     let mut problems = Vec::new();
     for (path, expected) in &before {
@@ -296,4 +293,16 @@ pub(crate) async fn assert_round_trip(source: &Path) {
         "round trip did not reproduce the source tree:\n  {}",
         problems.join("\n  ")
     );
+}
+
+/// Back up `source`, restore it, and assert the two trees are identical.
+pub(crate) async fn assert_round_trip(source: &Path) {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store.bin");
+    let committed = run_backup(source, &blob).await;
+    let destination = dir.path().join("restored");
+
+    run_restore(&blob, committed.snapshot, &destination).await;
+
+    assert_same_tree(source, &destination);
 }

@@ -4,12 +4,14 @@
 use std::io;
 
 use crate::{metadata, storage};
+mod apply;
 mod backup;
 mod pipeline;
 mod probe;
 mod restore;
 mod verify;
 
+pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{Committed, Options, backup};
 pub use probe::{Mismatch, Probed, Unheld, probe};
 pub use restore::{

@@ -425,7 +425,7 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
 /// that escapes the root refused *before* the destination is touched at all, which
 /// is the property `tests/containment.rs` pins — so the parallelism is applied to
 /// the syscall and not to the check.
-async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+pub(crate) async fn restore_directories(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     let mut paths = Vec::with_capacity(snapshot.dirs.len());
     for dir in &snapshot.dirs {
         paths.push(resolve(root, &dir.path, "a directory")?);
@@ -653,7 +653,13 @@ async fn write_file<S: storage::StorageGet>(job: RestoreJob, storage: Arc<S>) ->
 }
 
 /// Recreate hard links and symbolic links.
-fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+///
+/// Shared with [`super::apply`], which creates the same links from the same
+/// version. Only the *files* differ between the two — a restore writes every byte
+/// and an apply writes the ones a destination lacks — so this stage is the same
+/// work in both and duplicating it would be two places to keep in step for no
+/// reason.
+pub(crate) fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     for link in &snapshot.links {
         // Restoring over an existing tree must not trip over the old entry, so
         // each arm removes before it creates. Two arms rather than one `match` on
@@ -698,7 +704,12 @@ fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
 }
 
 /// Apply permission bits and modification times, files before directories.
-fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
+///
+/// Shared with [`super::apply`] for the same reason [`restore_links`] is. It is
+/// also why an apply prunes *before* calling this: removing an entry updates the
+/// modification time of the directory that held it, so a directory's time can only
+/// be set once nothing else is going to change it.
+pub(crate) fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
     for file in &snapshot.files {
         let path = resolve(root, &file.path, "a file")?;
         file.attrs.apply(&path)?;
@@ -713,7 +724,12 @@ fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<()> {
 }
 
 /// Remove whatever currently occupies `path`, if anything.
-fn remove_existing(path: &Path) -> io::Result<()> {
+///
+/// Shared with [`super::apply`], which prunes the entries a version does not
+/// record with it — and which needs exactly this behaviour, because the thing
+/// occupying a recorded path may be a directory, a file or a link, and each has to
+/// go the way its own kind does.
+pub(crate) fn remove_existing(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
         Ok(_) => fs::remove_file(path),
