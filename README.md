@@ -438,14 +438,21 @@ and a store written by version 1 is *refused* rather than misparsed.
 
 ## What is preserved
 
-Regular files, directories, symbolic links, hard links, permission bits and
-modification times. Empty files and empty directories survive. Paths that are
+Regular files, directories, symbolic links, hard links, ownership, permission bits
+and modification times. Empty files and empty directories survive. Paths that are
 not valid UTF-8 are stored as raw bytes rather than aborting the backup.
+
+Ownership is the owning **user and group id**, not a name: a name means nothing on
+any machine but the one it was read from, so recording one would be storing a
+portability bug next to the answer. Changing an owner takes privilege, so a restore
+by an unprivileged user cannot set one on a file it does not own — that is reported
+on stderr, and everything else about the entry is still applied. See
+[Ownership](#ownership) below.
 
 ## What is not preserved
 
-Ownership, ACLs, extended attributes, and hard-link relationships that point
-outside the tree being backed up.
+ACLs, extended attributes, and hard-link relationships that point outside the tree
+being backed up.
 
 Device nodes, named pipes and sockets are **skipped, and reported**. They are not
 skipped silently and they are not read: opening a FIFO for reading blocks until a
@@ -453,6 +460,35 @@ writer appears, so a tree containing one would hang the run — and a Ctrl-C wou
 not save it, because the signal is caught by the handler that releases claims and
 that handler cannot unwind a thread parked in a read. The run says which paths it
 left out, so a tree holding one is visible rather than quietly incomplete.
+
+## Ownership
+
+Each file and directory records its owning user and group as ids. On restore the
+owner is applied **before the mode**, because Linux clears a file's set-user-ID and
+set-group-ID bits when its owner changes — so the other order silently strips setuid
+from everything restored, and does it invisibly: the bytes match, the lengths match,
+and the only thing wrong is a bit nobody was looking for. Getting this right is the
+entire point of recording ownership; a system restore has to bring back a working
+`su` and `passwd`.
+
+Changing an owner takes privilege. An unprivileged restore of a tree containing
+files it does not own cannot set them, which is the ordinary case rather than an edge
+one, so it is reported rather than refused:
+
+```console
+$ lepatch restore /tmp/out set
+note: 2 entries in this restore recorded an owner this process could not set, which
+takes privilege; their contents, permissions and times are correct. Re-run as root to
+set them
+```
+
+The restore still succeeds. It is not refused, because refusing would leave a tree
+half written with the offending file already on disk under the wrong owner and
+nothing to retry — which is the outcome reporting an owner was supposed to prevent.
+
+Snapshots taken before ownership was recorded are still readable, and read back with
+no owner. That is a fact about them rather than a gap: they recorded nothing about
+ownership, so they had none to record.
 
 ## Failure behaviour
 
