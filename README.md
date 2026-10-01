@@ -251,6 +251,29 @@ than one of them believed: the index is what locates chunks, so if the two disag
 one is wrong, and picking the wrong one produces a pack that reads as valid and hands
 out ranges covering the wrong bytes.
 
+#### Delta packs
+
+`lepatch pack <set> <out> --from 7` writes a pack carrying version 8's file table
+and only the chunks a holder of version 7 lacks. `--full` (the default when no
+`--from` is given) writes the whole version.
+
+A chunk is left out only when the base places *every* one of the target's slices for
+it identically — same path, same offset, same length. Comparing chunk hashes instead
+would be wrong with shared content: a chunk the base holds somewhere is not thereby
+held everywhere, and a new file whose content repeats something already in the tree
+produces exactly that. Such a chunk is sent, even though the base has the bytes.
+
+**A delta records what it assumes, and `apply` checks it.** The header names the base
+version, and an apply refuses unless the directory's record says it is holding
+exactly that. The reason is structural: a probe verifies a slice by reading the
+chunk's bytes, and a delta holds precisely the chunks its reader is asserted to have,
+so nothing in the delta can confirm it. Refusing is the only honest answer —
+applying what it happens to contain would leave a directory that is neither version
+and report success.
+
+The file-table side is unaffected: a delta carries the whole version's snapshot, so a
+client can lay out every file from the one file it was sent.
+
 #### Applying a pack
 
 `lepatch apply <pack> <directory>` brings a directory up to the version, and
@@ -307,6 +330,11 @@ A file that changed but kept both its length and its modification time is invisi
 to this, and no stat-based scheme can see it. `apply --recheck` ignores the record
 and reads the tree, for when something else has been restoring timestamps. It is
 slower and reaches the same answer.
+
+The record is also what makes a delta pack applicable: a delta names the version it
+assumes, and the record beside the destination is how the client establishes that it
+holds it. Without one, or with one naming another version, `apply` refuses rather
+than guessing.
 
 **Pruning is opt-in.** An entry the version does not record is as likely to be the
 user's own work as a leftover from an older version, and nothing in the version can
