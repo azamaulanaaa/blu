@@ -1100,7 +1100,16 @@ async fn run_apply(
         "applying pack"
     );
 
-    let applied = apply(destination, &pack, ApplyOptions { prune, recheck }).await?;
+    let applied = apply(
+        destination,
+        &pack,
+        ApplyOptions {
+            prune,
+            recheck,
+            dry_run: false,
+        },
+    )
+    .await?;
 
     tracing::info!(
         held = applied.held,

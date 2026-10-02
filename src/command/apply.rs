@@ -93,6 +93,20 @@ pub struct Options {
     /// a full read of the tree — which is the honest cost of not believing a record
     /// of a directory that has been changing since it was written.
     pub recheck: bool,
+
+    /// Work out what an apply would change, and change none of it.
+    ///
+    /// Off by default. A dry run here does the expensive half and skips the cheap
+    /// half: it probes the destination against the version exactly as a real apply
+    /// would, and reads every chunk it is about to write back out of the pack to
+    /// check it hashes to what it is addressed by. What it does not do is open a
+    /// file, create a directory, set an attribute, prune an entry or record the
+    /// manifest an apply leaves beside the destination.
+    ///
+    /// So it costs as much as the apply it replaces and mutates nothing, which is
+    /// the whole reason it exists: the figure an apply prints *after* it has
+    /// already rewritten the tree is the one worth having before.
+    pub dry_run: bool,
 }
 
 /// What an [`apply`] run changed.
@@ -146,6 +160,12 @@ pub struct Applied {
     /// Every one of them, for an unprivileged caller applying to files it does not
     /// own. Their contents, modes and times are still correct; only the owner is not
     /// what the version recorded.
+    ///
+    /// On a dry run this is a bound rather than a count: it is how many entries
+    /// record an owner at all, which is the most that could fail to have it set.
+    /// Whether an owner *can* be set is only knowable by setting it, and reporting
+    /// zero would claim a tree could be fully owned on the strength of a run that
+    /// touched nothing.
     pub unowned: u64,
 }
 
@@ -200,6 +220,22 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     // be written over a correct directory, because a probe against a damaged pack
     // finds everything absent.
     verify_delta(&probed, pack).await?;
+
+    // And everything after here is a write, or a consequence of one. The counts
+    // the run would have reported are already in hand — the probe found every
+    // slice that is not right, and `verify_delta` has read the bytes behind them —
+    // so they are derived below rather than by doing the work.
+    if options.dry_run {
+        let wanted = DryRun { fetched, ranges };
+        return Ok(would_write(
+            root,
+            &snapshot,
+            &probed,
+            &established,
+            options,
+            &wanted,
+        ));
+    }
 
     let wanted: HashSet<(&Path, u64)> = probed
         .mismatched
@@ -268,6 +304,97 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
         extra: probed.extra.len().try_into().unwrap_or(0),
         unowned,
     })
+}
+
+/// The two figures a pack would be fetched with, carried into the plan so it can
+/// report them without asking the pack again.
+struct DryRun {
+    fetched: u64,
+    ranges: usize,
+}
+
+/// What an apply would change, counted from the probe it already took.
+///
+/// Every figure is the one a real run reports, and each comes from the same place
+/// the write stage takes it from. [`Probed::mismatched`] is the set of recorded
+/// slices whose bytes are not currently the right bytes, so the sum of their
+/// lengths is what `write_files` would write and the set of their chunks is what it
+/// would put on disk. The two counters above them are the ones a fetch would be
+/// sized by, and they come off the pack rather than off the destination.
+///
+/// The file count is the subtler one, because `write_files` opens a file for a
+/// reason beyond having something to write: a file with no mismatched slice but the
+/// wrong length is still opened, and truncated to the version's length. The same
+/// two conditions are applied here in the same order, or a plan would report fewer
+/// files than the apply would touch.
+fn would_write(
+    root: &Path,
+    snapshot: &metadata::Snapshot,
+    probed: &Probed,
+    established: &super::probe::Established<'_>,
+    options: Options,
+    transfer: &DryRun,
+) -> Applied {
+    let mut chunks: HashSet<BlobId> = HashSet::new();
+    let mut bytes = 0u64;
+    let mut mismatched_in: HashSet<&Path> = HashSet::new();
+
+    for mismatch in &probed.mismatched {
+        chunks.insert(mismatch.expected);
+        bytes = bytes.saturating_add(mismatch.length);
+        mismatched_in.insert(mismatch.path.as_path());
+    }
+
+    let mut files = 0u64;
+    for file in &snapshot.files {
+        // `write_files` skips a file with nothing to write and the right length
+        // without opening it, and opens every other one. Same test, same order.
+        if mismatched_in.contains(file.path.as_path()) || needs_touching(root, &file.path, file.len)
+        {
+            files = files.saturating_add(1);
+        }
+    }
+
+    // Not derived from the mismatch set, and for a reason worth stating: this is
+    // the one figure an apply reports about entries it does *not* touch. There are
+    // none of those here, so it is the length of what a `--prune` would remove —
+    // which is what the same run would report.
+    let extra = u64::try_from(probed.extra.len()).unwrap_or(0);
+
+    Applied {
+        held: u64::try_from(probed.held.len()).unwrap_or(0),
+        chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
+        fetched: transfer.fetched,
+        ranges: transfer.ranges,
+        files,
+        trusted: u64::try_from(established.files.len()).unwrap_or(0),
+        written: u64::try_from(chunks.len()).unwrap_or(0),
+        bytes,
+        removed: if options.prune { extra } else { 0 },
+        extra,
+        unowned: owners(snapshot),
+    }
+}
+
+/// How many entries a version records an owner for.
+///
+/// The most that could fail to have it set, and the reason [`Applied::unowned`]
+/// carries a bound rather than a count on a dry run: whether an owner can be set is
+/// only knowable by setting it, and every entry that would be tried is named here
+/// before any of them is.
+fn owners(snapshot: &metadata::Snapshot) -> u64 {
+    let files = snapshot
+        .files
+        .iter()
+        .filter(|file| file.attrs.owner.is_some())
+        .count();
+    let dirs = snapshot
+        .dirs
+        .iter()
+        .filter(|dir| dir.attrs.owner.is_some())
+        .count();
+
+    u64::try_from(files.saturating_add(dirs)).unwrap_or(0)
 }
 
 /// Record what this apply left, beside the destination.
