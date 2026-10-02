@@ -3433,12 +3433,12 @@ fn a_delta_merges_into_a_set_holding_its_base() {
         report.contains("version 2"),
         "the delta should become the set's next version: {report}"
     );
-    let fresh = figure(&report, ", ").and_then(|_| figure(&report, " new, "));
-    let whole = figure(&report, ": ").unwrap_or(0);
+    let chunks = figure(&report, ": ");
+    let fresh = figure(&report, " new, ");
     assert!(
-        fresh.unwrap_or(0) < whole,
+        matches!((chunks, fresh), (Some(chunks), Some(fresh)) if fresh < chunks),
         "a delta of one rewritten file out of seven should not store every chunk: \
-         {fresh:?} of {whole:?} in {report}"
+         {fresh:?} of {chunks:?} in {report}"
     );
 
     set_contents(dir.path(), "received", 2);
