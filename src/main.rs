@@ -1587,9 +1587,15 @@ fn warn_behind_tip<W: storage::WriteMode, C: storage::Compressor>(
     store: &storage::BlobStore<W, C>,
 ) -> std::io::Result<()> {
     let versions = store.versions()?;
-    // An empty set has no tip to be behind, and a set whose commit list could not
-    // be counted past `u32` has no number to compare against either; both answer
-    // "there is nothing here to be stale about".
+    // Bounded by the call above, which is why the `try_from` cannot fail here:
+    // `versions` returns an error rather than a count it cannot represent, so a
+    // store with more versions than `u32` has already been refused by the `?` on
+    // the line above. The fallback is dead code kept for the type, not a second
+    // answer to a case it once handled — an uncountable set is an error to
+    // propagate, not a set with a tip at the maximum.
+    //
+    // `try_from` rather than `as u32`, which `clippy::pedantic`'s
+    // `cast_possible_truncation` denies.
     let tip = u32::try_from(versions.len()).unwrap_or(u32::MAX);
     let from = pack.version();
 
