@@ -444,7 +444,7 @@ change, and writes nothing:
 
 ```console
 $ lepatch backup ~/Documents docs --dry-run
-dry run: version 4 would be committed, snapshot 5b525e0f...
+dry run: version 4 would be committed, snapshot 5b525e0f9a1c4e2d8b6f0a3c5d7e91b2c4a6e8d0f1b3c5d7e9a1c3e5d7f9b1d3
 dry run: 128 files, 14 dirs, 2 links, 3104 chunks (12 new, 3092 already held), 48210 bytes to store
 
 $ lepatch restore /tmp/docs-restored docs --dry-run
