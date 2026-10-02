@@ -350,7 +350,11 @@ impl Compression {
 mod compression_tests {
     use std::borrow::Cow;
 
-    use super::{Codec, Compression};
+    use super::{Codec, Compression, Decompressor, Zstd};
+
+    /// Bytes that are not a frame at all: the first thing a damaged or
+    /// hand-edited record can be.
+    const NOT_A_FRAME: &[u8] = b"these bytes are not a zstd frame";
 
     /// A payload the compressor cannot make smaller falls through untouched.
     ///
@@ -418,6 +422,93 @@ mod compression_tests {
         assert!(
             matches!(stored, Cow::Owned(_)),
             "a compressed payload owns its frame"
+        );
+    }
+
+    /// The message a caller sees when the stored bytes are not a frame.
+    ///
+    /// The texts in [`Zstd`] are the store's report of a damaged record, and a
+    /// restore is the only thing standing between a backup and a silently wrong
+    /// file — so they are part of what this crate promises. Asserting them here
+    /// is what stops that being true only because nobody has reworded them yet.
+    ///
+    /// `InvalidData` and the "not a readable zstd frame" wording are both
+    /// asserted: the kind is what a caller can branch on, and zstd's own `{e}` is
+    /// part of the message because it is what says which frame complaint this was.
+    ///
+    /// The panic path below it — a decode that panics inside `spawn_blocking` —
+    /// is deliberately not covered, because it cannot be reached from a test
+    /// without contrivance: it needs `zstd::bulk::decompress` itself to panic, and
+    /// this API gives a caller no way to arrange that. It is mapped to
+    /// `"decompression panicked: …"` so a panic cannot take the run down with it,
+    /// not because a test gets there.
+    #[tokio::test]
+    async fn bytes_that_are_not_a_frame_are_reported_as_such() {
+        let err = Zstd
+            .decompress(NOT_A_FRAME.to_vec(), 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a payload that is not a frame is damaged data, not an I/O failure"
+        );
+        assert!(
+            err.to_string()
+                .contains("a compressed payload is not a readable zstd frame:"),
+            "the message should name what was wrong and with which codec, and says {:?}",
+            err.to_string()
+        );
+    }
+
+    /// A frame that decodes to the wrong number of bytes is refused, by name.
+    ///
+    /// The check this is, on a frame that is otherwise perfectly good: a header
+    /// that lies about the payload's length would otherwise decode to something,
+    /// and a restore would write it out as if it were the file.
+    #[tokio::test]
+    async fn a_frame_that_decodes_to_the_wrong_size_is_refused_by_name() {
+        let raw = vec![b'a'; 64 * 1024];
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let short = u64::try_from(raw.len() - 1).unwrap();
+
+        let err = Zstd.decompress(frame, short).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("declares 65536 bytes but its record claims 65535"),
+            "the message should say what the frame declares and what the record claims, \
+             and says {:?}",
+            err.to_string()
+        );
+    }
+
+    /// A frame that declares no size at all is refused rather than decoded blind.
+    ///
+    /// A *streaming* frame is what looks like this: the encoder did not know the
+    /// length up front, so the header does not carry it. Nothing this crate
+    /// writes produces one, which is exactly why accepting one would mean decoding
+    /// a record with nothing to check the answer against.
+    #[tokio::test]
+    async fn a_frame_that_declares_no_size_is_refused_by_name() {
+        let mut frame = Vec::new();
+        zstd::stream::copy_encode(
+            &b"the quick brown fox jumps over the lazy dog. "[..],
+            &mut frame,
+            1,
+        )
+        .unwrap();
+
+        let err = Zstd.decompress(frame, 44).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("does not say how many bytes it decodes to"),
+            "a frame with no declared size should be refused in those words, and says {:?}",
+            err.to_string()
         );
     }
 
