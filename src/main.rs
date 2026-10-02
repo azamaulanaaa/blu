@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use lepatch::{
     command::{
-        ApplyOptions, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, apply, backup, load_snapshot,
-        lock_destination, restore, verify,
+        ApplyOptions, BackupPlan, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan, apply,
+        backup, backup_plan, load_snapshot, lock_destination, restore, restore_plan, verify,
     },
     layout::IndexSet,
     pack::Pack,
@@ -64,6 +64,17 @@ enum Command {
         /// under a different profile, so a set changed mid-life wants re-taking.
         #[arg(long, value_name = "PROFILE")]
         chunk_profile: Option<reader::ChunkerProfile>,
+        /// Say what this backup would store, and store none of it.
+        ///
+        /// Affects what is written and nothing else: the tree is still walked, cut
+        /// into chunks and hashed, and every chunk still compared against what the
+        /// set already holds — so a dry run costs what a backup costs and reports
+        /// the numbers a backup would have printed. Nothing is created: no segment,
+        /// no index file, no lock, and not the set's directory if it is not there
+        /// yet. No claim is taken either, so a plan can be taken against a set a
+        /// backup currently holds.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Rebuild the per-version index files from the store's commit records.
     ///
@@ -71,6 +82,14 @@ enum Command {
     Reindex {
         /// Base path of the backup set to rebuild.
         name: std::path::PathBuf,
+        /// Say how many index files would be written, and write none of them.
+        ///
+        /// Affects nothing but the writing: the set is still opened and scanned, so
+        /// the version count is the store's own. A torn tail is *not* reclaimed —
+        /// repairing one is the point of a real reindex, and a dry run repairs
+        /// nothing — and no lock is taken, because taking one creates a file.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List the versions a backup set holds, oldest first.
     ///
@@ -100,6 +119,17 @@ enum Command {
         /// left other files, and points at `--clean`.
         #[arg(long)]
         clean: bool,
+        /// Say what this restore would write, and write none of it.
+        ///
+        /// Affects what is written and nothing else: the version is still read out
+        /// of the set and every chunk still checked against the hash it is
+        /// addressed by, so a dry run refuses exactly what a restore refuses and
+        /// costs what one costs. Nothing is created and nothing is removed — no
+        /// file, no directory, no attribute, no `.partial` beside the destination —
+        /// and no claim is taken there, which is what lets a plan be taken against
+        /// a destination another restore is using.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Check a snapshot's stored chunks against their recorded hashes.
     Verify {
@@ -143,6 +173,15 @@ enum Command {
         /// and correct for any client — which is what makes it the one worth caching.
         #[arg(long)]
         full: bool,
+        /// Say what this pack would hold, and write none of it.
+        ///
+        /// Affects the file and nothing else: the version is still resolved and
+        /// every chunk still located, so the counts and the byte totals are the
+        /// pack's own. `--out` is neither created nor overwritten. The size on disk
+        /// and the content hash are not reported, because both are properties of a
+        /// file this run does not write.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Bring a directory up to the version a pack carries, writing only what is
     /// missing.
@@ -178,6 +217,16 @@ enum Command {
         /// by something that restores timestamps.
         #[arg(long)]
         recheck: bool,
+        /// Say what this apply would change, and change none of it.
+        ///
+        /// Affects what is written and nothing else: the destination is still
+        /// probed against the version, and every chunk about to be written is still
+        /// read out of the pack and hashed, so a damaged pack is still refused and
+        /// the figures are the ones an apply would have printed. Nothing is created
+        /// and nothing is removed — no file is opened, no entry pruned, and no
+        /// manifest recorded beside the destination — and no claim is taken there.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -337,17 +386,19 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             segment_size,
             compression_level,
             chunk_profile,
+            dry_run,
         } => {
             let compression = compression_policy(compression_level);
             let profile = chunk_profile.unwrap_or_default();
-            run_backup(&source, &name, segment_size, compression, profile).await
+            run_backup(&source, &name, segment_size, compression, profile, dry_run).await
         }
         Command::Restore {
             destination,
             name,
             version,
             clean,
-        } => run_restore(&destination, &name, version, clean).await,
+            dry_run,
+        } => run_restore(&destination, &name, version, clean, dry_run).await,
         Command::Verify { name, version } => run_verify(&name, version).await,
         Command::Pack {
             name,
@@ -355,14 +406,16 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             version,
             from,
             full,
-        } => run_pack(&name, &out, version, effective_from(from, full)).await,
+            dry_run,
+        } => run_pack(&name, &out, version, effective_from(from, full), dry_run).await,
         Command::Apply {
             pack,
             destination,
             prune,
             recheck,
-        } => run_apply(&pack, &destination, prune, recheck).await,
-        Command::Reindex { name } => run_reindex(&name).await,
+            dry_run,
+        } => run_apply(&pack, &destination, prune, recheck, dry_run).await,
+        Command::Reindex { name, dry_run } => run_reindex(&name, dry_run).await,
         Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
     }
 }
@@ -454,7 +507,12 @@ fn select_version(
 /// Opened for writing, which is what makes this a repair: a torn tail in the last
 /// segment is reclaimed on the way, and the lock is taken so no run is appending
 /// while the records are read.
-async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
+///
+/// A dry run takes neither. Both of them are writes — the lock is a file, and
+/// reclaiming a tail is the repair — and the version count it reports is the same
+/// one either way, because the count is read out of the commit records rather than
+/// taken from what the open did to the set.
+async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
     // Before taking the lock and before opening: opening for writing *creates* a
@@ -471,7 +529,31 @@ async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
         ));
     }
 
-    let _lock = set.lock()?;
+    let _lock = if dry_run { None } else { Some(set.lock()?) };
+
+    if dry_run {
+        let store = storage::BlobStore::open_for_reading(set.base()).await?;
+        let versions = store.versions()?;
+
+        // `write_index_files` writes one file per version whatever is already
+        // there — they are a cache, and rewriting one is how it is brought back to
+        // date — so the number a plan reports is the number a real run writes.
+        let existing = set.indexed_versions()?.len();
+
+        tracing::info!(name = %set.base().display(), "dry run: nothing was written");
+
+        say!(
+            "dry run: {} in {}",
+            plural_versions(versions.len()),
+            set.base().display()
+        )?;
+        say!(
+            "dry run: {} index file(s) would be written, {existing} of them already there",
+            versions.len()
+        )?;
+
+        return Ok(());
+    }
 
     let store = storage::BlobStore::open_for_writing(
         set.base(),
@@ -479,8 +561,8 @@ async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
         storage::Compression::default(),
     )
     .await?;
-    let versions = store.versions()?;
 
+    let versions = store.versions()?;
     let written = store.write_index_files()?;
 
     tracing::info!(
@@ -491,6 +573,15 @@ async fn run_reindex(name: &std::path::Path) -> std::io::Result<()> {
     );
 
     Ok(())
+}
+
+/// "1 version" or "3 versions", for a line that reports a count.
+fn plural_versions(count: usize) -> String {
+    if count == 1 {
+        "1 version".to_string()
+    } else {
+        format!("{count} versions")
+    }
 }
 
 /// List the versions a backup set holds, oldest first, each with its snapshot hash.
@@ -580,18 +671,27 @@ fn compression_policy(level: Option<u8>) -> storage::Compression {
 /// comes next, and what is already there is never rewritten — so it is logged
 /// with the sizes it resolved to rather than only as the name that was typed,
 /// since the name is a shorthand for three numbers a user cannot see.
+///
+/// A dry run does the whole of that and writes none of it: no lock, no segment,
+/// no index file, and not the set's directory when there is not one already. The
+/// set is opened for reading and only if it is there — opening for writing to
+/// find out whether a set exists would create it, which is the one thing a dry
+/// run must never do — so the first backup of a location plans as an all-new
+/// version rather than failing.
 async fn run_backup(
     source: &std::path::Path,
     name: &std::path::Path,
     segment_size: Option<u64>,
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
+    dry_run: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
     // The store is append-only with one commit point at the end of a run, so two
-    // runs interleaving would publish versions over each other.
-    let _lock = set.lock()?;
+    // runs interleaving would publish versions over each other. A dry run takes no
+    // lock: the claim is a file, and a file is a write.
+    let _lock = if dry_run { None } else { Some(set.lock()?) };
 
     let limit = match segment_size {
         Some(bytes) => storage::SegmentLimit::new(bytes),
@@ -599,18 +699,17 @@ async fn run_backup(
     };
     let lock_path = set.lock_path();
 
+    let segments = set.segments()?;
+
     // The set and its lock live next to the tree being read and grow while it is
     // read, so neither may be swept into the backup.
     let mut exclude = vec![lock_path];
-    for segment in set.segments()? {
-        exclude.push(segment);
+    for segment in &segments {
+        exclude.push(segment.clone());
     }
     // A segment this run has yet to create is named too: segment 0 of a fresh set,
     // and the one a roll-over opens during the run.
-    for segment in 0..u32::try_from(set.segments()?.len())
-        .unwrap_or(0)
-        .saturating_add(4)
-    {
+    for segment in 0..u32::try_from(segments.len()).unwrap_or(0).saturating_add(4) {
         exclude.push(set.segment_path(segment));
     }
 
@@ -627,6 +726,7 @@ async fn run_backup(
         min = chunker.min_size,
         avg = chunker.avg_size,
         max = chunker.max_size,
+        dry_run,
         "chunking this tree"
     );
 
@@ -635,6 +735,18 @@ async fn run_backup(
         chunker,
         ..Options::default()
     };
+
+    if dry_run {
+        let existing = if segments.is_empty() {
+            None
+        } else {
+            Some(storage::BlobStore::open_for_reading(set.base()).await?)
+        };
+        let fresh = existing.is_none();
+
+        let plan = backup_plan(source, options, existing).await?;
+        return report_backup_plan(&set, &plan, fresh);
+    }
 
     // Opening discards a torn tail in the last segment: an unfinished run, not data.
     let store = storage::BlobStore::open_for_writing(set.base(), limit, compression).await?;
@@ -663,12 +775,54 @@ async fn run_backup(
     Ok(())
 }
 
+/// Say what a backup would have stored, on stdout, and that it stored nothing.
+///
+/// On stdout rather than the log because this is the whole output of the run: a
+/// dry run produces no progress worth following and no summary about work that
+/// happened — what it produces is a report, and a report is data.
+fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io::Result<()> {
+    tracing::info!(name = %set.base().display(), "dry run: nothing was written");
+
+    say!(
+        "dry run: version {} would be committed, snapshot {}",
+        plan.version,
+        plan.snapshot
+    )?;
+    say!(
+        "dry run: {} files, {} dirs, {} links, {} chunks ({} new, {} already held), \
+         {} bytes to store",
+        plan.files,
+        plan.dirs,
+        plan.links,
+        plan.chunks,
+        plan.fresh,
+        plan.held,
+        plan.bytes
+    )?;
+
+    if fresh {
+        say!(
+            "dry run: there is no backup set at {} yet, so this would create it",
+            set.base().display()
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Rebuild a tree from the set at `name` into `destination`.
+///
+/// A dry run reads the version and checks it exactly as a restore does, and then
+/// stops. Nothing is created — no file, no directory, no attribute, no
+/// `.partial` beside the destination — and nothing is removed, which under
+/// `--clean` is the part worth being sure about. No claim is taken either, so a
+/// plan can be taken against a destination a restore is currently using.
 async fn run_restore(
     destination: &std::path::Path,
     name: &std::path::Path,
     version: Option<u32>,
     clean: bool,
+    dry_run: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
@@ -679,6 +833,7 @@ async fn run_restore(
         version,
         destination = %destination.display(),
         clean,
+        dry_run,
         "restoring"
     );
 
@@ -687,6 +842,17 @@ async fn run_restore(
     // happens after, so two runs cannot both decide to empty it.
     if clean {
         check_clean_destination(destination, &set)?;
+    }
+
+    // Before the claim rather than instead of it: a dry run takes none, and this
+    // is where the claim would be taken.
+    if dry_run {
+        return report_restore_plan(
+            version,
+            destination,
+            clean,
+            restore_plan(snapshot, store).await?,
+        );
     }
 
     // Held for the whole run, so two restores into one destination cannot
@@ -793,6 +959,44 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
     }
 
     report_restored(&restored);
+    Ok(())
+}
+
+/// Say what a restore would have written, on stdout, and that it wrote nothing.
+fn report_restore_plan(
+    version: u32,
+    destination: &std::path::Path,
+    clean: bool,
+    plan: RestorePlan,
+) -> std::io::Result<()> {
+    tracing::info!(destination = %destination.display(), "dry run: nothing was written");
+
+    say!("dry run: version {version} into {}", destination.display())?;
+    say!(
+        "dry run: {} files, {} dirs, {} links, {} chunks, {} bytes would be written",
+        plan.files,
+        plan.dirs,
+        plan.links,
+        plan.chunks,
+        plan.bytes
+    )?;
+
+    // Both forms say what would happen to everything the snapshot does not record,
+    // because under `--clean` that is the whole of the destructive part and a plan
+    // that did not mention it would be the least useful thing it could do.
+    if clean {
+        say!(
+            "dry run: {} would be emptied first, and the tree assembled beside it",
+            destination.display()
+        )?;
+    } else {
+        say!(
+            "dry run: anything already in {} would be left alone; pass --clean for an \
+             exact copy",
+            destination.display()
+        )?;
+    }
+
     Ok(())
 }
 
@@ -987,11 +1191,18 @@ fn effective_from(from: Option<u32>, full: bool) -> Option<u32> {
 /// Opened for reading and no lock taken: a pack does not touch the set. The
 /// version is resolved before the plan is built, so a set that grows under the run
 /// packs the version asked for rather than whatever is newest when it finishes.
+///
+/// A dry run builds the same plan and stops before the file is touched, so
+/// `--out` is neither created nor overwritten. The size on disk and the content
+/// hash are absent from a plan rather than guessed: the first depends on the
+/// header and the chunk index, and the second is the hash of the file, and a file
+/// this run does not write is the only thing either could be about.
 async fn run_pack(
     name: &std::path::Path,
     out: &std::path::Path,
     version: Option<u32>,
     from: Option<u32>,
+    dry_run: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
@@ -1002,51 +1213,64 @@ async fn run_pack(
         version,
         from,
         out = %out.display(),
+        dry_run,
         "packing"
     );
 
-    // A function of the tree, not of how the set laid its chunks out, so the pack
-    // is reproducible. The decoded snapshot is handed to the writer as well as
-    // resolved into a plan, because a pack carries its own file table and so is
-    // the version rather than a reference to it.
+    // The decoded snapshot is needed on both paths, because the plan is resolved
+    // from it rather than from the store's records: a dry run that counted records
+    // would be counting the wrong thing.
     let snapshot = load_snapshot(&store, snapshot_id).await?;
-    let whole = storage::Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 
-    // A delta is the same pack with fewer chunks in it. No format change and no new
-    // code path downstream: the snapshot still travels with it, so an apply can
-    // still find every file's bytes, and the chunks that are not here are exactly
-    // the ones a holder of `from` already has.
-    let (base, plan) = match from {
-        None => (None, whole.clone()),
+    // A delta is the same pack with fewer chunks in it, and the base it assumes is
+    // part of what has to be worked out before the contents are: it is what decides
+    // which chunks survive, and what an apply will later check the destination
+    // against.
+    let base = match from {
+        None => None,
         Some(base_version) => {
-            let base_id = select_version(&set, &store, Some(base_version))?.1;
-            let base_snapshot = load_snapshot(&store, base_id).await?;
-            (
-                Some((base_version, base_id)),
-                whole.since(&snapshot, &base_snapshot),
-            )
+            let (base_version, base_id) = select_version(&set, &store, Some(base_version))?;
+            Some(lepatch::command::Base {
+                version: base_version,
+                id: base_id,
+                snapshot: load_snapshot(&store, base_id).await?,
+            })
         }
     };
 
-    let pack = match base {
-        // `write_delta`, not `write` over a filtered plan, because the header has
-        // to say what the delta assumes — that is what lets an apply refuse rather
-        // than apply what it happens to hold.
-        Some((_, base_id)) => {
-            lepatch::pack::Pack::write_delta(&store, &plan, &snapshot, base_id, out).await?
-        }
-        None => lepatch::pack::Pack::write(&store, &plan, &snapshot, out).await?,
+    let packed = lepatch::command::pack(
+        &store,
+        &snapshot,
+        |id| store.locate(id),
+        base,
+        out,
+        lepatch::command::PackOptions { dry_run },
+    )
+    .await?;
+
+    // A plan reports and stops. It has read the version and every chunk it would
+    // write, so everything after this point on the real path would only be saying
+    // what the plan has already worked out.
+    if dry_run {
+        report_pack(version, out, &packed)?;
+        return Ok(());
+    }
+
+    // Matched rather than unwrapped, because the pair belongs to a written pack and
+    // this line is only reachable for one.
+    let (Some(bytes), Some(content)) = (packed.bytes, packed.content) else {
+        return Err(std::io::Error::other(
+            "the pack was written but reported neither a length nor a content hash",
+        ));
     };
-    let file_len = pack.file_len()?;
-    let content = lepatch::pack::hash_file(out).await?;
 
     tracing::info!(
         version,
-        base = base.map(|(v, _)| v),
-        chunks = pack.len(),
-        of = whole.len(),
-        bytes = file_len,
-        snapshot = file_len.saturating_sub(pack.snapshot_len()),
+        base = packed.base,
+        chunks = packed.chunks,
+        of = packed.of,
+        bytes,
+        snapshot = packed.table,
         content = %&content,
         "wrote pack"
     );
@@ -1054,29 +1278,45 @@ async fn run_pack(
     // The content hash is the pack's name, so it goes to stdout for a script to
     // key a cache on.
     say!("{}  {}", &content, out.display())?;
-    match base {
-        // Both figures, because the fraction is fixture-dependent and the
-        // request count is not: the whole version is one range either way.
-        Some((base_version, _)) => say!(
-            "version {version} since {base_version}: {} of {} chunks, {} bytes of \
-             payload, {} bytes of file table, {} bytes on disk",
-            pack.len(),
-            whole.len(),
-            pack.payload_len(),
-            pack.snapshot_len(),
-            file_len
-        )?,
-        None => say!(
-            "version {version}: {} chunks, {} bytes of payload, {} bytes of file table, \
-             {} bytes on disk",
-            pack.len(),
-            pack.payload_len(),
-            pack.snapshot_len(),
-            file_len
-        )?,
-    }
+    report_pack(version, out, &packed)?;
 
     Ok(())
+}
+
+/// Say what a pack holds, on stdout.
+///
+/// Both figures for a delta, because the fraction is fixture-dependent and the
+/// request count is not: the whole version is one range either way.
+fn report_pack(
+    version: u32,
+    out: &std::path::Path,
+    packed: &lepatch::command::Packed,
+) -> std::io::Result<()> {
+    let held = match packed.base {
+        Some(base_version) => format!(
+            "version {version} since {base_version}: {} of {} chunks",
+            packed.chunks, packed.of
+        ),
+        None => format!("version {version}: {} chunks", packed.chunks),
+    };
+
+    match packed.bytes {
+        // No file, so no size on disk. Saying "0 bytes on disk" would be a claim
+        // about a file that does not exist, so the figure is left out and what did
+        // happen is said instead.
+        None => say!(
+            "dry run: {held}, {} bytes of payload, {} bytes of file table; nothing written \
+             to {}",
+            packed.payload,
+            packed.table,
+            out.display()
+        ),
+        Some(bytes) => say!(
+            "{held}, {} bytes of payload, {} bytes of file table, {bytes} bytes on disk",
+            packed.payload,
+            packed.table
+        ),
+    }
 }
 
 /// Bring `destination` up to the version `pack` carries.
@@ -1084,19 +1324,29 @@ async fn run_pack(
 /// The destination is claimed for the length of the run, on the same terms a
 /// restore claims one: two applies into one directory would interleave, and the
 /// claim is a file *beside* it so it never appears in the result.
+///
+/// A dry run takes no claim and writes nothing — no file opened, no entry pruned,
+/// no manifest recorded — having already probed the destination against the
+/// version and read back every chunk it was about to write.
 async fn run_apply(
     pack: &std::path::Path,
     destination: &std::path::Path,
     prune: bool,
     recheck: bool,
+    dry_run: bool,
 ) -> std::io::Result<()> {
-    let _claim = lock_destination(destination)?;
+    let _claim = if dry_run {
+        None
+    } else {
+        Some(lock_destination(destination)?)
+    };
 
     let pack = Pack::open(pack)?;
     tracing::info!(
         pack = %pack.path().display(),
         destination = %destination.display(),
         chunks = pack.len(),
+        dry_run,
         "applying pack"
     );
 
@@ -1106,7 +1356,7 @@ async fn run_apply(
         ApplyOptions {
             prune,
             recheck,
-            dry_run: false,
+            dry_run,
         },
     )
     .await?;
@@ -1117,28 +1367,62 @@ async fn run_apply(
         written = applied.written,
         bytes = applied.bytes,
         removed = applied.removed,
+        dry_run,
         "applied pack"
     );
 
+    report_applied(&applied, &pack, destination, dry_run)
+}
+
+/// Say what an apply changed, or what it would have changed.
+///
+/// Two wordings rather than one with the verbs filled in, because the real run's
+/// line is what a script parses and interpolating into it would change bytes
+/// nobody asked to change.
+fn report_applied(
+    applied: &lepatch::command::Applied,
+    pack: &Pack,
+    destination: &std::path::Path,
+    dry_run: bool,
+) -> std::io::Result<()> {
     // The bytes a fetch would have needed, which is the number that says whether
     // this was an update or a whole tree.
-    say!(
-        "fetched {} of {} bytes in {} range(s); {} of {} chunks were already held, \
-         {} chunks written into {} file(s)",
-        applied.fetched,
-        pack.payload_len(),
-        applied.ranges,
-        applied.held,
-        applied.chunks,
-        applied.written,
-        applied.files,
-    )?;
+    if dry_run {
+        say!(
+            "dry run: would fetch {} of {} bytes in {} range(s); {} of {} chunks are already \
+             held, {} chunks would be written into {} file(s)",
+            applied.fetched,
+            pack.payload_len(),
+            applied.ranges,
+            applied.held,
+            applied.chunks,
+            applied.written,
+            applied.files,
+        )?;
+    } else {
+        say!(
+            "fetched {} of {} bytes in {} range(s); {} of {} chunks were already held, \
+             {} chunks written into {} file(s)",
+            applied.fetched,
+            pack.payload_len(),
+            applied.ranges,
+            applied.held,
+            applied.chunks,
+            applied.written,
+            applied.files,
+        )?;
+    }
 
     // Named on stderr, because stdout is data. Left in place unless `--prune`, and
     // said so either way: silence here would read as "nothing there".
     if applied.extra > 0 {
+        let what = match (dry_run, applied.removed) {
+            (true, 0) => "would be left alone; pass --prune to remove them",
+            (true, _) => "would be removed by --prune",
+            (false, _) => "left alone; pass --prune to remove them",
+        };
         eprintln!(
-            "note: {} unrecorded entr{} under {} left alone; pass --prune to remove them",
+            "note: {} unrecorded entr{} under {} {what}",
             applied.extra,
             if applied.extra == 1 { "y" } else { "ies" },
             destination.display(),
@@ -1147,14 +1431,27 @@ async fn run_apply(
 
     if applied.removed > 0 {
         say!(
-            "removed {} unrecorded entr{}",
+            "{} {} unrecorded entr{}",
+            if dry_run { "would remove" } else { "removed" },
             applied.removed,
             if applied.removed == 1 { "y" } else { "ies" }
         )?;
     }
 
     if applied.unowned > 0 {
-        report_unowned(applied.unowned, "apply");
+        if dry_run {
+            // The figure is a bound, not a count: it is how many entries record an
+            // owner at all, and only trying to set one says whether this process
+            // can. Claiming either outcome would be a guess.
+            eprintln!(
+                "note: {} entr{} in this version record an owner, which an apply may not be \
+                 able to set without privilege",
+                applied.unowned,
+                if applied.unowned == 1 { "y" } else { "ies" },
+            );
+        } else {
+            report_unowned(applied.unowned, "apply");
+        }
     }
 
     Ok(())
