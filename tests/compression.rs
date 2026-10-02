@@ -338,6 +338,57 @@ async fn bytes_that_are_not_the_payload_are_not_stored_under_its_name() {
     );
 }
 
+/// A policy that returns exactly as many bytes as it was given is not believed
+/// either.
+///
+/// The boundary is *strictly* smaller, and this is what pins it. A writer that
+/// compared with `<=` would store this policy's frame and pass every other test
+/// in this file, because a policy that grows its payload and one that merely
+/// matches it differ only at a boundary nobody asserted. A frame that saved
+/// nothing still costs its header, and it is still bytes the store did not hash
+/// under the codec the record would claim.
+struct MatchesSize;
+
+impl Compressor for MatchesSize {
+    fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>) {
+        let mut frame = zstd::bulk::compress(raw, 1).unwrap_or_else(|_| raw.to_vec());
+        frame.resize(raw.len(), 0);
+
+        (Codec::Zstd, Cow::Owned(frame))
+    }
+}
+
+#[tokio::test]
+async fn a_frame_that_saved_nothing_is_not_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store");
+
+    let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), MatchesSize)
+        .await
+        .unwrap();
+
+    // Compressible, because the frame has to be long enough to be padded up to the
+    // payload's own length at all; on content zstd cannot shrink there is no
+    // shorter frame to grow and the fixture would pass for the wrong reason.
+    let payload = compressible(200_000);
+    let id = put(&store, &payload).await;
+
+    let placement = store.locate(&id).unwrap();
+    assert_eq!(
+        placement.codec,
+        Codec::Raw,
+        "a frame no smaller than the payload was stored, and the reader will decode it"
+    );
+    assert_eq!(
+        placement.stored_len, placement.raw_len,
+        "a frame that saved nothing was stored anyway"
+    );
+
+    drop(store);
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
+    assert_eq!(read(&reader, &id).await, payload);
+}
+
 /// Compression off stores everything raw, whatever the content is.
 #[tokio::test]
 async fn compression_off_stores_everything_raw() {
