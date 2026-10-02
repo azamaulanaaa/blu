@@ -43,6 +43,7 @@
 //! not begin with the store magic is refused rather than scanned.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt::Debug,
     io::{self, SeekFrom},
@@ -61,7 +62,10 @@ use super::record::{self, Kind, Placement, STORE_HEADER};
 use crate::{
     layout::IndexSet,
     slice::{DecompressReader, SliceAsyncReader},
-    storage::{self, BlobId, Compression, SegmentLimit, StreamReadSeeker, VersionIndex},
+    storage::{
+        self, BlobId, Codec, Compression, Compressor, Decompressor, SegmentLimit, StreamReadSeeker,
+        VersionIndex, Zstd,
+    },
 };
 
 /// Copy buffer for a payload: where it is hashed on its way through, and what
@@ -155,7 +159,16 @@ impl WriteMode for Read {
 /// "read-only". [`Read`] and [`Write`] say which. The enforcement is unchanged and
 /// is still structural: only `impl StoragePut for BlobStore<Write>` exists, so
 /// naming the mode and permitting the method are the same edit.
-pub struct BlobStore<W: WriteMode> {
+///
+/// `C` is the [`Compressor`] this store writes payloads through, defaulting to
+/// [`Compression`]. It is a parameter rather than a constructor argument type for
+/// the same reason `W` is: the policy is part of the handle, so a store cannot be
+/// holding one policy while a caller believes it is writing under another, and a
+/// reader — which consults no policy, because the codec byte in each record says
+/// how that record was written — is not generic over it at all.
+/// [`BlobStore::open_for_reading`] is a [`Compression`] store whatever else exists,
+/// which is the honest answer: there is nothing on the reading side to configure.
+pub struct BlobStore<W: WriteMode, C: Compressor = Compression> {
     /// The set this store is, which is how its segments are named and found.
     set: IndexSet,
     /// Every segment on disk, in order. Fixed at open: the set only grows by
@@ -175,7 +188,10 @@ pub struct BlobStore<W: WriteMode> {
     limit: SegmentLimit,
     /// How record payloads are compressed. A write policy for the same reason, and
     /// a stronger one: each record names its own codec.
-    compression: Compression,
+    ///
+    /// The fallback is applied by the writer rather than trusted from here — see
+    /// [`Compressor`] — so this is whatever policy the caller brought.
+    compression: C,
     /// Segments this run has written to, so `sync_data` knows which files to sync.
     ///
     /// Not persisted: a run that wrote nothing has nothing to sync, and one that
@@ -191,7 +207,7 @@ pub struct BlobStore<W: WriteMode> {
     mode: PhantomData<fn() -> W>,
 }
 
-impl<W: WriteMode> Debug for BlobStore<W> {
+impl<W: WriteMode, C: Compressor> Debug for BlobStore<W, C> {
     /// Counts and paths, never the index.
     ///
     /// Hand-written because the derived version walks the whole in-memory
@@ -217,7 +233,7 @@ impl<W: WriteMode> Debug for BlobStore<W> {
     }
 }
 
-impl<W: WriteMode> BlobStore<W> {
+impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
     /// The path of segment `segment`.
     ///
     /// Every segment but the last is sealed, so this names the only one a run
@@ -455,7 +471,7 @@ impl<W: WriteMode> BlobStore<W> {
     }
 }
 
-impl BlobStore<Write> {
+impl<C: Compressor> BlobStore<Write, C> {
     /// Open a set for writing, creating its first segment and recovering it if
     /// necessary.
     ///
@@ -471,11 +487,17 @@ impl BlobStore<Write> {
     /// version is a backup and not a broken file; if the set is missing a segment
     /// in the middle; or if a *sealed* segment has a tail that does not verify,
     /// which is corruption and is never truncated.
+    ///
+    /// `compression` is any [`Compressor`], so this is where a caller outside this
+    /// crate brings its own write policy. Which one it is does not travel with the
+    /// store: every record names the codec it was written with, so a set opened
+    /// later under a different policy — or read by a build that has never heard of
+    /// either — still reads back.
     #[instrument(skip_all, err)]
     pub async fn open_for_writing<P: Into<PathBuf> + Debug>(
         path: P,
         limit: SegmentLimit,
-        compression: Compression,
+        compression: C,
     ) -> io::Result<Self> {
         let set = IndexSet::new(path.into());
 
@@ -511,7 +533,7 @@ impl BlobStore<Write> {
     }
 }
 
-impl BlobStore<Read> {
+impl BlobStore<Read, Compression> {
     /// Open a set for reading.
     ///
     /// The set must already exist and must be a store: a path that is not one is
@@ -551,7 +573,10 @@ impl BlobStore<Read> {
             })),
             // Both fields are shared with the writing constructor, and only that
             // one consults them. Neither has a value worth recording on a read: a
-            // read never rolls over, and never compresses anything.
+            // read never rolls over, and never compresses anything. The
+            // compressor is [`Compression`] rather than a parameter for the reason
+            // given on the type: nothing on this side consults it, and a reader
+            // decodes what each record says it is.
             limit: SegmentLimit::default(),
             compression: Compression::default(),
             dirty: Mutex::new(Vec::new()),
@@ -560,7 +585,7 @@ impl BlobStore<Read> {
     }
 }
 
-impl<W: WriteMode> storage::StorageGet for BlobStore<W> {
+impl<W: WriteMode, C: Compressor> storage::StorageGet for BlobStore<W, C> {
     /// Open the blob with this content hash.
     ///
     /// The stream yields the blob's **content**, decompressed if it is stored
@@ -618,8 +643,8 @@ impl<W: WriteMode> storage::StorageGet for BlobStore<W> {
         file.seek(SeekFrom::Start(placement.offset)).await?;
 
         match placement.codec {
-            storage::Codec::Raw => Ok(Box::new(SliceAsyncReader::new(file, placement.raw_len))),
-            storage::Codec::Zstd => {
+            Codec::Raw => Ok(Box::new(SliceAsyncReader::new(file, placement.raw_len))),
+            Codec::Zstd => {
                 // Read the frame, then decode it. The read is bounded to the
                 // stored length so a damaged record cannot pull in its neighbour,
                 // and the decode is told the expected size so a frame that does
@@ -630,14 +655,20 @@ impl<W: WriteMode> storage::StorageGet for BlobStore<W> {
                 )?;
                 file.read_exact(&mut frame).await?;
 
-                let reader = DecompressReader::new(frame, placement.raw_len).await?;
-                Ok(Box::new(reader))
+                // Through [`Zstd`] rather than through `DecompressReader::new`, so
+                // there is one implementation of "what a zstd frame means and
+                // what it must produce" rather than two that can disagree. This is
+                // the match on the codec byte: a read is answered by the record,
+                // not by whatever policy wrote it.
+                let bytes = Decompressor::decompress(&Zstd, frame, placement.raw_len).await?;
+
+                Ok(Box::new(DecompressReader::from_decoded(bytes)))
             }
         }
     }
 }
 
-impl storage::StoragePut for BlobStore<Write> {
+impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
     /// Store `len` bytes whose content hashes to `id`.
     ///
     /// A blob the store already holds is not written again, so the caller can hand
@@ -699,6 +730,34 @@ impl storage::StoragePut for BlobStore<Write> {
         // frame carries a header of its own, so on content it cannot compress it
         // comes out larger than the input.
         let (codec, stored) = self.compression.compress(&raw);
+
+        // And check the answer, because the policy that produced it is not this
+        // crate's code and need not be this crate's careful. This is the single
+        // place the "only when strictly smaller" rule is *enforced* rather than
+        // observed, so an implementor who returns a frame larger than its input
+        // costs a copy of the frame and nothing else: the payload is stored as it
+        // came in, and the record says `Raw`, which is exactly what the reader
+        // would have done with it. See the note on [`Compressor`].
+        //
+        // The codec is checked as well, and by naming `Zstd` rather than by
+        // asking the store's decoders: `Raw` in a record means "these are the
+        // bytes that hashed to this id", and a policy that paired it with
+        // anything else would be naming bytes the store never hashed. Nothing on
+        // the read path checks what it hands back, so the pairing is worth
+        // enforcing where it is written rather than assuming a caller got it
+        // right. `Zstd` is the fail-closed arm in exchange — its decode
+        // validates the frame against the `raw_len` the header claims — which is
+        // why the store may keep a frame on a policy's word that it decodes to
+        // exactly that.
+        //
+        // `Compression` never trips this, because it applies the rule itself and
+        // hands back a borrow of `raw` when the frame did not win.
+        let keep = matches!(codec, Codec::Zstd) && stored.len() < raw.len();
+        let (codec, stored) = if keep {
+            (Codec::Zstd, stored)
+        } else {
+            (Codec::Raw, Cow::Borrowed(raw.as_slice()))
+        };
         let stored_len = u64::try_from(stored.len()).unwrap_or(u64::MAX);
 
         let mut header =
@@ -890,7 +949,7 @@ fn write_index(set: &IndexSet, index: VersionIndex) -> io::Result<()> {
     index.write_atomic(&set.index_path(index.version))
 }
 
-impl BlobStore<Write> {
+impl<C: Compressor> BlobStore<Write, C> {
     /// Claim `total` bytes for a record, rolling into a new segment if it will not
     /// fit in the last one.
     ///
@@ -1015,7 +1074,7 @@ impl BlobStore<Write> {
     }
 }
 
-impl BlobStore<Write> {
+impl<C: Compressor> BlobStore<Write, C> {
     /// Write an index file for every version this store holds.
     ///
     /// Everything here is derived from the commit records, so a set with no index

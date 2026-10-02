@@ -7,13 +7,212 @@
 //! is the common case — photos, archives and video are already entropy-coded,
 //! and a frame around one comes out *larger* than the bytes it replaced.
 //!
+//! [`Compressor`] and [`Decompressor`] are the two halves of that policy as a
+//! seam, so a caller outside this crate can bring its own without the store
+//! learning about it. [`Compression`] implements the first and [`Zstd`] the
+//! second, which is the whole of what this crate ships.
+//!
 //! The measurements behind the default level are in the README, and
 //! `tests/compression.rs` is what holds the store's other properties still true
 //! across a codec byte.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io};
 
 use super::record::Codec;
+
+/// How a payload becomes the bytes a record stores.
+///
+/// The seam is *how a payload is written*, not *which codec*: an implementation is
+/// handed a payload and answers with the bytes to write and the codec to record
+/// beside them. Nothing here is about zstd, about a level, or about whether
+/// compressing is a good idea for this payload — [`Compression`] is one
+/// implementation and the one this crate ships, but a caller with its own policy
+/// (a size threshold, a level of its own, a rule about which payloads are worth a
+/// frame) implements this trait and hands it to
+/// [`BlobStore::open_for_writing`](super::BlobStore::open_for_writing) instead,
+/// without touching a line of the store.
+///
+/// What a caller cannot do through this trait is add a codec. [`Codec`] has two
+/// arms and the store decodes one of them, so a policy is a choice about *which
+/// payloads* get a frame, at what level, and whether one is built at all — and
+/// the codec that comes back is advice, because the store records its own:
+/// `Zstd` only for bytes it will keep, and `Raw` for the payload it hashed.
+/// Naming a third codec would mean a new on-disk format, which is a larger
+/// change than the seam is for.
+///
+/// # The fallback belongs to the writer, not to the trait
+///
+/// The one rule a payload must never break is **a frame is stored only when it is
+/// strictly smaller than the payload it replaces**. It is documented on
+/// [`Compressor::compress`] as an obligation and *not* left to the obligation:
+/// [`super::BlobStore`] re-checks the answer and stores the payload untouched
+/// whenever the returned bytes came back no smaller, or named a codec the store
+/// cannot decode. So the guarantee is a property of the store rather than a
+/// promise every implementor has to remember, and a third-party compressor
+/// cannot grow a set by accident, or store bytes under a name that means
+/// something else.
+///
+/// The alternative — leaving it to the implementor, and trusting it — was rejected
+/// for the obvious reason: the cost of getting it wrong is paid by the user's
+/// disk, not by the crate, and the mistake is invisible in review because a
+/// compressor that returns a frame is *doing what it was asked*. A compressor that
+/// is always allowed to answer is also a compressor that can always be wrong.
+///
+/// [`Compression`] applies the rule itself as well, which is not redundant: it is
+/// what lets it hand back the input borrowed rather than an owned frame the store
+/// would drop, and the frame has to be built either way to be measured against the
+/// input. So the rule is stated once, where the size is compared, and enforced
+/// once, where the bytes are written.
+///
+/// The lifetime is named rather than elided: with two input lifetimes, elision
+/// would tie the returned borrow to `&self` rather than to `raw`, which is the
+/// opposite of what every implementation wants — the answer usually borrows the
+/// payload and never touches the policy.
+pub trait Compressor: Send + Sync + 'static {
+    /// The bytes to store for `raw`, and the codec to record beside them.
+    ///
+    /// Returning [`Codec::Raw`] means "store these bytes as they are", which is a
+    /// legitimate answer for any payload and not a failure: the overwhelming
+    /// majority of a real tree is already entropy-coded, and a frame around one
+    /// comes out larger.
+    ///
+    /// The answer is not trusted to be an improvement, and not trusted to name a
+    /// codec either — see the note on the trait — so the store stores `raw`
+    /// untouched unless the returned bytes are strictly smaller and the codec is
+    /// one it can decode. `Cow` rather than `Vec` for the reason [`Compression`]
+    /// gives: most answers are the input, unchanged.
+    fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>);
+}
+
+impl Compressor for Compression {
+    fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>) {
+        // Fully qualified, because the inherent method and this one are the same
+        // operation under two names: the inherent one is what the tests in this
+        // module call, and it is not going away.
+        Compression::compress(*self, raw)
+    }
+}
+
+/// How stored bytes become a payload again.
+///
+/// The mirror of [`Compressor`], and separate from it for the reason the two are
+/// separate at all: a write policy is chosen by whoever opened the store, while a
+/// read is answered by the codec byte in the record being read. A caller reading a
+/// set written under a policy it has never heard of still has to decode it, so the
+/// reader is not given a policy — it is given the codec, and this is what the
+/// codec means.
+///
+/// [`Zstd`] is the only implementation, because [`Codec`] has only one
+/// non-trivial arm. It is a trait rather than a call to `zstd::bulk::decompress`
+/// because that call has more to it than the decode — it validates a frame against
+/// the length its record claims, which is a trust decision about the file and not a
+/// detail of the codec — and because the two places that decode were each doing
+/// that validation for themselves.
+///
+/// Return-position `impl Future` for the `+ Send`, and for the same reason as
+/// [`super::StorageGet::get`](super::StorageGet): a decode runs on the blocking
+/// pool and its future is awaited from a `get`, which is spawned.
+pub trait Decompressor: Send + Sync + 'static {
+    /// Decode `stored` into the payload, which must come back exactly `raw_len`
+    /// bytes long.
+    ///
+    /// `raw_len` is the record's claim, not a measurement: a record header carries a
+    /// truncated hash rather than a MAC, so it is checked against the frame and
+    /// never trusted. An implementation must refuse a frame that does not produce
+    /// exactly that many bytes rather than hand back a short read — a short read
+    /// looks like end of stream, and a restore that trusts one produces a file that
+    /// is quietly incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `stored` is not a frame this codec recognises, if the
+    /// frame does not say how many bytes it decodes to, if that number is not
+    /// `raw_len`, or if `raw_len` is not something this process can hold.
+    fn decompress(
+        &self,
+        stored: Vec<u8>,
+        raw_len: u64,
+    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
+}
+
+/// The only [`Decompressor`] this crate ships: zstd frames.
+///
+/// A unit struct rather than an enum because there is one thing to be, and a type
+/// that says which is what an implementor of [`Decompressor`] needs to name. It
+/// carries no level: decoding does not take one, and a frame records the level it
+/// was written at in its own header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Zstd;
+
+/// The body of [`Zstd::decompress`], split out so the trait method above can keep
+/// its return-position `impl Future` — the `manual_async_fn` lint points at a
+/// signature that names the future rather than an `async fn`, and here the naming
+/// is the point: it is what says the future can cross a thread, which an `async
+/// fn` in a trait does not.
+impl Zstd {
+    async fn decode(&self, stored: Vec<u8>, raw_len: u64) -> io::Result<Vec<u8>> {
+        let expected = usize::try_from(raw_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a payload of {raw_len} bytes does not fit in memory"),
+            )
+        })?;
+
+        // `None` means the frame does not declare a size, which is what a
+        // compressed *stream* looks like. Nothing here produces one, and
+        // accepting one would mean decoding blind.
+        let declared = zstd::zstd_safe::get_frame_content_size(&stored)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("a compressed payload is not a readable zstd frame: {e}"),
+                )
+            })?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a compressed payload does not say how many bytes it decodes to",
+                )
+            })?;
+
+        if usize::try_from(declared).unwrap_or(usize::MAX) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "a compressed payload declares {declared} bytes but its record claims \
+                     {expected}"
+                ),
+            ));
+        }
+
+        // Frame and header agree, so the decode can come up neither short nor long.
+        let bytes = tokio::task::spawn_blocking(move || zstd::bulk::decompress(&stored, expected))
+            .await
+            .map_err(|join| io::Error::other(format!("decompression panicked: {join}")))??;
+
+        if bytes.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "a compressed payload decoded to {} bytes but its record claims {expected}",
+                    bytes.len()
+                ),
+            ));
+        }
+
+        Ok(bytes)
+    }
+}
+
+impl Decompressor for Zstd {
+    fn decompress(
+        &self,
+        stored: Vec<u8>,
+        raw_len: u64,
+    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
+        self.decode(stored, raw_len)
+    }
+}
 
 /// How record payloads are compressed on the way in.
 ///
@@ -119,6 +318,11 @@ impl Compression {
 
     /// Compress `raw`, returning the codec to record and the bytes to store.
     ///
+    /// This is the inherent form of [`Compressor::compress`], and it is what the
+    /// store calls through the trait. It stays as a method because the unit tests
+    /// below pin the fallback through it, and a test that went through a trait
+    /// object to assert a pointer was not the clearest way to say what it meant.
+    ///
     /// A payload becomes a zstd frame only when that frame is strictly smaller
     /// than the input; otherwise [`Codec::Raw`] and the bytes unchanged, so
     /// already-compressed content never grows by a frame header.
@@ -157,7 +361,11 @@ impl Compression {
 mod compression_tests {
     use std::borrow::Cow;
 
-    use super::{Codec, Compression};
+    use super::{Codec, Compression, Decompressor, Zstd};
+
+    /// Bytes that are not a frame at all: the first thing a damaged or
+    /// hand-edited record can be.
+    const NOT_A_FRAME: &[u8] = b"these bytes are not a zstd frame";
 
     /// A payload the compressor cannot make smaller falls through untouched.
     ///
@@ -225,6 +433,93 @@ mod compression_tests {
         assert!(
             matches!(stored, Cow::Owned(_)),
             "a compressed payload owns its frame"
+        );
+    }
+
+    /// The message a caller sees when the stored bytes are not a frame.
+    ///
+    /// The texts in [`Zstd`] are the store's report of a damaged record, and a
+    /// restore is the only thing standing between a backup and a silently wrong
+    /// file — so they are part of what this crate promises. Asserting them here
+    /// is what stops that being true only because nobody has reworded them yet.
+    ///
+    /// `InvalidData` and the "not a readable zstd frame" wording are both
+    /// asserted: the kind is what a caller can branch on, and zstd's own `{e}` is
+    /// part of the message because it is what says which frame complaint this was.
+    ///
+    /// The panic path below it — a decode that panics inside `spawn_blocking` —
+    /// is deliberately not covered, because it cannot be reached from a test
+    /// without contrivance: it needs `zstd::bulk::decompress` itself to panic, and
+    /// this API gives a caller no way to arrange that. It is mapped to
+    /// `"decompression panicked: …"` so a panic cannot take the run down with it,
+    /// not because a test gets there.
+    #[tokio::test]
+    async fn bytes_that_are_not_a_frame_are_reported_as_such() {
+        let err = Zstd
+            .decompress(NOT_A_FRAME.to_vec(), 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a payload that is not a frame is damaged data, not an I/O failure"
+        );
+        assert!(
+            err.to_string()
+                .contains("a compressed payload is not a readable zstd frame:"),
+            "the message should name what was wrong and with which codec, and says {:?}",
+            err.to_string()
+        );
+    }
+
+    /// A frame that decodes to the wrong number of bytes is refused, by name.
+    ///
+    /// The check this is, on a frame that is otherwise perfectly good: a header
+    /// that lies about the payload's length would otherwise decode to something,
+    /// and a restore would write it out as if it were the file.
+    #[tokio::test]
+    async fn a_frame_that_decodes_to_the_wrong_size_is_refused_by_name() {
+        let raw = vec![b'a'; 64 * 1024];
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let short = u64::try_from(raw.len() - 1).unwrap();
+
+        let err = Zstd.decompress(frame, short).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("declares 65536 bytes but its record claims 65535"),
+            "the message should say what the frame declares and what the record claims, \
+             and says {:?}",
+            err.to_string()
+        );
+    }
+
+    /// A frame that declares no size at all is refused rather than decoded blind.
+    ///
+    /// A *streaming* frame is what looks like this: the encoder did not know the
+    /// length up front, so the header does not carry it. Nothing this crate
+    /// writes produces one, which is exactly why accepting one would mean decoding
+    /// a record with nothing to check the answer against.
+    #[tokio::test]
+    async fn a_frame_that_declares_no_size_is_refused_by_name() {
+        let mut frame = Vec::new();
+        zstd::stream::copy_encode(
+            &b"the quick brown fox jumps over the lazy dog. "[..],
+            &mut frame,
+            1,
+        )
+        .unwrap();
+
+        let err = Zstd.decompress(frame, 44).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("does not say how many bytes it decodes to"),
+            "a frame with no declared size should be refused in those words, and says {:?}",
+            err.to_string()
         );
     }
 
