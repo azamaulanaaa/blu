@@ -2444,3 +2444,646 @@ fn a_clean_restore_through_a_symlink_lands_in_the_destination() {
         "a restore should not replace the destination's symbolic link with a directory"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dry runs.
+//
+// Each of the five writing subcommands takes `--dry-run`, and each of these says
+// two things: that a dry run reports the numbers the real run would print, and
+// that it wrote nothing — not one byte, not one file, and not one directory that
+// did not exist before it.
+//
+// The second is the one worth being paranoid about, because the failure is silent:
+// a plan that quietly created the store, the lock or the destination it was
+// describing would still print a correct-looking report, and the test that only
+// checked the report would pass. So every test here compares a listing taken
+// before with the same listing taken after, and the interesting cases are the ones
+// where the artifact in question did not exist to begin with.
+// ---------------------------------------------------------------------------
+
+/// Every name in `dir`, sorted, as a listing a person would give.
+///
+/// Recursive, because the thing a dry run must not leave behind is not always
+/// beside what it was asked about — a clean restore stages its tree next to the
+/// destination, and an apply records a manifest next to it.
+fn listing(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        let mut paths: Vec<std::path::PathBuf> =
+            entries.filter_map(Result::ok).map(|e| e.path()).collect();
+        paths.sort();
+
+        for path in paths {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            out.push(relative.display().to_string());
+
+            // `symlink_metadata`, so a link is not followed into whatever it
+            // points at — a tree being backed up may well hold one.
+            if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                walk(root, &path, out);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// The figure a report states, as the digits following `marker`.
+fn after(report: &str, marker: &str) -> String {
+    let at = report
+        .find(marker)
+        .unwrap_or_else(|| panic!("{marker:?} should be in the report:\n{report}"))
+        + marker.len();
+
+    report[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect()
+}
+
+/// Every number in a line, in order.
+///
+/// Both the pack and the apply say what they are doing in one sentence of figures,
+/// and what a plan has to agree with is the whole sentence apart from the part it
+/// cannot know — so comparing the numbers is simpler and stricter than matching on
+/// wording, and it survives the two wordings being different sentences.
+fn numbers(line: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut digits = String::new();
+
+    for c in line.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if !digits.is_empty() {
+            out.push(digits.parse().unwrap_or(0));
+            digits.clear();
+        }
+    }
+
+    out
+}
+
+/// The hash of the snapshot a set's newest version committed.
+fn latest_snapshot(dir: &Path, set: &str) -> String {
+    let listed = ok(dir, &["versions", set]);
+    listed
+        .lines()
+        .next_back()
+        .expect("at least one version")
+        .split_whitespace()
+        .nth(1)
+        .expect("a hash after the version number")
+        .to_string()
+}
+
+/// The bytes of every regular file in `root`.
+///
+/// What a restore writes and — with nothing already held — what a backup stores,
+/// since both are the tree's own content. Checked against a plan's figure so the
+/// report is pinned to the tree rather than to itself.
+fn content_bytes(root: &Path) -> u64 {
+    common::describe(root)
+        .values()
+        .filter_map(|entry| match entry {
+            common::Entry::File(bytes) => u64::try_from(bytes.len()).ok(),
+            _ => None,
+        })
+        .sum()
+}
+
+/// The snapshot a backup plan says it would commit.
+fn planned_snapshot(report: &str) -> String {
+    report
+        .lines()
+        .next()
+        .expect("a plan says something")
+        .split_whitespace()
+        .last()
+        .expect("and the first line ends with the hash")
+        .to_string()
+}
+
+/// A backup plan's figures: files, directories, links, chunks, and of those the
+/// new, the already held and the bytes to store.
+fn backup_figures(report: &str) -> Vec<u64> {
+    numbers(
+        report
+            .lines()
+            .find(|line| line.contains("chunks ("))
+            .unwrap_or_else(|| panic!("a plan reports its counts:\n{report}")),
+    )
+}
+
+#[test]
+fn a_dry_backup_of_a_new_location_creates_nothing_and_plans_every_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    let before = listing(dir.path());
+
+    let report = ok(dir.path(), &["backup", "src", "snap", "--dry-run"]);
+
+    // Nothing at all. The set's directory does not exist and must not be made:
+    // `open_for_writing` creates segment 0 for a set with none, so a dry run that
+    // opened the store the way a backup does would leave an empty store behind and
+    // report a first version in it.
+    assert_eq!(
+        listing(dir.path()),
+        before,
+        "a dry backup changed the directory"
+    );
+    assert!(
+        !dir.path().join("snap.0000.bin").exists(),
+        "a dry backup created a segment"
+    );
+    assert!(
+        !dir.path().join("snap.lock").exists(),
+        "a dry backup took the write lock"
+    );
+
+    // The plan is a plan: it says what it would commit, and it knows there is no set
+    // behind the name yet rather than failing the way reading one would.
+    assert!(
+        report.contains("would create it"),
+        "the first backup of a location should plan as an all-new version: {report}"
+    );
+    let planned = planned_snapshot(&report);
+    assert_eq!(
+        planned.len(),
+        64,
+        "a plan should name the snapshot it would commit, got: {report}"
+    );
+
+    // And it is true. The real run immediately afterwards commits exactly that
+    // snapshot, which is what makes the hash worth printing at all.
+    ok(dir.path(), &["backup", "src", "snap"]);
+    assert_eq!(
+        latest_snapshot(dir.path(), "snap"),
+        planned,
+        "the planned snapshot is not the one the next backup committed"
+    );
+
+    // Nothing was held before, so every chunk is new — and the byte total is the
+    // tree's content, which is a figure a test can check against the tree itself.
+    let figures = backup_figures(&report);
+    let (files, _dirs, _links, chunks, fresh, held, stored) = (
+        figures[0], figures[1], figures[2], figures[3], figures[4], figures[5], figures[6],
+    );
+
+    assert_eq!(fresh, chunks, "a first backup stores every chunk: {report}");
+    assert_eq!(held, 0, "and there is nothing to hold: {report}");
+    assert_ne!(chunks, 0, "a tree this size has chunks: {report}");
+    assert_eq!(
+        files, 3,
+        "the fixture holds three regular files and two links: {report}"
+    );
+
+    let content = content_bytes(&dir.path().join("src"));
+    assert_eq!(
+        stored, content,
+        "the bytes a plan would store are the tree's own, since nothing is held: {report}"
+    );
+}
+
+#[test]
+fn a_dry_backup_of_an_unchanged_set_reports_nothing_to_store_and_grows_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    let set = common::set_size(&dir.path().join("snap"));
+    let before = listing(dir.path());
+
+    let report = ok(dir.path(), &["backup", "src", "snap", "--dry-run"]);
+
+    assert_eq!(
+        listing(dir.path()),
+        before,
+        "a dry backup changed the directory"
+    );
+    assert_eq!(
+        common::set_size(&dir.path().join("snap")),
+        set,
+        "a dry backup appended to the store"
+    );
+
+    let figures = backup_figures(&report);
+    assert_eq!(
+        figures[4], 0,
+        "an unchanged tree has nothing new to store: {report}"
+    );
+    assert_eq!(figures[6], 0, "and nothing to write: {report}");
+    assert_eq!(
+        figures[5], figures[3],
+        "every chunk is one the set already holds: {report}"
+    );
+    assert!(figures[3] > 0, "a tree this size has chunks: {report}");
+
+    // The version it would commit is the next one, and the tree is unchanged, so
+    // the snapshot hash is the one the *first* backup committed — a second version
+    // of the same tree is the same version.
+    ok(dir.path(), &["backup", "src", "snap"]);
+    assert_eq!(
+        latest_snapshot(dir.path(), "snap"),
+        planned_snapshot(&report),
+        "the planned snapshot is not the one the next backup committed"
+    );
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        2,
+        "the dry run should not have published anything"
+    );
+}
+
+#[test]
+fn a_dry_restore_writes_no_file_no_directory_and_no_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let destination = dir.path().join("out");
+    let report = ok(dir.path(), &["restore", "out", "snap", "--dry-run"]);
+
+    assert!(
+        !destination.exists(),
+        "a dry restore created the destination"
+    );
+    assert!(
+        !claim_path(&destination).exists(),
+        "a dry restore took a claim beside the destination"
+    );
+    assert!(
+        !dir.path().join("out.lepatch-restore-partial").exists(),
+        "a dry restore staged a tree beside the destination"
+    );
+
+    // The counts are the ones the restore will go on to report, and the bytes are
+    // the tree's — a restore writes each recorded file whole.
+    let source_bytes = content_bytes(&dir.path().join("src"));
+    let figures = numbers(report.lines().nth(1).expect("a plan reports its counts"));
+    assert_eq!(
+        figures[0], 3,
+        "the fixture holds three regular files: {report}"
+    );
+    assert_eq!(figures[1], 2, "and two directories: {report}");
+    assert_eq!(
+        figures[4], source_bytes,
+        "a restore writes every recorded file whole; the tree is {source_bytes} bytes: {report}"
+    );
+    assert_ne!(figures[3], 0, "the version names chunks: {report}");
+
+    // And it is true: the real run writes that many bytes into that many files.
+    ok(dir.path(), &["restore", "out", "snap"]);
+    common::assert_same_tree(&dir.path().join("src"), &destination);
+}
+
+#[test]
+fn a_dry_clean_restore_does_not_empty_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let destination = dir.path().join("out");
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(destination.join("mine"), b"work in progress\n").unwrap();
+    let before = common::describe(&destination);
+
+    // `--clean` is the one operation here that destroys data, so a dry run that
+    // did not empty the destination would be the single most surprising thing this
+    // flag could do.
+    let report = ok(
+        dir.path(),
+        &["restore", "out", "snap", "--clean", "--dry-run"],
+    );
+    assert!(
+        report.contains("would be emptied first"),
+        "a dry clean restore should say what it would empty: {report}"
+    );
+
+    assert_eq!(
+        common::describe(&destination),
+        before,
+        "a dry clean restore changed the destination"
+    );
+    assert!(
+        !dir.path().join("out.lepatch-restore-partial").exists(),
+        "a dry clean restore staged a tree beside the destination"
+    );
+    assert!(
+        !dir.path().join("out.lepatch-restore-previous").exists(),
+        "a dry clean restore moved the destination aside"
+    );
+}
+
+#[test]
+fn a_dry_pack_writes_no_file_and_reports_what_it_would_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let plan = ok(dir.path(), &["pack", "snap", "v1.pack", "--dry-run"]);
+
+    assert!(
+        !dir.path().join("v1.pack").exists(),
+        "a dry pack wrote the file it was asked about"
+    );
+    assert!(
+        !plan.contains(&latest_snapshot(dir.path(), "snap")),
+        "a dry pack has no content hash, and should not print one: {plan}"
+    );
+    assert!(
+        plan.lines().count() == 1,
+        "a dry pack prints a plan and not a hash: {plan}"
+    );
+    assert!(
+        plan.contains("nothing written to v1.pack"),
+        "a dry pack should say the file was not written: {plan}"
+    );
+
+    // The plan and the pack agree, chunk for chunk and byte for byte: the plan's
+    // sentence is the pack's with the one figure a plan cannot know left off.
+    let written = ok(dir.path(), &["pack", "snap", "v1.pack"]);
+    let planned = numbers(
+        plan.lines()
+            .last()
+            .expect("a summary line")
+            .split("; nothing")
+            .next()
+            .unwrap_or_default(),
+    );
+    let actual = numbers(written.lines().last().expect("a summary line"));
+
+    assert!(
+        !planned.is_empty(),
+        "the plan should report figures: {plan}"
+    );
+    assert_eq!(
+        actual.get(..planned.len()),
+        Some(planned.as_slice()),
+        "a dry pack should report the figures the pack has:\n{plan}\n{written}"
+    );
+    assert!(
+        written.lines().count() == 2,
+        "a written pack prints its content hash and its summary: {written}"
+    );
+}
+
+#[test]
+fn a_dry_delta_pack_reports_the_chunks_it_would_leave_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0u8..5 {
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            common::untagged_stream(i, 200_000),
+        )
+        .unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    fs::write(source.join("f2.bin"), common::untagged_stream(9, 230_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+
+    let plan = ok(
+        dir.path(),
+        &[
+            "pack",
+            "set",
+            "v2.delta",
+            "--version",
+            "2",
+            "--from",
+            "1",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        !dir.path().join("v2.delta").exists(),
+        "a dry delta pack wrote the file it was asked about"
+    );
+    assert!(
+        plan.contains("since 1"),
+        "a dry delta pack should still say what it is a delta against: {plan}"
+    );
+
+    let written = ok(
+        dir.path(),
+        &["pack", "set", "v2.delta", "--version", "2", "--from", "1"],
+    );
+    let planned = numbers(
+        plan.lines()
+            .last()
+            .expect("a summary line")
+            .split("; nothing")
+            .next()
+            .unwrap_or_default(),
+    );
+    let actual = numbers(written.lines().last().expect("a summary line"));
+
+    assert_eq!(
+        actual.get(..planned.len()),
+        Some(planned.as_slice()),
+        "a dry delta pack should report the figures the delta has:\n{plan}\n{written}"
+    );
+}
+
+#[test]
+fn a_dry_apply_writes_nothing_and_records_no_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..4 {
+        fs::write(source.join(format!("f{i}.bin")), common::noisy(150_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+
+    let target = dir.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    let before = listing(dir.path());
+
+    let plan = ok(dir.path(), &["apply", "v1.pack", "target", "--dry-run"]);
+
+    assert_eq!(
+        listing(dir.path()),
+        before,
+        "a dry apply changed the directory"
+    );
+    assert!(
+        !claim_path(&target).exists(),
+        "a dry apply took a claim beside the destination"
+    );
+    assert!(
+        !listing(dir.path())
+            .iter()
+            .any(|name| name.contains(lepatch::command::MANIFEST_SUFFIX)),
+        "a dry apply recorded a manifest beside the destination"
+    );
+
+    // Nothing is held yet, so every chunk would be written, and the target is
+    // empty so every file would be opened.
+    let figures = numbers(plan.lines().next().expect("a fetch line"));
+    let (fetched, payload, _ranges, held, chunks, written, files) = (
+        figures[0], figures[1], figures[2], figures[3], figures[4], figures[5], figures[6],
+    );
+
+    assert_eq!(held, 0, "an empty target holds nothing: {plan}");
+    assert_eq!(fetched, payload, "so all of it would be fetched: {plan}");
+    assert_eq!(chunks, written, "and every chunk would be written: {plan}");
+    assert_eq!(files, 4, "one file per file in the tree: {plan}");
+
+    // And the real run goes on to say exactly those numbers.
+    let applied = ok(dir.path(), &["apply", "v1.pack", "target"]);
+    assert_eq!(
+        numbers(applied.lines().next().expect("a fetch line")),
+        numbers(plan.lines().next().expect("a fetch line")),
+        "a dry apply should report the figures a real apply does:\n{plan}\n{applied}"
+    );
+    common::assert_same_tree(&source, &target);
+}
+
+#[test]
+fn a_dry_apply_with_prune_removes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("kept.bin"), common::noisy(120_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack"]);
+    ok(dir.path(), &["apply", "v1.pack", "target"]);
+
+    // Somebody's own work, in a directory the version does not record.
+    let stray = dir.path().join("target/notes.txt");
+    fs::write(&stray, b"mine\n").unwrap();
+    let before = common::describe(&dir.path().join("target"));
+
+    let plan = ok(
+        dir.path(),
+        &["apply", "v1.pack", "target", "--prune", "--dry-run"],
+    );
+
+    assert_eq!(
+        common::describe(&dir.path().join("target")),
+        before,
+        "a dry apply removed something"
+    );
+    assert!(
+        plan.contains("would remove 1 unrecorded entry"),
+        "a dry prune should say what it would remove: {plan}"
+    );
+    assert!(stray.is_file(), "the stray entry is gone after a dry run");
+}
+
+#[test]
+fn a_dry_reindex_writes_no_index_file_and_takes_no_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    for index in index_files(dir.path(), "snap") {
+        fs::remove_file(index).unwrap();
+    }
+    let before = listing(dir.path());
+
+    let plan = ok(dir.path(), &["reindex", "snap", "--dry-run"]);
+
+    assert_eq!(
+        listing(dir.path()),
+        before,
+        "a dry reindex changed the directory"
+    );
+    assert!(
+        index_files(dir.path(), "snap").is_empty(),
+        "a dry reindex wrote an index file"
+    );
+    assert!(
+        !dir.path().join("snap.lock").exists(),
+        "a dry reindex took the write lock"
+    );
+    assert_eq!(
+        after(&plan, "index file(s) would be written, "),
+        "0",
+        "the index files were deleted before the dry run: {plan}"
+    );
+    assert_eq!(
+        after(&plan, "dry run: "),
+        "1",
+        "and the set holds one version: {plan}"
+    );
+
+    ok(dir.path(), &["reindex", "snap"]);
+    assert_eq!(
+        index_files(dir.path(), "snap").len(),
+        1,
+        "the real reindex should have written the index file"
+    );
+}
+
+#[test]
+fn versions_and_verify_refuse_a_dry_run_rather_than_pretending_to_have_one() {
+    // They are already read-only, so a flag that did nothing there would be noise
+    // in `--help`. Refusal is the honest answer, and it is what clap gives.
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    for args in [
+        &["versions", "snap", "--dry-run"][..],
+        &["verify", "snap", "--dry-run"][..],
+    ] {
+        let output = lepatch(dir.path(), args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "`lepatch {}` is a usage error, not a failure of the command: {args:?}",
+            args.join(" ")
+        );
+        assert!(
+            stderr(&output).contains("unexpected argument '--dry-run'"),
+            "and it should say the argument is not one this command takes: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn every_writing_subcommand_documents_its_dry_run() {
+    // The help is where somebody looks before trusting the flag, and the neighbours
+    // say both what it affects and what it does not — so this checks both are there
+    // rather than just the word.
+    let dir = tempfile::tempdir().unwrap();
+
+    for (command, affects, does_not) in [
+        (
+            "backup",
+            "the tree is still walked",
+            "not the set's directory",
+        ),
+        ("restore", "still checked", "no claim is taken"),
+        ("pack", "still located", "`--out` is neither created"),
+        ("apply", "hashed", "no manifest recorded"),
+        (
+            "reindex",
+            "version count is the store's own",
+            "no lock is taken",
+        ),
+    ] {
+        let help = ok(dir.path(), &[command, "--help"]);
+        assert!(
+            help.contains("--dry-run"),
+            "`lepatch {command} --help` should offer --dry-run"
+        );
+        assert!(
+            help.contains(affects),
+            "`lepatch {command} --help` should say what a dry run still does: {help}"
+        );
+        assert!(
+            help.contains(does_not),
+            "`lepatch {command} --help` should say what a dry run does not do: {help}"
+        );
+    }
+}
