@@ -926,7 +926,8 @@ being handed something that can append to the store.
 ## Upgrading across a format change
 
 Two on-disk formats changed in `0.3.0`, and both go one way. Neither direction
-needs a re-backup.
+needs a re-backup. `0.4.0` changes no set format at all; it moves the pack format,
+which is derived output and regenerable.
 
 **Sets are readable, but only forwards.** `0.3.0` reads snapshots it did not write
 (`MIN_READABLE_VERSION` is 3), so your existing backup sets keep working. `0.2.0`
@@ -942,15 +943,16 @@ time, so nothing has to be backed up again to bring a client up to date.
 $ lepatch pack set v8.pack --version 8     # after upgrading the server
 ```
 
-The pack format moves to `4` with the recorded version described above, so a `3`
-pack is refused by name — `it is pack format 3, but this build reads 4` — rather
-than read as though the four bytes it does not have were part of its snapshot hash.
+The pack format moved to `4` in `0.4.0`, with the recorded version described above, so
+a `3` pack is refused by name — `it is pack format 3, but this build reads 4` —
+rather than read as though the four bytes it does not have were part of its
+snapshot hash.
 Every earlier pack format is refused the same way, and the reason is the same: a
 pack this build cannot parse would otherwise produce byte ranges that look
 entirely plausible and point at the wrong bytes.
 
-**Order matters if clients fetch packs from a server you are upgrading.** A `0.3.0`
-client refuses a `0.2.0` pack, so the server has to go first:
+**Order matters if clients fetch packs from a server you are upgrading.** A `0.4.0`
+client refuses a `0.3.0` pack, so the server has to go first:
 
 1. Upgrade the server. It now writes snapshots and packs this build understands.
 2. Re-run `lepatch pack` for whatever versions clients are fetching, and let them

@@ -9,7 +9,7 @@ autobenches = false
 # 0.2.0 introduced zstd compression, which changed the record format:
 # `FORMAT_VERSION` is 2, and a store written by 0.1 is refused rather than
 # misparsed. Anyone with an existing backup set re-takes it.
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 # Minimum supported Rust version.
 #
