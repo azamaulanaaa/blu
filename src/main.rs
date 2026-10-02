@@ -542,11 +542,12 @@ async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<(
         let versions = store.versions()?;
 
         // `write_index_files` writes one file per version it can resolve a snapshot
-        // for and skips the rest, so the number a plan reports has to be counted
-        // the same way to be the number a real run writes. Counting the versions
-        // instead would over-report a set whose commit record names a snapshot that
-        // does not resolve — and a real reindex skips that version too, so it would
-        // write no file for it either.
+        // for and skips the rest, returning the lower count, so the plan applies
+        // the same test rather than counting the commit records. A version whose
+        // snapshot does not resolve is not counted here for the same reason a real
+        // reindex writes no index file for it: a plan reports what the run does, and
+        // it does not write one. The index files are a cache either way, so
+        // rewriting one is how they are brought back to date.
         let writable = versions
             .iter()
             .filter(|version| store.snapshot(**version).is_ok())
