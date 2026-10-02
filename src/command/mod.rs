@@ -13,7 +13,7 @@ mod restore;
 mod verify;
 
 pub use apply::{Applied, Options as ApplyOptions, apply};
-pub use backup::{Committed, Options, backup};
+pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{

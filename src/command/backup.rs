@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{self, Cursor},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use tracing::instrument;
@@ -74,6 +74,140 @@ pub struct Committed {
     pub snapshot: storage::BlobId,
 }
 
+/// What a backup of a tree would do, worked out by reading the tree and asking
+/// the set what it already holds, and by writing nothing.
+///
+/// **Every figure here comes from the run a real backup would have made.** It is
+/// not a second walk and an estimate beside it: [`backup_plan`] drives the same
+/// walk, the same chunker and the same deduplication map as [`backup`], with a
+/// store that answers what it is asked and keeps none of it. So a plan that says
+/// two chunks are new is describing a set that will grow by exactly those two
+/// chunks, and a plan that says none are new is describing a set that will not
+/// grow at all.
+///
+/// The dry run is a separate entry point rather than a field on [`Options`], and
+/// the reason is the return type. `backup` answers with a [`Committed`], whose
+/// version number is chosen by the store at the moment it commits — and a run that
+/// writes nothing never reaches a commit, so there is no version for it to report.
+/// Asking one function for either answer means either making that field a lie or
+/// inventing a report type a caller has to unwrap, and the plan is worth having in
+/// full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupPlan {
+    /// The version this run would commit, given the set as it stands.
+    pub version: u32,
+    /// Hash of the snapshot blob it would commit.
+    pub snapshot: storage::BlobId,
+    /// Regular files the walk found.
+    pub files: u64,
+    /// Directories the walk found.
+    pub dirs: u64,
+    /// Hard and symbolic links the walk found.
+    pub links: u64,
+    /// Distinct chunks the tree is cut into.
+    pub chunks: u64,
+    /// Of those, how many the set already holds.
+    pub held: u64,
+    /// Of those, how many would have to be written.
+    pub fresh: u64,
+    /// Bytes of chunk content that would be written.
+    ///
+    /// The content, before any compression: how large the records are on disk
+    /// depends on the set's compression policy, which is chosen when the store is
+    /// opened and so is not a property of the tree.
+    pub bytes: u64,
+}
+
+/// What a walk found, which a plan reports and a committed run has no use for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Entries {
+    files: u64,
+    dirs: u64,
+    links: u64,
+}
+
+/// One blob a planning run was asked to store, and whether the set already had it.
+struct Asked {
+    id: storage::BlobId,
+    len: u64,
+    held: bool,
+}
+
+/// A store that answers what it is asked and keeps none of it.
+///
+/// The whole of a dry run: it stands where the real store would, so the walk,
+/// the chunker, the deduplication map and the snapshot are built by exactly the
+/// code a backup runs, and nothing reaches the disk.
+///
+/// [`StoragePut::put`] asks the set whether it already holds the content instead
+/// of writing it. That is the one question a real store answers by consulting its
+/// own index and returning without a byte, so a plan costs the same lookup a
+/// deduplicating backup would have cost and nothing more. Which means it is not
+/// [`StoragePut`] itself that decides — see [`Planned`]'s implementation — and the
+/// answer is recorded per blob so the report can count them afterwards.
+struct Planned {
+    /// The set, if there is one. `None` is the first backup of a location: no
+    /// store, nothing held, and the whole tree new.
+    store: Option<storage::BlobStore<storage::Read>>,
+    /// Every distinct blob the run offered, and what became of it.
+    asked: Arc<Mutex<Vec<Asked>>>,
+}
+
+// `async` on all three, and none of them awaits anything: that is what a store
+// which writes nothing looks like, and the trait is spelled in `async fn` because
+// the two implementations that do real I/O are.
+#[allow(clippy::unused_async_trait_impl)]
+impl storage::StoragePut for Planned {
+    /// Record what the run would have written, and drop the bytes.
+    async fn put(
+        &self,
+        id: &storage::BlobId,
+        _reader: storage::StreamReadSeeker,
+        len: u64,
+    ) -> io::Result<()> {
+        // The reader is dropped unread. Nothing downstream needs the bytes: the
+        // chunker has already hashed them, and the snapshot records the hashes.
+        let held = match self.store.as_ref() {
+            // `locate` is the store's own index, so this is a lookup and not a
+            // read of the chunk — which is what keeps planning a large set the
+            // cost of a walk rather than the cost of a backup.
+            Some(store) => match store.locate(id) {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            },
+            None => false,
+        };
+
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Asked { id: *id, len, held });
+
+        Ok(())
+    }
+
+    /// Nothing was written, so there is nothing to make durable.
+    async fn sync_data(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// The version this run *would* have committed.
+    ///
+    /// A plan publishes nothing, so there is no commit to report. The number is
+    /// still worth handing back, and it is the one a real run would get: the set's
+    /// own commit log, plus one.
+    async fn commit(&self, _snapshot: &storage::BlobId) -> io::Result<u32> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(1);
+        };
+
+        Ok(u32::try_from(store.versions()?.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1))
+    }
+}
+
 /// Uploads to run at once, bounded by what the machine can do.
 fn default_concurrency() -> usize {
     super::concurrency(DEFAULT_CONCURRENCY)
@@ -117,6 +251,86 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     options: Options,
     storage: S,
 ) -> io::Result<Committed> {
+    Ok(run(root, options, storage).await?.1)
+}
+
+/// Work out what a backup of `root` would write, and write none of it.
+///
+/// Everything a real backup does, in the same order and through the same code: the
+/// tree is walked, cut into chunks, hashed and deduplicated, and the snapshot that
+/// would be committed is built and hashed as well. The only difference is where the
+/// chunks go — into a store that asks the set whether it holds them and keeps the
+/// answers — so the figures are the ones a real run would have printed rather
+/// than an estimate made beside one.
+///
+/// `store` is `None` for a location with no set behind it, which is the first
+/// backup of somewhere and the case where a dry run has to answer "everything is
+/// new" instead of failing the way [`storage::BlobStore::open_for_reading`] would.
+/// Opening a set for writing to find out is not an option: that *creates* it.
+///
+/// Nothing is created, not even the directory the set would have lived in, and no
+/// lock is taken — so a plan can be run against a set another backup is holding
+/// the lock on, at the cost of possibly planning against a set that moves under
+/// it.
+///
+/// # Errors
+///
+/// As [`backup`]: a tree that cannot be walked or read, a file that changes while
+/// it is being read, or a set that cannot answer what it already holds.
+pub async fn backup_plan<P: AsRef<Path> + Debug>(
+    root: P,
+    options: Options,
+    store: Option<storage::BlobStore<storage::Read>>,
+) -> io::Result<BackupPlan> {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let planned = Planned {
+        store,
+        asked: Arc::clone(&asked),
+    };
+
+    let (entries, committed) = run(root, options, planned).await?;
+
+    // The snapshot is offered to the store like any other blob and is not a chunk
+    // of anything, so it is dropped here rather than counted. It is identified by
+    // the hash the run committed it under, which is the one thing that run knows it
+    // is not.
+    let asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut chunks = 0u64;
+    let mut held = 0u64;
+    let mut bytes = 0u64;
+    for ask in asked.iter().filter(|ask| ask.id != committed.snapshot) {
+        chunks = chunks.saturating_add(1);
+        if ask.held {
+            held = held.saturating_add(1);
+        } else {
+            bytes = bytes.saturating_add(ask.len);
+        }
+    }
+
+    Ok(BackupPlan {
+        version: committed.version,
+        snapshot: committed.snapshot,
+        files: entries.files,
+        dirs: entries.dirs,
+        links: entries.links,
+        chunks,
+        held,
+        fresh: chunks.saturating_sub(held),
+        bytes,
+    })
+}
+
+/// The run both entries to this module make, with or without a store underneath.
+///
+/// Split out rather than written twice because the thing that has to be shared is
+/// the *whole* run: a dry run that walked the tree by any other route could report
+/// a snapshot no backup would ever commit, which would be worse than no report.
+#[instrument(level = "info", skip(storage, options), err)]
+async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
+    root: P,
+    options: Options,
+    storage: S,
+) -> io::Result<(Entries, Committed)> {
     let Options {
         exclude,
         chunker: config,
@@ -143,6 +357,11 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     // Counted before the index moves into the pipeline, so the opening progress
     // line can report the file total before a single one is read.
     let files = u64::try_from(file_index.len()).unwrap_or(0);
+    let entries = Entries {
+        files,
+        dirs: u64::try_from(snapshot.dirs.len()).unwrap_or(0),
+        links: u64::try_from(snapshot.links.len()).unwrap_or(0),
+    };
 
     let pipeline = pipeline::Pipeline::new(root.to_path_buf(), file_index, storage);
 
@@ -184,10 +403,13 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 
     let version = pipeline.storage.commit(&id).await?;
 
-    Ok(Committed {
-        version,
-        snapshot: id,
-    })
+    Ok((
+        entries,
+        Committed {
+            version,
+            snapshot: id,
+        },
+    ))
 }
 
 /// Walk the tree, recording everything that is not file content.
