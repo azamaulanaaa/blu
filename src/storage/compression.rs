@@ -65,9 +65,10 @@ pub trait Compressor: Send + Sync + 'static {
     /// majority of a real tree is already entropy-coded, and a frame around one
     /// comes out larger.
     ///
-    /// The answer is not trusted to be an improvement — see the note on the trait
-    /// — and the store stores `raw` untouched whenever the returned bytes are not
-    /// strictly smaller. `Cow` rather than `Vec` for the reason [`Compression`]
+    /// The answer is not trusted to be an improvement, and not trusted to name a
+    /// codec either — see the note on the trait — so the store stores `raw`
+    /// untouched unless the returned bytes are strictly smaller and the codec is
+    /// one it can decode. `Cow` rather than `Vec` for the reason [`Compression`]
     /// gives: most answers are the input, unchanged.
     fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>);
 }

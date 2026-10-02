@@ -83,6 +83,20 @@ impl Compressor for AlwaysGrows {
     }
 }
 
+/// A policy that hands back bytes that are not the payload, under a codec the
+/// reader will never decode, to pin that the codec the store records is its own.
+struct Truncates;
+
+/// `Raw` in a record means "the bytes the store hashed", so a policy that claims
+/// it while returning half the payload is not believed: what the reader is handed
+/// for chunk `id` would otherwise be those half bytes followed by whatever record
+/// follows them in the segment.
+impl Compressor for Truncates {
+    fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>) {
+        (Codec::Raw, Cow::Owned(vec![0u8; raw.len() / 2]))
+    }
+}
+
 /// Bytes that zstd cannot compress, so a frame is never smaller than the input.
 ///
 /// The store falls back to raw for these, which is what makes a size assertion
@@ -279,6 +293,49 @@ async fn a_compressor_that_grows_its_payload_cannot_grow_the_store() {
     drop(store);
     let reader = BlobStore::open_for_reading(&blob).await.unwrap();
     assert_eq!(read(&reader, &id).await, payload);
+}
+
+/// A policy that returns fewer bytes than it was given cannot make a chunk read
+/// back as something else.
+///
+/// The size check and the codec check are separate obligations, and this pins the
+/// second one. `Truncates` returns strictly fewer bytes than the payload, so it
+/// passes a writer that only compares sizes — and pairs them with a codec the
+/// reader does not decode, so the payload is written under a name that means
+/// "these are the bytes that hashed to `id`" without them being so. Nothing on the
+/// read path hashes what it hands back, so the damage is silent: a restore
+/// produces a file of zeros and the bytes of whichever record came next.
+#[tokio::test]
+async fn bytes_that_are_not_the_payload_are_not_stored_under_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store");
+
+    let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), Truncates)
+        .await
+        .unwrap();
+
+    let payload = incompressible(9, 200_000);
+    let id = put(&store, &payload).await;
+
+    let placement = store.locate(&id).unwrap();
+    assert_eq!(
+        placement.stored_len, placement.raw_len,
+        "a record of {} bytes cannot be the {} byte payload it was stored for",
+        placement.stored_len, placement.raw_len
+    );
+
+    // A second record, so a stored length short of the payload would run into
+    // another record's bytes rather than into end of file.
+    let other = incompressible(10, 100_000);
+    put(&store, &other).await;
+
+    drop(store);
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
+    assert_eq!(
+        read(&reader, &id).await,
+        payload,
+        "a chunk read back as something other than the content it is named for"
+    );
 }
 
 /// Compression off stores everything raw, whatever the content is.

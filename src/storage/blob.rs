@@ -739,10 +739,22 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
         // came in, and the record says `Raw`, which is exactly what the reader
         // would have done with it. See the note on [`Compressor`].
         //
+        // The codec is checked as well, and by naming `Zstd` rather than by
+        // asking the store's decoders: `Raw` in a record means "these are the
+        // bytes that hashed to this id", and a policy that paired it with
+        // anything else would be naming bytes the store never hashed. Nothing on
+        // the read path checks what it hands back, so the pairing is worth
+        // enforcing where it is written rather than assuming a caller got it
+        // right. `Zstd` is the fail-closed arm in exchange — its decode
+        // validates the frame against the `raw_len` the header claims — which is
+        // why the store may keep a frame on a policy's word that it decodes to
+        // exactly that.
+        //
         // `Compression` never trips this, because it applies the rule itself and
         // hands back a borrow of `raw` when the frame did not win.
-        let (codec, stored) = if stored.len() < raw.len() {
-            (codec, stored)
+        let keep = matches!(codec, Codec::Zstd) && stored.len() < raw.len();
+        let (codec, stored) = if keep {
+            (Codec::Zstd, stored)
         } else {
             (Codec::Raw, Cow::Borrowed(raw.as_slice()))
         };
