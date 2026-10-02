@@ -7,13 +7,200 @@
 //! is the common case — photos, archives and video are already entropy-coded,
 //! and a frame around one comes out *larger* than the bytes it replaced.
 //!
+//! [`Compressor`] and [`Decompressor`] are the two halves of that policy as a
+//! seam, so a caller outside this crate can bring its own without the store
+//! learning about it. [`Compression`] implements the first and [`Zstd`] the
+//! second, which is the whole of what this crate ships.
+//!
 //! The measurements behind the default level are in the README, and
 //! `tests/compression.rs` is what holds the store's other properties still true
 //! across a codec byte.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, io};
 
 use super::record::Codec;
+
+/// How a payload becomes the bytes a record stores.
+///
+/// The seam is *how*, not *which codec*: an implementation is handed a payload and
+/// answers with the bytes to write and the codec to record beside them. Nothing
+/// here is about zstd, about a level, or about whether compressing is a good idea
+/// for this payload — [`Compression`] is one implementation and the one this crate
+/// ships, but a caller with its own policy (a different codec, a size threshold, a
+/// learned dictionary) implements this trait and hands it to
+/// [`BlobStore::open_for_writing`](super::BlobStore::open_for_writing) instead,
+/// without touching a line of the store.
+///
+/// # The fallback belongs to the writer, not to the trait
+///
+/// The one rule a payload must never break is **a frame is stored only when it is
+/// strictly smaller than the payload it replaces**. It is documented on
+/// [`Compressor::compress`] as an obligation and *not* left to the obligation:
+/// [`super::BlobStore`] re-checks the answer and stores the payload untouched
+/// whenever the bytes came back no smaller. So the guarantee is a property of the
+/// store rather than a promise every implementor has to remember, and a
+/// third-party compressor cannot grow a set by accident.
+///
+/// The alternative — leaving it to the implementor, and trusting it — was rejected
+/// for the obvious reason: the cost of getting it wrong is paid by the user's
+/// disk, not by the crate, and the mistake is invisible in review because a
+/// compressor that returns a frame is *doing what it was asked*. A compressor that
+/// is always allowed to answer is also a compressor that can always be wrong.
+///
+/// [`Compression`] applies the rule itself as well, which is not redundant: it is
+/// what lets it hand back the input borrowed rather than an owned frame the store
+/// would drop, and the frame has to be built either way to be measured against the
+/// input. So the rule is stated once, where the size is compared, and enforced
+/// once, where the bytes are written.
+///
+/// The lifetime is named rather than elided: with two input lifetimes, elision
+/// would tie the returned borrow to `&self` rather than to `raw`, which is the
+/// opposite of what every implementation wants — the answer usually borrows the
+/// payload and never touches the policy.
+pub trait Compressor: Send + Sync + 'static {
+    /// The bytes to store for `raw`, and the codec to record beside them.
+    ///
+    /// Returning [`Codec::Raw`] means "store these bytes as they are", which is a
+    /// legitimate answer for any payload and not a failure: the overwhelming
+    /// majority of a real tree is already entropy-coded, and a frame around one
+    /// comes out larger.
+    ///
+    /// The answer is not trusted to be an improvement — see the note on the trait
+    /// — and the store stores `raw` untouched whenever the returned bytes are not
+    /// strictly smaller. `Cow` rather than `Vec` for the reason [`Compression`]
+    /// gives: most answers are the input, unchanged.
+    fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>);
+}
+
+impl Compressor for Compression {
+    fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>) {
+        // Fully qualified, because the inherent method and this one are the same
+        // operation under two names: the inherent one is what the tests in this
+        // module call, and it is not going away.
+        Compression::compress(*self, raw)
+    }
+}
+
+/// How stored bytes become a payload again.
+///
+/// The mirror of [`Compressor`], and separate from it for the reason the two are
+/// separate at all: a write policy is chosen by whoever opened the store, while a
+/// read is answered by the codec byte in the record being read. A caller reading a
+/// set written under a policy it has never heard of still has to decode it, so the
+/// reader is not given a policy — it is given the codec, and this is what the
+/// codec means.
+///
+/// [`Zstd`] is the only implementation, because [`Codec`] has only one
+/// non-trivial arm. It is a trait rather than a call to `zstd::bulk::decompress`
+/// because that call has more to it than the decode — it validates a frame against
+/// the length its record claims, which is a trust decision about the file and not a
+/// detail of the codec — and because the two places that decode were each doing
+/// that validation for themselves.
+///
+/// Return-position `impl Future` for the `+ Send`, and for the same reason as
+/// [`super::StorageGet::get`](super::StorageGet): a decode runs on the blocking
+/// pool and its future is awaited from a `get`, which is spawned.
+pub trait Decompressor: Send + Sync + 'static {
+    /// Decode `stored` into the payload, which must come back exactly `raw_len`
+    /// bytes long.
+    ///
+    /// `raw_len` is the record's claim, not a measurement: a record header carries a
+    /// truncated hash rather than a MAC, so it is checked against the frame and
+    /// never trusted. An implementation must refuse a frame that does not produce
+    /// exactly that many bytes rather than hand back a short read — a short read
+    /// looks like end of stream, and a restore that trusts one produces a file that
+    /// is quietly incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `stored` is not a frame this codec recognises, if the
+    /// frame does not say how many bytes it decodes to, if that number is not
+    /// `raw_len`, or if `raw_len` is not something this process can hold.
+    fn decompress(
+        &self,
+        stored: Vec<u8>,
+        raw_len: u64,
+    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
+}
+
+/// The only [`Decompressor`] this crate ships: zstd frames.
+///
+/// A unit struct rather than an enum because there is one thing to be, and a type
+/// that says which is what an implementor of [`Decompressor`] needs to name. It
+/// carries no level: decoding does not take one, and a frame records the level it
+/// was written at in its own header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Zstd;
+
+/// The body of [`Zstd::decompress`], split out so the trait method above can keep
+/// its return-position `impl Future` — the `manual_async_fn` lint points at a
+/// signature that names the future rather than an `async fn`, and here the naming
+/// is the point: it is what says the future can cross a thread, which an `async
+/// fn` in a trait does not.
+impl Zstd {
+    async fn decode(&self, stored: Vec<u8>, raw_len: u64) -> io::Result<Vec<u8>> {
+        let expected = usize::try_from(raw_len).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a payload of {raw_len} bytes does not fit in memory"),
+            )
+        })?;
+
+        // `None` means the frame does not declare a size, which is what a
+        // compressed *stream* looks like. Nothing here produces one, and
+        // accepting one would mean decoding blind.
+        let declared = zstd::zstd_safe::get_frame_content_size(&stored)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("a compressed payload is not a readable zstd frame: {e}"),
+                )
+            })?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a compressed payload does not say how many bytes it decodes to",
+                )
+            })?;
+
+        if usize::try_from(declared).unwrap_or(usize::MAX) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "a compressed payload declares {declared} bytes but its record claims \
+                     {expected}"
+                ),
+            ));
+        }
+
+        // Frame and header agree, so the decode can come up neither short nor long.
+        let bytes = tokio::task::spawn_blocking(move || zstd::bulk::decompress(&stored, expected))
+            .await
+            .map_err(|join| io::Error::other(format!("decompression panicked: {join}")))??;
+
+        if bytes.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "a compressed payload decoded to {} bytes but its record claims {expected}",
+                    bytes.len()
+                ),
+            ));
+        }
+
+        Ok(bytes)
+    }
+}
+
+impl Decompressor for Zstd {
+    fn decompress(
+        &self,
+        stored: Vec<u8>,
+        raw_len: u64,
+    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
+        self.decode(stored, raw_len)
+    }
+}
 
 /// How record payloads are compressed on the way in.
 ///
@@ -118,6 +305,11 @@ impl Compression {
     }
 
     /// Compress `raw`, returning the codec to record and the bytes to store.
+    ///
+    /// This is the inherent form of [`Compressor::compress`], and it is what the
+    /// store calls through the trait. It stays as a method because the unit tests
+    /// below pin the fallback through it, and a test that went through a trait
+    /// object to assert a pointer was not the clearest way to say what it meant.
     ///
     /// A payload becomes a zstd frame only when that frame is strictly smaller
     /// than the input; otherwise [`Codec::Raw`] and the bytes unchanged, so

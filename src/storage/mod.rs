@@ -19,7 +19,8 @@
 //! * `record` — the framing of a record, and how a store is read back.
 //! * `hash` — what a chunk is named by, and the truncated digest a header checks
 //!   itself with.
-//! * `compression` — the write policy for record payloads.
+//! * `compression` — the seams for how a payload becomes stored bytes and how
+//!   they come back, and the write policy this crate ships.
 //! * `segment` — the write policy for how large a segment may get.
 //! * `plan` — a snapshot turned into the ordered list of chunks a store holds.
 //! * `locate` — finding a version's snapshot without scanning the whole set.
@@ -39,7 +40,7 @@ mod version_index;
 
 pub use backend::{AsyncReadSeek, StorageGet, StoragePut, StreamReadSeeker};
 pub use blob::{BlobStore, Read, Write, WriteMode};
-pub use compression::{Compression, MAX_COMPRESSION_LEVEL};
+pub use compression::{Compression, Compressor, Decompressor, MAX_COMPRESSION_LEVEL, Zstd};
 pub use error::{at, at_async};
 pub use hash::BlobId;
 pub use locate::{Resolved, resolve, resolve_with};

@@ -19,6 +19,8 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::storage::{Decompressor, Zstd};
+
 /// Size of the stack scratch buffer used to stage bytes out of the inner
 /// reader.
 ///
@@ -288,72 +290,34 @@ impl std::fmt::Debug for DecompressReader {
 }
 
 impl DecompressReader {
-    /// Decompress `compressed` into a reader, on a blocking thread.
+    /// Decompress a zstd frame into a reader, on a blocking thread.
     ///
-    /// `raw_len` pre-sizes the buffer, and the frame's declared content size is
-    /// checked against it *before* anything is allocated: a record header is a
-    /// truncated hash, not a MAC, so `raw_len` is untrusted. Any other decoded
-    /// length is an error, because the record is not what the store says it is.
+    /// The codec is not a parameter: this is the reader for a zstd frame and
+    /// nothing else. The decode behind it is [`Zstd`], the one [`Decompressor`]
+    /// this crate ships, so the validation of the frame against `raw_len` lives
+    /// with the codec rather than here — this used to hold a second copy of it,
+    /// one that could disagree with the copy the store used.
     ///
     /// # Errors
     ///
-    /// Returns an error if the bytes are not a zstd frame, if the frame does not
-    /// declare a size, if that size is not `raw_len`, or if `raw_len` is not
-    /// something this process can hold in memory.
+    /// Whatever [`Zstd::decompress`] returns: the frame must be a readable zstd
+    /// frame, must declare a size, and that size must be `raw_len`.
     pub async fn new(compressed: Vec<u8>, raw_len: u64) -> std::io::Result<Self> {
-        let expected = usize::try_from(raw_len).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("a payload of {raw_len} bytes does not fit in memory"),
-            )
-        })?;
-
-        // `None` means the frame does not declare a size, which is what a
-        // compressed *stream* looks like. Nothing here produces one, and
-        // accepting one would mean decoding blind.
-        let declared = zstd::zstd_safe::get_frame_content_size(&compressed)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("a compressed payload is not a readable zstd frame: {e}"),
-                )
-            })?
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "a compressed payload does not say how many bytes it decodes to",
-                )
-            })?;
-
-        if usize::try_from(declared).unwrap_or(usize::MAX) != expected {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "a compressed payload declares {declared} bytes but its record claims \
-                     {expected}"
-                ),
-            ));
-        }
-
-        // Frame and header agree, so the decode can come up neither short nor long.
-        let bytes =
-            tokio::task::spawn_blocking(move || zstd::bulk::decompress(&compressed, expected))
-                .await
-                .map_err(|join| {
-                    std::io::Error::other(format!("decompression panicked: {join}"))
-                })??;
-
-        if bytes.len() != expected {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "a compressed payload decoded to {} bytes but its record claims {expected}",
-                    bytes.len()
-                ),
-            ));
-        }
+        let bytes = Decompressor::decompress(&Zstd, compressed, raw_len).await?;
 
         Ok(Self { bytes, position: 0 })
+    }
+
+    /// Serve already-decoded payload bytes.
+    ///
+    /// The other half of [`DecompressReader::new`], for a caller that has decoded
+    /// through [`Decompressor`] itself — which is what [`super::BlobStore`] does,
+    /// because it is the store that reads the codec byte and so is the place that
+    /// knows which decompressor applies. Two constructors rather than one taking
+    /// a decompressor, because a reader does not choose how its bytes were made.
+    #[must_use]
+    pub fn from_decoded(bytes: Vec<u8>) -> Self {
+        Self { bytes, position: 0 }
     }
 }
 
