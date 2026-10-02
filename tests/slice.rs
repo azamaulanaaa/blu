@@ -220,7 +220,7 @@ async fn seeking_to_the_end_is_allowed() {
     reader.seek(SeekFrom::Start(1_000)).await.unwrap();
     let mut out = Vec::new();
     reader.read_to_end(&mut out).await.unwrap();
-    assert!(out.is_empty());
+    assert_eq!(out, []);
 }
 
 /// An empty payload is empty, not an error.
@@ -233,7 +233,7 @@ async fn an_empty_payload_reads_as_empty() {
     let mut reader = DecompressReader::new(frame_of(&[]), 0).await.unwrap();
     let mut out = Vec::new();
     reader.read_to_end(&mut out).await.unwrap();
-    assert!(out.is_empty());
+    assert_eq!(out, []);
 }
 
 /// A record claiming an absurd length is refused, and does not allocate.

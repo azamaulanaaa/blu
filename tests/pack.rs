@@ -300,7 +300,7 @@ async fn a_client_holding_everything_needs_nothing() {
 
     let have: HashSet<_> = built.plan.iter().map(|c| c.id).collect();
 
-    assert!(pack.needed(&have).is_empty());
+    assert_eq!(pack.needed(&have), []);
     assert_eq!(pack.needed_bytes(&have), 0);
 }
 

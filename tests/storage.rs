@@ -107,12 +107,7 @@ async fn an_empty_blob_round_trips() {
         .unwrap();
 
     let store = BlobStore::open_for_reading(&blob).await.unwrap();
-    assert!(
-        read_all(&store, &common::id_of(&[]))
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(read_all(&store, &common::id_of(&[])).await.unwrap(), []);
 }
 
 #[tokio::test]

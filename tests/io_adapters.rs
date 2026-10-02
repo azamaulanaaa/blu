@@ -41,7 +41,7 @@ async fn a_zero_limit_yields_nothing() {
     let mut out = Vec::new();
     reader.read_to_end(&mut out).await.unwrap();
 
-    assert!(out.is_empty());
+    assert_eq!(out, []);
 }
 
 #[tokio::test]
@@ -127,7 +127,7 @@ async fn a_zero_limit_writer_writes_nothing() {
         assert_eq!(written, 0);
     }
 
-    assert!(sink.is_empty());
+    assert_eq!(sink, []);
 }
 
 #[tokio::test]

@@ -581,8 +581,8 @@ mod tests {
             super::super::FORMAT_VERSION,
         )
         .expect("decodes");
-        assert!(decoded.files.is_empty());
-        assert!(decoded.links.is_empty());
+        assert_eq!(decoded.files, []);
+        assert_eq!(decoded.links, []);
     }
 
     #[test]
