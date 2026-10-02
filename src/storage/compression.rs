@@ -22,14 +22,23 @@ use super::record::Codec;
 
 /// How a payload becomes the bytes a record stores.
 ///
-/// The seam is *how*, not *which codec*: an implementation is handed a payload and
-/// answers with the bytes to write and the codec to record beside them. Nothing
-/// here is about zstd, about a level, or about whether compressing is a good idea
-/// for this payload — [`Compression`] is one implementation and the one this crate
-/// ships, but a caller with its own policy (a different codec, a size threshold, a
-/// learned dictionary) implements this trait and hands it to
+/// The seam is *how a payload is written*, not *which codec*: an implementation is
+/// handed a payload and answers with the bytes to write and the codec to record
+/// beside them. Nothing here is about zstd, about a level, or about whether
+/// compressing is a good idea for this payload — [`Compression`] is one
+/// implementation and the one this crate ships, but a caller with its own policy
+/// (a size threshold, a level of its own, a rule about which payloads are worth a
+/// frame) implements this trait and hands it to
 /// [`BlobStore::open_for_writing`](super::BlobStore::open_for_writing) instead,
 /// without touching a line of the store.
+///
+/// What a caller cannot do through this trait is add a codec. [`Codec`] has two
+/// arms and the store decodes one of them, so a policy is a choice about *which
+/// payloads* get a frame, at what level, and whether one is built at all — and
+/// the codec that comes back is advice, because the store records its own:
+/// `Zstd` only for bytes it will keep, and `Raw` for the payload it hashed.
+/// Naming a third codec would mean a new on-disk format, which is a larger
+/// change than the seam is for.
 ///
 /// # The fallback belongs to the writer, not to the trait
 ///
@@ -37,9 +46,11 @@ use super::record::Codec;
 /// strictly smaller than the payload it replaces**. It is documented on
 /// [`Compressor::compress`] as an obligation and *not* left to the obligation:
 /// [`super::BlobStore`] re-checks the answer and stores the payload untouched
-/// whenever the bytes came back no smaller. So the guarantee is a property of the
-/// store rather than a promise every implementor has to remember, and a
-/// third-party compressor cannot grow a set by accident.
+/// whenever the returned bytes came back no smaller, or named a codec the store
+/// cannot decode. So the guarantee is a property of the store rather than a
+/// promise every implementor has to remember, and a third-party compressor
+/// cannot grow a set by accident, or store bytes under a name that means
+/// something else.
 ///
 /// The alternative — leaving it to the implementor, and trusting it — was rejected
 /// for the obvious reason: the cost of getting it wrong is paid by the user's
