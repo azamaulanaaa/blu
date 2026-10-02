@@ -3023,6 +3023,56 @@ fn a_dry_reindex_writes_no_index_file_and_takes_no_lock() {
     );
 }
 
+/// A dry run is taken against a set or a destination something else holds.
+///
+/// Every write a real run makes around the work — the write lock on a set, the
+/// claim beside a destination — is a file, and a plan that created one would be
+/// making the very claim it must not. A listing taken after the run cannot see
+/// this, because the file is removed on the way out again; the claim that *was*
+/// taken is what another process would have collided with while the run was in
+/// progress, so the way to see it is to be holding it.
+///
+/// Which is also the property worth having: the reason a dry run takes no claim
+/// is that it reads nothing that a claim protects, so a plan can be taken against
+/// a set a backup is holding or a destination a restore is writing into. The
+/// refusals at the end are what make the successes meaningful — without them, a
+/// lock nobody honours would prove nothing.
+#[test]
+fn a_dry_run_needs_no_claim_and_takes_none() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["pack", "snap", "v1.pack"]);
+
+    // Two claims somebody else is holding: the set's own lock, and the one a
+    // restore or an apply takes beside a destination.
+    let set_lock = dir.path().join("snap.lock");
+    fs::write(&set_lock, b"").unwrap();
+    let destination = dir.path().join("out");
+    let destination_claim = claim_path(&destination);
+    fs::write(&destination_claim, b"").unwrap();
+
+    ok(dir.path(), &["backup", "src", "snap", "--dry-run"]);
+    ok(dir.path(), &["reindex", "snap", "--dry-run"]);
+    ok(dir.path(), &["restore", "out", "snap", "--dry-run"]);
+    ok(dir.path(), &["apply", "v1.pack", "out", "--dry-run"]);
+
+    // And the same commands are refused while the claims are held, so the four
+    // successes above are about the dry run rather than about a lock nobody takes.
+    fails(dir.path(), &["backup", "src", "snap"]);
+    fails(dir.path(), &["reindex", "snap"]);
+    fails(dir.path(), &["restore", "out", "snap"]);
+    fails(dir.path(), &["apply", "v1.pack", "out"]);
+
+    // Neither claim was disturbed: a plan that took one and dropped it on the way
+    // out would have removed somebody else's.
+    assert!(set_lock.is_file(), "the write lock should still be there");
+    assert!(
+        destination_claim.is_file(),
+        "the destination's claim should still be there"
+    );
+}
+
 #[test]
 fn versions_and_verify_refuse_a_dry_run_rather_than_pretending_to_have_one() {
     // They are already read-only, so a flag that did nothing there would be noise
