@@ -25,7 +25,7 @@ mod fixture;
 // builds files that share nothing, because a shared prefix would hide the store
 // behind the reader. Neither is reusable for the other's job, and both have to
 // satisfy the properties below.
-#[path = "../examples/fixtures/ab.rs"]
+#[path = "fixtures/ab.rs"]
 mod ab_fixture;
 
 use std::collections::HashSet;

@@ -14,13 +14,16 @@
 //! a measurement fixture and nothing outside the example and the one test should
 //! touch it.
 //!
-//! In a subdirectory rather than beside `ab.rs` because cargo builds every
-//! `examples/*.rs` as its own target and would fail on the missing `main`. It
-//! only looks for `examples/*/main.rs`, so one level down is not a target — the
-//! same accident of layout that `benches/fixture.rs` relies on, arrived at from
-//! the other direction. Declaring `[[example]]` entries to exclude it also works
-//! and is worse: a partly-specified example target inherits the package metadata,
-//! so cargo then warns that `edition` is unset and that setting it is deprecated.
+//! It lives here, under `tests/`, because the property is what is durable and
+//! the generator is only its witness. The test suite is the guardian of it, so
+//! the thing being guarded belongs to the guardian — a generator whose only
+//! claims on the tree are that it is the hardest to delete quietly is a
+//! generator nobody will miss until the numbers it corrupts are already
+//! published. Cargo builds every `tests/*.rs` as its own test target and only
+//! looks for `tests/*/main.rs` below that, so a file one level down is a module
+//! rather than a target — the same accident of layout `tests/common/mod.rs`
+//! relies on, and unlike the dodge this replaces, it is the one that says what
+//! the file is.
 //!
 //! The two generators are separate on purpose. `benches/fixture.rs` builds a
 //! tree with a deliberately shared prefix, because deduplication moving work out

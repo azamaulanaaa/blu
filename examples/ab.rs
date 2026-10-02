@@ -104,7 +104,7 @@ const NOISE_FLOOR: f64 = 0.20;
 // properties that guard it. An example is the first thing anyone deletes, and
 // three property tests used to live here under `#[cfg(test)]` — a target
 // `cargo test` does not run.
-#[path = "fixtures/ab.rs"]
+#[path = "../tests/fixtures/ab.rs"]
 mod fixture;
 
 use fixture::noisy;
