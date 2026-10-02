@@ -12,7 +12,7 @@ mod common;
 
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -3142,6 +3142,7 @@ fn every_writing_subcommand_documents_its_dry_run() {
             "version count is the store's own",
             "no lock is taken",
         ),
+        ("merge", "still resolved", "no lock is taken"),
     ] {
         let help = ok(dir.path(), &[command, "--help"]);
         assert!(
@@ -3157,4 +3158,735 @@ fn every_writing_subcommand_documents_its_dry_run() {
             "`lepatch {command} --help` should say what a dry run does not do: {help}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// `lepatch merge` — the receiving half of a pack.
+// ---------------------------------------------------------------------------
+
+/// A source tree with several files, big enough that a delta is a real fraction
+/// of it rather than one chunk.
+fn merge_tree(dir: &Path) -> std::path::PathBuf {
+    let source = dir.join("source");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    for i in 0..6 {
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            noisy(200_000 + i * 20_000),
+        )
+        .unwrap();
+    }
+    fs::write(source.join("nested/leaf.txt"), b"a leaf\n").unwrap();
+    source
+}
+
+/// Every entry of a restored tree, by path, as `describe` sees it.
+fn set_contents(
+    dir: &Path,
+    name: &str,
+    version: u32,
+) -> std::collections::BTreeMap<PathBuf, common::Entry> {
+    let out = dir.join(format!("out-{name}-{version}"));
+    ok(
+        dir,
+        &[
+            "restore",
+            out.to_str().unwrap(),
+            name,
+            "--version",
+            &version.to_string(),
+            "--clean",
+        ],
+    );
+    common::describe(&out)
+}
+
+/// `lepatch merge` is the other half of `pack`, and the two must compose.
+///
+/// The property that decides whether merge is a real operation rather than a
+/// write that happens to succeed: a set built by merging a pack restores to the
+/// same tree as one built by `backup`, byte for byte. Compared as trees rather
+/// than by exit code, because a merge that dropped a file, truncated one or
+/// stored the wrong chunk at the wrong offset would still exit 0.
+///
+/// What would falsify it: the merge storing chunks under the wrong hashes, or
+/// committing a snapshot that does not match the chunks beside it, or the pack
+/// being read at the wrong offsets. Any of those leaves a set that restores to
+/// something else, which `assert_same_tree` catches and an exit code does not.
+#[test]
+fn a_merged_set_restores_exactly_as_a_backed_up_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+
+    ok(
+        dir.path(),
+        &["backup", source.to_str().unwrap(), "backed-up"],
+    );
+    ok(dir.path(), &["pack", "backed-up", "v1.pack"]);
+    ok(dir.path(), &["merge", "v1.pack", "merged"]);
+
+    let backed = set_contents(dir.path(), "backed-up", 1);
+    let merged = set_contents(dir.path(), "merged", 1);
+
+    assert!(
+        !backed.is_empty(),
+        "the fixture should have restored something to compare"
+    );
+    assert_eq!(
+        backed, merged,
+        "a set built by merging a pack restored differently from one built by backup"
+    );
+    // And both against the tree itself, so a difference in `describe` cannot
+    // make two wrong sets look equal.
+    common::assert_same_tree(&source, &dir.path().join("out-merged-1"));
+}
+
+/// A full pack into a set that is not there creates it, which is the case a
+/// remote push is for: a new machine receiving its first version.
+///
+/// Falsified by a merge that refused a name with nothing behind it, or that
+/// created the set and then failed to leave a version in it.
+#[test]
+fn a_full_pack_creates_a_set_that_is_not_there() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    assert!(
+        !dir.path().join("received.0000.bin").exists(),
+        "the fixture should start with no set at the receiving name"
+    );
+
+    let report = ok(dir.path(), &["merge", "v1.pack", "received"]);
+
+    assert!(
+        report.contains("version 1"),
+        "the first version into a new set should be version 1: {report}"
+    );
+    let versions = ok(dir.path(), &["versions", "received", "--numbers-only"]);
+    assert_eq!(
+        versions.trim(),
+        "1",
+        "the new set should hold exactly the version that was merged: {versions}"
+    );
+    set_contents(dir.path(), "received", 1);
+    common::assert_same_tree(
+        &dir.path().join("source"),
+        &dir.path().join("out-received-1"),
+    );
+}
+
+/// The same pack into a set that already holds versions.
+///
+/// The falsifiable part is that the chunks already held are *not* written again
+/// and the set still grows a version: a merge that deduplicated without
+/// committing would lose the version, and one that committed without
+/// deduplicating would double the store.
+#[test]
+fn a_full_pack_merges_into_a_set_that_already_has_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+
+    // Version 1 of the receiving set, from a different tree.
+    fs::create_dir_all(dir.path().join("other")).unwrap();
+    fs::write(dir.path().join("other/other.bin"), noisy(50_000)).unwrap();
+    ok(dir.path(), &["backup", "other", "received"]);
+
+    // Then the pack of a version made somewhere else, which shares nothing.
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    let report = ok(dir.path(), &["merge", "v1.pack", "received"]);
+
+    assert!(
+        report.contains("version 2"),
+        "the merged version should follow the one already there: {report}"
+    );
+    assert!(
+        figure(&report, "chunks, ").is_some(),
+        "the report should count the chunks: {report}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        2,
+        "the set should now hold both versions"
+    );
+    // The first version is still restorable, which is the half a re-merge could
+    // quietly break.
+    set_contents(dir.path(), "received", 1);
+    common::assert_same_tree(
+        &dir.path().join("other"),
+        &dir.path().join("out-received-1"),
+    );
+    set_contents(dir.path(), "received", 2);
+    common::assert_same_tree(&source, &dir.path().join("out-received-2"));
+}
+
+/// Merging the same pack twice makes a second version and stores no chunk bytes.
+///
+/// The decision this pins: allowed rather than refused. A store is a log, and a
+/// transfer may be retried, so a second arrival has to be answerable. What would
+/// falsify the test is either half of the opposite choice — a refusal, or a
+/// second version whose report claims chunks were written when nothing was.
+#[test]
+fn merging_the_same_pack_twice_adds_a_version_and_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+    let first = fs::metadata(dir.path().join("received.0000.bin"))
+        .unwrap()
+        .len();
+
+    let second = ok(dir.path(), &["merge", "v1.pack", "received"]);
+
+    assert!(
+        second.contains("version 2"),
+        "the second merge should be version 2: {second}"
+    );
+    assert!(
+        second.contains(", 0 new, "),
+        "every chunk was already held, so nothing should have been stored: {second}"
+    );
+    let said = ok_logs(dir.path(), &["merge", "v1.pack", "received", "--dry-run"]);
+    assert!(
+        said.contains("already holds this version as version 1"),
+        "a user has to be able to tell a repeat from a first merge: {said}"
+    );
+
+    // Both versions are real, and both restore the same tree — which is what
+    // makes the second one harmless rather than a mistake.
+    // The only growth is the second commit record: `put` deduplicated every
+    // chunk, so no payload was written, and a repeat that re-sent the version
+    // would grow the segment by the whole pack.
+    let grown = fs::metadata(dir.path().join("received.0000.bin"))
+        .unwrap()
+        .len();
+    assert!(
+        grown - first < 1024,
+        "a repeat merge should add a commit record and nothing else: {first} to {grown}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        2
+    );
+    set_contents(dir.path(), "received", 1);
+    set_contents(dir.path(), "received", 2);
+    common::assert_same_tree(
+        &dir.path().join("source"),
+        &dir.path().join("out-received-1"),
+    );
+    common::assert_same_tree(
+        &dir.path().join("source"),
+        &dir.path().join("out-received-2"),
+    );
+}
+
+/// A delta merges into a set that holds its base, and does not re-send what the
+/// base already has.
+///
+/// The falsifiable part is the count: if the delta's chunks were all written, or
+/// if the base's chunks were fetched from nowhere, the "already held" figure
+/// would not be a delta-sized one.
+#[test]
+fn a_delta_merges_into_a_set_holding_its_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // The receiving set takes version 1, then the set moves on.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+
+    // Version 2 of the origin: one file rewritten, one added.
+    fs::write(source.join("f3.bin"), noisy(260_000)).unwrap();
+    fs::write(source.join("fresh.bin"), noisy(30_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &[
+            "pack",
+            "origin",
+            "v2.delta",
+            "--version",
+            "2",
+            "--from",
+            "1",
+        ],
+    );
+
+    let report = ok(dir.path(), &["merge", "v2.delta", "received"]);
+
+    assert!(
+        report.contains("since 1"),
+        "a merged delta should name the base version it was against: {report}"
+    );
+    assert!(
+        report.contains("version 2"),
+        "the delta should become the set's next version: {report}"
+    );
+    let fresh = figure(&report, ", ").and_then(|_| figure(&report, " new, "));
+    let whole = figure(&report, ": ").unwrap_or(0);
+    assert!(
+        fresh.unwrap_or(0) < whole,
+        "a delta of one rewritten file out of seven should not store every chunk: \
+         {fresh:?} of {whole:?} in {report}"
+    );
+
+    set_contents(dir.path(), "received", 2);
+    common::assert_same_tree(&source, &dir.path().join("out-received-2"));
+    // And version 1 of the receiving set is untouched by the merge, which is the
+    // half a delta merge could quietly break: the base's own chunks had to be
+    // found in the set rather than fetched from the pack.
+    set_contents(dir.path(), "received", 1);
+    common::assert_same_tree(
+        &merge_tree_at_v1(dir.path()),
+        &dir.path().join("out-received-1"),
+    );
+}
+
+/// The tree as it was at version 1 of `origin`, restored.
+///
+/// Version 1 is gone from `source` by the time the delta test looks at it, and
+/// this is how the earlier version is compared without assuming anything about
+/// what a later version changed.
+fn merge_tree_at_v1(dir: &Path) -> std::path::PathBuf {
+    let copy = dir.join("at-v1");
+    let _ = fs::remove_dir_all(&copy);
+    ok(
+        dir,
+        &[
+            "restore",
+            copy.to_str().unwrap(),
+            "origin",
+            "--version",
+            "1",
+            "--clean",
+        ],
+    );
+    copy
+}
+
+/// A delta is refused for a set that does not hold its base, and refuses to
+/// create one.
+///
+/// The whole reason the base check exists, and the half that is easy to get
+/// wrong: a refused merge must leave the name exactly as it was, or the refusal
+/// has created the set it just declined to use. Falsified by an exit code of 0,
+/// by a segment appearing, or by a version in the set afterwards.
+#[test]
+fn a_delta_is_refused_for_a_set_that_does_not_hold_its_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    fs::write(source.join("f3.bin"), noisy(260_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &[
+            "pack",
+            "origin",
+            "v2.delta",
+            "--version",
+            "2",
+            "--from",
+            "1",
+        ],
+    );
+
+    // Into a name with no set behind it.
+    let output = lepatch(dir.path(), &["merge", "v2.delta", "absent"]);
+    assert!(
+        !output.status.success(),
+        "a delta into a set that does not exist should be refused"
+    );
+    let said = stderr(&output);
+    assert!(
+        said.contains("is a delta against") && said.contains("merge the full pack instead"),
+        "and the refusal should say what to do instead: {said}"
+    );
+    assert!(
+        !dir.path().join("absent.0000.bin").exists(),
+        "the refused merge should not have created the set: {:?}",
+        fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A delta is refused for a set that holds *other* versions but not this one.
+///
+/// The case a "is the set on the base version?" check gets backwards. A set at a
+/// later version still holds every chunk of an earlier one, so the only thing
+/// that matters is whether the base is among its committed versions — and here it
+/// is not, however many versions there are.
+#[test]
+fn a_delta_is_refused_for_a_set_holding_only_other_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // Version 2 and then 3 exist at the origin, so a delta against version 2 can
+    // be packed for version 3.
+    fs::write(source.join("f4.bin"), noisy(240_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    fs::write(source.join("f5.bin"), noisy(255_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &[
+            "pack",
+            "origin",
+            "v3.delta",
+            "--version",
+            "3",
+            "--from",
+            "2",
+        ],
+    );
+
+    // The receiving set holds version 1 only.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        1
+    );
+
+    let refused = fails(dir.path(), &["merge", "v3.delta", "received"]);
+    assert!(
+        refused.contains("is a delta against"),
+        "the refusal should name the pack as a delta: {refused}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        1,
+        "the refused delta should have published nothing"
+    );
+
+    // The full pack of the same version is accepted into the same set, which is
+    // the alternative the refusal points at.
+    ok(dir.path(), &["pack", "origin", "v3.pack", "--version", "3"]);
+    ok(dir.path(), &["merge", "v3.pack", "received"]);
+    set_contents(dir.path(), "received", 2);
+    common::assert_same_tree(&source, &dir.path().join("out-received-2"));
+}
+
+/// A delta is merged into a set that is *ahead* of its base.
+///
+/// The other half of the case above, and the one that justifies the containment
+/// check: the set holds version 3 while the delta assumes version 1, and the
+/// merge must succeed because every chunk of version 1 is still there. A check
+/// ported from `apply` — which establishes a base against a *directory* that may
+/// hold extra files — would refuse this, and refusing it would be wrong.
+#[test]
+fn a_delta_is_merged_into_a_set_that_is_ahead_of_its_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // The receiving set takes version 1 and then version 2.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+
+    fs::write(source.join("f0.bin"), noisy(230_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v2.pack", "--version", "2"]);
+    ok(dir.path(), &["merge", "v2.pack", "received"]);
+
+    // A delta assuming version 1, arriving at a set now on version 2.
+    fs::write(source.join("f1.bin"), noisy(250_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &[
+            "pack",
+            "origin",
+            "v3.delta",
+            "--version",
+            "3",
+            "--from",
+            "1",
+        ],
+    );
+
+    let report = ok(dir.path(), &["merge", "v3.delta", "received"]);
+    assert!(
+        report.contains("since 1"),
+        "the delta should have been merged against the version it names: {report}"
+    );
+    set_contents(dir.path(), "received", 3);
+    common::assert_same_tree(&source, &dir.path().join("out-received-3"));
+    // And the versions the delta did not concern are still there, which is what
+    // makes a set ahead of its base safe to merge into.
+    set_contents(dir.path(), "received", 1);
+    set_contents(dir.path(), "received", 2);
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        3,
+        "the merged delta should have left every earlier version in place"
+    );
+}
+
+/// A pack whose payload has been damaged is refused, and publishes nothing.
+///
+/// Falsified by a merge that succeeds: the chunk is addressed by a hash of its
+/// contents, and `put` checks what it is given against it, so damaged bytes
+/// cannot be stored under a chunk's name. What is *not* asserted is that nothing
+/// was written to the segment — records no version references are wasted space,
+/// not corruption, and the store's own recovery reclaims them.
+#[test]
+fn a_damaged_pack_is_refused_and_publishes_no_version() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // One byte of payload flipped. The header and index still agree with each
+    // other, so `Pack::open` accepts this file; only the bytes are wrong.
+    let bytes = fs::read(dir.path().join("v1.pack")).unwrap();
+    let mut damaged = bytes.clone();
+    let at = 200;
+    damaged[at] ^= 0xff;
+    fs::write(dir.path().join("damaged.pack"), &damaged).unwrap();
+
+    let refused = fails(dir.path(), &["merge", "damaged.pack", "received"]);
+    assert!(
+        refused.contains("does not hash to") || refused.contains("not a pack"),
+        "the refusal should name what is wrong with the pack: {refused}"
+    );
+
+    // Nothing was published. The segment may exist — the open created it, and the
+    // records it holds are unreferenced — but there is no version.
+    let output = lepatch(dir.path(), &["versions", "received"]);
+    assert!(
+        output.status.success(),
+        "the set exists, so listing it should work: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).trim().is_empty(),
+        "a refused merge should have published no version, got: {}",
+        stdout(&output)
+    );
+
+    // And a truncated pack is refused too, by the reader rather than by a hash.
+    fs::write(dir.path().join("cut.pack"), &bytes[..bytes.len() / 2]).unwrap();
+    let cut = fails(dir.path(), &["merge", "cut.pack", "other"]);
+    assert!(
+        cut.contains("not a pack"),
+        "a truncated pack should be refused as one, got: {cut}"
+    );
+}
+
+/// `--dry-run` writes nothing and says what it would have merged.
+///
+/// The falsifiable part is the *nothing*: not just no new version, but no
+/// segment, no index file, no lock, and not the set's directory for a name that
+/// had none. A dry run that created a set in order to report on it would be the
+/// one thing the flag promises it never does.
+#[test]
+fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // Into a name with no set behind it.
+    let plan = ok(dir.path(), &["merge", "v1.pack", "absent", "--dry-run"]);
+    assert!(
+        plan.contains("would create it"),
+        "a plan for a set that is not there should say it would create one: {plan}"
+    );
+    assert!(
+        plan.contains("nothing written"),
+        "and should say it wrote nothing: {plan}"
+    );
+    assert!(
+        !dir.path().join("absent.0000.bin").exists(),
+        "a dry merge created the set: {:?}",
+        fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !dir.path().join("absent.lock").exists(),
+        "a dry merge took the lock"
+    );
+
+    // Against a set that does exist: the figures are the merge's own, and still
+    // nothing moves.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+    let before = fs::read(dir.path().join("received.0000.bin")).unwrap();
+
+    let again = ok(dir.path(), &["merge", "v1.pack", "received", "--dry-run"]);
+    assert!(
+        again.contains("already held"),
+        "a dry merge into a set that holds the version should say so: {again}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("received.0000.bin")).unwrap(),
+        before,
+        "a dry merge grew the segment"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        1,
+        "a dry merge published a version"
+    );
+
+    // And the real run then does exactly what the plan said.
+    let real = ok(dir.path(), &["merge", "v1.pack", "received"]);
+    assert!(
+        real.contains("version 2"),
+        "the real merge should commit what the plan reported: {real}"
+    );
+}
+
+/// A dry merge refuses a delta for a set that does not hold its base, like a
+/// real one.
+///
+/// A plan that waved a delta through would send somebody to run a command that
+/// cannot work, and the report would have been the last place the problem
+/// surfaced.
+#[test]
+fn a_dry_merge_refuses_a_delta_whose_base_the_set_lacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    fs::write(source.join("f2.bin"), noisy(240_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &[
+            "pack",
+            "origin",
+            "v2.delta",
+            "--version",
+            "2",
+            "--from",
+            "1",
+        ],
+    );
+
+    let refused = fails(dir.path(), &["merge", "v2.delta", "absent", "--dry-run"]);
+    assert!(
+        refused.contains("is a delta against"),
+        "a dry merge should refuse a delta for a set that lacks its base: {refused}"
+    );
+    assert!(
+        !dir.path().join("absent.0000.bin").exists(),
+        "and should not have created the set to find out"
+    );
+
+    // With the base merged first, the plan is happy and reports a delta-sized
+    // figure — which is the difference the refusal is about.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+    let plan = ok(dir.path(), &["merge", "v2.delta", "received", "--dry-run"]);
+    assert!(plan.contains("since 1"), "{plan}");
+    assert!(
+        plan.contains("nothing written"),
+        "a dry merge should say it wrote nothing: {plan}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        1,
+        "the plan published a version"
+    );
+}
+
+/// A dry merge refuses a damaged pack, like a real one.
+///
+/// The plan resolves the pack and hashes every chunk the merge would store, so a
+/// pack it waves through is a pack a real merge accepts. A plan that only counted
+/// records would report success for a file that cannot be merged.
+#[test]
+fn a_dry_merge_refuses_a_damaged_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    let bytes = fs::read(dir.path().join("v1.pack")).unwrap();
+    let mut damaged = bytes.clone();
+    damaged[200] ^= 0xff;
+    fs::write(dir.path().join("damaged.pack"), &damaged).unwrap();
+
+    let refused = fails(
+        dir.path(),
+        &["merge", "damaged.pack", "received", "--dry-run"],
+    );
+    assert!(
+        refused.contains("do not hash to"),
+        "a dry merge should refuse damaged bytes by hashing them: {refused}"
+    );
+    assert!(
+        !dir.path().join("received.0000.bin").exists(),
+        "and should not have created the set"
+    );
+}
+
+/// A merge holds the set's claim for its run, like any other write.
+///
+/// Two merges into one set at once would interleave their commit records, since
+/// the store has one publish point per run.
+#[test]
+fn a_second_merge_is_refused_while_the_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+
+    fs::write(dir.path().join("received.lock"), b"").unwrap();
+    let refused = fails(dir.path(), &["merge", "v1.pack", "received"]);
+    assert!(
+        refused.contains("locked by another lepatch process"),
+        "a second merge should be refused while the set is claimed: {refused}"
+    );
+    fs::remove_file(dir.path().join("received.lock")).unwrap();
+}
+
+/// A merged version verifies, so it is as sound as a backed-up one.
+///
+/// The property is about the store rather than the tree: the chunks a merge
+/// wrote must hash to what they are addressed by, which is the same check a
+/// backup's own store passes.
+#[test]
+fn a_merged_version_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+
+    let report = ok(dir.path(), &["verify", "received"]);
+    assert!(
+        report.contains("all chunks match"),
+        "a merged version should verify: {report}"
+    );
 }

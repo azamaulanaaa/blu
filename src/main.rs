@@ -109,8 +109,9 @@ enum Command {
         /// against the set, and every chunk about to be stored is still read out
         /// of it and hashed, so a plan refuses exactly what a merge refuses and
         /// costs what one costs. Nothing is created — no segment, no index file,
-        /// no lock, and not the set's directory if it is not there yet — and a
-        /// delta is still refused for a set that does not hold its base.
+        /// not the set's directory if it is not there yet — and no lock is taken,
+        /// since the claim is a file. A delta is still refused for a set that
+        /// does not hold its base.
         #[arg(long)]
         dry_run: bool,
     },
