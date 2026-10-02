@@ -1438,13 +1438,21 @@ async fn run_merge(
     // into a new set would create one. The check is repeated inside `merge`
     // against the store the run actually writes to, which is the one that counts
     // and the only one taken under the lock.
-    if let Some(base) = pack.base() {
-        let existing = if set.segments()?.is_empty() {
-            None
-        } else {
-            Some(storage::BlobStore::open_for_reading(set.base()).await?)
-        };
-        lepatch::command::establish_base(existing.as_ref(), base, pack.path())?;
+    //
+    // So this one is for the name with nothing behind it, where there is no store
+    // to ask and the refusal has to come from here: `None` cannot hold the base
+    // by anything, and the open below would have made a set to refuse. Where a
+    // set *is* there, asking it here would be a read open, and a reader does not
+    // repair — so a set left on a torn tail by a killed run would be refused by
+    // the one operation that could put it right.
+    if let Some(base) = pack.base()
+        && set.segments()?.is_empty()
+    {
+        lepatch::command::establish_base::<storage::Write, storage::Compression>(
+            None,
+            base,
+            pack.path(),
+        )?;
     }
 
     let _lock = set.lock()?;

@@ -3453,6 +3453,88 @@ fn a_delta_merges_into_a_set_holding_its_base() {
     );
 }
 
+/// A delta merges into a set left with a torn tail, and the merge repairs it.
+///
+/// A merge killed mid-`put` leaves bytes past the last valid record, and nothing
+/// ever claims them, so the set is not damaged — it is unfinished. The run that
+/// comes next is what reclaims that space, and this pins that the run is a
+/// *merge* that does it: refusing the tail instead would leave a delta
+/// permanently unmergeable into its own set, with no command left that could fix
+/// it.
+///
+/// What would falsify it: a merge that refuses the torn set the way a read does,
+/// or one that succeeds and leaves the torn bytes where they were.
+#[test]
+fn a_delta_merges_into_a_set_left_with_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // The receiving set takes version 1, and a run then dies part-way through
+    // the next one: a record header with its payload cut short, and no commit
+    // record behind it.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+    let segment = dir.path().join("received.0000.bin");
+    let mut bytes = fs::read(&segment).unwrap();
+    bytes.extend_from_slice(b"LPB1\x00\x80\x01");
+    bytes.extend_from_slice(&[0u8; 16]);
+    bytes.extend_from_slice(b"half a record");
+    fs::write(&segment, &bytes).unwrap();
+
+    // The set really is torn, which is what the merge is about: a read refuses
+    // it, because a reader does not repair.
+    let refused = fails(dir.path(), &["restore", "out", "received"]);
+    assert!(
+        refused.contains("does not repair"),
+        "the fixture should have left a set a reader refuses, got: {refused}"
+    );
+    assert!(
+        !dir.path().join("out").exists(),
+        "the refused restore should not have produced a tree"
+    );
+
+    // The delta of version 2, which can only be merged by a set holding its
+    // base — and version 1 is there, commit record and all.
+    fs::write(source.join("f3.bin"), noisy(260_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &[
+            "pack",
+            "origin",
+            "v2.delta",
+            "--version",
+            "2",
+            "--from",
+            "1",
+        ],
+    );
+
+    let report = ok(dir.path(), &["merge", "v2.delta", "received"]);
+
+    assert!(
+        report.contains("version 2"),
+        "the delta should have merged into the torn set: {report}"
+    );
+    // The merge is the run that repaired the set: the same read that refused it
+    // a moment ago now works, and restores the tree the delta merged.
+    set_contents(dir.path(), "received", 2);
+    common::assert_same_tree(&source, &dir.path().join("out-received-2"));
+    assert!(
+        !fs::read(&segment)
+            .unwrap()
+            .windows(b"half a record".len())
+            .any(|w| w == b"half a record"),
+        "the merge should have truncated the torn tail rather than kept it"
+    );
+    set_contents(dir.path(), "received", 1);
+    common::assert_same_tree(
+        &merge_tree_at_v1(dir.path()),
+        &dir.path().join("out-received-1"),
+    );
+}
+
 /// The tree as it was at version 1 of `origin`, restored.
 ///
 /// Version 1 is gone from `source` by the time the delta test looks at it, and
