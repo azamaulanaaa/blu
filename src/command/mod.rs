@@ -7,6 +7,7 @@ use crate::{metadata, storage};
 mod apply;
 mod backup;
 mod manifest;
+mod pack;
 mod pipeline;
 mod probe;
 mod restore;
@@ -15,6 +16,7 @@ mod verify;
 pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
+pub use pack::{Base, Options as PackOptions, Packed, pack};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan, Restored, lock_destination,
