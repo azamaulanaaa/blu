@@ -1500,6 +1500,20 @@ async fn run_merge(
     )
     .await?;
 
+    // Before the already-merged answer below, because that answer is about the
+    // set and this is about the pack: a pre-check that reports "already merged"
+    // from a pack it has not verified is answering for a file neither `merge`
+    // nor `merge_plan` would accept, so a damaged pack whose header names a
+    // snapshot the set holds would succeed here and be refused by the dry run.
+    // The two paths must not disagree about one file.
+    //
+    // [`Pack::snapshot`] rather than a check of our own — it is the same
+    // verification `merge` and `merge_plan` start with, hashing the section
+    // against the hash its header names, and the repo would rather have one
+    // answer to "does this file table hash to this snapshot" than two that
+    // agree today.
+    let _ = pack.snapshot()?;
+
     // Before the warning and before the merge, and before the merge on both
     // counts: the warning says what a merge would publish, and a pack the set
     // already holds publishes nothing. Asked again inside `merge`, under the

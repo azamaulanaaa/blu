@@ -4061,6 +4061,75 @@ fn a_dry_merge_refuses_a_damaged_pack() {
     );
 }
 
+/// A pack the set already holds is still refused when its file table is damaged.
+///
+/// `a_dry_merge_refuses_a_damaged_pack` above only asks about a set that does not
+/// exist, where the refusal cannot be confused with the already-merged answer.
+/// Once the set holds the pack's snapshot, the two paths have something to
+/// disagree about: the real run's pre-check consults the set, and a pre-check
+/// that answers "already merged" from an unverified pack reports success and
+/// exits zero for a file neither library path would accept, while the dry run
+/// still refuses it. A dry run that does not say what the real run does is not a
+/// dry run.
+#[test]
+fn a_merge_of_a_damaged_pack_is_refused_even_when_the_set_already_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // Merged for real, so the set now holds this pack's snapshot and the
+    // already-merged answer is the one the pre-check is looking for.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+    let before = fs::read(dir.path().join("received.0000.bin")).unwrap();
+
+    // Damaged inside the file table, which is the section the header names a
+    // hash for. The header is left alone, so the pack still opens and still
+    // claims the snapshot the set already holds — the pre-check has everything
+    // it would need to answer, and answers for a pack that cannot be merged.
+    let bytes = fs::read(dir.path().join("v1.pack")).unwrap();
+    let mut damaged = bytes;
+    let start = lepatch::pack::Pack::open(&dir.path().join("v1.pack"))
+        .unwrap()
+        .snapshot_start();
+    damaged[usize::try_from(start).unwrap() as usize] ^= 0xff;
+    fs::write(dir.path().join("damaged.pack"), &damaged).unwrap();
+
+    let refused = fails(dir.path(), &["merge", "damaged.pack", "received"]);
+    assert!(
+        refused.contains("does not hash to the one its header names"),
+        "a real merge should refuse a pack whose file table does not hash to the one its header \
+         names: {refused}"
+    );
+    assert!(
+        !refused.contains("already merged"),
+        "and must not report a damaged pack as already merged: {refused}"
+    );
+
+    // Same file, same set, same refusal: the two paths cannot disagree about one
+    // pack, or a dry run is promising something the real run will not do. The
+    // wording around it differs — one refuses the pack, one refuses the merge —
+    // so this asks for the clause they share rather than for identical text.
+    let planned = fails(
+        dir.path(),
+        &["merge", "damaged.pack", "received", "--dry-run"],
+    );
+    assert!(
+        planned.contains("does not hash to the one its header names"),
+        "a dry merge should refuse it for the same reason the real run did: {planned}"
+    );
+    assert!(
+        !planned.contains("already merged"),
+        "and must not plan a merge of a pack whose file table is damaged: {planned}"
+    );
+
+    assert_eq!(
+        fs::read(dir.path().join("received.0000.bin")).unwrap(),
+        before,
+        "a refused merge changed the segment"
+    );
+}
+
 /// A merge holds the set's claim for its run, like any other write.
 ///
 /// Two merges into one set at once would interleave their commit records, since
