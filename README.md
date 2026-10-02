@@ -490,10 +490,10 @@ written. Everything else — which chunks, how many, how much payload, how big t
 table — is known before a byte is fetched.
 
 **A dry run is not a repair.** It opens the set for reading, so a store with a torn
-tail in its last segment — which a real backup reclaims on the way past — is refused
-rather than planned against. A plan reports what a run would do; deciding that a
-store's tail is damage is itself a write, and it belongs to a command that was asked
-to make one.
+tail in its last segment — which a real backup or `reindex` reclaims on the way
+past — is refused rather than planned against. A plan reports what a run would do;
+deciding that a store's tail is damage is itself a write, and it belongs to a
+command that was asked to make one.
 
 **`--clean` deserves the check.** A clean restore is the one operation here that
 destroys what is already there, and a dry run of it empties nothing while still

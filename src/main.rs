@@ -87,7 +87,8 @@ enum Command {
         /// Affects nothing but the writing: the set is still opened and scanned, so
         /// the version count is the store's own. A torn tail is *not* reclaimed —
         /// repairing one is the point of a real reindex, and a dry run repairs
-        /// nothing — and no lock is taken, because taking one creates a file.
+        /// nothing, so a set left by a killed run is refused here and repaired by a
+        /// real one — and no lock is taken, because taking one creates a file.
         #[arg(long)]
         dry_run: bool,
     },
@@ -512,6 +513,11 @@ fn select_version(
 /// reclaiming a tail is the repair — and the version count it reports is the same
 /// one either way, because the count is read out of the commit records rather than
 /// taken from what the open did to the set.
+///
+/// Which leaves a consequence worth stating rather than leaving to be found: a set
+/// left behind by a killed run has a torn tail, and its dry run fails where its
+/// real reindex succeeds and repairs the store. That is the right way round,
+/// because deciding a tail is damage is itself a write.
 async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
