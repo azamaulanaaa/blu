@@ -713,8 +713,9 @@ Stated rather than discovered:
   the exit code follows the shell convention (130 and 143), and any claim on a
   backup set or a destination is released on the way out. What is *not* undone is
   work already done: a killed backup leaves no commit record, so no version is
-  published, and the chunks it did store are reclaimed by the next run, and a
-  killed merging restore leaves whatever it had written.
+  published, and the chunks it did store are wasted space that no run reclaims —
+  only a record the kill tore is discarded, by the next run — and a killed merging
+  restore leaves whatever it had written.
 - **The format limits above are for restore.** A backup holds one bounded window
   of chunks regardless of tree size, so it streams.
 - **The on-disk format is not stable, and changing it loses existing backup
