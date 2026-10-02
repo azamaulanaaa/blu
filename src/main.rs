@@ -5,8 +5,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use lepatch::{
     command::{
-        ApplyOptions, BackupPlan, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan, apply,
-        backup, backup_plan, load_snapshot, lock_destination, restore, restore_plan, verify,
+        ApplyOptions, BackupPlan, MergePlan, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan,
+        apply, backup, backup_plan, load_snapshot, lock_destination, merge, merge_plan, restore,
+        restore_plan, verify,
     },
     layout::IndexSet,
     pack::Pack,
@@ -73,6 +74,43 @@ enum Command {
         /// no index file, no lock, and not the set's directory if it is not there
         /// yet. No claim is taken either, so a plan can be taken against a set a
         /// backup currently holds.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Apply a pack into a backup set, as a new version of it.
+    ///
+    /// The receiving half of `pack`, and the one a remote push would use: the set
+    /// ends up holding the version the pack carries, and nothing else is consulted
+    /// to do it — the pack carries its own file table.
+    ///
+    /// A full pack suits any set and creates one if there is none. A delta pack
+    /// names a version its reader already holds and omits those chunks, so it is
+    /// **refused unless some committed version of the set is that version** —
+    /// nothing here can tell you were missing the chunks the pack left out.
+    ///
+    /// Atomic in the store's own sense: every chunk is stored, made durable, and
+    /// then one commit record publishes the version. A run that fails before that
+    /// leaves no version, and no rollback is attempted because there is nothing to
+    /// undo — see `src/command/merge.rs` for why.
+    ///
+    /// Merging the same pack twice is allowed and makes a second version with the
+    /// same snapshot, which the report says so you can tell. The second merge
+    /// stores no chunk bytes; a version's existence is a fact about the set, and a
+    /// transfer that may be retried cannot afford to refuse one.
+    Merge {
+        /// The pack to merge.
+        pack: std::path::PathBuf,
+        /// Base path of the backup set to merge into, e.g. `photos` creates
+        /// `photos.0000.bin` and `photos.lock`.
+        name: std::path::PathBuf,
+        /// Say what this merge would store, and store none of it.
+        ///
+        /// Affects what is written and nothing else: the pack is still resolved
+        /// against the set, and every chunk about to be stored is still read out
+        /// of it and hashed, so a plan refuses exactly what a merge refuses and
+        /// costs what one costs. Nothing is created — no segment, no index file,
+        /// no lock, and not the set's directory if it is not there yet — and a
+        /// delta is still refused for a set that does not hold its base.
         #[arg(long)]
         dry_run: bool,
     },
@@ -416,6 +454,11 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             recheck,
             dry_run,
         } => run_apply(&pack, &destination, prune, recheck, dry_run).await,
+        Command::Merge {
+            pack,
+            name,
+            dry_run,
+        } => run_merge(&pack, &name, dry_run).await,
         Command::Reindex { name, dry_run } => run_reindex(&name, dry_run).await,
         Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
     }
@@ -1342,6 +1385,163 @@ fn report_pack(
             packed.table
         ),
     }
+}
+
+/// Apply `pack` into the set at `name` as a new version.
+///
+/// Opened for writing, which creates the set when there is not one already: a
+/// full pack carries its snapshot and every chunk it reads, so a set with
+/// nothing behind it is not a reason to refuse — it is the "receive the first
+/// version into a new set" case. The lock is taken because the run appends to the
+/// store, and a store is append-only with one publish point, so two merges
+/// interleaving would publish versions over each other. A dry run takes neither,
+/// since the claim is a file and opening for writing creates a set: a plan has to
+/// be able to run against a set that does not exist yet, and answer "everything
+/// is new" rather than create it in order to find out.
+async fn run_merge(
+    pack: &std::path::Path,
+    name: &std::path::Path,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    let set = IndexSet::new(name);
+    let pack = Pack::open(pack)?;
+
+    tracing::info!(
+        pack = %pack.path().display(),
+        name = %set.base().display(),
+        chunks = pack.len(),
+        base = ?pack.base(),
+        dry_run,
+        "merging pack"
+    );
+
+    if dry_run {
+        // Read-only, and only if the set is there. Opened for writing to find out
+        // would create it, which is the one thing a dry run must never do — so a
+        // full pack into a name with nothing behind it plans as an all-new
+        // version instead of failing, or creating the set in order to succeed.
+        let existing = if set.segments()?.is_empty() {
+            None
+        } else {
+            Some(storage::BlobStore::open_for_reading(set.base()).await?)
+        };
+        let fresh = existing.is_none();
+
+        let plan = merge_plan(&pack, existing.as_ref()).await?;
+        return report_merge_plan(&set, &plan, fresh);
+    }
+
+    let _lock = set.lock()?;
+    let store = storage::BlobStore::open_for_writing(
+        set.base(),
+        storage::SegmentLimit::default(),
+        storage::Compression::default(),
+    )
+    .await?;
+
+    let merged = merge(&store, &pack).await?;
+    tracing::info!(
+        name = %set.base().display(),
+        version = merged.version,
+        snapshot = %&merged.plan.snapshot,
+        base = merged.plan.base,
+        chunks = merged.plan.chunks,
+        fresh = merged.plan.fresh,
+        held = merged.plan.held,
+        bytes = merged.plan.bytes,
+        segments = store.segment_count(),
+        "merge complete"
+    );
+
+    report_merge(&set, &merged, &pack)
+}
+
+/// Say what a merge committed, and what it left out.
+///
+/// Two lines: what went in, and the name the new version is known by — the same
+/// hash `pack` printed when it was written, since a pack is a function of the
+/// version it carries and both sides hash the same bytes.
+fn report_merge(
+    set: &IndexSet,
+    merged: &lepatch::command::Merged,
+    pack: &Pack,
+) -> std::io::Result<()> {
+    let plan = &merged.plan;
+
+    let since = match plan.base {
+        Some(base) => format!(" since {base}"),
+        None => String::new(),
+    };
+
+    say!(
+        "merged version {}{since}: {} chunks, {} new, {} already held, {} bytes stored from {}",
+        merged.version,
+        plan.chunks,
+        plan.fresh,
+        plan.held,
+        plan.bytes,
+        pack.path().display()
+    )?;
+    say!("{}  {}", &plan.snapshot, set.base().display())?;
+
+    // Named on stderr because stdout is data, and said rather than left for the
+    // user to notice: a second version carrying the same snapshot is a
+    // deliberate outcome of this command rather than a fault, but in a listing
+    // it looks like a mistake, and nothing else says otherwise.
+    if let Some(already) = plan.already {
+        eprintln!(
+            "note: {} already held this version as version {already}; merging it again adds a \
+             version and stores no chunk bytes",
+            set.base().display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Say what a merge would have committed, on stdout, and that it committed
+/// nothing.
+///
+/// The same wording as the real report with the verbs changed, for the reason
+/// `report_applied` gives: the real run's line is what a script parses, and
+/// interpolating "would" into it would change bytes nobody asked to change.
+fn report_merge_plan(set: &IndexSet, plan: &MergePlan, fresh: bool) -> std::io::Result<()> {
+    tracing::info!(name = %set.base().display(), "dry run: nothing was written");
+
+    let since = match plan.base {
+        Some(base) => format!(" since {base}"),
+        None => String::new(),
+    };
+
+    say!(
+        "dry run: version {}{since}: {} chunks, {} new, {} already held, {} bytes to store, \
+         nothing written to {}",
+        plan.version,
+        plan.chunks,
+        plan.fresh,
+        plan.held,
+        plan.bytes,
+        set.base().display()
+    )?;
+    say!("dry run: {} would be the snapshot", &plan.snapshot)?;
+
+    if fresh {
+        say!(
+            "dry run: there is no backup set at {} yet, so this would create it",
+            set.base().display()
+        )?;
+    }
+
+    if let Some(already) = plan.already {
+        eprintln!(
+            "note: {} already holds this version as version {already}; a real merge would add \
+             version {} and store no chunk bytes",
+            set.base().display(),
+            plan.version
+        );
+    }
+
+    Ok(())
 }
 
 /// Bring `destination` up to the version `pack` carries.
