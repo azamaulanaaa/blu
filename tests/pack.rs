@@ -68,6 +68,8 @@ struct Built {
     dir: tempfile::TempDir,
     blob: std::path::PathBuf,
     plan: Plan,
+    /// What the set calls this version, which goes in the pack's header.
+    version: u32,
 }
 
 impl Built {
@@ -76,19 +78,24 @@ impl Built {
         let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
         let snapshot = snapshot_of(&self.blob).await;
 
-        Pack::write(&store, &self.plan, &snapshot, at)
+        Pack::write(&store, &self.plan, &snapshot, self.version, at)
             .await
             .unwrap()
     }
 }
 
-/// Pack a set's latest version to `at`.
+/// Pack a set's latest version to `at`, recorded as version 1.
+///
+/// The number is the set's own, and these fixtures hold one version, so 1 is what
+/// `versions` would print beside it. Stated at every call rather than worked out
+/// here because a helper that invented the number would be exactly the thing the
+/// header exists to make impossible to get wrong quietly.
 async fn pack(blob: &Path, at: &Path) -> Pack {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
     let plan = plan_of(blob).await;
     let snapshot = snapshot_of(blob).await;
 
-    Pack::write(&store, &plan, &snapshot, at).await.unwrap()
+    Pack::write(&store, &plan, &snapshot, 1, at).await.unwrap()
 }
 
 async fn build(files: usize, size: usize) -> Built {
@@ -107,7 +114,12 @@ async fn build(files: usize, size: usize) -> Built {
     common::run_backup(&source, &blob).await;
     let plan = plan_of(&blob).await;
 
-    Built { dir, blob, plan }
+    Built {
+        dir,
+        blob,
+        plan,
+        version: 1,
+    }
 }
 
 /// A pack holds every chunk its version needs, and the bytes are the chunks.
@@ -270,7 +282,7 @@ async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
 
     let store = BlobStore::open_for_reading(&blob).await.unwrap();
     let snapshot = snapshot_of(&blob).await;
-    let pack = Pack::write(&store, &v2, &snapshot, &dir.path().join("v2.pack"))
+    let pack = Pack::write(&store, &v2, &snapshot, 2, &dir.path().join("v2.pack"))
         .await
         .unwrap();
 
@@ -432,7 +444,9 @@ async fn a_header_that_contradicts_its_index_is_refused() {
     // when the layout changes, and breaks by being unreadable rather than by
     // failing usefully. The flag byte sits between the snapshot hash and the
     // counts, and is clear for a full pack, so this is where they start.
-    let count_at = 4 + 4 + 32 + 1;
+    // The `+ 4` is the version field the header now carries, which is why this
+    // offset is written out rather than imported from the module.
+    let count_at = 4 + 4 + 4 + 32 + 1;
     assert_eq!(
         good[count_at - 1],
         0,
@@ -567,6 +581,117 @@ async fn a_future_pack_format_is_named_rather_than_misread() {
     assert!(
         err.to_string().contains("format 9999"),
         "a future format version was not named: {err}"
+    );
+}
+
+/// A pack records the version it was packed from, and hands it back.
+///
+/// The number is the set's, not the pack's, so it can only come from the writer —
+/// nothing about a snapshot implies it, and two sets number independently. If it
+/// were defaulted rather than passed, every pack written by a caller that forgot
+/// would carry a `0` that reads back as a real version number.
+///
+/// What would falsify it: a header that does not carry the field, a reader that
+/// reads it at the wrong offset (which would show up as the snapshot hash being
+/// four bytes short of a shift), or a delta — the header is the same for both, so
+/// a delta that lost the number while a full pack kept it would pass a full-pack
+/// test and break the case that matters most.
+#[tokio::test]
+async fn a_pack_records_the_version_it_was_packed_from() {
+    let built = build(3, 100_000).await;
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let snapshot = snapshot_of(&built.blob).await;
+    let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
+    let base = common::id_of(&[7u8; 32]);
+
+    for number in [1u32, 2, 9, u32::MAX] {
+        let at = built.dir.path().join(format!("v{number}.pack"));
+        let written = Pack::write(&store, &plan, &snapshot, number, &at)
+            .await
+            .unwrap();
+        assert_eq!(
+            written.version(),
+            number,
+            "the pack this crate just wrote should report the version it was given"
+        );
+
+        // Through the file, not through the struct that was returned: the point
+        // is what a *reader* learns, and a field the writer kept to itself would
+        // satisfy the line above and nothing.
+        assert_eq!(
+            Pack::open(&at).unwrap().version(),
+            number,
+            "the version should survive the file: {number} did not round-trip"
+        );
+
+        // And it is fixed-length in the header, so it costs nothing in the
+        // variable section: the same pack with a four-byte-larger number is the
+        // same size.
+        let delta_at = built.dir.path().join(format!("d{number}.pack"));
+        let delta = Pack::write_delta(&store, &plan, &snapshot, base, number, &delta_at)
+            .await
+            .unwrap();
+        assert_eq!(delta.version(), number, "a delta carries it too");
+    }
+
+    let length_of = |name: &str| {
+        fs::metadata(built.dir.path().join(name))
+            .unwrap_or_else(|e| panic!("{name} should have been written: {e}"))
+            .len()
+    };
+
+    assert_eq!(
+        length_of("v1.pack"),
+        length_of(&format!("v{}.pack", u32::MAX)),
+        "a longer version number changed the size, so it is not in the fixed part"
+    );
+}
+
+/// A pack in format `3` is refused by name, before its bytes are read as a `4`.
+///
+/// `3` has no version field, so the four bytes this build reads as one are the
+/// first four of its snapshot hash. A reader that carried on past the format
+/// check would take every chunk at an offset four bytes wrong and hand out byte
+/// ranges that look entirely plausible — which is why the refusal has to happen
+/// where it does, and has to name both formats so the person holding the file
+/// knows which `lepatch` produced it.
+#[tokio::test]
+async fn a_pack_in_the_previous_format_is_refused_by_name() {
+    let built = build(3, 100_000).await;
+    let path = built.dir.path().join("v1.pack");
+    built.pack(&path).await;
+
+    // Patched rather than built: a real `3` pack is a file this build cannot
+    // produce, and patching the four format bytes is the only honest way to hold
+    // one. The rest of the file is a valid `4` pack's, which is the point — the
+    // only thing wrong with it is the format it claims.
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+    let at = built.dir.path().join("v3.pack");
+    fs::write(&at, &bytes).unwrap();
+
+    let err = Pack::open(&at).unwrap_err();
+    let said = err.to_string();
+    assert!(
+        said.contains("pack format 3") && said.contains("reads 4"),
+        "a format 3 pack should be refused naming both formats, got: {said}"
+    );
+    assert!(
+        said.contains("not a pack this build can read"),
+        "and refused as unreadable rather than as damaged: {said}"
+    );
+
+    // The same file with the format byte put back is a perfectly good pack again,
+    // which is what shows the refusal was about the format and nothing else: a
+    // reader that had carried on past the check would have been reading the top
+    // of a snapshot hash as a version and believing it.
+    bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+    let at = built.dir.path().join("restored.pack");
+    fs::write(&at, &bytes).unwrap();
+    assert_eq!(
+        Pack::open(&at).unwrap().version(),
+        built.version,
+        "restoring the format byte should restore a pack that reads back"
     );
 }
 
@@ -838,7 +963,7 @@ async fn a_pack_of_an_empty_version_opens() {
     assert!(plan.is_empty(), "an empty tree should plan to no chunks");
 
     let path = dir.path().join("v1.pack");
-    Pack::write(&store, &plan, &snapshot_of(&blob).await, &path)
+    Pack::write(&store, &plan, &snapshot_of(&blob).await, 1, &path)
         .await
         .unwrap();
 
@@ -1191,7 +1316,7 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
     let first = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let v1 = snapshot_of(&built.blob).await;
     let v1_full = Plan::from_snapshot(&v1, |id| first.locate(id)).unwrap();
-    let v1_pack = Pack::write(&first, &v1_full, &v1, &built.dir.path().join("v1.pack"))
+    let v1_pack = Pack::write(&first, &v1_full, &v1, 1, &built.dir.path().join("v1.pack"))
         .await
         .unwrap();
 
@@ -1211,7 +1336,7 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
     let delta = full.since(&v2, &v1);
 
     let at = built.dir.path().join("delta.pack");
-    let packed = Pack::write_delta(&store, &delta, &v2, v1_pack.snapshot_id(), &at)
+    let packed = Pack::write_delta(&store, &delta, &v2, v1_pack.snapshot_id(), 2, &at)
         .await
         .unwrap();
 
@@ -1278,6 +1403,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
         &first,
         &Plan::from_snapshot(&v1, |id| first.locate(id)).unwrap(),
         &v1,
+        1,
         &built.dir.path().join("v1.pack"),
     )
     .await
@@ -1292,6 +1418,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
         &second,
         &Plan::from_snapshot(&v2, |id| second.locate(id)).unwrap(),
         &v2,
+        2,
         &built.dir.path().join("v2.pack"),
     )
     .await
@@ -1318,6 +1445,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
         &delta,
         &v3,
         v1_pack.snapshot_id(),
+        3,
         &built.dir.path().join("v3-from-v1.pack"),
     )
     .await
@@ -1374,6 +1502,7 @@ async fn a_full_pack_names_no_base_and_a_delta_names_one() {
         &store,
         &plan,
         &snapshot,
+        1,
         &built.dir.path().join("full.pack"),
     )
     .await
@@ -1386,6 +1515,7 @@ async fn a_full_pack_names_no_base_and_a_delta_names_one() {
         &plan,
         &snapshot,
         some,
+        1,
         &built.dir.path().join("delta.pack"),
     )
     .await
@@ -1416,7 +1546,7 @@ async fn a_delta_is_a_function_of_the_two_versions() {
 
     for at in [&first, &second] {
         let delta = full.since(&v2, &v1);
-        Pack::write_delta(&store, &delta, &v2, v2.chunks[0], at)
+        Pack::write_delta(&store, &delta, &v2, v2.chunks[0], 2, at)
             .await
             .unwrap();
     }

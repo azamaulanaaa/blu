@@ -3388,6 +3388,115 @@ fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
     );
 }
 
+/// A pack from behind the set's tip is warned about on stderr, and merged anyway.
+///
+/// The property is the comparison and where it is said. The pack's recorded
+/// version is the *origin* set's numbering and the tip is this set's, and the
+/// only fact two independently-assigned numbers can support is whether the
+/// sender's view of its own set was stale.
+///
+/// What would falsify it, one per assertion: a warning at equal or above (a
+/// sender exactly up to date would learn to ignore the warning, and there would
+/// be nothing left for it to mean); no warning below (the feature would do
+/// nothing at all); the warning on stdout (a script reading the report would
+/// have to skip a line to find the line it wanted); or a refusal — the pack is
+/// not wrong, its chunks are exactly the ones its snapshot names, and only the
+/// sender's view is behind.
+#[test]
+fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+
+    // Three versions at the origin, so there are three recorded numbers to merge
+    // in an order that walks the receiving set's tip up past two of them.
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &["pack", "origin", "one.pack", "--version", "1"],
+    );
+
+    fs::write(source.join("f1.bin"), noisy(230_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &["pack", "origin", "two.pack", "--version", "2"],
+    );
+
+    fs::write(source.join("f2.bin"), noisy(240_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &["pack", "origin", "three.pack", "--version", "3"],
+    );
+
+    // Ahead of the tip (3 against 0) and then on the line (2 against 1): neither
+    // is behind, and saying so would be noise.
+    for pack in ["three.pack", "two.pack"] {
+        let said = ok_logs(dir.path(), &["merge", pack, "behind"]);
+        assert!(
+            !said.contains("this pack is version"),
+            "a pack at or above the tip should not warn: {pack} said: {said}"
+        );
+    }
+    assert_eq!(
+        ok(dir.path(), &["versions", "behind", "--numbers-only"])
+            .lines()
+            .count(),
+        2,
+        "the two unremarkable merges should have published versions"
+    );
+
+    // Behind: origin version 1 arriving at a set on version 2. It merges, and
+    // the warning names both numbers and what the merge is about to publish.
+    let said = ok_logs(dir.path(), &["merge", "one.pack", "behind"]);
+    assert!(
+        said.contains("warning")
+            && said.contains("this pack is version 1")
+            && said.contains("is at version 2"),
+        "a pack from behind the tip should be warned about, naming both: {said}"
+    );
+    assert!(
+        said.contains("version 3"),
+        "and should say what merging publishes: {said}"
+    );
+
+    let report = ok(dir.path(), &["merge", "one.pack", "behind", "--dry-run"]);
+    assert!(
+        report.contains("already merged"),
+        "but a repeat of it is nothing to warn about: {report}"
+    );
+
+    // The version really was published, and it really restores the tree the
+    // pack carries — the whole point of warning rather than refusing.
+    assert_eq!(
+        ok(dir.path(), &["versions", "behind", "--numbers-only"])
+            .lines()
+            .count(),
+        3
+    );
+    set_contents(dir.path(), "behind", 3);
+    common::assert_same_tree(
+        &merge_tree_at_v1(dir.path()),
+        &dir.path().join("out-behind-3"),
+    );
+
+    // And a pack exactly on the tip: equal is not lower, and the ordinary case
+    // of a sender who is up to date must be silent.
+    ok(dir.path(), &["merge", "three.pack", "level"]);
+    let level = ok_logs(dir.path(), &["merge", "one.pack", "level"]);
+    assert!(
+        !level.contains("this pack is version"),
+        "a pack from the tip's own version is not behind it: {level}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "level", "--numbers-only"])
+            .lines()
+            .count(),
+        2,
+        "the pack from the tip should still have merged"
+    );
+}
+
 /// A delta merges into a set that holds its base, and does not re-send what the
 /// base already has.
 ///

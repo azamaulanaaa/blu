@@ -18,7 +18,7 @@ pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use merge::{MergePlan, Merged, Planned, establish_base, merge, merge_plan, version_holding};
-pub use pack::{Base, Options as PackOptions, Packed, pack};
+pub use pack::{Base, Options as PackOptions, Packed, Version, pack};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan, Restored, lock_destination,

@@ -190,6 +190,26 @@ enum Command {
     /// fetching a new version gets one range rather than one per chunk. A pack is
     /// output, not a backup: it is regenerated from the set and its snapshot
     /// alone, and losing one loses nothing.
+    ///
+    /// ## What the pack records about where it came from
+    ///
+    /// A pack records the number of the version it was built from — *that set's*
+    /// number, the one `lepatch versions` would print beside it. So `pack set
+    /// v2.pack --version 2` writes a pack whose header says version 2.
+    ///
+    /// It buys one thing: `merge` can see that a pack arrived from behind and
+    /// say so, so a stale sender is noticed at the moment a transfer lands rather
+    /// than when a later restore returns an older version than was asked for. It
+    /// changes nothing about what the pack *is* — the same chunks, the same file
+    /// table, the same content hash — and nothing about whether it merges.
+    ///
+    /// **It is not a coordinate.** It says which version of the set the pack came
+    /// from, not where it lands in the set you merge it into: a pack of origin
+    /// version 2 merged into a set already on version 5 is published as version 6.
+    /// The two sets numbered their versions independently and never met, so there
+    /// is nothing for the 2 to map onto. What you restore is chosen with
+    /// `restore --version N`, and with no `--version` you get the set's most
+    /// recent version, which is not necessarily the one this pack was built from.
     Pack {
         /// Base path of the backup set to pack from.
         name: std::path::PathBuf,
@@ -1314,7 +1334,10 @@ async fn run_pack(
 
     let packed = lepatch::command::pack(
         &store,
-        &snapshot,
+        &lepatch::command::Version {
+            number: version,
+            snapshot,
+        },
         |id| store.locate(id),
         base,
         out,
@@ -1434,6 +1457,15 @@ async fn run_merge(
         let fresh = existing.is_none();
 
         let planned = merge_plan(&pack, existing.as_ref()).await?;
+
+        // Only when there is going to be a merge to warn about. A pack the set
+        // already holds publishes nothing, so telling the user what version it
+        // would publish is telling them about a version that will not exist —
+        // and the report one line later is going to say so.
+        if let (Some(store), Planned::Merge(_)) = (&existing, &planned) {
+            warn_behind_tip(&set, &pack, store)?;
+        }
+
         return report_merge_plan(&set, &planned, fresh);
     }
 
@@ -1483,6 +1515,11 @@ async fn run_merge(
         return report_already_merged(&set, version);
     }
 
+    // Before the merge and before the commit, so the tip is the one the merge
+    // publishes onto rather than one that has already counted this version. Taken
+    // under the lock with everything else that reads the set's commit list.
+    warn_behind_tip(&set, &pack, &store)?;
+
     let merged = merge(&store, &pack).await?;
 
     match merged {
@@ -1512,6 +1549,50 @@ async fn run_merge(
             report_already_merged(&set, version)
         }
     }
+}
+
+/// Say on stderr that the pack was built from a version behind the set's tip.
+///
+/// The one thing the pack's recorded version is for. The two numbers are
+/// different sets' numbering and comparing them is exactly the point — the tip is
+/// *this* set's most recent version and the pack's is where its version sat in
+/// the set that made it — so the message names both and says what the merge is
+/// about to do instead, because "this pack is version 1" on its own reads as a
+/// complaint about the pack rather than as a fact about the sender being behind.
+///
+/// A warning and not a refusal: the pack's chunks are the chunks its own snapshot
+/// names, and merging them produces a version that restores exactly what the pack
+/// holds. What is stale is the sender's *view*, not the artifact, and refusing
+/// would refuse a file that is not wrong.
+///
+/// On stderr because stdout is the report channel — a script reading the merge
+/// report must not have to skip a line to find the line it wanted.
+fn warn_behind_tip<W: storage::WriteMode, C: storage::Compressor>(
+    set: &IndexSet,
+    pack: &Pack,
+    store: &storage::BlobStore<W, C>,
+) -> std::io::Result<()> {
+    let versions = store.versions()?;
+    // An empty set has no tip to be behind, and a set whose commit list could not
+    // be counted past `u32` has no number to compare against either; both answer
+    // "there is nothing here to be stale about".
+    let tip = u32::try_from(versions.len()).unwrap_or(u32::MAX);
+    let from = pack.version();
+
+    // Strictly below. A pack from the tip's own version is a sender exactly up to
+    // date, which is the ordinary case and not worth a word.
+    if from >= tip {
+        return Ok(());
+    }
+
+    eprintln!(
+        "warning: this pack is version {from} and {} is at version {tip}; merging publishes it \
+         as version {}, and a restore with no --version will return that one",
+        set.base().display(),
+        tip.saturating_add(1),
+    );
+
+    Ok(())
 }
 
 /// Report a pack the set already holds, and that nothing was done.
