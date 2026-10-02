@@ -38,7 +38,7 @@ const LEN: usize = 4 + 4 + 4 + 32 + 8;
 const UNCHECKED: usize = LEN - 8;
 
 fn check(head: &[u8]) -> [u8; 8] {
-    super::truncated_hash(head)
+    super::hash::truncated_hash(head)
 }
 
 /// Where a version's snapshot is.

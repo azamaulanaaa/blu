@@ -314,7 +314,7 @@ fn write_varint(out: &mut Vec<u8>, value: u64) {
 }
 
 fn check(header_without_check: &[u8]) -> [u8; CHECK] {
-    super::truncated_hash(header_without_check)
+    super::hash::truncated_hash(header_without_check)
 }
 
 /// Decode the header of the record starting at `at` in the store.
