@@ -70,11 +70,12 @@ pub struct RestorePlan {
     /// Every recorded file's length, which is what a restore writes: each file is
     /// created at that length before its chunks go in and set back to it afterwards.
     pub bytes: u64,
-    /// Entries that record an owner this process could not set.
+    /// Entries that record an owner, which this process may not be able to set.
     ///
-    /// A bound rather than a count, for the reason
-    /// [`super::apply::owners`] gives: only setting an owner says whether this
-    /// process can set it, so this names every entry that would be tried.
+    /// A bound rather than a count, and deliberately so: only *setting* an owner
+    /// says whether this process is allowed to, so a run that has written nothing
+    /// cannot know how many of these it would have failed on. Every entry that
+    /// records an owner is named, which is the most that could fail.
     pub unowned: u64,
 }
 
