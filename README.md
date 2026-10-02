@@ -436,6 +436,69 @@ bytes. So three things follow, and each is asserted in `tests/compression.rs`:
 `FORMAT_VERSION` is **2**: a record header now carries a codec byte and two lengths,
 and a store written by version 1 is *refused* rather than misparsed.
 
+### Dry runs
+
+`backup`, `restore`, `apply`, `pack` and `reindex` take `--dry-run`. A dry run
+reads and plans everything the real command reads and plans, prints what it would
+change, and writes nothing:
+
+```console
+$ lepatch backup ~/Documents docs --dry-run
+dry run: version 4 would be committed, snapshot 5b525e0f...
+dry run: 128 files, 14 dirs, 2 links, 3104 chunks (12 new, 3092 already held), 48210 bytes to store
+
+$ lepatch restore /tmp/docs-restored docs --dry-run
+dry run: version 4 into /tmp/docs-restored
+dry run: 128 files, 14 dirs, 2 links, 3104 chunks, 48210881 bytes would be written
+dry run: anything already in /tmp/docs-restored would be left alone; pass --clean for an exact copy
+```
+
+`versions` and `verify` do not take it. They write nothing in the first place, and
+a flag that did nothing there would be noise in `--help`; passing it there is a usage
+error.
+
+**A dry run reads everything.** That is the whole trade, and it is deliberate: a plan is
+worth having *because* it is derived from the same walk, the same chunking and the
+same comparison against what is already stored that the real run uses. So
+
+- `backup --dry-run` still reads and hashes every file in the tree. It costs about
+  what a backup costs and saves only the writing.
+- `restore --dry-run` still reads the version out of the store and re-hashes every
+  chunk against the hash it is addressed by, which is most of a restore's work.
+- `apply --dry-run` still probes the destination against the version and reads every
+  chunk back out of the pack to check it — so a damaged pack is still refused.
+- `pack --dry-run` still resolves the version and locates every chunk.
+
+**It writes nothing at all.** Not a segment, not an index file, not a lock, not a
+`.partial` or `.previous` beside a destination, not the manifest an apply records,
+and not the store's directory when there is not one yet. The last of those is the
+one that decides whether the flag is worth having: opening a set for writing *creates*
+it, so a dry run opens for reading and reports a location backed by no set as an
+all-new version rather than failing. No claim is taken either, so a plan can be run
+against a set or a destination something else is using.
+
+**The numbers are the real ones.** A backup's plan is computed by running the real
+walk and the real pipeline against a store that answers what it is asked and keeps
+none of it, so the snapshot it names is the one the next real backup commits, and the
+chunk count is the one that will be written. The counts are pinned against the run
+that follows them in `tests/cli.rs`.
+
+**A dry pack cannot report two of its figures.** The size on disk includes a header
+and a chunk index whose length depends on varint-encoded offsets, and the content
+hash is the hash of the file itself; both are properties of a file that was not
+written. Everything else — which chunks, how many, how much payload, how big the file
+table — is known before a byte is fetched.
+
+**A dry run is not a repair.** It opens the set for reading, so a store with a torn
+tail in its last segment — which a real backup reclaims on the way past — is refused
+rather than planned against. A plan reports what a run would do; deciding that a
+store's tail is damage is itself a write, and it belongs to a command that was asked
+to make one.
+
+**`--clean` deserves the check.** A clean restore is the one operation here that
+destroys what is already there, and a dry run of it empties nothing while still
+saying what it would empty.
+
 ## What is preserved
 
 Regular files, directories, symbolic links, hard links, ownership, permission bits
