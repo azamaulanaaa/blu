@@ -541,9 +541,16 @@ async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<(
         let store = storage::BlobStore::open_for_reading(set.base()).await?;
         let versions = store.versions()?;
 
-        // `write_index_files` writes one file per version whatever is already
-        // there — they are a cache, and rewriting one is how it is brought back to
-        // date — so the number a plan reports is the number a real run writes.
+        // `write_index_files` writes one file per version it can resolve a snapshot
+        // for and skips the rest, so the number a plan reports has to be counted
+        // the same way to be the number a real run writes. Counting the versions
+        // instead would over-report a set whose commit record names a snapshot that
+        // does not resolve — and a real reindex skips that version too, so it would
+        // write no file for it either.
+        let writable = versions
+            .iter()
+            .filter(|version| store.snapshot(**version).is_ok())
+            .count();
         let existing = set.indexed_versions()?.len();
 
         tracing::info!(name = %set.base().display(), "dry run: nothing was written");
@@ -554,8 +561,7 @@ async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<(
             set.base().display()
         )?;
         say!(
-            "dry run: {} index file(s) would be written, {existing} of them already there",
-            versions.len()
+            "dry run: {writable} index file(s) would be written, {existing} of them already there"
         )?;
 
         return Ok(());

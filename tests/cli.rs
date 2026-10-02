@@ -3015,11 +3015,20 @@ fn a_dry_reindex_writes_no_index_file_and_takes_no_lock() {
         "and the set holds one version: {plan}"
     );
 
+    // The figure a plan leads with is how many index files the real run writes,
+    // which is a count of what it can resolve rather than of what it holds.
+    let planned = numbers(plan.lines().nth(1).expect("a plan reports its counts"))[0];
+
     ok(dir.path(), &["reindex", "snap"]);
     assert_eq!(
         index_files(dir.path(), "snap").len(),
         1,
         "the real reindex should have written the index file"
+    );
+    assert_eq!(
+        u64::try_from(index_files(dir.path(), "snap").len()).unwrap(),
+        planned,
+        "the plan should report the index files a real reindex writes: {plan}"
     );
 }
 
