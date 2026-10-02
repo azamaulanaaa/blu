@@ -382,7 +382,12 @@ fn would_write(
 /// carries a bound rather than a count on a dry run: whether an owner can be set is
 /// only knowable by setting it, and every entry that would be tried is named here
 /// before any of them is.
-fn owners(snapshot: &metadata::Snapshot) -> u64 {
+///
+/// Shared with [`super::restore::restore_plan`], which reports the same bound for
+/// the same reason: a restore that did not set the owner is not a failure, and a
+/// plan that could not report it would leave the figure out of the one run that
+/// does.
+pub(super) fn owners(snapshot: &metadata::Snapshot) -> u64 {
     let files = snapshot
         .files
         .iter()

@@ -1009,6 +1009,18 @@ fn report_restore_plan(
         )?;
     }
 
+    if plan.unowned > 0 {
+        // The figure is a bound, not a count: it is how many entries record an
+        // owner at all, and only trying to set one says whether this process can.
+        // Claiming either outcome would be a guess.
+        eprintln!(
+            "note: {} entr{} in this version record an owner, which a restore may not be \
+             able to set without privilege",
+            plan.unowned,
+            if plan.unowned == 1 { "y" } else { "ies" },
+        );
+    }
+
     Ok(())
 }
 

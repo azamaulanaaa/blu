@@ -2736,6 +2736,18 @@ fn a_dry_restore_writes_no_file_no_directory_and_no_claim() {
     );
     assert_ne!(figures[3], 0, "the version names chunks: {report}");
 
+    // And the one figure a real restore can only turn into a count afterwards: the
+    // bound a plan gives, in the apply dry run's words, because whether this
+    // process could set an owner is only knowable by setting it.
+    let logs = ok_logs(dir.path(), &["restore", "out", "snap", "--dry-run"]);
+    assert!(
+        logs.contains(
+            "note: 5 entries in this version record an owner, which a restore may not be \
+             able to set without privilege"
+        ),
+        "a dry restore should bound what it might not be able to set: {logs}"
+    );
+
     // And it is true: the real run writes that many bytes into that many files.
     ok(dir.path(), &["restore", "out", "snap"]);
     common::assert_same_tree(&dir.path().join("src"), &destination);
