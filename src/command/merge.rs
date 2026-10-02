@@ -66,8 +66,16 @@
 //! Every chunk is stored, then `sync_data`, then `commit`. The commit record is
 //! the only thing that makes a version exist, so a run that fails before it
 //! leaves records in the last segment that no version references: wasted space,
-//! reclaimed by the next run's recovery, and no corruption. That is the store's
-//! existing guarantee — the same one a backup has — and this command does not
+//! and no corruption, because nothing names those records and a store that
+//! holds a record nobody reads is still a store whose every named version
+//! restores. The space is not reclaimed, and deliberately not: recovery
+//! truncates only what is *past* the last valid record, so a record that was
+//! written whole and never referenced is a perfectly valid record that outlives
+//! every later run, while one cut short by the crash is the tail recovery does
+//! discard. So the cost of a failed merge is bounded by what it wrote and
+//! permanent, and that is a fair trade for never having to know which records a
+//! later run can safely drop. That is the store's existing guarantee — the same
+//! one a backup has — and this command does not
 //! invent a second mechanism on top of it. There is nothing to undo, because
 //! nothing was published: a version either exists or it does not, and the record
 //! that says so is written once.

@@ -3733,7 +3733,9 @@ fn a_delta_is_merged_into_a_set_that_is_ahead_of_its_base() {
 /// contents, and `put` checks what it is given against it, so damaged bytes
 /// cannot be stored under a chunk's name. What is *not* asserted is that nothing
 /// was written to the segment — records no version references are wasted space,
-/// not corruption, and the store's own recovery reclaims them.
+/// not corruption, and nothing names them. The space is not reclaimed either,
+/// only a record the run tore on the way out is: a record written whole is a
+/// valid record, and recovery truncates only what is past the last valid one.
 #[test]
 fn a_damaged_pack_is_refused_and_publishes_no_version() {
     let dir = tempfile::tempdir().unwrap();
