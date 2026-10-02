@@ -311,7 +311,7 @@ impl DecompressReader {
     /// Serve already-decoded payload bytes.
     ///
     /// The other half of [`DecompressReader::new`], for a caller that has decoded
-    /// through [`Decompressor`] itself — which is what [`super::BlobStore`] does,
+    /// through [`Decompressor`] itself — which is what the store does,
     /// because it is the store that reads the codec byte and so is the place that
     /// knows which decompressor applies. Two constructors rather than one taking
     /// a decompressor, because a reader does not choose how its bytes were made.
