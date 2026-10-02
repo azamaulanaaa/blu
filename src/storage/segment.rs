@@ -18,7 +18,6 @@ use super::record;
 ///
 /// The default is 4 GiB, under what FAT32 and several older archive formats
 /// refuse, and small enough that no single file needs 64-bit offsets.
-/// A write policy, and the floor it cannot go below.
 ///
 /// # Example
 ///

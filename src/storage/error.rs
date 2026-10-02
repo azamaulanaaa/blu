@@ -23,6 +23,7 @@ use std::{io, path::Path};
 /// The kind is carried through, which is the whole reason this is a function and
 /// not a `format!`. A bare `io::Error::new(Other, ...)` would be a lie about a
 /// permission problem, and a crate that hands `io::Error` to callers has already
+/// promised that the kind they match on is the one the operating system reported:
 ///
 /// ```no_run
 /// # fn main() -> std::io::Result<()> {

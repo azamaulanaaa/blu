@@ -22,7 +22,6 @@ use super::record::Codec;
 /// written at mixed levels — or with compression off — reads back and
 /// deduplicates correctly. The default is [`Compression::Zstd`] at level 1; the
 /// measurements behind that are in the README.
-/// A write policy, chosen per run and recorded per record.
 ///
 /// # Example
 ///
