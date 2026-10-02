@@ -19,6 +19,7 @@ $ lepatch verify docs                  # check the stored chunks
 $ lepatch restore /tmp/docs-restored docs
 $ lepatch reindex docs                 # rebuild the per-version index files
 $ lepatch pack docs game.pack          # one version as a single distributable file
+$ lepatch merge game.pack other        # and one version into another set
 ```
 
 `--version N` selects a specific version; without it, restore, verify and pack use
@@ -343,6 +344,70 @@ against the hash it is addressed by before the first byte is stored, so a damage
 pack makes everything look absent rather than overwriting a correct directory and
 reporting success.
 
+#### Merging a pack
+
+`lepatch merge <pack> <name>` applies a pack *into a backup set*, as a new version
+of it. It is the other half of `pack`: where `apply` brings a directory up to a
+version, `merge` brings a *set* up to one. Nothing else is consulted to do it —
+the pack carries its own file table — and the set ends up holding the version, so
+it restores, verifies and lists like any other.
+
+```console
+$ lepatch pack docs game.pack
+afd66e609e57fbceef225d03ab97bbfb1cd538a00be7245fed8d7e8b2a881f4f  game.pack
+
+$ lepatch merge game.pack laptop
+merged version 1: 44 chunks, 44 new, 0 already held, 850000 bytes stored from game.pack
+afd66e60...  laptop
+```
+
+A **full pack** is correct against any set and **creates one** if there is none.
+That is the case this command exists for: a new machine, a new location, or a set
+rebuilt from packs after the original was lost. There is nothing to check a
+self-contained pack against, so refusing a name with nothing behind it would mean
+merge could only ever add to a set `backup` had made.
+
+A **delta pack** is refused unless some committed version of the set is the version
+it names. The check is *containment* — "is the base among the versions this set
+holds" — and nothing more:
+
+```console
+$ lepatch merge v2.delta laptop
+error: refusing to merge: v2.delta is a delta against the version whose snapshot
+hashes to 0e2751a6..., and no committed version of the set holds that snapshot. A
+delta omits the chunks that version has, so nothing here could tell you were
+missing them — merge the full pack instead, or merge the base version first
+```
+
+A set at a **later** version still holds every chunk of an earlier one, so a set
+ahead of the base is one the delta can be merged into. This is where `merge` and
+`apply` deliberately disagree: an apply establishes its base against a *directory*,
+which may hold extra files or be half-applied, so it has to check the tree is
+exactly the base; a backup set is append-only, and a set holding the base at all is
+a set that can merge the delta. Copying apply's check here would refuse merges that
+are safe, and read as though the set had to be pristine.
+
+**Atomic in the store's own sense, and there is no rollback.** Every chunk is
+stored, then made durable, then one commit record publishes the version. A run that
+fails before that commit leaves no version — only records in the last segment that
+nothing references, which the next run's recovery reclaims. That is the guarantee
+the store already gives a backup, and merge adds no mechanism on top of it: a
+version either exists or does not, and the record that says so is written once.
+
+**Merging the same pack twice is allowed**, and makes a second version with the
+same snapshot. A store is a log, and refusing to record something that happened is
+the wrong default for one; it would also make the command unsafe to retry, which is
+what a transfer over a network needs. It costs one commit record, because a chunk
+already held is not written again. Three ways to tell it happened: the report says
+how many chunks were new, `versions` prints the snapshot hash beside each version,
+and a note on stderr names the version already holding it.
+
+**A damaged pack is refused, never half-merged.** Each chunk is hashed against the
+hash it is addressed by as it is stored, so corrupted payload cannot be filed under
+a chunk's name, and a snapshot naming a chunk that neither the pack nor the set
+holds is refused before a byte is written. A refused merge leaves the name exactly
+as it was.
+
 ### Chunk profiles
 
 How big a chunk should be is a trade, and the trade depends on the tree. Fine cuts
@@ -438,9 +503,9 @@ and a store written by version 1 is *refused* rather than misparsed.
 
 ### Dry runs
 
-`backup`, `restore`, `apply`, `pack` and `reindex` take `--dry-run`. A dry run
-reads and plans everything the real command reads and plans, prints what it would
-change, and writes nothing:
+`backup`, `restore`, `apply`, `pack`, `merge` and `reindex` take `--dry-run`. A dry
+run reads and plans everything the real command reads and plans, prints what it
+would change, and writes nothing:
 
 ```console
 $ lepatch backup ~/Documents docs --dry-run
@@ -468,6 +533,9 @@ same comparison against what is already stored that the real run uses. So
 - `apply --dry-run` still probes the destination against the version and reads every
   chunk back out of the pack to check it — so a damaged pack is still refused.
 - `pack --dry-run` still resolves the version and locates every chunk.
+- `merge --dry-run` still resolves the pack against the set and reads back every
+  chunk a merge would store to check it, and still refuses a delta for a set that
+  does not hold its base.
 
 **It writes nothing at all.** Not a segment, not an index file, not a lock, not a
 `.partial` or `.previous` beside a destination, not the manifest an apply records,
