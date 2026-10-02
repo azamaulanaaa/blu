@@ -66,12 +66,20 @@ impl Compressor for BigPayloadsOnly {
 /// A compressor that always makes its payload bigger, to pin what the store does
 /// with a policy it cannot vouch for.
 ///
-/// It cannot store the bytes it returns and still read them back — nothing decodes
-/// them — so it returns a zstd frame of the payload padded to be larger. The store
-/// must notice and store the payload untouched, which is the whole of the
-/// "the fallback belongs to the writer" argument in [`Compressor`]: a third-party
-/// compressor that gets this wrong costs a wasted frame, never a grown set and
-/// never an unreadable record.
+/// It returns a zstd frame of the payload padded past its own end. The store must
+/// notice and store the payload untouched, which is the whole of the "the fallback
+/// belongs to the writer" argument in [`Compressor`]: a third-party compressor that
+/// gets this wrong costs a wasted frame, never a grown set.
+///
+/// The reason is not that the padded buffer could not be decoded back, which is
+/// what this comment used to say and is not what happens. zstd reads the *first*
+/// frame's declared size and ignores whatever follows it, so the padded buffer
+/// still declares the payload's own length and the decode's size check would pass;
+/// it is `zstd::bulk::decompress` that then refuses a source which is not exactly
+/// one frame, with "Src size is incorrect". So a store that trusted the policy
+/// would fail a restore loudly rather than hand back the wrong bytes — a milder
+/// failure than the two size assertions below, which catch it at the point where
+/// it was still a decision rather than a restore.
 struct AlwaysGrows;
 
 impl Compressor for AlwaysGrows {
