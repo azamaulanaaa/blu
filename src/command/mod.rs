@@ -17,7 +17,7 @@ mod verify;
 pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
-pub use merge::{MergePlan, Merged, merge, merge_plan};
+pub use merge::{MergePlan, Merged, establish_base, merge, merge_plan};
 pub use pack::{Base, Options as PackOptions, Packed, pack};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{

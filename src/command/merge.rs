@@ -232,9 +232,21 @@ pub async fn merge<C: storage::Compressor>(
         // stores a chunk whole, and `put` checks the hash of everything it is
         // given against the name that chunk is addressed by, so a prefix would
         // be refused for the very reason the check exists.
+        //
+        // The error is wrapped because `put`'s own is a statement about a record
+        // and a person reading it has no way to know it came from merging a pack
+        // — or that the bytes are the pack's rather than the set's. A damaged
+        // pack is the likeliest cause by a long way, and saying so is what tells
+        // them to go and look at the file they downloaded.
         store
             .put(&chunk.id, pack.get(&chunk.id).await?, located.len)
-            .await?;
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("refusing to merge: {} could not be stored: {e}", chunk.id),
+                )
+            })?;
 
         merged.fresh = merged.fresh.saturating_add(1);
         merged.bytes = merged.bytes.saturating_add(located.len);
@@ -378,10 +390,23 @@ fn checked_snapshot(pack: &Pack) -> io::Result<(Snapshot, Vec<u8>)> {
 
 /// The version of the set holding `base`, or a refusal naming why not.
 ///
+/// `set` is `None` for a name with no set behind it, which is a refusal rather
+/// than an empty answer: there is no committed version, so no version holds the
+/// base.
+///
 /// See this module's docs for why this is containment among committed versions
-/// and not a check that the set is exactly the base. Shared with [`merge_plan`],
-/// which has a read-only handle and needs the same answer.
-fn establish_base<W: storage::WriteMode, C: storage::Compressor>(
+/// and not a check that the set is exactly the base. Public because a caller
+/// needs it *before* opening the set for writing, which creates a set that does
+/// not exist: a delta refused against a name with nothing behind it must leave
+/// that name alone, and the store handle that would answer the question is the
+/// thing being created.
+///
+/// # Errors
+///
+/// Returns an error if the set cannot list its versions or read a version's
+/// snapshot, or if no committed version holds `base` — naming the hash and what
+/// to do instead.
+pub fn establish_base<W: storage::WriteMode, C: storage::Compressor>(
     store: Option<&storage::BlobStore<W, C>>,
     base: BlobId,
     path: &std::path::Path,

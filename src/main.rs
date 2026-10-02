@@ -1431,6 +1431,21 @@ async fn run_merge(
         return report_merge_plan(&set, &plan, fresh);
     }
 
+    // Checked before the lock and before the open for writing, because both of
+    // those create: a delta refused for a set that does not hold its base must
+    // leave the name exactly as it was, and opening for writing is how a merge
+    // into a new set would create one. The check is repeated inside `merge`
+    // against the store the run actually writes to, which is the one that counts
+    // and the only one taken under the lock.
+    if let Some(base) = pack.base() {
+        let existing = if set.segments()?.is_empty() {
+            None
+        } else {
+            Some(storage::BlobStore::open_for_reading(set.base()).await?)
+        };
+        lepatch::command::establish_base(existing.as_ref(), base, pack.path())?;
+    }
+
     let _lock = set.lock()?;
     let store = storage::BlobStore::open_for_writing(
         set.base(),
