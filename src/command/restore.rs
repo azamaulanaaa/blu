@@ -49,6 +49,29 @@ pub struct Restored {
     pub unowned: u64,
 }
 
+/// What a restore of a version would put into a destination, worked out by reading
+/// the version and the store and by writing nothing.
+///
+/// The figures are the ones a real restore reports, from the same snapshot and the
+/// same checks: a plan that says 12,000 bytes would be written is describing a
+/// restore that writes 12,000 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RestorePlan {
+    /// Regular files the version records.
+    pub files: u64,
+    /// Directories it records.
+    pub dirs: u64,
+    /// Hard and symbolic links it records.
+    pub links: u64,
+    /// Distinct chunks it would read out of the store.
+    pub chunks: u64,
+    /// Bytes of file content it would write.
+    ///
+    /// Every recorded file's length, which is what a restore writes: each file is
+    /// created at that length before its chunks go in and set back to it afterwards.
+    pub bytes: u64,
+}
+
 /// Reassemble the snapshot identified by `key` under `root`.
 ///
 /// Restoration runs in four phases so that ordering constraints hold:
@@ -160,6 +183,73 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
         bytes: written,
         unowned,
+    })
+}
+
+/// Work out what restoring `snapshot_id` would write, and write none of it.
+///
+/// Everything a real restore does before its first byte, and nothing after: the
+/// version is read out of the store and decoded, its chunks are read back and
+/// checked against the hashes it addresses them by, and its recorded paths are
+/// resolved. So a plan refuses exactly what a restore refuses — a version whose
+/// chunks do not verify, or one that records a path escaping the destination — and
+/// a plan that succeeds is a restore that would have.
+///
+/// It costs what it costs: the whole version is read and hashed, which is most of
+/// a restore's work. A dry run saves the writes, not the reading.
+///
+/// A separate entry point rather than a field on the options a restore takes,
+/// for the reason [`super::backup_plan`] gives: `restore` answers with a
+/// [`Restored`], and every figure in that describes work that happened. There is
+/// no way to return it from a run that wrote nothing without the field being a
+/// lie, and a plan worth having is worth having in full.
+///
+/// # Errors
+///
+/// As [`restore`], and for the same reasons: a snapshot that cannot be read or
+/// decoded, a chunk that does not verify, a path that would land outside the
+/// destination, or a recorded length its own slices do not account for.
+pub async fn restore_plan<S: storage::StorageGet + 'static>(
+    snapshot_id: storage::BlobId,
+    storage: S,
+) -> io::Result<RestorePlan> {
+    let snapshot = super::load_snapshot(&storage, snapshot_id).await?;
+
+    super::verify::check(&snapshot, Arc::new(storage))
+        .await
+        .into_result()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("refusing to restore snapshot {snapshot_id}: {e}"),
+            )
+        })?;
+
+    super::restore::check_paths(&snapshot).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("refusing to restore snapshot {snapshot_id}: {e}"),
+        )
+    })?;
+
+    snapshot
+        .verify_file_lengths("does not match its own chunks")
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("refusing to restore snapshot {snapshot_id}: {e}"),
+            )
+        })?;
+
+    Ok(RestorePlan {
+        files: u64::try_from(snapshot.files.len()).unwrap_or(0),
+        dirs: u64::try_from(snapshot.dirs.len()).unwrap_or(0),
+        links: u64::try_from(snapshot.links.len()).unwrap_or(0),
+        chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
+        bytes: snapshot
+            .files
+            .iter()
+            .fold(0u64, |total, file| total.saturating_add(file.len)),
     })
 }
 

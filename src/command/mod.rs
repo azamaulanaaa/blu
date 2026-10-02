@@ -17,7 +17,8 @@ pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{
-    DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Restored, lock_destination, restore,
+    DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan, Restored, lock_destination,
+    restore, restore_plan,
 };
 pub use verify::{Failure, Reason, Report, verify};
 
