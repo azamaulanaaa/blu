@@ -3326,67 +3326,174 @@ fn a_full_pack_merges_into_a_set_that_already_has_versions() {
     common::assert_same_tree(&source, &dir.path().join("out-received-2"));
 }
 
-/// Merging the same pack twice makes a second version and stores no chunk bytes.
+/// Merging the same pack twice does nothing, and says which version holds it.
 ///
-/// The decision this pins: allowed rather than refused. A store is a log, and a
-/// transfer may be retried, so a second arrival has to be answerable. What would
-/// falsify the test is either half of the opposite choice — a refusal, or a
-/// second version whose report claims chunks were written when nothing was.
+/// The decision this pins: a no-op reported as success. A store is a log, and a
+/// transfer may be retried, so a second arrival has to be answerable — and the
+/// answer has to name the version, because the client that has to decide what to
+/// do next is asking *which* version the pack became, not whether the command was
+/// pleased.
+///
+/// What would falsify it: a second version appearing (the old behaviour, which
+/// manufactured a number nobody asked for), a non-zero exit (a retried transfer
+/// would be stuck), or a report that says "already merged" without saying what it
+/// is already merged as.
 #[test]
-fn merging_the_same_pack_twice_adds_a_version_and_stores_nothing() {
+fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
     let dir = tempfile::tempdir().unwrap();
     merge_tree(dir.path());
     ok(dir.path(), &["backup", "source", "origin"]);
     ok(dir.path(), &["pack", "origin", "v1.pack"]);
 
     ok(dir.path(), &["merge", "v1.pack", "received"]);
-    let first = fs::metadata(dir.path().join("received.0000.bin"))
+    let before = fs::metadata(dir.path().join("received.0000.bin"))
         .unwrap()
         .len();
 
     let second = ok(dir.path(), &["merge", "v1.pack", "received"]);
 
     assert!(
-        second.contains("version 2"),
-        "the second merge should be version 2: {second}"
+        second.contains("already merged") && second.contains("as version 1"),
+        "a repeated merge should name the version already holding it: {second}"
     );
     assert!(
-        second.contains(", 0 new, "),
-        "every chunk was already held, so nothing should have been stored: {second}"
-    );
-    let said = ok_logs(dir.path(), &["merge", "v1.pack", "received", "--dry-run"]);
-    assert!(
-        said.contains("already holds this version as version 1"),
-        "a user has to be able to tell a repeat from a first merge: {said}"
+        !second.contains("merged version"),
+        "a repeated merge should not claim to have published anything: {second}"
     );
 
-    // Both versions are real, and both restore the same tree — which is what
-    // makes the second one harmless rather than a mistake.
-    // The only growth is the second commit record: `put` deduplicated every
-    // chunk, so no payload was written, and a repeat that re-sent the version
-    // would grow the segment by the whole pack.
+    // Not one byte written. A repeat that re-sent the version would grow the
+    // segment by the whole pack, and one that committed an empty version would
+    // grow it by a commit record — both are what "does nothing" rules out.
     let grown = fs::metadata(dir.path().join("received.0000.bin"))
         .unwrap()
         .len();
-    assert!(
-        grown - first < 1024,
-        "a repeat merge should add a commit record and nothing else: {first} to {grown}"
+    assert_eq!(
+        grown, before,
+        "a repeated merge wrote to the segment: {before} to {grown}"
     );
     assert_eq!(
         ok(dir.path(), &["versions", "received", "--numbers-only"])
             .lines()
             .count(),
-        2
+        1,
+        "a repeated merge published a version"
     );
+
+    // And the version it did not touch still restores the tree, which is the
+    // half a no-op could get wrong by being wrong about which version it holds.
     set_contents(dir.path(), "received", 1);
-    set_contents(dir.path(), "received", 2);
     common::assert_same_tree(
         &dir.path().join("source"),
         &dir.path().join("out-received-1"),
     );
+}
+
+/// A pack from behind the set's tip is warned about on stderr, and merged anyway.
+///
+/// The property is the comparison and where it is said. The pack's recorded
+/// version is the *origin* set's numbering and the tip is this set's, and the
+/// only fact two independently-assigned numbers can support is whether the
+/// sender's view of its own set was stale.
+///
+/// What would falsify it, one per assertion: a warning at equal or above (a
+/// sender exactly up to date would learn to ignore the warning, and there would
+/// be nothing left for it to mean); no warning below (the feature would do
+/// nothing at all); the warning on stdout (a script reading the report would
+/// have to skip a line to find the line it wanted); or a refusal — the pack is
+/// not wrong, its chunks are exactly the ones its snapshot names, and only the
+/// sender's view is behind.
+#[test]
+fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+
+    // Three versions at the origin, so there are three recorded numbers to merge
+    // in an order that walks the receiving set's tip up past two of them.
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &["pack", "origin", "one.pack", "--version", "1"],
+    );
+
+    fs::write(source.join("f1.bin"), noisy(230_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &["pack", "origin", "two.pack", "--version", "2"],
+    );
+
+    fs::write(source.join("f2.bin"), noisy(240_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &["pack", "origin", "three.pack", "--version", "3"],
+    );
+
+    // Ahead of the tip (3 against 0) and then on the line (2 against 1): neither
+    // is behind, and saying so would be noise.
+    for pack in ["three.pack", "two.pack"] {
+        let said = ok_logs(dir.path(), &["merge", pack, "behind"]);
+        assert!(
+            !said.contains("this pack is version"),
+            "a pack at or above the tip should not warn: {pack} said: {said}"
+        );
+    }
+    assert_eq!(
+        ok(dir.path(), &["versions", "behind", "--numbers-only"])
+            .lines()
+            .count(),
+        2,
+        "the two unremarkable merges should have published versions"
+    );
+
+    // Behind: origin version 1 arriving at a set on version 2. It merges, and
+    // the warning names both numbers and what the merge is about to publish.
+    let said = ok_logs(dir.path(), &["merge", "one.pack", "behind"]);
+    assert!(
+        said.contains("warning")
+            && said.contains("this pack is version 1")
+            && said.contains("is at version 2"),
+        "a pack from behind the tip should be warned about, naming both: {said}"
+    );
+    assert!(
+        said.contains("version 3"),
+        "and should say what merging publishes: {said}"
+    );
+
+    let report = ok(dir.path(), &["merge", "one.pack", "behind", "--dry-run"]);
+    assert!(
+        report.contains("already merged"),
+        "but a repeat of it is nothing to warn about: {report}"
+    );
+
+    // The version really was published, and it really restores the tree the
+    // pack carries — the whole point of warning rather than refusing.
+    assert_eq!(
+        ok(dir.path(), &["versions", "behind", "--numbers-only"])
+            .lines()
+            .count(),
+        3
+    );
+    set_contents(dir.path(), "behind", 3);
     common::assert_same_tree(
-        &dir.path().join("source"),
-        &dir.path().join("out-received-2"),
+        &merge_tree_at_v1(dir.path()),
+        &dir.path().join("out-behind-3"),
+    );
+
+    // And a pack exactly on the tip: equal is not lower, and the ordinary case
+    // of a sender who is up to date must be silent.
+    ok(dir.path(), &["merge", "three.pack", "level"]);
+    let level = ok_logs(dir.path(), &["merge", "one.pack", "level"]);
+    assert!(
+        !level.contains("this pack is version"),
+        "a pack from the tip's own version is not behind it: {level}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "level", "--numbers-only"])
+            .lines()
+            .count(),
+        2,
+        "the pack from the tip should still have merged"
     );
 }
 
@@ -3816,15 +3923,17 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
         "a dry merge took the lock"
     );
 
-    // Against a set that does exist: the figures are the merge's own, and still
-    // nothing moves.
+    // Against a set that does exist, and holds the version already: a dry run of
+    // a repeat has to say so, because a plan that reported a merge of something
+    // already merged would be promising the user a version their set is not
+    // about to grow. Nothing moves.
     ok(dir.path(), &["merge", "v1.pack", "received"]);
     let before = fs::read(dir.path().join("received.0000.bin")).unwrap();
 
     let again = ok(dir.path(), &["merge", "v1.pack", "received", "--dry-run"]);
     assert!(
-        again.contains("already held"),
-        "a dry merge into a set that holds the version should say so: {again}"
+        again.contains("already merged") && again.contains("as version 1"),
+        "a dry merge of what the set already holds should say so: {again}"
     );
     assert_eq!(
         fs::read(dir.path().join("received.0000.bin")).unwrap(),
@@ -3839,8 +3948,26 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
         "a dry merge published a version"
     );
 
-    // And the real run then does exactly what the plan said.
-    let real = ok(dir.path(), &["merge", "v1.pack", "received"]);
+    // And a version the set does *not* hold is planned in full, and the real run
+    // then does exactly what the plan said.
+    fs::write(dir.path().join("source/f3.bin"), noisy(260_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v2.pack"]);
+
+    let plan = ok(dir.path(), &["merge", "v2.pack", "received", "--dry-run"]);
+    assert!(
+        plan.contains("version 2") && plan.contains("nothing written"),
+        "a plan for a version the set lacks should report it: {plan}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        1,
+        "the plan published a version"
+    );
+
+    let real = ok(dir.path(), &["merge", "v2.pack", "received"]);
     assert!(
         real.contains("version 2"),
         "the real merge should commit what the plan reported: {real}"
@@ -3931,6 +4058,75 @@ fn a_dry_merge_refuses_a_damaged_pack() {
     assert!(
         !dir.path().join("received.0000.bin").exists(),
         "and should not have created the set"
+    );
+}
+
+/// A pack the set already holds is still refused when its file table is damaged.
+///
+/// `a_dry_merge_refuses_a_damaged_pack` above only asks about a set that does not
+/// exist, where the refusal cannot be confused with the already-merged answer.
+/// Once the set holds the pack's snapshot, the two paths have something to
+/// disagree about: the real run's pre-check consults the set, and a pre-check
+/// that answers "already merged" from an unverified pack reports success and
+/// exits zero for a file neither library path would accept, while the dry run
+/// still refuses it. A dry run that does not say what the real run does is not a
+/// dry run.
+#[test]
+fn a_merge_of_a_damaged_pack_is_refused_even_when_the_set_already_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // Merged for real, so the set now holds this pack's snapshot and the
+    // already-merged answer is the one the pre-check is looking for.
+    ok(dir.path(), &["merge", "v1.pack", "received"]);
+    let before = fs::read(dir.path().join("received.0000.bin")).unwrap();
+
+    // Damaged inside the file table, which is the section the header names a
+    // hash for. The header is left alone, so the pack still opens and still
+    // claims the snapshot the set already holds — the pre-check has everything
+    // it would need to answer, and answers for a pack that cannot be merged.
+    let bytes = fs::read(dir.path().join("v1.pack")).unwrap();
+    let mut damaged = bytes;
+    let start = lepatch::pack::Pack::open(&dir.path().join("v1.pack"))
+        .unwrap()
+        .snapshot_start();
+    damaged[usize::try_from(start).unwrap() as usize] ^= 0xff;
+    fs::write(dir.path().join("damaged.pack"), &damaged).unwrap();
+
+    let refused = fails(dir.path(), &["merge", "damaged.pack", "received"]);
+    assert!(
+        refused.contains("does not hash to the one its header names"),
+        "a real merge should refuse a pack whose file table does not hash to the one its header \
+         names: {refused}"
+    );
+    assert!(
+        !refused.contains("already merged"),
+        "and must not report a damaged pack as already merged: {refused}"
+    );
+
+    // Same file, same set, same refusal: the two paths cannot disagree about one
+    // pack, or a dry run is promising something the real run will not do. The
+    // wording around it differs — one refuses the pack, one refuses the merge —
+    // so this asks for the clause they share rather than for identical text.
+    let planned = fails(
+        dir.path(),
+        &["merge", "damaged.pack", "received", "--dry-run"],
+    );
+    assert!(
+        planned.contains("does not hash to the one its header names"),
+        "a dry merge should refuse it for the same reason the real run did: {planned}"
+    );
+    assert!(
+        !planned.contains("already merged"),
+        "and must not plan a merge of a pack whose file table is damaged: {planned}"
+    );
+
+    assert_eq!(
+        fs::read(dir.path().join("received.0000.bin")).unwrap(),
+        before,
+        "a refused merge changed the segment"
     );
 }
 

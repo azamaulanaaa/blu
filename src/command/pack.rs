@@ -46,6 +46,27 @@ pub struct Base {
     pub snapshot: Snapshot,
 }
 
+/// The version being packed, and what the set it came from calls it.
+///
+/// The pair because neither half is enough. The snapshot is what the pack
+/// *holds* — the file table, and through it every chunk — and the number is what
+/// the header *says about where it came from*, which is not derivable from the
+/// snapshot: two sets number their versions independently, so the same snapshot
+/// is version 2 of one and version 9 of another, and a pack that recorded only
+/// the snapshot could not tell a receiver which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    /// What the set this is packed from calls the version.
+    ///
+    /// Written into the header, where it is fixed-length and so readable without
+    /// walking the variable part. It buys `merge` the ability to notice that a
+    /// pack arrived from behind; it is not a coordinate in the receiving set and
+    /// nothing maps it onto one.
+    pub number: u32,
+    /// The version itself, which the pack carries as its own file table.
+    pub snapshot: Snapshot,
+}
+
 /// What a pack holds, or would hold.
 ///
 /// On a dry run the two figures that can only come from the written file are
@@ -78,6 +99,10 @@ pub struct Packed {
 
 /// Resolve a version into the chunks a pack would carry, and write it.
 ///
+/// `version.number` is recorded in the header: a receiver reading the pack back
+/// needs to be able to see that this arrived from a version behind the one it is
+/// already on, which a snapshot hash cannot tell it.
+///
 /// `locate` answers where a chunk is in the store, and is given as a callback
 /// rather than a store so that this works for any backend — the same reason
 /// [`storage::Plan::from_snapshot`] takes one.
@@ -94,7 +119,7 @@ pub struct Packed {
 /// the file cannot be written.
 pub async fn pack<S, F>(
     store: &S,
-    snapshot: &Snapshot,
+    version: &Version,
     mut locate: F,
     base: Option<Base>,
     out: &Path,
@@ -104,11 +129,16 @@ where
     S: StorageGet + ?Sized,
     F: FnMut(&BlobId) -> io::Result<Placement>,
 {
+    let Version {
+        number,
+        snapshot: version_snapshot,
+    } = version;
+
     // A function of the tree, not of how the set laid its chunks out, so the pack
     // is reproducible. The decoded snapshot is handed to the writer as well as
     // resolved into a plan, because a pack carries its own file table and so is
     // the version rather than a reference to it.
-    let whole = storage::Plan::from_snapshot(snapshot, &mut locate)?;
+    let whole = storage::Plan::from_snapshot(version_snapshot, &mut locate)?;
     let of = u64::try_from(whole.len()).unwrap_or(0);
 
     // A delta is the same pack with fewer chunks in it: no format change and no new
@@ -116,11 +146,11 @@ where
     // chunks that are not here are exactly the ones a holder of `base` has.
     let plan = match base.as_ref() {
         None => whole,
-        Some(base) => whole.since(snapshot, &base.snapshot),
+        Some(base) => whole.since(version_snapshot, &base.snapshot),
     };
 
     let table = u64::try_from(
-        snapshot
+        version_snapshot
             .to_bytes()
             .map_err(|e| {
                 io::Error::new(
@@ -150,8 +180,10 @@ where
     // say what the delta assumes — that is what lets an apply refuse rather than
     // apply what it happens to hold.
     let written = match base.as_ref() {
-        Some(base) => Pack::write_delta(store, &plan, snapshot, base.id, out).await?,
-        None => Pack::write(store, &plan, snapshot, out).await?,
+        Some(base) => {
+            Pack::write_delta(store, &plan, version_snapshot, base.id, *number, out).await?
+        }
+        None => Pack::write(store, &plan, version_snapshot, *number, out).await?,
     };
 
     // Read back off the written pack rather than computed here, so the figures a

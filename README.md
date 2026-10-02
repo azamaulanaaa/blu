@@ -206,7 +206,7 @@ fraction is fixture-dependent, and `tests/pack.rs` asserts the robust one on
 content that is not a special case.
 
 ```text
-magic | version | snapshot hash | chunk count | payload bytes
+magic | format version | version | snapshot hash | chunk count | payload bytes
 ...payloads, end to end, in plan order...
 ...the snapshot, encoded: the file table that gives the payload meaning...
 ...index: per chunk, hash | offset | length...
@@ -251,6 +251,33 @@ Where a header's counts and its own index could disagree, the pack is refused ra
 than one of them believed: the index is what locates chunks, so if the two disagree
 one is wrong, and picking the wrong one produces a pack that reads as valid and hands
 out ranges covering the wrong bytes.
+
+#### What a pack records about where it came from
+
+The header carries a number: the version the pack was built from, as **that set**
+called it. `lepatch pack docs game.pack` for a set on version 3 writes a pack whose
+header says 3.
+
+**It is the origin set's numbering, and it is not a coordinate here.** Two sets
+number their versions independently, so a pack of origin version 2 merged into a set
+already on version 5 is published as version 6, and the 2 maps onto nothing. There is
+nothing for it to be, because the two numberings never met. What you restore is
+chosen with `restore --version N`, and with no `--version` you get the receiving
+set's most recent version, which is not necessarily the one this pack was built from.
+
+It buys exactly one thing, and it is the thing a receiver otherwise cannot see. A
+pack's snapshot hash says what the pack *holds* and nothing about whether the sender
+was working from current information: two packs of adjacent versions differ in their
+hashes, and neither hash hints that one arrived after the other had already been
+received. Comparing the recorded version against the set's tip is the whole of the
+check, and it is what lets a transfer be diagnosed at the moment it lands rather than
+when somebody notices a restore returning an older version than they expected.
+
+It changes nothing about what the pack is. Same chunks, same file table, same content
+hash — the number is one fact about the pack's provenance, not one about its bytes,
+and the byte-identical property above is unaffected by which version was packed. It
+is fixed-length in the header, so it costs four bytes once per pack and is readable
+without walking the base flag and the varint counts that follow it.
 
 #### Delta packs
 
@@ -394,13 +421,50 @@ nothing references, which the next run's recovery reclaims. That is the guarante
 the store already gives a backup, and merge adds no mechanism on top of it: a
 version either exists or does not, and the record that says so is written once.
 
-**Merging the same pack twice is allowed**, and makes a second version with the
-same snapshot. A store is a log, and refusing to record something that happened is
-the wrong default for one; it would also make the command unsafe to retry, which is
-what a transfer over a network needs. It costs one commit record, because a chunk
-already held is not written again. Three ways to tell it happened: the report says
-how many chunks were new, `versions` prints the snapshot hash beside each version,
-and a note on stderr names the version already holding it.
+**Merging the same pack twice does nothing, and says which version holds it.** A pack
+whose snapshot the set already has is a no-op: no version is published, no byte is
+written, and the run reports the version it is already there as. A transfer over a
+network may be retried, and a retry has to be answerable — the client that has to
+decide whether to send again needs *which* version the pack became, not whether the
+command was pleased. So:
+
+```console
+$ lepatch merge game.pack laptop
+already merged: laptop holds this version as version 2; nothing to do
+```
+
+This is the same under `--dry-run`: a plan that reported a merge of something
+already merged would be promising a version the set is not about to grow.
+
+The alternatives were both worse. *Refusing* would leave a client that merged and
+lost the reply unable to tell "already merged" from "never merged", so the retry
+protocol would need an answer the set can give in one scan of its commit list.
+*Making a second version* is what a log does by default, and what this used to do:
+it publishes a number nobody asked for, which then competes with real ones — a
+script that pushes and then checks the latest version reads a duplicate as the most
+recent thing that happened — over the fact that the second arrival taught the set
+nothing it did not already hold.
+
+**A pack from behind the set's tip is warned about, and merged anyway.** The
+recorded version is compared against the receiving set's most recent version, and a
+number below it means the sender's view was stale: whatever they changed since has
+not left.
+
+```console
+$ lepatch merge old.pack laptop
+warning: this pack is version 1 and laptop is at version 5; merging publishes it
+as version 6, and a restore with no --version will return that one
+merged version 6: 51 chunks, 12 new, 39 already held, 244000 bytes stored from old.pack
+```
+
+On stderr, because stdout is the report channel and a script reading the merge
+report should not have to skip a line to find the line it wanted. And a warning
+rather than a refusal, because the pack is not wrong: its chunks are exactly the ones
+its own snapshot names, and merging it produces a version that restores what the
+pack holds. Only the sender's *view* is stale, and there is nothing a refusal could
+assert about a file that is internally consistent. Equal is not lower — a pack from
+the tip's own version is a sender exactly up to date, and warning about that would
+train people to ignore the warning.
 
 **A damaged pack is refused, never half-merged.** Each chunk is hashed against the
 hash it is addressed by as it is stored, so corrupted payload cannot be filed under
@@ -535,7 +599,8 @@ same comparison against what is already stored that the real run uses. So
 - `pack --dry-run` still resolves the version and locates every chunk.
 - `merge --dry-run` still resolves the pack against the set and reads back every
   chunk a merge would store to check it, and still refuses a delta for a set that
-  does not hold its base.
+  does not hold its base. A pack the set already holds is reported as already
+  merged rather than planned as a merge, because that is what the real run does.
 
 **It writes nothing at all.** Not a segment, not an index file, not a lock, not a
 `.partial` or `.previous` beside a destination, not the manifest an apply records,
@@ -804,7 +869,7 @@ let store = BlobStore::open_for_reading("docs").await?;
 let snapshot = load_snapshot(&store, store.snapshot(2)?).await?;
 let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 
-let pack = Pack::write(&store, &plan, &snapshot, std::path::Path::new("game.pack")).await?;
+let pack = Pack::write(&store, &plan, &snapshot, 2, std::path::Path::new("game.pack")).await?;
 
 // What a client already holding some of it does not have, as byte ranges of the
 // pack. Adjacent ranges merge, which is the point of packing: a client needs one
@@ -876,6 +941,13 @@ time, so nothing has to be backed up again to bring a client up to date.
 ```console
 $ lepatch pack set v8.pack --version 8     # after upgrading the server
 ```
+
+The pack format moves to `4` with the recorded version described above, so a `3`
+pack is refused by name — `it is pack format 3, but this build reads 4` — rather
+than read as though the four bytes it does not have were part of its snapshot hash.
+Every earlier pack format is refused the same way, and the reason is the same: a
+pack this build cannot parse would otherwise produce byte ranges that look
+entirely plausible and point at the wrong bytes.
 
 **Order matters if clients fetch packs from a server you are upgrading.** A `0.3.0`
 client refuses a `0.2.0` pack, so the server has to go first:

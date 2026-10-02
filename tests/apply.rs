@@ -67,7 +67,6 @@ impl Versions {
     async fn pack(&self) -> Pack {
         let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
         let (version, id) = store.latest().unwrap();
-        let _ = version;
 
         let snapshot = read_snapshot(&store, id).await;
         let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
@@ -76,6 +75,7 @@ impl Versions {
             &store,
             &plan,
             &snapshot,
+            version,
             &self.dir.path().join("latest.pack"),
         )
         .await

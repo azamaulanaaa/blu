@@ -83,6 +83,7 @@ impl Built {
             &store,
             &self.plan,
             &self.snapshot,
+            1,
             &self.dir.path().join("v1.pack"),
         )
         .await
