@@ -5,9 +5,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use lepatch::{
     command::{
-        ApplyOptions, BackupPlan, MergePlan, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan,
-        apply, backup, backup_plan, load_snapshot, lock_destination, merge, merge_plan, restore,
-        restore_plan, verify,
+        ApplyOptions, BackupPlan, MergePlan, Merged, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX,
+        Planned, RestorePlan, apply, backup, backup_plan, load_snapshot, lock_destination, merge,
+        merge_plan, restore, restore_plan, verify, version_holding,
     },
     layout::IndexSet,
     pack::Pack,
@@ -93,10 +93,15 @@ enum Command {
     /// leaves no version, and no rollback is attempted because there is nothing to
     /// undo — see `src/command/merge.rs` for why.
     ///
-    /// Merging the same pack twice is allowed and makes a second version with the
-    /// same snapshot, which the report says so you can tell. The second merge
-    /// stores no chunk bytes; a version's existence is a fact about the set, and a
-    /// transfer that may be retried cannot afford to refuse one.
+    /// Merging the same pack twice is not an error: the second run reports which
+    /// version of this set already holds the pack's snapshot and writes nothing.
+    /// A transfer may be retried, and the retry has to be answerable.
+    ///
+    /// A pack built from a version *behind* this set's tip is warned about on
+    /// stderr and merged anyway — the two sets number their versions
+    /// independently, so the pack's own number says nothing about where it lands.
+    /// It lands on the set's next version, which is what `restore` with no
+    /// `--version` returns, and that is what the warning says.
     Merge {
         /// The pack to merge.
         pack: std::path::PathBuf,
@@ -1428,8 +1433,8 @@ async fn run_merge(
         };
         let fresh = existing.is_none();
 
-        let plan = merge_plan(&pack, existing.as_ref()).await?;
-        return report_merge_plan(&set, &plan, fresh);
+        let planned = merge_plan(&pack, existing.as_ref()).await?;
+        return report_merge_plan(&set, &planned, fresh);
     }
 
     // Checked before the lock and before the open for writing, because both of
@@ -1463,21 +1468,64 @@ async fn run_merge(
     )
     .await?;
 
-    let merged = merge(&store, &pack).await?;
-    tracing::info!(
-        name = %set.base().display(),
-        version = merged.version,
-        snapshot = %&merged.plan.snapshot,
-        base = merged.plan.base,
-        chunks = merged.plan.chunks,
-        fresh = merged.plan.fresh,
-        held = merged.plan.held,
-        bytes = merged.plan.bytes,
-        segments = store.segment_count(),
-        "merge complete"
-    );
+    // Before the warning and before the merge, and before the merge on both
+    // counts: the warning says what a merge would publish, and a pack the set
+    // already holds publishes nothing. Asked again inside `merge`, under the
+    // lock and against the store this run writes to, which is the check that
+    // counts; this one is what lets the report be right.
+    if let Some(version) = version_holding(&store, &pack.snapshot_id())? {
+        tracing::info!(
+            name = %set.base().display(),
+            version,
+            "merge: already merged, nothing to do"
+        );
 
-    report_merge(&set, &merged, &pack)
+        return report_already_merged(&set, version);
+    }
+
+    let merged = merge(&store, &pack).await?;
+
+    match merged {
+        Merged::Committed { version, plan } => {
+            tracing::info!(
+                name = %set.base().display(),
+                version,
+                snapshot = %&plan.snapshot,
+                base = plan.base,
+                chunks = plan.chunks,
+                fresh = plan.fresh,
+                held = plan.held,
+                bytes = plan.bytes,
+                segments = store.segment_count(),
+                "merge complete"
+            );
+
+            report_merge(&set, version, &plan, &pack)
+        }
+        Merged::Already { version } => {
+            tracing::info!(
+                name = %set.base().display(),
+                version,
+                "merge: already merged, nothing to do"
+            );
+
+            report_already_merged(&set, version)
+        }
+    }
+}
+
+/// Report a pack the set already holds, and that nothing was done.
+///
+/// On stdout, because it is the run's answer and a script that pushed a pack and
+/// then checked the exit code is entitled to know why the set did not move. It
+/// names the version the set holds it as, because "already merged" on its own
+/// leaves the one question a retried transfer actually has — *which* version, so
+/// a client can ask for that one by number — unanswered.
+fn report_already_merged(set: &IndexSet, version: u32) -> std::io::Result<()> {
+    say!(
+        "already merged: {} holds this version as version {version}; nothing to do",
+        set.base().display()
+    )
 }
 
 /// Say what a merge committed, and what it left out.
@@ -1485,13 +1533,18 @@ async fn run_merge(
 /// Two lines: what went in, and the name the new version is known by — the same
 /// hash `pack` printed when it was written, since a pack is a function of the
 /// version it carries and both sides hash the same bytes.
+///
+/// Every number here is *this* set's. The version is the one the commit record
+/// published, and the "since N" is the version of this set that holds the pack's
+/// base, looked up by snapshot hash rather than taken from the pack — which is
+/// the only way it can be right, since the pack's base is a hash and a hash says
+/// nothing about what this set calls it.
 fn report_merge(
     set: &IndexSet,
-    merged: &lepatch::command::Merged,
+    version: u32,
+    plan: &MergePlan,
     pack: &Pack,
 ) -> std::io::Result<()> {
-    let plan = &merged.plan;
-
     let since = match plan.base {
         Some(base) => format!(" since {base}"),
         None => String::new(),
@@ -1499,28 +1552,14 @@ fn report_merge(
 
     say!(
         "merged version {}{since}: {} chunks, {} new, {} already held, {} bytes stored from {}",
-        merged.version,
+        version,
         plan.chunks,
         plan.fresh,
         plan.held,
         plan.bytes,
         pack.path().display()
     )?;
-    say!("{}  {}", &plan.snapshot, set.base().display())?;
-
-    // Named on stderr because stdout is data, and said rather than left for the
-    // user to notice: a second version carrying the same snapshot is a
-    // deliberate outcome of this command rather than a fault, but in a listing
-    // it looks like a mistake, and nothing else says otherwise.
-    if let Some(already) = plan.already {
-        eprintln!(
-            "note: {} already held this version as version {already}; merging it again adds a \
-             version and stores no chunk bytes",
-            set.base().display()
-        );
-    }
-
-    Ok(())
+    say!("{}  {}", &plan.snapshot, set.base().display())
 }
 
 /// Say what a merge would have committed, on stdout, and that it committed
@@ -1529,8 +1568,21 @@ fn report_merge(
 /// The same wording as the real report with the verbs changed, for the reason
 /// `report_applied` gives: the real run's line is what a script parses, and
 /// interpolating "would" into it would change bytes nobody asked to change.
-fn report_merge_plan(set: &IndexSet, plan: &MergePlan, fresh: bool) -> std::io::Result<()> {
+///
+/// A pack the set already holds is reported exactly as the real run would report
+/// it, with "dry run" nowhere in the line. There is nothing to plan: the real run
+/// writes nothing either, so a dry-run-prefixed version of the answer would be
+/// the more qualified of two statements about the same event, and the qualified
+/// one is the less true.
+fn report_merge_plan(set: &IndexSet, planned: &Planned, fresh: bool) -> std::io::Result<()> {
     tracing::info!(name = %set.base().display(), "dry run: nothing was written");
+
+    let plan = match planned {
+        Planned::Already { version } => {
+            return report_already_merged(set, *version);
+        }
+        Planned::Merge(plan) => plan,
+    };
 
     let since = match plan.base {
         Some(base) => format!(" since {base}"),
@@ -1554,15 +1606,6 @@ fn report_merge_plan(set: &IndexSet, plan: &MergePlan, fresh: bool) -> std::io::
             "dry run: there is no backup set at {} yet, so this would create it",
             set.base().display()
         )?;
-    }
-
-    if let Some(already) = plan.already {
-        eprintln!(
-            "note: {} already holds this version as version {already}; a real merge would add \
-             version {} and store no chunk bytes",
-            set.base().display(),
-            plan.version
-        );
     }
 
     Ok(())

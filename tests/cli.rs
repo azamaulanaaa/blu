@@ -3326,67 +3326,65 @@ fn a_full_pack_merges_into_a_set_that_already_has_versions() {
     common::assert_same_tree(&source, &dir.path().join("out-received-2"));
 }
 
-/// Merging the same pack twice makes a second version and stores no chunk bytes.
+/// Merging the same pack twice does nothing, and says which version holds it.
 ///
-/// The decision this pins: allowed rather than refused. A store is a log, and a
-/// transfer may be retried, so a second arrival has to be answerable. What would
-/// falsify the test is either half of the opposite choice — a refusal, or a
-/// second version whose report claims chunks were written when nothing was.
+/// The decision this pins: a no-op reported as success. A store is a log, and a
+/// transfer may be retried, so a second arrival has to be answerable — and the
+/// answer has to name the version, because the client that has to decide what to
+/// do next is asking *which* version the pack became, not whether the command was
+/// pleased.
+///
+/// What would falsify it: a second version appearing (the old behaviour, which
+/// manufactured a number nobody asked for), a non-zero exit (a retried transfer
+/// would be stuck), or a report that says "already merged" without saying what it
+/// is already merged as.
 #[test]
-fn merging_the_same_pack_twice_adds_a_version_and_stores_nothing() {
+fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
     let dir = tempfile::tempdir().unwrap();
     merge_tree(dir.path());
     ok(dir.path(), &["backup", "source", "origin"]);
     ok(dir.path(), &["pack", "origin", "v1.pack"]);
 
     ok(dir.path(), &["merge", "v1.pack", "received"]);
-    let first = fs::metadata(dir.path().join("received.0000.bin"))
+    let before = fs::metadata(dir.path().join("received.0000.bin"))
         .unwrap()
         .len();
 
     let second = ok(dir.path(), &["merge", "v1.pack", "received"]);
 
     assert!(
-        second.contains("version 2"),
-        "the second merge should be version 2: {second}"
+        second.contains("already merged") && second.contains("as version 1"),
+        "a repeated merge should name the version already holding it: {second}"
     );
     assert!(
-        second.contains(", 0 new, "),
-        "every chunk was already held, so nothing should have been stored: {second}"
-    );
-    let said = ok_logs(dir.path(), &["merge", "v1.pack", "received", "--dry-run"]);
-    assert!(
-        said.contains("already holds this version as version 1"),
-        "a user has to be able to tell a repeat from a first merge: {said}"
+        !second.contains("merged version"),
+        "a repeated merge should not claim to have published anything: {second}"
     );
 
-    // Both versions are real, and both restore the same tree — which is what
-    // makes the second one harmless rather than a mistake.
-    // The only growth is the second commit record: `put` deduplicated every
-    // chunk, so no payload was written, and a repeat that re-sent the version
-    // would grow the segment by the whole pack.
+    // Not one byte written. A repeat that re-sent the version would grow the
+    // segment by the whole pack, and one that committed an empty version would
+    // grow it by a commit record — both are what "does nothing" rules out.
     let grown = fs::metadata(dir.path().join("received.0000.bin"))
         .unwrap()
         .len();
-    assert!(
-        grown - first < 1024,
-        "a repeat merge should add a commit record and nothing else: {first} to {grown}"
+    assert_eq!(
+        grown, before,
+        "a repeated merge wrote to the segment: {before} to {grown}"
     );
     assert_eq!(
         ok(dir.path(), &["versions", "received", "--numbers-only"])
             .lines()
             .count(),
-        2
+        1,
+        "a repeated merge published a version"
     );
+
+    // And the version it did not touch still restores the tree, which is the
+    // half a no-op could get wrong by being wrong about which version it holds.
     set_contents(dir.path(), "received", 1);
-    set_contents(dir.path(), "received", 2);
     common::assert_same_tree(
         &dir.path().join("source"),
         &dir.path().join("out-received-1"),
-    );
-    common::assert_same_tree(
-        &dir.path().join("source"),
-        &dir.path().join("out-received-2"),
     );
 }
 
@@ -3816,15 +3814,17 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
         "a dry merge took the lock"
     );
 
-    // Against a set that does exist: the figures are the merge's own, and still
-    // nothing moves.
+    // Against a set that does exist, and holds the version already: a dry run of
+    // a repeat has to say so, because a plan that reported a merge of something
+    // already merged would be promising the user a version their set is not
+    // about to grow. Nothing moves.
     ok(dir.path(), &["merge", "v1.pack", "received"]);
     let before = fs::read(dir.path().join("received.0000.bin")).unwrap();
 
     let again = ok(dir.path(), &["merge", "v1.pack", "received", "--dry-run"]);
     assert!(
-        again.contains("already held"),
-        "a dry merge into a set that holds the version should say so: {again}"
+        again.contains("already merged") && again.contains("as version 1"),
+        "a dry merge of what the set already holds should say so: {again}"
     );
     assert_eq!(
         fs::read(dir.path().join("received.0000.bin")).unwrap(),
@@ -3839,8 +3839,26 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
         "a dry merge published a version"
     );
 
-    // And the real run then does exactly what the plan said.
-    let real = ok(dir.path(), &["merge", "v1.pack", "received"]);
+    // And a version the set does *not* hold is planned in full, and the real run
+    // then does exactly what the plan said.
+    fs::write(dir.path().join("source/f3.bin"), noisy(260_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v2.pack"]);
+
+    let plan = ok(dir.path(), &["merge", "v2.pack", "received", "--dry-run"]);
+    assert!(
+        plan.contains("version 2") && plan.contains("nothing written"),
+        "a plan for a version the set lacks should report it: {plan}"
+    );
+    assert_eq!(
+        ok(dir.path(), &["versions", "received", "--numbers-only"])
+            .lines()
+            .count(),
+        1,
+        "the plan published a version"
+    );
+
+    let real = ok(dir.path(), &["merge", "v2.pack", "received"]);
     assert!(
         real.contains("version 2"),
         "the real merge should commit what the plan reported: {real}"

@@ -82,24 +82,51 @@
 //!
 //! ## Merging the same pack twice
 //!
-//! **Allowed, and it makes a second version with the same snapshot.** The
-//! alternatives were considered and both are worse:
+//! **A no-op, reported and successful.** A pack whose snapshot the set already
+//! holds changes nothing: no version is published and no chunk is stored, and the
+//! run says which version the set is already holding it as.
 //!
-//! * *Refuse it as a no-op.* A store is a log, and refusing to record something
-//!   that happened is the wrong default for a log. It also makes the command
-//!   unsafe to retry, which is what a network transfer needs: a client that
-//!   merged a pack and lost the reply would be stuck, unable to ask again
-//!   without a way to tell "already merged" from "never merged".
-//! * *Report success and write nothing.* Then the set's version list does not
-//!   say the version arrived, and a script that pushes and then verifies against
-//!   `lepatch versions` sees a set that has not moved.
+//! The alternatives were considered and both are worse:
 //!
-//! What it costs is one commit record, because `put` deduplicates: the second
-//! merge finds every chunk held and stores no bytes. And a user can always tell
-//! what happened, in three ways — the report says how many chunks were new,
-//! `lepatch versions` prints the snapshot hash beside each version so two
-//! versions of one snapshot are visible, and the report names the earlier version
-//! holding the same snapshot when there is one.
+//! * *Refuse it.* A transfer may be retried, and a client that merged a pack and
+//!   lost the reply has to be able to ask again. A refusal cannot be told from
+//!   "never merged" by the client that has to decide whether to send, so the
+//!   retry protocol would need an out-of-band answer to a question the set can
+//!   answer itself in one scan of its commit list.
+//! * *Make a second version.* It was what this did, and it is what a log does by
+//!   default: the second arrival records again, deduplicates every chunk, and
+//!   publishes a version number nobody asked for. That number then competes with
+//!   real ones — a script that pushes and then verifies against the latest
+//!   version reads a duplicate as the most recent thing that happened — and it is
+//!   a *fact about the receiving set* being manufactured by a transfer that
+//!   happened to be repeated. Nothing was learned the second time.
+//!
+//! What it costs is one scan of the commit list, which the run does anyway to
+//! find a delta's base, and it is the reason [`version_holding`] is a public-ish
+//! seam rather than a detail of planning: the check has to happen before any
+//! planning or writing at all, and identically under a dry run. A dry run that
+//! reported a merge of something already merged would be telling the user their
+//! set is about to grow a version it is not.
+//!
+//! ## An older pack is warned about, not refused
+//!
+//! The pack records the version it was built from ([`Pack::version`]), and a
+//! merge compares it against the set's tip. A pack from below the tip means the
+//! sender's view is behind: the version it carries was built from an older one, so
+//! whatever they changed since has not left. That is worth saying out loud and it
+//! is not worth refusing, because the two sets number independently and there is
+//! nothing a refusal could assert — the pack is internally consistent, its chunks
+//! are the chunks its snapshot names, and merging it produces a version that
+//! restores exactly what the pack holds.
+//!
+//! It goes to **stderr** rather than stdout because stdout is the report channel:
+//! the warning is about what the merge is about to do, not a figure the run
+//! produced, and a script reading the report must not have to skip a line to find
+//! the one it wants.
+//!
+//! **Equal is not lower.** A pack from the tip's own version is the ordinary case
+//! of a sender who is exactly up to date, and warning about it would train people
+//! to ignore the warning.
 
 use std::io::{self, Cursor};
 
@@ -115,25 +142,50 @@ use crate::{
 /// chunk and an unexpectedly large blob costs reads rather than allocation.
 const SCRATCH: usize = 64 * 1024;
 
-/// What a [`merge`] run merged.
+/// What a [`merge`] run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Merged {
-    /// Version the commit record published.
+pub enum Merged {
+    /// The run published a new version.
+    Committed {
+        /// Version the commit record published.
+        ///
+        /// The store's own number, allocated at commit time. Nothing here plans a
+        /// version: a merge that guessed one and was wrong would publish a version
+        /// under a name that already meant something else.
+        version: u32,
+        /// The figures the merge stored.
+        plan: MergePlan,
+    },
+    /// The set already held the pack's snapshot, so nothing was written.
     ///
-    /// The store's own number, allocated at commit time. Nothing here plans a
-    /// version: a merge that guessed one and was wrong would publish a version
-    /// under a name that already meant something else.
-    pub version: u32,
-    /// The figures the merge stored.
-    pub plan: MergePlan,
+    /// Success, and deliberately so: see this module's docs on merging the same
+    /// pack twice. `version` is the set's own number for the snapshot the pack
+    /// carries, which is the whole of the answer a caller has to report.
+    Already {
+        /// Version of the set already holding this snapshot.
+        version: u32,
+    },
+}
+
+/// What a [`merge_plan`] run found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Planned {
+    /// A real merge would have committed this.
+    Merge(MergePlan),
+    /// A real merge would have done nothing.
+    Already {
+        /// Version of the set already holding the pack's snapshot.
+        version: u32,
+    },
 }
 
 /// What a merge stored, or would store.
 ///
 /// [`MergePlan::version`] is what the run *would* commit, given the set as it
 /// stands, on the same terms as [`super::BackupPlan::version`]: the set's commit
-/// list plus one. A real run ignores it and reports [`Merged::version`], which is
-/// the number the store allocated rather than one derived a moment earlier.
+/// list plus one. A real run ignores it and reports [`Merged::Committed`]'s
+/// `version`, which is the number the store allocated rather than one derived a
+/// moment earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MergePlan {
     /// Version this run would commit.
@@ -155,12 +207,6 @@ pub struct MergePlan {
     /// out depends on the set's compression policy, which is chosen when the
     /// store is opened.
     pub bytes: u64,
-    /// An earlier version of the set already holding this same snapshot.
-    ///
-    /// Merging a pack twice is allowed and makes a second version; this is what
-    /// tells a user that is what happened rather than a duplicate appearing in
-    /// `lepatch versions` with no explanation.
-    pub already: Option<u32>,
 }
 
 /// Apply `pack` into the set at `store` as a new version.
@@ -195,11 +241,20 @@ pub async fn merge<C: storage::Compressor>(
     // here at all.
     let (snapshot, table) = checked_snapshot(pack)?;
     let snapshot_id = pack.snapshot_id();
+
+    // Before the base check and before the plan, because a pack the set already
+    // holds has nothing to decide: it would publish a version number nobody asked
+    // for, over a version the set can name already. Doing it first also means a
+    // delta that is itself already merged is reported as such rather than refused
+    // for a base it will never need.
+    if let Some(version) = version_holding(store, &snapshot_id)? {
+        return Ok(Merged::Already { version });
+    }
+
     let base = match pack.base() {
         Some(base) => Some(establish_base(Some(store), base, pack.path())?),
         None => None,
     };
-    let already = version_holding(store, &snapshot_id)?;
 
     // The plan is what makes a merge refuse a pack that is short of a chunk its
     // own snapshot reads, and it is where the counts come from.
@@ -215,7 +270,6 @@ pub async fn merge<C: storage::Compressor>(
         held: 0,
         fresh: 0,
         bytes: 0,
-        already,
     };
 
     for chunk in &plan {
@@ -275,7 +329,7 @@ pub async fn merge<C: storage::Compressor>(
     store.sync_data().await?;
     let version = store.commit(&snapshot_id).await?;
 
-    Ok(Merged {
+    Ok(Merged::Committed {
         version,
         plan: merged,
     })
@@ -303,16 +357,23 @@ pub async fn merge<C: storage::Compressor>(
 pub async fn merge_plan<C: storage::Compressor>(
     pack: &Pack,
     set: Option<&storage::BlobStore<storage::Read, C>>,
-) -> io::Result<MergePlan> {
+) -> io::Result<Planned> {
     let (snapshot, _table) = checked_snapshot(pack)?;
     let snapshot_id = pack.snapshot_id();
 
+    // The same check, in the same place relative to the base and the plan, as
+    // `merge`'s — and for the same reason. A plan that reported a merge of
+    // something already merged would be telling the user their set is about to
+    // grow a version it is not, which is the one lie a dry run cannot tell.
+    if let Some(version) = match set {
+        Some(store) => version_holding(store, &snapshot_id)?,
+        None => None,
+    } {
+        return Ok(Planned::Already { version });
+    }
+
     let base = match pack.base() {
         Some(base) => Some(establish_base(set, base, pack.path())?),
-        None => None,
-    };
-    let already = match set {
-        Some(store) => version_holding(store, &snapshot_id)?,
         None => None,
     };
 
@@ -331,7 +392,6 @@ pub async fn merge_plan<C: storage::Compressor>(
         held: 0,
         fresh: 0,
         bytes: 0,
-        already,
     };
 
     for chunk in &plan {
@@ -357,7 +417,7 @@ pub async fn merge_plan<C: storage::Compressor>(
         merged.bytes = merged.bytes.saturating_add(located.len);
     }
 
-    Ok(merged)
+    Ok(Planned::Merge(merged))
 }
 
 /// The pack's file table, and the bytes to store it as.
@@ -445,7 +505,19 @@ pub fn establish_base<W: storage::WriteMode, C: storage::Compressor>(
 /// not consulted either — they are a cache of the same answer, and `lepatch
 /// versions` already treats a stale or missing one as a scan rather than as a
 /// fact.
-fn version_holding<W: storage::WriteMode, C: storage::Compressor>(
+///
+/// Public because a caller has to answer this *before* deciding what the run is:
+/// whether a merge is going to write anything, and therefore whether the warning
+/// about a pack from behind is about anything, is decided by this and nothing
+/// else. Doing it here and in [`merge`] is deliberate — the run under the lock is
+/// the one that counts, and this is the one that lets the CLI report without
+/// taking one.
+///
+/// # Errors
+///
+/// Returns an error if the set cannot list its versions or read a version's
+/// snapshot.
+pub fn version_holding<W: storage::WriteMode, C: storage::Compressor>(
     store: &storage::BlobStore<W, C>,
     id: &BlobId,
 ) -> io::Result<Option<u32>> {
