@@ -130,10 +130,69 @@ pub struct IndexSet {
     base: PathBuf,
 }
 
+/// The set a segment file belongs to, or `path` itself when it is not one.
+///
+/// Unwraps the same fixed-shape tail that a segment listing matches, and nothing
+/// else: a name is a set's name until it is shaped exactly like one of the files
+/// that set is made of.
+///
+/// A name that is not valid UTF-8 is left exactly as it was given. Building an
+/// `OsStr` from a truncated byte slice needs `from_encoded_bytes_unchecked`,
+/// which is `unsafe`, and this crate forbids unsafe code — so a set whose base
+/// name is not valid UTF-8 keeps the spelling it always had rather than being
+/// addressed by a lossy one.
+fn strip_segment_tail(path: PathBuf) -> PathBuf {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return path;
+    };
+    let Some(cut) = name
+        .len()
+        .checked_sub(1 + SEGMENT_DIGITS + 1 + SEGMENT_EXTENSION.len())
+    else {
+        return path;
+    };
+    let (base, rest) = name.split_at(cut);
+
+    if base.is_empty()
+        || !rest.starts_with('.')
+        || !rest[1..=SEGMENT_DIGITS].bytes().all(|b| b.is_ascii_digit())
+        || rest.get(1 + SEGMENT_DIGITS + 1..) != Some(SEGMENT_EXTENSION)
+    {
+        return path;
+    }
+
+    // The directory is the caller's and is kept exactly as it was given; only
+    // the file name is read as naming something inside the set.
+    match path.parent() {
+        Some(parent) => parent.join(base),
+        None => PathBuf::from(base),
+    }
+}
+
 impl IndexSet {
     /// A backup set whose files are named after `base`.
+    ///
+    /// `base` may name the set or one of its segments. `photos` and
+    /// `photos.0000.bin` are one set, and the second is the name a directory
+    /// listing shows and the one a person copies, so both should work wherever a
+    /// set is named rather than only the one this tool invented.
+    ///
+    /// The tail is stripped on **shape**, not on what happens to be on disk, so a
+    /// set that does not exist yet behaves exactly like one that does, and a
+    /// mistyped segment path opens the set the user meant rather than a second
+    /// one under a name they did not say. The cost is that a set genuinely named
+    /// `report.2024.bin` cannot be addressed — its name reads as a segment of
+    /// `report`. That is the same trade every command makes about a path shaped
+    /// like one of its own files, and the alternative, probing the disk, makes
+    /// the answer depend on what exists, which is worse to explain.
+    ///
+    /// Only a segment's tail is unwrapped. An index file or a lock names the set
+    /// just as well, and taking those too would be three shapes to get right and
+    /// three ways to be wrong; they are refused instead.
     pub fn new(base: impl Into<PathBuf>) -> Self {
-        Self { base: base.into() }
+        Self {
+            base: strip_segment_tail(base.into()),
+        }
     }
 
     /// The base path this set is named after.

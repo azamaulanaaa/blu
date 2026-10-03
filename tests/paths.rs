@@ -103,3 +103,84 @@ async fn a_path_this_platform_cannot_represent_is_refused() {
         "and must not have mangled it on the way: {message}"
     );
 }
+
+/// A segment's path names the set it belongs to, so either spelling opens the
+/// same set.
+///
+/// `photos.0000.bin` is the name a directory listing shows and the one a person
+/// copies out of it. If only `photos` worked, the obvious thing to type would be
+/// the thing that does not, and the resulting error — a new empty set beside the
+/// old one — is the kind that costs an afternoon.
+///
+/// What would falsify it: a name that is not shaped like a segment being
+/// unwrapped anyway, which is the other half of this rule and is tested beside
+/// it.
+#[test]
+fn a_segment_path_names_the_set_it_belongs_to() {
+    use lepatch::layout::IndexSet;
+
+    for (given, expected) in [
+        ("photos.0000.bin", "photos"),
+        ("photos.0007.bin", "photos"),
+        ("/data/photos.0000.bin", "/data/photos"),
+        ("/data/nightly/photos.0001.bin", "/data/nightly/photos"),
+        // A base that itself contains dots, and a tail that is only
+        // segment-shaped after one is removed.
+        ("my.set.0000.bin", "my.set"),
+        // The name it already had, and the shapes next to it that are not
+        // segments.
+        ("photos", "photos"),
+        ("photos.tar", "photos.tar"),
+        ("photos.v0001.idx", "photos.v0001.idx"),
+        ("photos.lock", "photos.lock"),
+        ("photos.0000.bin.tmp", "photos.0000.bin.tmp"),
+        ("photos.00000.bin", "photos.00000.bin"),
+        ("photos.000.bin", "photos.000.bin"),
+        ("photos.000a.bin", "photos.000a.bin"),
+        (".0000.bin", ".0000.bin"),
+    ] {
+        assert_eq!(
+            IndexSet::new(given).base(),
+            std::path::Path::new(expected),
+            "{given} should name the set {expected}"
+        );
+    }
+}
+
+/// The two spellings must be one set on disk, not two.
+///
+/// Unwrapping the name is only half of it: what a backup writes has to land where
+/// the other spelling looks, or `backup src photos` followed by
+/// `restore out photos.0000.bin` would be two sets that each think they hold
+/// nothing.
+#[tokio::test]
+async fn a_backup_named_by_a_segment_path_lands_in_that_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("f.bin"),
+        b"content that must survive the round trip\n",
+    )
+    .unwrap();
+
+    let by_name = dir.path().join("by-name");
+    let by_segment = dir.path().join("by-segment");
+    common::run_backup(&source, &by_name.join("photos.0000.bin")).await;
+    common::run_backup(&source, &by_segment.join("photos.0000.bin")).await;
+
+    for parent in [&by_name, &by_segment] {
+        let nested = parent.join("photos.0000.bin.0000.bin");
+        assert!(
+            parent.join("photos.0000.bin").is_file(),
+            "{parent:?} should hold one segment named after the set, not a set named after \
+             itself: {}",
+            nested.display()
+        );
+        assert!(
+            !nested.exists(),
+            "{parent:?} holds a set whose name is the segment's: {}",
+            nested.display()
+        );
+    }
+}
