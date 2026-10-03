@@ -937,7 +937,8 @@ impl Pack {
     /// header does, and a range has to be answerable before a byte of payload has
     /// been read — so a chunk's record runs from its own offset to where the
     /// record after it begins, and the last one to the end of the payload. That is
-    /// only sound because the records do not overlap, which [`open`] checks and
+    /// only sound because the records do not overlap, which [`Pack::open`]
+    /// checks and
     /// this crate's writer is what makes true.
     ///
     /// **And so the entries are sorted by offset first, every call.** The index is
@@ -1467,8 +1468,9 @@ impl StorageGet for Pack {
     /// A compressed chunk is buffered whole and served from memory, which is the
     /// same trade the store's read path makes and for the same reason: a frame
     /// cannot seek backwards, and every consumer of a [`StorageGet`] stream seeks.
-    /// The buffer is one chunk — bounded by [`MAX_CHUNK`], which is the largest
-    /// the chunker can produce — and never the pack.
+    /// The buffer is one chunk — bounded by the largest the chunker can produce,
+    /// which is `fastcdc`'s maximum rather than this crate's to raise — and never
+    /// the pack.
     ///
     /// A raw chunk is streamed straight out of the file, bounded to its content
     /// length, because there is nothing to decode and a file handle costs nothing

@@ -735,7 +735,8 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
     /// Store a payload that is already encoded, after checking what it decodes to.
     ///
     /// The decode is the whole of the verification and is not optional — see
-    /// [`StoragePut::put_stored`], which says why in the terms a caller has. This
+    /// [`StoragePut::put_stored`](crate::storage::StoragePut::put_stored), which
+    /// says why in the terms a caller has. This
     /// is the part of that method specific to a store: the frame is kept as it
     /// came in only when it is strictly smaller than the content and names a
     /// codec the store can decode, and otherwise the content is stored raw, which
