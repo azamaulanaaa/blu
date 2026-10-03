@@ -5,6 +5,7 @@ mod common;
 use std::fs;
 
 use common::assert_round_trip;
+use lepatch::layout::IndexSet;
 
 /// A filename that is not valid UTF-8 must survive the round trip rather than
 /// aborting the whole backup, which is what `PathBuf`'s default `Serialize`
@@ -160,34 +161,62 @@ fn a_segment_path_names_the_set_it_belongs_to() {
 /// the other spelling looks, or `backup src photos` followed by
 /// `restore out photos.0000.bin` would be two sets that each think they hold
 /// nothing.
+///
+/// Which is the scenario this used to describe and not run: it wrote the same
+/// spelling into two different directories and asserted the same two things twice,
+/// so a set written as `photos` and read as `photos.0000.bin` — the case the
+/// rule exists for — was never put through a backup at all. It is now the only
+/// thing here: one set, written one way and read the other.
 #[tokio::test]
 async fn a_backup_named_by_a_segment_path_lands_in_that_set() {
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source");
-    fs::create_dir_all(&source).unwrap();
+    let source = common::source(dir.path());
     fs::write(
         source.join("f.bin"),
         b"content that must survive the round trip\n",
     )
     .unwrap();
 
-    let by_name = dir.path().join("by-name");
-    let by_segment = dir.path().join("by-segment");
-    common::run_backup(&source, &by_name.join("photos.0000.bin")).await;
-    common::run_backup(&source, &by_segment.join("photos.0000.bin")).await;
+    let parent = dir.path().join("by-name");
+    fs::create_dir_all(&parent).unwrap();
 
-    for parent in [&by_name, &by_segment] {
-        let nested = parent.join("photos.0000.bin.0000.bin");
-        assert!(
-            parent.join("photos.0000.bin").is_file(),
-            "{parent:?} should hold one segment named after the set, not a set named after \
-             itself: {}",
-            nested.display()
-        );
-        assert!(
-            !nested.exists(),
-            "{parent:?} holds a set whose name is the segment's: {}",
-            nested.display()
-        );
-    }
+    // Written as the plain name, which is what a person says.
+    common::run_backup(&source, &parent.join("photos")).await;
+
+    // And read back as the name a directory listing shows, which is the other
+    // thing a person says and the one a copy out of the directory brings with it.
+    let by_name = parent.join("photos");
+    let by_segment = parent.join("photos.0000.bin");
+    let named = IndexSet::new(&by_name);
+    let segment = IndexSet::new(&by_segment);
+
+    assert_eq!(
+        segment.base(),
+        named.base(),
+        "the two spellings should be one set"
+    );
+    assert_eq!(
+        segment.segments().unwrap(),
+        named.segments().unwrap(),
+        "and hold the same segments"
+    );
+    assert_eq!(
+        segment.indexed_versions().unwrap(),
+        vec![1],
+        "and the version the backup published, found through the other spelling"
+    );
+
+    // A restore naming the segment reads that version out of it, which is the
+    // whole claim: the bytes land where the version 1 the backup committed is.
+    let restored = dir.path().join("restored");
+    common::run_restore_version(&by_segment, &restored, 1).await;
+    common::assert_same_tree(&source, &restored);
+
+    let nested = parent.join("photos.0000.bin.0000.bin");
+    assert!(
+        !nested.exists(),
+        "the set should be named photos and hold a segment, not be a set named \
+         after its own segment: {}",
+        nested.display()
+    );
 }
