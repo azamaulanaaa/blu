@@ -352,6 +352,19 @@ pub(crate) fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
 
     let (stored_len, stored_bytes) = read_varint(&buffer[PREFIX..])?;
     let (raw_len, raw_bytes) = read_varint(&buffer[PREFIX + stored_bytes..])?;
+
+    // Both lengths in the fewest bytes that hold them, or not a header this build
+    // wrote. Everything below measures the header twice — once with the widths a
+    // length takes, once with the widths the bytes took — and a number written in
+    // more bytes than it needs is the one input that makes the two disagree. It
+    // is a small thing to refuse and not a small thing to read: `hash_at` then
+    // points past the header `total` describes, and the check below indexes with
+    // it. A downloaded pack or a copied segment is exactly where such a header
+    // comes from, so the disagreement is refused here rather than measured.
+    if stored_bytes != varint_len(stored_len) || raw_bytes != varint_len(raw_len) {
+        return None;
+    }
+
     let total = header_len(stored_len, raw_len);
 
     // A header that does not fit in the buffer was never written, not merely
@@ -1108,6 +1121,56 @@ fn scan_read_size() {
     }
 
     std::fs::remove_file(&file).ok();
+}
+
+/// A length written in more bytes than it needs is not a header.
+///
+/// The decoder measures the header twice: `total` from the widths the two lengths
+/// take, and `hash_at` from the widths the bytes in front of them actually took.
+/// `varint::read` accepts a number written wider than its own size — it refuses
+/// only what does not fit a `u64` — so the two counts can disagree, and where
+/// they do the hash begins past the end of the header the lengths describe. That
+/// is an index rather than a value, and the record it belongs to is a pack that
+/// was downloaded or a segment that was copied.
+///
+/// The check is recomputed over the widened header, so the only thing wrong with
+/// these bytes is the width: the refusal is the width's and not the check's.
+#[test]
+fn a_length_wider_than_its_own_size_is_refused() {
+    let mut canonical = Vec::new();
+    encode_header(&mut canonical, Kind::Blob, Codec::Raw, &[0x5a; HASH], 5, 5);
+
+    assert!(
+        decode_header(&canonical, 0).is_some(),
+        "the header this build writes must decode"
+    );
+
+    // The stored length's one byte becomes the same value in three: `0x85 0x80
+    // 0x00`. Every byte after it moves two places along, including the check.
+    let mut widened = Vec::new();
+    widened.extend_from_slice(&canonical[..PREFIX]);
+    widened.extend_from_slice(&[0x85, 0x80, 0x00]);
+    widened.extend_from_slice(&canonical[PREFIX + 1..]);
+
+    let without_check = widened.len() - CHECK;
+    let recomputed = check(&widened[..without_check]);
+    widened[without_check..].copy_from_slice(&recomputed);
+
+    assert_eq!(
+        read_varint(&widened[PREFIX..]),
+        Some((5, 3)),
+        "the fixture must be a length read back from three bytes, or it is not \
+         the case this test is about"
+    );
+    assert_eq!(
+        varint_len(5),
+        1,
+        "and it must be a length this crate would write in one"
+    );
+    assert!(
+        decode_header(&widened, 0).is_none(),
+        "a header whose two measurements of itself disagree was accepted"
+    );
 }
 
 /// A torn tail is never mistaken for a record, at any length.
