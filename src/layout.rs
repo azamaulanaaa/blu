@@ -210,6 +210,11 @@ fn strip_segment_tail(path: PathBuf) -> PathBuf {
     // the file name is read as naming something inside the set.
     match path.parent() {
         Some(parent) => parent.join(base),
+        // Unreachable while the `to_str` above answered: a path with no parent is
+        // a root, and a root has no file name for the tail to be cut from. Kept
+        // rather than folded into the other arm, because it returns the right
+        // thing — the same path with the tail off — and a future caller reaching
+        // it should get that rather than the name it was given.
         None => PathBuf::from(base),
     }
 }
