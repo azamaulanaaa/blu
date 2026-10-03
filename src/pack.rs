@@ -967,8 +967,9 @@ impl Pack {
     /// hash order — that is what [`Pack::locate`] binary-searches — and hash
     /// order is not payload order, so a merge that ran along the index would find
     /// two ranges meeting nowhere and answer with one range per chunk, which is
-    /// the entire cost a pack exists to remove. The order to walk is
-    /// [`Pack::order`], which was built when the pack was opened or written.
+    /// the entire cost a pack exists to remove. The order to walk is the one
+    /// `open` built while checking that records tile, which is also the one a
+    /// pack that was just written carries.
     ///
     /// A set rather than anything ordered, because the set is only ever asked
     /// whether it holds a chunk. The order of the result comes from the order of
@@ -1494,6 +1495,11 @@ impl StorageGet for Pack {
     /// length, because there is nothing to decode and a file handle costs nothing
     /// to keep.
     ///
+    /// For the same chunk as the pack stores it, without the decode, see
+    /// [`StorageStored::stored`]. Both open the one record the same way — seek,
+    /// read its header, hold it to the index — so they cannot disagree about
+    /// which bytes it is.
+    ///
     /// # Errors
     ///
     /// Returns an error if the pack does not hold that chunk, if its record's
@@ -1503,13 +1509,145 @@ impl StorageGet for Pack {
     /// read. The stream itself carries any later read failure.
     #[instrument(skip_all, err)]
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
+        let Opened {
+            mut file,
+            header,
+            start,
+            ..
+        } = self.open_record(id).await?;
+
+        match header.codec {
+            Codec::Raw => {
+                // Seeked rather than left where the header read finished it: the
+                // buffer holds the widest header a record can have, so where it
+                // ended is not necessarily where this record's payload starts.
+                file.seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
+                    .await?;
+                Ok(Box::new(crate::slice::SliceAsyncReader::new(
+                    file,
+                    header.raw_len,
+                )))
+            }
+            Codec::Zstd => {
+                file.seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
+                    .await?;
+                let mut frame = crate::storage::zeroed(
+                    header.stored_len,
+                    &format!("the compressed frame of chunk {id}"),
+                )?;
+                file.read_exact(&mut frame).await?;
+
+                // Through [`Zstd`] rather than through `DecompressReader::new`, so
+                // there is one implementation of "what a zstd frame means and what
+                // it must produce" rather than two that can disagree. This is the
+                // match on the codec byte: a read is answered by the record, not by
+                // whatever policy wrote it.
+                let bytes = Decompressor::decompress(&Zstd, frame, header.raw_len).await?;
+
+                Ok(Box::new(crate::slice::DecompressReader::from_decoded(
+                    bytes,
+                )))
+            }
+        }
+    }
+}
+
+/// A record opened out of the payload: the handle it is behind and the header
+/// that says how it is stored.
+struct Opened {
+    /// The file, seeked to the record's first byte.
+    file: tfs::File,
+    /// The record's own header, decoded and checked against the index.
+    header: crate::storage::RecordHeader,
+    /// Where the record begins, in file coordinates.
+    start: u64,
+}
+
+/// A pack read as the store a merge writes from, so both halves read the same way.
+///
+/// [`StorageGet`] is [`StorageStored`] plus the decode: one record, opened and
+/// checked the same way, and then either served as content or handed over as it
+/// stands. `merge`'s keep path had its own copy of the first half — six steps,
+/// the same bounds, the same message — and a copy is a second answer to the
+/// question "which bytes is this chunk", which is the one question a damaged pack
+/// makes expensive to get wrong.
+impl StorageStored for Pack {
+    /// The chunk's payload as this pack stores it: a frame where the record says
+    /// `Zstd`, and the content itself where it says `Raw`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pack does not hold that chunk, if its record's
+    /// header does not decode or does not agree with the index, or if the payload
+    /// cannot be read.
+    #[instrument(skip_all, err)]
+    async fn stored(&self, id: &BlobId) -> io::Result<Stored> {
+        let Opened {
+            mut file,
+            header,
+            start,
+            ..
+        } = self.open_record(id).await?;
+
+        // Seeked rather than left where the header read finished it, for the
+        // reason `get` seeks: the buffer holds the widest header a record can
+        // have, so where the read ended is not where the payload starts.
+        file.seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
+            .await?;
+
+        let mut bytes = crate::storage::zeroed(
+            header.stored_len,
+            &format!("chunk {id} as {} stores it", self.path().display()),
+        )?;
+        file.read_exact(&mut bytes).await?;
+
+        Ok(Stored {
+            bytes,
+            codec: header.codec,
+            raw_len: header.raw_len,
+        })
+    }
+}
+
+impl Pack {
+    /// Open the record holding `id` and hold it to the index.
+    ///
+    /// Everything the two ways of reading a chunk do together, and nothing that
+    /// depends on what the caller wants afterwards: the file seeked to the
+    /// record, its header read through the store's own decoder, and both claims
+    /// about those bytes — the header's and the index's — checked against each
+    /// other. A reader that serves content and a writer that copies the stored
+    /// form have to agree about which bytes a chunk is, and this is where they
+    /// agree.
+    ///
+    /// **The record's own header is what says how the payload is stored.**
+    /// Nothing in the index duplicates the codec: a pack is a file that was
+    /// downloaded, and a byte at an offset it claims is not this crate's to
+    /// believe. The header is decoded by the store's own decoder, so a header
+    /// whose eight-byte check does not verify stops the chunk here rather than
+    /// being read as content.
+    ///
+    /// **And the two are checked against each other**, because they are two claims
+    /// about the same bytes. The header says how long this record is and the index
+    /// says how much room it has: a record claiming to reach past its own slot
+    /// would be read into the next chunk's bytes, and one claiming a different
+    /// content length is not the chunk this entry names. A raw record's two
+    /// lengths have to be the same number as well, because it is those bytes that
+    /// are served rather than decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pack does not hold that chunk, if its record's
+    /// header does not decode or does not agree with the index, or if the file
+    /// cannot be opened, seeked or read.
+    async fn open_record(&self, id: &BlobId) -> io::Result<Opened> {
         let at = self.position(id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("this pack does not hold a chunk hashing to {id}"),
             )
         })?;
-        let located = self.chunks[at];
+        let located = &self.chunks[at];
         let span = self.record_span(located.offset);
 
         let mut file =
@@ -1545,13 +1683,6 @@ impl StorageGet for Pack {
             ));
         };
 
-        // The record's header and the index are two claims about the same bytes, so
-        // they are checked against each other. The header says how long this record
-        // is and the index says how much room it has: a record claiming to reach
-        // past its own slot would be read into the next chunk's bytes, and one
-        // claiming a different content length is not the chunk this entry names.
-        // A raw record's two lengths have to be the same number as well, because it
-        // is those bytes that are served rather than decoded.
         let total = header.total_len.saturating_add(header.stored_len);
         if header.kind != RecordKind::Blob
             || BlobId::from_bytes(header.hash) != *id
@@ -1570,50 +1701,27 @@ impl StorageGet for Pack {
             ));
         }
 
-        match header.codec {
-            Codec::Raw => {
-                // Seeked rather than left where the header read finished it: the
-                // buffer holds the widest header a record can have, so where it
-                // ended is not necessarily where this record's payload starts.
-                file.seek(io::SeekFrom::Start(start + header.total_len))
-                    .await?;
-                Ok(Box::new(crate::slice::SliceAsyncReader::new(
-                    file,
-                    header.raw_len,
-                )))
-            }
-            Codec::Zstd => {
-                if header.raw_len > MAX_CHUNK {
-                    return Err(not_a_pack(
-                        self.path(),
-                        &format!(
-                            "chunk {id} claims {} bytes of content, which is more than the \
-                             largest chunk this crate's chunker produces ({MAX_CHUNK})",
-                            header.raw_len
-                        ),
-                    ));
-                }
-
-                file.seek(io::SeekFrom::Start(start + header.total_len))
-                    .await?;
-                let mut frame = crate::storage::zeroed(
-                    header.stored_len,
-                    &format!("the compressed frame of chunk {id}"),
-                )?;
-                file.read_exact(&mut frame).await?;
-
-                // Through [`Zstd`] rather than through `DecompressReader::new`, so
-                // there is one implementation of "what a zstd frame means and what
-                // it must produce" rather than two that can disagree. This is the
-                // match on the codec byte: a read is answered by the record, not by
-                // whatever policy wrote it.
-                let bytes = Decompressor::decompress(&Zstd, frame, header.raw_len).await?;
-
-                Ok(Box::new(crate::slice::DecompressReader::from_decoded(
-                    bytes,
-                )))
-            }
+        // The content claim is bounded before it is believed, and before anything
+        // reserves it: a frame declaring more content than the chunker can ever
+        // produce would have the decode allocate that much before finding out.
+        // The index bounds the claim only as far as the index is honest, and the
+        // index is as downloaded as the header is.
+        if header.raw_len > MAX_CHUNK {
+            return Err(not_a_pack(
+                self.path(),
+                &format!(
+                    "chunk {id} claims {} bytes of content, which is more than the largest \
+                     chunk this crate's chunker produces ({MAX_CHUNK})",
+                    header.raw_len
+                ),
+            ));
         }
+
+        Ok(Opened {
+            file,
+            header,
+            start,
+        })
     }
 }
 

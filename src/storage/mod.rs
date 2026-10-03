@@ -60,8 +60,8 @@ pub use record::Placement;
 // than through a second copy of either. See the note in `record` on who else
 // frames a record.
 pub(crate) use record::{
-    Kind as RecordKind, MAX_HEADER as MAX_RECORD_HEADER, MIN_HEADER as MIN_RECORD_HEADER,
-    decode_header, encode_header, header_len,
+    Header as RecordHeader, Kind as RecordKind, MAX_HEADER as MAX_RECORD_HEADER,
+    MIN_HEADER as MIN_RECORD_HEADER, decode_header, encode_header, header_len,
 };
 
 // Crate-internal rather than re-exported from `error` at every call site: `pack`

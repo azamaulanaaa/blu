@@ -161,20 +161,14 @@
 //! and it cannot rewrite what the set already holds, because every record names
 //! the codec it was written with.
 
-use std::io::{self, Cursor, SeekFrom};
+use std::io::{self, Cursor};
 
-use tokio::{
-    fs as tfs,
-    io::{AsyncReadExt, AsyncSeekExt},
-};
 use tracing::instrument;
 
 use crate::{
     metadata::Snapshot,
-    pack::{Pack, Stored},
-    storage::{
-        self, BlobId, Codec, MAX_RECORD_HEADER, Placement, RecordKind, StorageGet, StoragePut,
-    },
+    pack::{Pack, StorageStored},
+    storage::{self, BlobId, Codec, Placement, StorageGet, StoragePut},
 };
 
 /// Scratch size for hashing a chunk out of a pack, so a plan never holds a whole
@@ -274,6 +268,12 @@ pub enum Compression {
     /// check the chunk's hash — see [`StoragePut::put_stored`] — because a pack's
     /// claim about what a chunk is is not evidence of it, and this is the one path
     /// where a chunk's bytes are not hashed on the way in.
+    ///
+    /// Read through [`crate::pack::StorageStored`], which is [`StorageGet`] without
+    /// the decode: the same record, opened and held to the index by the same code.
+    /// This path used to open the record itself, and a copy of that is a second
+    /// answer to "which bytes is this chunk" — the one question a damaged pack
+    /// makes expensive to get wrong.
     #[default]
     Keep,
     /// Decode each chunk and store it under the set's own compression policy.
@@ -391,7 +391,7 @@ pub async fn merge<C: storage::Compressor>(
             // again. The store still decodes it — see [`StoragePut::put_stored`] —
             // so this saves the encode and nothing else.
             Compression::Keep => {
-                let stored = stored_chunk(pack, &chunk.id, located).await?;
+                let stored = pack.stored(&chunk.id).await?;
                 let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
 
                 store
@@ -530,118 +530,6 @@ pub async fn merge_plan<C: storage::Compressor>(
     }
 
     Ok(Planned::Merge(merged))
-}
-
-/// One chunk's stored form as the pack carries it: its record's payload, and
-/// what that record says about the payload.
-///
-/// Read out of the pack's payload region rather than through [`StorageGet`],
-/// which decodes: this is the one path a merge takes where the bytes handed to
-/// the store are the pack's own rather than the chunk's content.
-///
-/// **The record's own header is what says how the payload is stored**, and it is
-/// read through [`crate::storage`]'s decoder so a header whose check does not
-/// verify stops the chunk here rather than being taken as a length. The header is
-/// then held to the index the same way [`Pack::get`] holds it — same hash, same
-/// content length, and a record that fits inside the payload — so the two paths
-/// into a chunk cannot disagree about which bytes it is.
-///
-/// Bounding the read by the end of the *payload* rather than by the next record's
-/// offset is weaker than [`Pack::get`]'s bound, and deliberately: what a
-/// misjudged span could cost here is reading a few bytes of a neighbouring record,
-/// which the hash check in [`StoragePut::put_stored`] then refuses, rather than
-/// serving them as a chunk. Reading the index to find the true span would mean a
-/// sort per chunk to guard against an outcome the identity check already catches.
-///
-/// # Errors
-///
-/// Returns an error if the record's header does not decode or does not agree with
-/// the index, if the record does not fit inside the payload, or if the payload
-/// cannot be read.
-async fn stored_chunk(
-    pack: &Pack,
-    id: &BlobId,
-    located: crate::pack::Located,
-) -> io::Result<Stored> {
-    let path = pack.path();
-    let mut file = crate::storage::at_async(path, "open", tfs::File::open(path)).await?;
-
-    let start = pack.payload_start().saturating_add(located.offset);
-    file.seek(SeekFrom::Start(start)).await?;
-
-    // Variable width, so read rather than stepped over, and bounded by what is
-    // left of the payload: a header that did not fit there is not this record's
-    // header, and reading on would pull in the snapshot's bytes.
-    let left = pack.payload_len().saturating_sub(located.offset);
-    let head_len = left.min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
-    let mut head = crate::storage::zeroed(
-        head_len,
-        &format!("the record header of chunk {id} in {}", path.display()),
-    )?;
-    file.read_exact(&mut head).await?;
-
-    let Some(header) = crate::storage::decode_header(&head, 0) else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "refusing to merge: the record {} holds for chunk {id} does not begin with a \
-                 record header: its magic, kind, codec or its own check do not verify",
-                path.display()
-            ),
-        ));
-    };
-
-    let total = header.total_len.saturating_add(header.stored_len);
-    // The claim is bounded before it is believed, here as it is on the reading
-    // path, and for the same reason: a pack is a file that was downloaded, and
-    // a frame declaring more content than the chunker can ever produce would
-    // have the decode reserve that much before finding out. `stored_len` is
-    // bounded already, by what is left of the payload; `raw_len` is only
-    // bounded by the index, which is as untrusted as the header it agrees with.
-    if header.raw_len > crate::pack::MAX_CHUNK {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "chunk {id} claims {} bytes of content, which is more than the largest chunk \
-                 this crate's chunker produces ({})",
-                header.raw_len,
-                crate::pack::MAX_CHUNK
-            ),
-        ));
-    }
-
-    if header.kind != RecordKind::Blob
-        || BlobId::from_bytes(header.hash) != *id
-        || header.raw_len != located.content_len
-        || total > left
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "refusing to merge: the record {} holds for chunk {id} is not the one its index \
-                 names: it claims {total} bytes of a {left}-byte payload, and {} bytes of content \
-                 where the index says {}, stored as {:?}",
-                path.display(),
-                header.raw_len,
-                located.content_len,
-                header.codec,
-            ),
-        ));
-    }
-
-    file.seek(SeekFrom::Start(start.saturating_add(header.total_len)))
-        .await?;
-    let mut bytes = crate::storage::zeroed(
-        header.stored_len,
-        &format!("chunk {id} as {} stores it", path.display()),
-    )?;
-    file.read_exact(&mut bytes).await?;
-
-    Ok(Stored {
-        bytes,
-        codec: header.codec,
-        raw_len: header.raw_len,
-    })
 }
 
 /// The pack's file table, and the bytes to store it as.
