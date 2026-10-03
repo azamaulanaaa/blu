@@ -125,9 +125,10 @@ async fn build(files: usize, size: usize) -> Built {
 /// A pack holds every chunk its version needs, each as a store record.
 ///
 /// The payload is the run of records and nothing else: `offset` is where a
-/// chunk's record starts, `len` covers that record whole, and the records tile
-/// the region with no gap between them — which is what makes a full download one
-/// range.
+/// chunk's record starts, and the records are written end to end — which is what
+/// makes a full download one range, and what lets a range covering a chunk cover
+/// the whole of it now that the index says where each record begins rather than
+/// how long it is.
 ///
 /// What each record holds is the chunk, in the form the store already had it, and
 /// `get` hands that back as content: a chunk whose record is a frame comes back
@@ -137,21 +138,9 @@ async fn a_pack_holds_its_versions_chunks() {
     let built = build(5, 200_000).await;
     let path = built.dir.path().join("v1.pack");
     let pack = built.pack(&path).await;
+    let bytes = fs::read(&path).unwrap();
 
     assert_eq!(pack.len(), built.plan.len());
-    assert_eq!(
-        pack.payload_len(),
-        built
-            .plan
-            .iter()
-            .map(|c| pack.locate(&c.id).unwrap().len)
-            .sum::<u64>(),
-        "the payload should be exactly its records, and no gap between them"
-    );
-    assert!(
-        pack.payload_len() > built.plan.total_bytes(),
-        "a record is its chunk plus a header, so the payload is larger than the content"
-    );
 
     let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let mut file = fs::File::open(&path).unwrap();
@@ -165,10 +154,12 @@ async fn a_pack_holds_its_versions_chunks() {
             located.offset, at,
             "chunk {i} is not where the one before it ended"
         );
-        at += located.len;
+        at += record_len(&bytes, pack.payload_start(), located.offset);
 
         // And the record at that offset is one: the store's magic, its kind, its
-        // codec byte, and the chunk's own hash in it.
+        // codec byte, and the chunk's own hash in it. Read through the header the
+        // file itself carries, so the length added below is the record's own claim
+        // rather than a second one about it.
         let mut header = [0u8; 48];
         file.seek(SeekFrom::Start(pack.payload_start() + located.offset))
             .unwrap();
@@ -223,6 +214,10 @@ async fn a_pack_holds_its_versions_chunks() {
         at,
         pack.payload_len(),
         "the records do not fill the payload"
+    );
+    assert!(
+        pack.payload_len() > built.plan.total_bytes(),
+        "a record is its chunk plus a header, so the payload is larger than the content"
     );
 }
 
@@ -591,7 +586,7 @@ fn sections(bytes: &[u8]) -> Sections {
 
 /// The offsets, within a pack's index, where each entry's hash begins.
 ///
-/// Walked rather than computed, because an entry is 32 bytes plus three varints
+/// Walked rather than computed, because an entry is 32 bytes plus two varints
 /// and the varints' widths depend on the offsets the fixture happened to
 /// produce. A test that assumed a width would be asserting about its own fixture
 /// rather than about the pack.
@@ -601,7 +596,6 @@ fn index_entries(index: &[u8]) -> Vec<usize> {
     while at < index.len() {
         out.push(at);
         at += 32;
-        at += varint_len(index, at);
         at += varint_len(index, at);
         at += varint_len(index, at);
     }
@@ -614,6 +608,222 @@ fn varint_len(bytes: &[u8], at: usize) -> usize {
         .expect("a varint running off the end of the buffer")
 }
 
+/// Bytes one record occupies, read out of the record's own header.
+///
+/// The header and the index used to both carry this number, and a test that read
+/// it from the index could not tell a pack whose records were laid out as claimed
+/// from one whose index claimed something else. So the record's own header is the
+/// only place a test reads it from too, which is what makes a disagreement between
+/// the two visible at all.
+fn record_len(bytes: &[u8], payload_start: u64, offset: u64) -> u64 {
+    let at = usize::try_from(payload_start + offset).unwrap();
+    let stored_at = at + 6;
+    let stored_len = decode_varint(bytes, stored_at);
+    let raw_at = stored_at + varint_len(bytes, stored_at);
+
+    // The header is the two lengths, the hash and the check; the record is that
+    // with the stored payload on the end.
+    let header_len = 6 + varint_len(bytes, stored_at) + varint_len(bytes, raw_at) + 32 + 8;
+
+    u64::try_from(header_len)
+        .unwrap()
+        .saturating_add(stored_len)
+}
+
+/// A record header carrying `stored_len` and `raw_len` for `id`, check and all.
+///
+/// Written out rather than a length field patched in place, and that is the whole
+/// point of it: patching a length leaves the header's own eight-byte check stale,
+/// so the header stops decoding and the pack is refused for being unreadable —
+/// which says nothing about whether the index and the record disagree. This is
+/// what a header claiming those lengths *would* be, so the only thing wrong with
+/// the pack built around it is the claim.
+fn record_header(
+    codec: u8,
+    id: &lepatch::storage::BlobId,
+    stored_len: u64,
+    raw_len: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"LPB1");
+    out.push(0);
+    out.push(codec);
+    lepatch::varint::write(&mut out, stored_len);
+    lepatch::varint::write(&mut out, raw_len);
+    out.extend_from_slice(id.as_bytes());
+
+    let check: [u8; 8] = blake3::hash(&out).as_bytes()[..8].try_into().unwrap();
+    out.extend_from_slice(&check);
+
+    out
+}
+
+/// Where a chunk's record header starts, and what it says.
+///
+/// `(offset in the file, byte width of the header, stored length, content length,
+/// codec)` — everything a test needs to stand a different header in its place.
+fn record_claim(
+    bytes: &[u8],
+    payload_start: u64,
+    chunk: &lepatch::pack::Located,
+) -> (usize, usize, u64, u64, u8) {
+    let at = usize::try_from(payload_start + chunk.offset).unwrap();
+    let stored_at = at + 6;
+    let raw_at = stored_at + varint_len(bytes, stored_at);
+    let stored_len = decode_varint(bytes, stored_at);
+    let raw_len = decode_varint(bytes, raw_at);
+    let header_len = 6 + varint_len(bytes, stored_at) + varint_len(bytes, raw_at) + 32 + 8;
+
+    (at, header_len, stored_len, raw_len, bytes[at + 5])
+}
+
+/// The first chunk of `codec` whose two lengths can both be nudged by one without
+/// either varint changing width.
+///
+/// Same width means the replacement header is the same size as the one it stands
+/// in for, so every byte after it stays where it is and the only thing wrong with
+/// the file is the claim inside that header. `codec` picks the record's kind,
+/// which is not incidental: see [`an_index_and_a_record_header_cannot_disagree`].
+fn nudgeable<'a>(
+    bytes: &[u8],
+    payload_start: u64,
+    pack: &'a Pack,
+    codec: u8,
+) -> &'a lepatch::pack::Located {
+    pack.chunks()
+        .iter()
+        .find(|chunk| {
+            let (_, _, stored_len, raw_len, held) = record_claim(bytes, payload_start, chunk);
+            held == codec
+                && lepatch::varint::len(stored_len + 1) == lepatch::varint::len(stored_len)
+                && lepatch::varint::len(raw_len + 1) == lepatch::varint::len(raw_len)
+        })
+        .unwrap_or_else(|| panic!("the fixture should hold a record stored as codec {codec}"))
+}
+
+/// An index and a record's own header cannot disagree about the same bytes.
+///
+/// The index no longer carries a record's length, so there is no second number to
+/// catch a header that lies about one. What is left is the header checked against
+/// what the index does say: the room the index gives the record, and the content
+/// length it names. Both are refusals, at the chunk, before any bytes are served —
+/// the alternative is a chunk handed out with somebody else's bytes at the end of
+/// it.
+///
+/// **The records damaged here are compressed ones, and that is the whole
+/// subtlety.** A raw record's stored length and its content length are the same
+/// number, so a raw record damaged in either one is caught by both checks at once
+/// and neither can be seen to be doing any work: a test on raw records alone would
+/// pass with either check deleted. A frame's two lengths are different numbers, so
+/// each can be wrong on its own. The raw case is asserted too, as the last one,
+/// because a record whose two lengths move together is refused by whichever check
+/// fires first and that is worth pinning as well.
+///
+/// Fixture: [`common::untagged_stream`], whose second half is a repeated block and
+/// so compresses. `noisy` is incompressible by construction, so every record of a
+/// pack built from it is raw and this test would have nothing to work with.
+///
+/// What would falsify it: a `get` that answered at all, or one that answered with
+/// the wrong bytes — a record served a byte too long reads the next record's
+/// header as content, and the caller is handed a chunk that does not hash to the
+/// name it asked for.
+#[tokio::test]
+async fn an_index_and_a_record_header_cannot_disagree() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let blob = dir.path().join("store");
+
+    for i in 0..3 {
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            common::untagged_stream(u8::try_from(i).unwrap(), 300_000 + i * 40_000),
+        )
+        .unwrap();
+    }
+    common::run_backup(&source, &blob).await;
+
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let plan = plan_of(&blob).await;
+    let path = dir.path().join("v1.pack");
+    let pack = Pack::write(&store, &plan, &snapshot_of(&blob).await, 1, &path)
+        .await
+        .unwrap();
+    let good = fs::read(&path).unwrap();
+
+    for codec in [1u8, 0u8] {
+        let victim = nudgeable(&good, pack.payload_start(), &pack, codec);
+        let (at, header_len, stored_len, raw_len, held) =
+            record_claim(&good, pack.payload_start(), victim);
+
+        // Sanity: the record as it stands reads back as its own chunk.
+        let mut actual = Vec::new();
+        pack.get(&victim.id)
+            .await
+            .unwrap()
+            .read_to_end(&mut actual)
+            .await
+            .unwrap();
+        assert_eq!(blake3::hash(&actual), victim.id, "codec {held}");
+
+        // A frame one byte longer than the index leaves room for: the check the
+        // index's own length used to make, and the one that stops a record being
+        // read into its neighbour's bytes. A raw record cannot be damaged this way
+        // without its two lengths disagreeing, which is a different refusal.
+        if held == 1 {
+            let mut too_long = good.clone();
+            too_long[at..at + header_len].copy_from_slice(&record_header(
+                held,
+                &victim.id,
+                stored_len + 1,
+                raw_len,
+            ));
+            let at_path = dir.path().join(format!("too-long-{held}.pack"));
+            fs::write(&at_path, &too_long).unwrap();
+
+            let error = Pack::open(&at_path)
+                .unwrap()
+                .get(&victim.id)
+                .await
+                .err()
+                .expect("a record claiming more bytes than the index gives it must be refused");
+            assert!(
+                error.to_string().contains("where the index gives it"),
+                "a record reaching past the span the index gives it was not caught: {error}"
+            );
+        }
+
+        // A content length the index does not name. On a raw record this moves the
+        // stored length with it, so the two refusals are not separable and either
+        // message is a correct answer.
+        let mut wrong_content = good.clone();
+        wrong_content[at..at + header_len].copy_from_slice(&record_header(
+            held,
+            &victim.id,
+            stored_len + u64::from(held == 0),
+            raw_len + 1,
+        ));
+        let at_path = dir.path().join(format!("wrong-content-{held}.pack"));
+        fs::write(&at_path, &wrong_content).unwrap();
+
+        let error = Pack::open(&at_path)
+            .unwrap()
+            .get(&victim.id)
+            .await
+            .err()
+            .expect("a record claiming a content length its index does not name must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("bytes of content where the index says"),
+            "a header disagreeing with the index about a chunk's content length was not caught: \
+             {error}"
+        );
+    }
+
+    // And the pack each of those was cut from is an ordinary one, which is what
+    // shows the refusals were about the claims rather than about the files.
+    assert_eq!(Pack::open(&path).unwrap().len(), pack.len());
+}
 /// Decode a little-endian base-128 varint, for the test's own assertions.
 ///
 /// This was a hand-written copy of the crate's decoder, kept because the crate's
@@ -713,20 +923,20 @@ async fn a_pack_records_the_version_it_was_packed_from() {
     );
 }
 
-/// A pack in format `4` is refused by name, before a byte of it is believed.
+/// A pack in format `5` is refused by name, before a byte of it is believed.
 ///
-/// `4` is the previous format: its payload region is the chunks' content end to
-/// end with nothing between them, where this build's is a run of records. The two
-/// differ in the payload region alone — header, trailer and index framing are the
-/// same shape — so a reader that carried on would go looking for a record header
-/// in the middle of a file's bytes and take the first chunk's content for a record
-/// whose magic is not there.
+/// `5` is the previous format: the same run of records for a payload, but with
+/// each record's length repeated in the index beside the length its own header
+/// already carries. The two differ in the index alone, and an index whose entries
+/// are wider than this build reads them is not something a reader can notice by
+/// looking — the offsets it would decode are numbers of the right shape, pointing
+/// at the wrong bytes.
 ///
 /// What this pins is *where* the refusal happens. The trailer and the index are
 /// read before the header is, because that is what makes opening a pack cheap;
 /// the format check then has to come before any field of the header is trusted —
-/// the recorded version and the snapshot hash are read after it — or a `4` would
-/// be reported with this build's numbers and a `5` field would be read out of a
+/// the recorded version and the snapshot hash are read after it — or a `5` would
+/// be reported with this build's numbers and a `6` field would be read out of a
 /// file that has none.
 #[tokio::test]
 async fn a_pack_in_the_previous_format_is_refused_by_name() {
@@ -734,20 +944,20 @@ async fn a_pack_in_the_previous_format_is_refused_by_name() {
     let path = built.dir.path().join("v1.pack");
     built.pack(&path).await;
 
-    // Patched rather than built: a real `4` pack is a file this build cannot
+    // Patched rather than built: a real `5` pack is a file this build cannot
     // produce, and patching the four format bytes is the only honest way to hold
-    // one. The rest of the file is a valid `5` pack's, which is the point — the
+    // one. The rest of the file is a valid `6` pack's, which is the point — the
     // only thing wrong with it is the format it claims.
     let mut bytes = fs::read(&path).unwrap();
-    bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
-    let at = built.dir.path().join("v4.pack");
+    bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+    let at = built.dir.path().join("v5.pack");
     fs::write(&at, &bytes).unwrap();
 
     let err = Pack::open(&at).unwrap_err();
     let said = err.to_string();
     assert!(
-        said.contains("pack format 4") && said.contains("reads 5"),
-        "a format 4 pack should be refused naming both formats, got: {said}"
+        said.contains("pack format 5") && said.contains("reads 6"),
+        "a format 5 pack should be refused naming both formats, got: {said}"
     );
     assert!(
         said.contains("not a pack this build can read"),
@@ -756,7 +966,7 @@ async fn a_pack_in_the_previous_format_is_refused_by_name() {
 
     // The same file with the format byte put back is a perfectly good pack again,
     // which is what shows the refusal was about the format and nothing else.
-    bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
     let at = built.dir.path().join("restored.pack");
     fs::write(&at, &bytes).unwrap();
     assert_eq!(
@@ -850,10 +1060,14 @@ async fn a_damaged_index_is_refused() {
 /// A chunk the index places outside the payload is refused when the pack opens.
 ///
 /// The header check bounds the *payload*; nothing bounded where each chunk sits
-/// within it. An offset and a length that reach past the end are numbers a client
-/// is told to add up — `needed` and `chunks_covering` both do
-/// `payload_start + offset + len` — so accepting them means the arithmetic that
-/// consumes a pack can overflow rather than fail.
+/// within it. An offset that reaches past the end is a number a client is told to
+/// add to the payload's start — `needed` and `chunks_covering` both do exactly
+/// that — so accepting it means the arithmetic that consumes a pack can hand a
+/// client a range outside the file rather than failing.
+///
+/// The index carries no record length, so these are the two claims it does make:
+/// every record starts inside the payload, and no record starts before the one
+/// before it has ended.
 #[tokio::test]
 async fn a_chunk_outside_the_payload_is_refused() {
     let built = build(4, 150_000).await;
@@ -892,13 +1106,14 @@ async fn a_chunk_outside_the_payload_is_refused() {
     fs::write(&path, &far).unwrap();
     let err = Pack::open(&path).unwrap_err();
     assert!(
-        err.to_string().contains("past the"),
+        err.to_string().contains("record header occupies"),
         "a chunk placed past the payload was accepted: {err}"
     );
 
-    // The same bytes as a number one past the type, so the offset and the length
-    // together cannot be represented at all. This is the case that panicked in
-    // `needed` rather than misbehaving quietly.
+    // The same bytes filled to the width of both numbers, so the offset is a
+    // number near the top of the type: adding the payload's start to it is
+    // arithmetic on a claim, and this is the case that has to be refused before
+    // anything does that addition.
     let mut wrapping = good.clone();
     for byte in wrapping
         .iter_mut()
@@ -914,7 +1129,7 @@ async fn a_chunk_outside_the_payload_is_refused() {
     fs::write(&path, &wrapping).unwrap();
     assert!(
         Pack::open(&path).is_err(),
-        "a chunk whose offset and length cannot be added was accepted"
+        "a chunk whose offset cannot be added to the payload's start was accepted"
     );
 }
 
@@ -1174,9 +1389,11 @@ async fn a_partial_range_records_nothing() {
 
     let first = pack.chunks()[0];
     let start = pack.payload_start() + first.offset;
+    let bytes = fs::read(pack.path()).unwrap();
+    let whole_len = record_len(&bytes, pack.payload_start(), first.offset);
     let half = lepatch::pack::Range {
         start,
-        end: start + first.len / 2,
+        end: start + whole_len / 2,
     };
 
     assert!(
@@ -1186,7 +1403,7 @@ async fn a_partial_range_records_nothing() {
 
     let whole = lepatch::pack::Range {
         start,
-        end: start + first.len,
+        end: start + whole_len,
     };
     assert_eq!(pack.chunks_covering(&[whole]).len(), 1);
 }
@@ -1659,7 +1876,7 @@ async fn the_layout_is_the_one_this_test_writes_out() {
     assert_eq!(&bytes[..4], b"LPK1", "a pack begins with its magic");
     assert_eq!(
         &bytes[4..8],
-        &5u32.to_le_bytes(),
+        &6u32.to_le_bytes(),
         "and names the format this build writes"
     );
     assert_eq!(
@@ -1816,7 +2033,11 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
 
     // The last byte of a record is in its payload: a record is a header and a
     // payload, and the header is at most 66 of the record's bytes.
-    let at = usize::try_from(pack.payload_start() + raw.offset + raw.len - 1).unwrap();
+    let at = usize::try_from(
+        pack.payload_start() + raw.offset + record_len(&bytes, pack.payload_start(), raw.offset)
+            - 1,
+    )
+    .unwrap();
     let mut damaged = bytes.clone();
     damaged[at] ^= 0x01;
     let at_damaged = built.dir.path().join("damaged-payload.pack");

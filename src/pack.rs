@@ -39,16 +39,27 @@
 //! payload bytes (varint) [| base flag (1) | base hash (32)]
 //! ...records, end to end, in plan order: a store record per chunk...
 //! ...snapshot: the encoded snapshot this version is, verbatim...
-//! ...index: per chunk, hash (32) | offset (varint) | record length (varint) |
-//! content length (varint)...
+//! ...index: per chunk, hash (32) | offset (varint) | content length (varint)...
 //! index length (8) | snapshot length (8) | magic (4)
 //! ```
 //!
-//! `offset` is where a chunk's *record* starts and `record length` covers the
-//! header with the payload, so a range that covers a chunk covers the whole of
-//! what a client has to have to read it. `content length` is the same number
-//! after decoding, which is what a snapshot's lengths are counted in and what
-//! `put` hashes.
+//! `offset` is where a chunk's *record* starts. How long that record is, the
+//! record's own header already says — the header is the first thing in it, and
+//! it is written by the store's encoder — so the index does not say it a second
+//! time. Two copies of one number in one file is two claims that can disagree,
+//! and a pack is a file somebody downloaded.
+//!
+//! A range drawn from the index still has to cover a chunk whole, header
+//! included, and it does because the records are written end to end: an entry's
+//! record runs from its own offset to the next entry's, so a client that fetches
+//! everything between two offsets has everything a chunk needs to be read. The
+//! header is inside that run rather than across it.
+//!
+//! `content length` is the same number after decoding, which is what a
+//! snapshot's lengths are counted in and what `put` hashes. It is the one length
+//! the index keeps, because it is the one thing about a chunk the header does
+//! not say in the form a caller wants: it is in content bytes, and the header's
+//! own lengths are the payload's on disk and its bytes once decoded.
 //!
 //! A player fetches the last twenty bytes, learns where the index is and how long
 //! it is, fetches *that* range, and then knows every chunk's offset without having
@@ -152,14 +163,16 @@ const MAGIC: [u8; 4] = *b"LPK1";
 
 /// Layout version, so a pack this build does not understand is reported as such.
 ///
-/// `5` is a pack whose payload region is a run of store records, one per chunk,
-/// so a chunk keeps its codec across a pack and `get` decodes rather than handing
-/// out a frame. `4` is a pack whose payload region is the chunks' content end to
-/// end with nothing between them; `3` recorded the number of the version it was
-/// packed from, which `4`'s predecessor did not; `2` carried its snapshot and
-/// did not, and `1` did not either and has a twelve-byte trailer where these have
-/// twenty, so those two cannot be told apart by their contents and would take
-/// their index length from the wrong place.
+/// `6` is a pack whose index does not repeat the record length each chunk's own
+/// header already carries; `5` is the same payload region with that length
+/// duplicated in the index, so its index entries are wider and would be decoded
+/// here as offsets that are really something else. `4` is a pack whose payload
+/// region is the chunks' content end to end with nothing between them; `3`
+/// recorded the number of the version it was packed from, which `4`'s predecessor
+/// did not; `2` carried its snapshot and did not, and `1` did not either and has
+/// a twelve-byte trailer where these have twenty, so those two cannot be told
+/// apart by their contents and would take their index length from the wrong
+/// place.
 ///
 /// **Every earlier version is refused rather than guessed at**, and the error names
 /// both — this build's number and the pack's — because a client holding a pack
@@ -172,7 +185,7 @@ const MAGIC: [u8; 4] = *b"LPK1";
 /// first chunk's bytes would be read as a record header and refused for a magic
 /// that is not there, so the damage is loud. It is refused by name anyway,
 /// because the alternative is a reader that works out what a file is by trying.
-const FORMAT_VERSION: u32 = 5;
+const FORMAT_VERSION: u32 = 6;
 
 /// Set in the header when a base snapshot hash follows it, making this a delta.
 const BASE_FLAG: u8 = 0x01;
@@ -203,27 +216,25 @@ const COUNTS_MAX: usize = 20;
 
 /// Where a chunk sits in a pack.
 ///
-/// The two lengths are different numbers and are named for what they hold, which
-/// is the whole reason this type has not been left with one: with a record per
-/// chunk, the bytes a client fetches are the header and the stored payload
-/// together, and the bytes a snapshot counts and `put` hashes are the same
-/// payload after decoding. Neither is derivable from the other, and a reader that
-/// mixed them up would fetch a frame and hash it as though it were a file.
+/// `offset` and `content_len` are what the index carries. The record's own
+/// length is not among them, because the record's header — the first bytes of the
+/// record, written by the store's own encoder — already carries it, and a second
+/// copy in the index is a second claim about the same bytes that the two could
+/// disagree about. What a reader has instead is the fact the index does state:
+/// the records tile the payload, so a record runs from its entry's offset to the
+/// next entry's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Located {
     /// The chunk's content hash.
     pub id: BlobId,
     /// Byte offset of its record, relative to [`Pack::payload_start`].
-    pub offset: u64,
-    /// Bytes the record occupies: its header and its stored payload.
     ///
-    /// What a byte range has to cover for a client to have the chunk, so this is
-    /// what [`Pack::needed`] adds to an offset.
-    pub len: u64,
+    /// The record's start, header included: a range covering a chunk starts here.
+    pub offset: u64,
     /// Bytes of content the record's payload is once decoded.
     ///
     /// What a snapshot's lengths are counted in and what [`StoragePut::put`] is
-    /// told to read, so it is what a merge hands over rather than [`Located::len`].
+    /// told to read, so it is what a merge hands over.
     ///
     /// [`StoragePut::put`]: crate::storage::StoragePut::put
     pub content_len: u64,
@@ -232,10 +243,9 @@ pub struct Located {
 /// A chunk as the store holds it: its record's payload, and what that record
 /// says about it.
 ///
-/// The two lengths are the pack's own [`Located::len`] and
-/// [`Located::content_len`] again, kept together because they are what one
-/// chunk's record is: a payload that occupies `bytes.len()` bytes on disk and
-/// decodes to `raw_len` of them.
+/// `raw_len` is the pack's own [`Located::content_len`] again, kept here beside
+/// the bytes because the two are what one chunk's record is: a payload that
+/// occupies `bytes.len()` bytes on disk and decodes to `raw_len` of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
     /// The payload exactly as it sits in the source: a frame where the record
@@ -534,13 +544,13 @@ impl Pack {
         file.write_all(&header).await?;
 
         for planned in plan.chunks() {
-            let mut located = write_record(&mut file, store, planned).await?;
+            let (mut located, record_len) = write_record(&mut file, store, planned).await?;
             located.offset = offset;
 
             // Saturating, to match the count the header carries: the header
             // reports one total and the index is built on the other, and a plain
             // `+=` would panic where both would have clamped.
-            offset = offset.saturating_add(located.len);
+            offset = offset.saturating_add(record_len);
             chunks.push(located);
         }
 
@@ -908,6 +918,14 @@ impl Pack {
     /// client needs are written end to end, so a run of them is one range, and the
     /// record header between two of them is inside the run rather than across it.
     ///
+    /// **A range's end comes from the next entry in the index, not from a length.**
+    /// The index does not carry the record's length — the record's own header does,
+    /// and a range has to be answerable before a byte of payload has been read —
+    /// so a chunk's record runs from its own offset to where the record after it
+    /// begins, and the last one to the end of the payload. That is only sound
+    /// because the records do not overlap, which [`open`] checks and this crate's
+    /// writer is what makes true.
+    ///
     /// A set rather than anything ordered, because the set is only ever asked
     /// whether it holds a chunk. The order of the result comes from the order of
     /// [`Pack::chunks`], not from the set, so nothing observable depends on it —
@@ -918,7 +936,7 @@ impl Pack {
     pub fn needed(&self, have: &HashSet<BlobId>) -> Vec<Range> {
         let mut ranges: Vec<Range> = Vec::new();
 
-        for chunk in &self.chunks {
+        for (at, chunk) in self.chunks.iter().enumerate() {
             if have.contains(&chunk.id) {
                 continue;
             }
@@ -927,7 +945,7 @@ impl Pack {
             // are over numbers that came out of the index, and this type is what
             // a client is told to add them up with.
             let start = self.payload_start.saturating_add(chunk.offset);
-            let end = start.saturating_add(chunk.len);
+            let end = start.saturating_add(self.record_span(at));
 
             match ranges.last_mut() {
                 Some(last) if last.end == start => last.end = end,
@@ -951,7 +969,40 @@ impl Pack {
     /// Where a chunk is, if the pack holds it.
     #[must_use]
     pub fn locate(&self, id: &BlobId) -> Option<Located> {
-        self.chunks.iter().find(|c| c.id == *id).copied()
+        self.position(id).map(|at| self.chunks[at])
+    }
+
+    /// Where a chunk sits in the index, which is what the range questions need.
+    ///
+    /// Not `locate`'s answer: `needed` and `chunks_covering` have to know which
+    /// record a chunk's is, and that is a position in the index rather than a
+    /// copy of an entry — the span of one record is a fact about where the next
+    /// one starts, which an entry no longer says on its own.
+    fn position(&self, id: &BlobId) -> Option<usize> {
+        self.chunks.iter().position(|chunk| chunk.id == *id)
+    }
+
+    /// The bytes the record at `at` of the index occupies.
+    ///
+    /// **From where the next record begins, not from a length.** The index does not
+    /// carry each record's length — the record's own header does, and it is read
+    /// by whoever reads the record — so the extent comes from the layout instead:
+    /// records are written end to end and [`Pack::open`] refuses an index whose
+    /// records overlap, so a record runs to the record after it and the last one
+    /// runs to the end of the payload.
+    ///
+    /// The last case is where an over-claim rather than a short answer comes from:
+    /// a writer that left a gap before the snapshot would have the last record's
+    /// range reach past its own end, so a client fetches a few bytes it does not
+    /// need. Under-claiming would be the other way round and cannot happen, which
+    /// is the direction worth being wrong in.
+    fn record_span(&self, at: usize) -> u64 {
+        let end = self
+            .chunks
+            .get(at + 1)
+            .map_or(self.payload_len, |next| next.offset);
+
+        end.saturating_sub(self.chunks[at].offset)
     }
 }
 
@@ -977,10 +1028,13 @@ fn planned_payload_len(plan: &Plan) -> u64 {
     })
 }
 
-/// Write one chunk's record and say where it landed.
+/// Write one chunk's record and say where it landed, and how long it is.
 ///
 /// The offset is left at zero for the caller to fill in, because it is the sum of
-/// every record before this one and this function does not know them.
+/// every record before this one and this function does not know them. The length
+/// comes back rather than staying in the returned [`Located`], because the index
+/// does not carry it: it is in the record's header, which was just written, and a
+/// second copy of it in the index would be a second claim about the same bytes.
 ///
 /// # Errors
 ///
@@ -991,7 +1045,7 @@ async fn write_record<S>(
     file: &mut tfs::File,
     store: &S,
     planned: &PlannedChunk,
-) -> io::Result<Located>
+) -> io::Result<(Located, u64)>
 where
     S: StorageStored + ?Sized,
 {
@@ -1044,14 +1098,16 @@ where
     file.write_all(&record).await?;
     file.write_all(&stored.bytes).await?;
 
-    Ok(Located {
-        id: planned.id,
-        offset: 0,
-        len: u64::try_from(record.len())
+    Ok((
+        Located {
+            id: planned.id,
+            offset: 0,
+            content_len: stored.raw_len,
+        },
+        u64::try_from(record.len())
             .unwrap_or(u64::MAX)
             .saturating_add(stored_len),
-        content_len: stored.raw_len,
-    })
+    ))
 }
 
 /// How a codec is named in a message about two of them disagreeing.
@@ -1158,12 +1214,16 @@ struct Header {
 }
 
 /// The index: one entry per chunk, in pack order.
+///
+/// The two numbers are the record's offset and the chunk's content length. The
+/// record's own length is *not* here: it is in the record's header, which is the
+/// first thing the record holds, and the index says where the records begin
+/// rather than how long each one is.
 fn encode_index(chunks: &[Located]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * (32 + 24));
+    let mut out = Vec::with_capacity(chunks.len() * (32 + 16));
     for chunk in chunks {
         out.extend_from_slice(chunk.id.as_bytes());
         write_varint(&mut out, chunk.offset);
-        write_varint(&mut out, chunk.len);
         write_varint(&mut out, chunk.content_len);
     }
 
@@ -1174,7 +1234,7 @@ fn encode_index(chunks: &[Located]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Returns an error if a 32-byte hash or any of the three varints runs past the
+/// Returns an error if a 32-byte hash or either of the two varints runs past the
 /// end of `bytes`, if a number is overlong or overflows, or if a hash is
 /// repeated — which would mean two chunks at one offset.
 fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
@@ -1195,8 +1255,6 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
 
         let (offset, used) = read_varint(bytes, at)?;
         at = at.checked_add(used).ok_or_else(truncated)?;
-        let (len, used) = read_varint(bytes, at)?;
-        at = at.checked_add(used).ok_or_else(truncated)?;
         let (content_len, used) = read_varint(bytes, at)?;
         at = at.checked_add(used).ok_or_else(truncated)?;
 
@@ -1213,7 +1271,6 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
         out.push(Located {
             id,
             offset,
-            len,
             content_len,
         });
     }
@@ -1280,13 +1337,17 @@ impl Pack {
     /// pack.needed(&have)                  // what the client lacks
     /// chunks_covering(&pack, &ranges)     // what the client now has
     /// ```
+    ///
+    /// A chunk is recorded only where a range covers its **whole record**, header
+    /// included, which — as in [`Pack::needed`] — is the span from its own offset
+    /// to the next record's.
     #[must_use]
     pub fn chunks_covering(&self, ranges: &[Range]) -> HashSet<BlobId> {
         let mut out = HashSet::new();
 
-        for chunk in &self.chunks {
+        for (at, chunk) in self.chunks.iter().enumerate() {
             let start = self.payload_start.saturating_add(chunk.offset);
-            let end = start.saturating_add(chunk.len);
+            let end = start.saturating_add(self.record_span(at));
 
             if ranges.iter().any(|r| r.start <= start && end <= r.end) {
                 out.insert(chunk.id);
@@ -1343,18 +1404,20 @@ impl StorageGet for Pack {
     /// # Errors
     ///
     /// Returns an error if the pack does not hold that chunk, if its record's
-    /// header does not decode or does not agree with the index about the chunk or
-    /// its lengths, if a frame does not decode to the length its record claims, or
-    /// if the file cannot be opened, seeked or read. The stream itself carries any
-    /// later read failure.
+    /// header does not decode or does not agree with the index about the chunk,
+    /// its lengths or the room the index gives it, if a frame does not decode to
+    /// the length its record claims, or if the file cannot be opened, seeked or
+    /// read. The stream itself carries any later read failure.
     #[instrument(skip_all, err)]
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
-        let located = self.locate(id).ok_or_else(|| {
+        let at = self.position(id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("this pack does not hold a chunk hashing to {id}"),
             )
         })?;
+        let located = self.chunks[at];
+        let span = self.record_span(at);
 
         let mut file =
             crate::storage::at_async(self.path(), "open", tfs::File::open(self.path())).await?;
@@ -1366,12 +1429,10 @@ impl StorageGet for Pack {
         file.seek(io::SeekFrom::Start(start)).await?;
 
         // The header is variable width, so it is read rather than stepped over, and
-        // bounded by the record's own length: a chunk whose index entry claims
-        // fewer bytes than a header cannot be read as one, and reading past it
-        // would pull in the next chunk's bytes.
-        let head_len = located
-            .len
-            .min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
+        // bounded by the record's own span: a header that did not fit inside the
+        // span the index gives the record is not this record's header, and reading
+        // on would pull in the next chunk's bytes.
+        let head_len = span.min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
         let mut head = crate::storage::zeroed(
             head_len,
             &format!(
@@ -1391,22 +1452,27 @@ impl StorageGet for Pack {
             ));
         };
 
-        // The index and the record are two claims about the same bytes, so they
-        // are checked against each other: `needed` hands a client the index's
-        // extent, and a client that fetched it has to have got a whole record.
+        // The record's header and the index are two claims about the same bytes, so
+        // they are checked against each other. The header says how long this record
+        // is and the index says how much room it has: a record claiming to reach
+        // past its own slot would be read into the next chunk's bytes, and one
+        // claiming a different content length is not the chunk this entry names.
+        // A raw record's two lengths have to be the same number as well, because it
+        // is those bytes that are served rather than decoded.
         let total = header.total_len.saturating_add(header.stored_len);
         if header.kind != RecordKind::Blob
             || BlobId::from_bytes(header.hash) != *id
-            || total != located.len
+            || total > span
             || header.raw_len != located.content_len
+            || (header.codec == Codec::Raw && header.stored_len != header.raw_len)
         {
             return Err(not_a_pack(
                 self.path(),
                 &format!(
-                    "the record it holds for chunk {id} is not the one its index names: the \
-                     record is {total} bytes of {} content stored as {:?}, and the index says \
-                     {} bytes of {}",
-                    header.raw_len, header.codec, located.len, located.content_len,
+                    "the record it holds for chunk {id} is not the one its index names: it \
+                     claims {total} bytes where the index gives it {span}, and {} bytes of \
+                     content where the index says {}, stored as {:?}",
+                    header.raw_len, located.content_len, header.codec,
                 ),
             ));
         }
@@ -1458,63 +1524,80 @@ impl StorageGet for Pack {
     }
 }
 
-/// Check that every chunk the index names lies inside the payload.
+/// Check that the records the index names are inside the payload and do not
+/// overlap.
 ///
 /// The index is a claim about where each chunk sits, and `open` checks only the
-/// payload's *extent*. A chunk may therefore name an offset and a length that
-/// reach past the end, or that wrap around it — and the arithmetic which
-/// combines them, `payload_start + offset + len`, would then overflow rather
-/// than fail. Both `needed` and `chunks_covering` do exactly that arithmetic, and
-/// `Range` is the type they hand the answer to, so it is checked here that every
-/// later consumer can add those numbers without re-deriving whether they hold. A
-/// length too short to be a record is refused here as well, because `get` reads a
-/// record's header out of exactly these bytes.
+/// payload's *extent*. What the index no longer carries is each record's length —
+/// the record's own header carries that, and a second copy here would be a second
+/// claim about the same bytes — so what it does make is that each record begins
+/// at or after where the one before it ends. `needed` and `chunks_covering` both
+/// turn a chunk into a byte range from exactly that, and hand the answer to a
+/// client that cannot check it, so it is checked here that every later consumer
+/// can do the arithmetic without re-deriving whether it holds.
+///
+/// Three ways it can fail, all refused: a record placed before the one before it
+/// ends, a record placed past the payload, and an index naming no records at all
+/// over a payload that is not empty. What *cannot* be checked here is that the
+/// records exactly fill the payload — that would mean reading every header, which
+/// is the cost the index at the end exists to avoid — so the last record's end is
+/// taken as the payload's, which over-claims rather than under-claims if a writer
+/// left a gap.
 ///
 /// # Errors
 ///
-/// Returns an error naming the chunk that does not fit, and why: either its two
-/// numbers cannot be added at all, or they describe a position past the end of
-/// the payload, or they describe a span too short to hold the record header the
-/// chunk is supposed to begin with.
+/// Returns an error naming the offset that does not fit and why.
 fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io::Result<()> {
-    for chunk in chunks {
-        let end = chunk.offset.checked_add(chunk.len).ok_or_else(|| {
-            not_a_pack(
-                path,
-                &format!(
-                    "its index places a chunk at {} for {} bytes, which is not a \
-                     position in any file",
-                    chunk.offset, chunk.len
-                ),
-            )
-        })?;
-        if end > payload_len {
+    let min_header = u64::try_from(crate::storage::MIN_RECORD_HEADER).unwrap_or(u64::MAX);
+
+    // Sorted by offset, not walked in index order: what has to hold is a fact
+    // about the payload, and the order the index happens to keep its entries in
+    // is the index's own business.
+    let mut placed: Vec<&Located> = chunks.iter().collect();
+    placed.sort_unstable_by_key(|chunk| chunk.offset);
+
+    // Where the record before this one has to have ended, at the least.
+    let mut earliest = 0u64;
+
+    for chunk in placed {
+        if chunk.offset < earliest {
             return Err(not_a_pack(
                 path,
                 &format!(
-                    "its index places a chunk at {} for {} bytes, past the {payload_len}-byte \
-                     payload",
-                    chunk.offset, chunk.len
+                    "its index places a chunk at {}, where the record before it has not ended, \
+                     so the records it names do not tile the {payload_len}-byte payload",
+                    chunk.offset
                 ),
             ));
         }
 
-        // The other end of the same question: a record cannot be shorter than its
-        // own header, so an index entry covering a handful of bytes names
-        // something that is not a record. `get` would refuse that a chunk at a
-        // time; refusing the pack says it once, before anything is served.
-        if chunk.len < u64::try_from(crate::storage::MIN_RECORD_HEADER).unwrap_or(u64::MAX) {
-            return Err(not_a_pack(
-                path,
-                &format!(
-                    "its index places a chunk at {} for {} bytes, which is less than the {} \
-                     bytes a record header occupies",
-                    chunk.offset,
-                    chunk.len,
-                    crate::storage::MIN_RECORD_HEADER
-                ),
-            ));
-        }
+        // The far end of the same question: a record cannot be shorter than its
+        // own header, so an entry a handful of bytes from the end names something
+        // that is not a record — and `get` would refuse that a chunk at a time,
+        // where refusing the pack says it once, before anything is served.
+        earliest = chunk
+            .offset
+            .checked_add(min_header)
+            .filter(|end| *end <= payload_len)
+            .ok_or_else(|| {
+                not_a_pack(
+                    path,
+                    &format!(
+                        "its index places a chunk at {}, with fewer than the {min_header} bytes \
+                         a record header occupies left before the {payload_len}-byte payload ends",
+                        chunk.offset
+                    ),
+                )
+            })?;
+    }
+
+    if chunks.is_empty() && payload_len != 0 {
+        return Err(not_a_pack(
+            path,
+            &format!(
+                "its index names no chunks, but the payload it describes is {payload_len} bytes"
+            ),
+        ));
     }
 
     Ok(())

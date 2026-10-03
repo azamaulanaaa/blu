@@ -583,10 +583,11 @@ fn plan_against<W: storage::WriteMode, C: storage::Compressor>(
 /// [`Placement`] names a segment and an offset because a *store* is several
 /// files, and a pack is one, so every placement in a plan built against a pack
 /// names segment 0 and a file offset. The `offset` is where the chunk's *record*
-/// starts rather than where its payload does, and `stored_len` covers the header
-/// with the payload, because nothing seeks with it: a plan reads `raw_len`, which
-/// is the one number that has to be right, and the caller goes back to
-/// [`Pack::get`] for the bytes.
+/// starts rather than where its payload does, and `stored_len` is zero: a pack's
+/// index no longer carries the record's length — the record's own header does,
+/// and it is read there rather than looked up here — and nothing reads that field
+/// from a plan built over a pack. A plan reads `raw_len`, which is the one number
+/// that has to be right, and the caller goes back to [`Pack::get`] for the bytes.
 ///
 /// The codec is `Raw`, and it is the one field here that is not a fact about the
 /// bytes: a plan never decodes a placement, and the bytes themselves arrive
@@ -599,7 +600,7 @@ fn in_pack(pack: &Pack, id: &BlobId) -> Option<Placement> {
     Some(Placement {
         segment: 0,
         offset: pack.payload_start().saturating_add(located.offset),
-        stored_len: located.len,
+        stored_len: 0,
         raw_len: located.content_len,
         codec: Codec::Raw,
     })
