@@ -138,6 +138,13 @@ fn a_segment_path_names_the_set_it_belongs_to() {
         ("photos.000.bin", "photos.000.bin"),
         ("photos.000a.bin", "photos.000a.bin"),
         (".0000.bin", ".0000.bin"),
+        // A base whose last character is two bytes, so the tail's arithmetic
+        // counts four bytes off a three-character name and lands in the middle of
+        // it. Left exactly as it was given: unwrapping it needs a byte boundary
+        // the name does not have, and a panic here is what a set named by a
+        // person rather than a script would get.
+        ("café0000.bin", "café0000.bin"),
+        ("café.0000.bin", "café"),
     ] {
         assert_eq!(
             IndexSet::new(given).base(),

@@ -151,7 +151,15 @@ fn strip_segment_tail(path: PathBuf) -> PathBuf {
     else {
         return path;
     };
-    let (base, rest) = name.split_at(cut);
+    // `None` where the offset is not a character boundary, which a name can put
+    // there by having a multi-byte character under the tail's arithmetic: `café`
+    // is three characters and four bytes, and the fourth is in the middle of the
+    // last one. `split_at` would panic on it, and the set it names is one this
+    // build could read perfectly well — so the name is left as it was given,
+    // which is what every other name this function does not recognise gets.
+    let Some((base, rest)) = name.split_at_checked(cut) else {
+        return path;
+    };
 
     if base.is_empty()
         || !rest.starts_with('.')
