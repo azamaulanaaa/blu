@@ -1633,3 +1633,214 @@ async fn a_delta_is_a_function_of_the_two_versions() {
          verify what it was sent"
     );
 }
+
+/// The layout, written out by hand rather than read back through the pack.
+///
+/// Every other test here asks a `Pack` where things are, so a change to the
+/// format would move the writer and the reader together and nothing would fail.
+/// The offsets below are therefore arithmetic on the header's field widths,
+/// stated here rather than imported from the module that writes them — and the
+/// first record's magic is read at the byte that arithmetic puts it at, which is
+/// the one thing in a pack that cannot be arranged by accident.
+///
+/// What would falsify it: a header field moved, a count that stopped being a
+/// varint, the payload no longer starting where the two counts end, or a payload
+/// that is not records — the last of which would show up here as a first record
+/// without a record's magic in it.
+#[tokio::test]
+async fn the_layout_is_the_one_this_test_writes_out() {
+    let built = build(3, 120_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+    let bytes = fs::read(&path).unwrap();
+
+    // magic (4) | format version (4) | version (4) | snapshot hash (32) |
+    // base flag (1), then the two counts as varints.
+    assert_eq!(&bytes[..4], b"LPK1", "a pack begins with its magic");
+    assert_eq!(
+        &bytes[4..8],
+        &5u32.to_le_bytes(),
+        "and names the format this build writes"
+    );
+    assert_eq!(
+        &bytes[8..12],
+        &1u32.to_le_bytes(),
+        "and the version of the set it was packed from"
+    );
+    assert_eq!(
+        &bytes[12..44],
+        pack.snapshot_id().as_bytes(),
+        "and the snapshot it carries, at offset twelve"
+    );
+    assert_eq!(bytes[44], 0, "and a clear base flag for a full pack");
+
+    let count_at = 45;
+    let count_len = varint_len(&bytes, count_at);
+    let len_at = count_at + count_len;
+    let len_len = varint_len(&bytes, len_at);
+
+    assert_eq!(
+        decode_varint(&bytes, count_at),
+        pack.len() as u64,
+        "the first count is the chunk count"
+    );
+    assert_eq!(
+        decode_varint(&bytes, len_at),
+        pack.payload_len(),
+        "and the second is the payload, which is now records and not content"
+    );
+
+    let payload_start = count_at + count_len + len_len;
+    assert_eq!(
+        payload_start as u64,
+        pack.payload_start(),
+        "the payload starts where the two counts end"
+    );
+    assert_eq!(
+        &bytes[payload_start..payload_start + 4],
+        b"LPB1",
+        "and what is at that offset is a store record, not a file's bytes"
+    );
+
+    // The trailer: index length, snapshot length, magic — twenty bytes at the end,
+    // and the sections are located by subtracting from it rather than by trusting
+    // an offset.
+    let end = bytes.len();
+    let trailer = &bytes[end - 20..];
+    assert_eq!(&trailer[16..], b"LPK1", "a pack ends with its magic too");
+    let sections = sections(&bytes);
+    assert_eq!(sections.file_len, end, "the trailer is twenty bytes");
+    assert_eq!(
+        sections.index_start + sections.index_len + 20,
+        end,
+        "and the index runs up to it"
+    );
+    assert_eq!(
+        sections.snapshot_start as u64,
+        payload_start as u64 + pack.payload_len(),
+        "the snapshot begins where the records end"
+    );
+}
+
+/// A record whose header does not verify is refused, not read as content.
+///
+/// The eight-byte check at the end of a store record header is what makes a
+/// record self-synchronising, and it has to be load-bearing for a pack too: a pack
+/// is a file that was downloaded, and the payload region is now records rather
+/// than a file's own bytes, so a header that is wrong would otherwise be read as
+/// somebody's content. The codec byte is the byte to flip — everything ahead of it
+/// that matters is a length or a hash, and this one is what decides how the rest is
+/// interpreted.
+///
+/// Opening still succeeds, which is the point: the damage is invisible to a reader
+/// that only wants offsets, so the refusal has to be where the bytes are read.
+///
+/// What would falsify it: a `get` that returned the chunk anyway, a refusal that
+/// came from somewhere else — the index and the header still agree with each other
+/// here — or a message that named a different fault.
+#[tokio::test]
+async fn a_record_whose_header_does_not_verify_is_refused() {
+    let built = build(3, 100_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+    let first = pack.chunks()[0];
+
+    let mut damaged = fs::read(&path).unwrap();
+    let at = usize::try_from(pack.payload_start() + first.offset).unwrap();
+    damaged[at + 5] ^= 0x01;
+    let at_damaged = built.dir.path().join("damaged-header.pack");
+    fs::write(&at_damaged, &damaged).unwrap();
+
+    let reopened = Pack::open(&at_damaged).expect(
+        "the geometry is undamaged: the header and the index still agree with each other, \
+         which is exactly why this has to be caught where the chunk is read",
+    );
+
+    let Err(error) = reopened.get(&first.id).await else {
+        panic!("a chunk whose record header does not verify was read anyway");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not begin with a record header"),
+        "the refusal should name the record framing, got: {error}"
+    );
+
+    // The same pack with the byte put back reads the chunk again, so the refusal
+    // was about that byte and nothing else.
+    damaged[at + 5] ^= 0x01;
+    fs::write(&at_damaged, &damaged).unwrap();
+    let restored = Pack::open(&at_damaged).unwrap();
+    let mut bytes = Vec::new();
+    restored
+        .get(&first.id)
+        .await
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .await
+        .unwrap();
+    assert_eq!(blake3::hash(&bytes), first.id);
+}
+
+/// A record whose payload byte is flipped is refused, and publishes nothing.
+///
+/// The header's own check covers the header; a flipped byte in the payload is
+/// caught by the chunk's hash instead, and this is where that is enforced for a
+/// pack: `put` hashes what it is given against the name the chunk is addressed by,
+/// so a merge of a damaged pack fails rather than storing bytes under a hash they
+/// are not.
+///
+/// A *raw* record is the one to damage for this, deliberately: flipping a byte of
+/// a frame is caught by the codec instead, which would leave this test passing for
+/// the wrong reason — a frame that happens not to decode says nothing about the
+/// hash check.
+///
+/// What would falsify it: a merge that succeeded, or one that failed after
+/// publishing a version — so the set is checked for having published nothing.
+#[tokio::test]
+async fn a_record_whose_payload_byte_is_flipped_is_refused() {
+    let built = build(3, 100_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+
+    let bytes = fs::read(&path).unwrap();
+    let raw = pack
+        .chunks()
+        .iter()
+        .find(|chunk| {
+            let at = usize::try_from(pack.payload_start() + chunk.offset).unwrap();
+            bytes[at + 5] == 0
+        })
+        .copied();
+    let raw = raw.expect("the fixture should hold at least one uncompressed record");
+
+    // The last byte of a record is in its payload: a record is a header and a
+    // payload, and the header is at most 66 of the record's bytes.
+    let at = usize::try_from(pack.payload_start() + raw.offset + raw.len - 1).unwrap();
+    let mut damaged = bytes.clone();
+    damaged[at] ^= 0x01;
+    let at_damaged = built.dir.path().join("damaged-payload.pack");
+    fs::write(&at_damaged, &damaged).unwrap();
+
+    let reopened = Pack::open(&at_damaged).unwrap();
+    let received = built.dir.path().join("received");
+    let store = BlobStore::open_for_writing(
+        &received,
+        lepatch::storage::SegmentLimit::default(),
+        lepatch::storage::Compression::default(),
+    )
+    .await
+    .unwrap();
+
+    let error = lepatch::command::merge(&store, &reopened)
+        .await
+        .expect_err("a merge of a pack with a flipped payload byte should be refused");
+    assert!(
+        error.to_string().contains("does not hash to"),
+        "a flipped payload byte must be caught by the chunk hash, not by the codec, got: {error}"
+    );
+    assert!(
+        store.latest().is_none(),
+        "and a refused merge must not have published a version"
+    );
+}
