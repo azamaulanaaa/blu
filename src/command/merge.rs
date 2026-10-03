@@ -127,15 +127,54 @@
 //! **Equal is not lower.** A pack from the tip's own version is the ordinary case
 //! of a sender who is exactly up to date, and warning about it would train people
 //! to ignore the warning.
+//!
+//! ## What form a chunk arrives in
+//!
+//! A pack carries each chunk as the record its source set already held — a zstd
+//! frame, or the content itself — so a merge has a choice about what it does with
+//! that form, and it is [`Compression`]'s to make.
+//!
+//! **The default is to keep it**, and the reason is that the alternative is work
+//! done twice: decoding every frame of a compressed pack only to compress the
+//! result again under the receiving set's own policy, which is the expensive half
+//! of a transfer performed for nothing. Keeping the form is what the pack format
+//! was built for, and it is what a set that already compresses wants — it holds
+//! frames, and a frame is a frame whichever set wrote it.
+//!
+//! **The frame is still decoded, and this is the part that looks like waste.** A
+//! chunk is named by the hash of its content, so what a pack says about a chunk is
+//! a claim, and the only thing that could check it is the content itself; see
+//! [`StoragePut::put_stored`], which says why at the length it deserves. What the
+//! default saves is the encode, and what it keeps is the guarantee every other
+//! path has: a damaged or hostile pack is refused on this path exactly as on any
+//! other, and a merge that refuses it publishes no version.
+//!
+//! **A frame is kept only if it earned its place**, which the store decides rather
+//! than this command: a frame no smaller than its content, or one naming a codec
+//! this build cannot read, is stored raw instead. Both lengths are in the record,
+//! so the check is two integer comparisons, and without it a pack could grow the
+//! set it is merged into.
+//!
+//! A level re-encodes, for the set that has a compression policy of its own and
+//! does not want the sender's frames. It changes what is stored and nothing else —
+//! the same chunks are read, the same hashes checked, the same figures reported —
+//! and it cannot rewrite what the set already holds, because every record names
+//! the codec it was written with.
 
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, SeekFrom};
 
+use tokio::{
+    fs as tfs,
+    io::{AsyncReadExt, AsyncSeekExt},
+};
 use tracing::instrument;
 
 use crate::{
     metadata::Snapshot,
-    pack::Pack,
-    storage::{self, BlobId, Codec, Placement, StorageGet, StoragePut},
+    pack::{Pack, Stored},
+    storage::{
+        self, BlobId, Codec, MAX_RECORD_HEADER, Placement, RecordKind, StorageGet, StoragePut,
+    },
 };
 
 /// Scratch size for hashing a chunk out of a pack, so a plan never holds a whole
@@ -202,11 +241,43 @@ pub struct MergePlan {
     pub fresh: u64,
     /// Bytes of chunk content that would be stored.
     ///
-    /// Content, before compression: a pack hands `put` the chunk's bytes as they
-    /// were hashed, so this is what goes in, and how large the records come out
+    /// Content, before compression: a pack hands the chunk's bytes as they were
+    /// hashed, so this is what goes in, and how large the records come out
     /// depends on the set's compression policy, which is chosen when the store is
     /// opened.
+    ///
+    /// **The same figure under every [`Compression`], and that is deliberate.** It
+    /// counts what the version *is* rather than what a particular policy makes of
+    /// it, so a report does not change its meaning with a flag and a script
+    /// comparing two merges is comparing the two runs rather than the two
+    /// encodings. A run that kept a pack's frames stored fewer bytes on disk than
+    /// this says, and the on-disk size is the segment file's to be measured from.
     pub bytes: u64,
+}
+
+/// What a merge does with each chunk's stored form.
+///
+/// The two are the whole of the choice, and the second one is the set's own write
+/// policy rather than anything this command decides: a re-encoded chunk goes to
+/// [`StoragePut::put`], which encodes it under the policy the set was opened
+/// with. So a caller asking for a level opens the set with it and passes
+/// [`Compression::Reencode`] — the two are not separate arguments because they
+/// cannot be allowed to disagree, and the store's compressor is a type parameter
+/// this command does not get to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compression {
+    /// Store each chunk's stored form as the pack carries it.
+    ///
+    /// A chunk that reached the source set as a zstd frame is written as that same
+    /// frame, so a merge of a compressed pack copies frames rather than inflating
+    /// every chunk and compressing it again. **The frame is still decoded** to
+    /// check the chunk's hash — see [`StoragePut::put_stored`] — because a pack's
+    /// claim about what a chunk is is not evidence of it, and this is the one path
+    /// where a chunk's bytes are not hashed on the way in.
+    #[default]
+    Keep,
+    /// Decode each chunk and store it under the set's own compression policy.
+    Reencode,
 }
 
 /// Apply `pack` into the set at `store` as a new version.
@@ -220,14 +291,20 @@ pub struct MergePlan {
 /// what lets the counts below come from the store's own index rather than from
 /// what `put` happened to decide.
 ///
+/// `compression` chooses between [`StoragePut::put_stored`] and
+/// [`StoragePut::put`] per chunk, and changes nothing else: the same chunks are
+/// read, the same hashes are checked and the same figures are reported, because
+/// [`MergePlan::bytes`] counts content rather than stored bytes.
+///
 /// # Errors
 ///
 /// Returns an error if the pack's snapshot cannot be read, does not hash to the
 /// one its header names, or does not decode; if the pack is a delta and no
 /// committed version of the set names its base; if a chunk the version reads is
 /// in neither the pack nor the set; if a chunk the pack does hold does not hash
-/// to the hash it is addressed by, which [`StoragePut::put`] checks per record;
-/// or if the set cannot be written or committed.
+/// to the hash it is addressed by, which both [`StoragePut::put`] and
+/// [`StoragePut::put_stored`] check per record; or if the set cannot be written
+/// or committed.
 ///
 /// A failure before the commit record leaves the set with no new version. See
 /// this module's docs on why there is no rollback.
@@ -235,6 +312,7 @@ pub struct MergePlan {
 pub async fn merge<C: storage::Compressor>(
     store: &storage::BlobStore<storage::Write, C>,
     pack: &Pack,
+    compression: Compression,
 ) -> io::Result<Merged> {
     // Both before a byte is written, and in that order: the snapshot says what
     // the version is, and the base check decides whether this version can be put
@@ -291,29 +369,52 @@ pub async fn merge<C: storage::Compressor>(
         })?;
 
         // The *whole* chunk, not the length this version reads of it: a pack
-        // stores a chunk whole, and `put` checks the hash of everything it is
-        // given against the name that chunk is addressed by, so a prefix would
-        // be refused for the very reason the check exists.
+        // stores a chunk whole, and both write paths check the hash of everything
+        // they are given against the name that chunk is addressed by, so a prefix
+        // would be refused for the very reason the check exists.
         //
-        // The length handed over is the chunk's *content* length, which is not
-        // the length of the pack's record: that one covers the header and, for a
-        // chunk the set held compressed, a frame. `get` decodes, so what comes
-        // back is content and content is what `put` hashes.
-        //
-        // The error is wrapped because `put`'s own is a statement about a record
-        // and a person reading it has no way to know it came from merging a pack
-        // — or that the bytes are the pack's rather than the set's. A damaged
+        // The error is wrapped because the store's own is a statement about a
+        // record and a person reading it has no way to know it came from merging a
+        // pack — or that the bytes are the pack's rather than the set's. A damaged
         // pack is the likeliest cause by a long way, and saying so is what tells
         // them to go and look at the file they downloaded.
-        store
-            .put(&chunk.id, pack.get(&chunk.id).await?, located.content_len)
-            .await
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("refusing to merge: {} could not be stored: {e}", chunk.id),
-                )
-            })?;
+        let refused = |e: io::Error| {
+            io::Error::new(
+                e.kind(),
+                format!("refusing to merge: {} could not be stored: {e}", chunk.id),
+            )
+        };
+
+        match compression {
+            // The chunk's stored form goes in as it stands, so the frame a source
+            // set deduplicated it into is copied rather than decoded and built
+            // again. The store still decodes it — see [`StoragePut::put_stored`] —
+            // so this saves the encode and nothing else.
+            Compression::Keep => {
+                let stored = stored_chunk(pack, &chunk.id, located).await?;
+                let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
+
+                store
+                    .put_stored(
+                        &chunk.id,
+                        Box::new(Cursor::new(stored.bytes)),
+                        stored_len,
+                        stored.raw_len,
+                        stored.codec,
+                    )
+                    .await
+                    .map_err(refused)?;
+            }
+            // Today's path: the chunk's *content* is handed over, and the length
+            // handed with it is the content length, which is not the length of the
+            // pack's record — that one covers the header and, for a chunk the set
+            // held compressed, a frame. `get` decodes, so what comes back is
+            // content and content is what `put` hashes.
+            Compression::Reencode => store
+                .put(&chunk.id, pack.get(&chunk.id).await?, located.content_len)
+                .await
+                .map_err(refused)?,
+        }
 
         merged.fresh = merged.fresh.saturating_add(1);
         merged.bytes = merged.bytes.saturating_add(located.content_len);
@@ -353,6 +454,12 @@ pub async fn merge<C: storage::Compressor>(
 /// pack and hashed, because `put` is what performs that check on the real path
 /// and a plan that skipped it would report success for a pack a real merge
 /// refuses. So this costs what the merge costs and mutates nothing.
+///
+/// **It takes no [`Compression`], and reports the same figures under every one.**
+/// A chunk is hashed as content whichever path stores it, so the check a plan
+/// makes is the check both paths make, and [`MergePlan::bytes`] counts content
+/// rather than stored bytes — there is nothing about the encoding for a plan to
+/// decide differently.
 ///
 /// # Errors
 ///
@@ -423,6 +530,100 @@ pub async fn merge_plan<C: storage::Compressor>(
     }
 
     Ok(Planned::Merge(merged))
+}
+
+/// One chunk's stored form as the pack carries it: its record's payload, and
+/// what that record says about the payload.
+///
+/// Read out of the pack's payload region rather than through [`StorageGet`],
+/// which decodes: this is the one path a merge takes where the bytes handed to
+/// the store are the pack's own rather than the chunk's content.
+///
+/// **The record's own header is what says how the payload is stored**, and it is
+/// read through [`crate::storage`]'s decoder so a header whose check does not
+/// verify stops the chunk here rather than being taken as a length. The header is
+/// then held to the index the same way [`Pack::get`] holds it — same hash, same
+/// content length, and a record that fits inside the payload — so the two paths
+/// into a chunk cannot disagree about which bytes it is.
+///
+/// Bounding the read by the end of the *payload* rather than by the next record's
+/// offset is weaker than [`Pack::get`]'s bound, and deliberately: what a
+/// misjudged span could cost here is reading a few bytes of a neighbouring record,
+/// which the hash check in [`StoragePut::put_stored`] then refuses, rather than
+/// serving them as a chunk. Reading the index to find the true span would mean a
+/// sort per chunk to guard against an outcome the identity check already catches.
+///
+/// # Errors
+///
+/// Returns an error if the record's header does not decode or does not agree with
+/// the index, if the record does not fit inside the payload, or if the payload
+/// cannot be read.
+async fn stored_chunk(
+    pack: &Pack,
+    id: &BlobId,
+    located: crate::pack::Located,
+) -> io::Result<Stored> {
+    let path = pack.path();
+    let mut file = crate::storage::at_async(path, "open", tfs::File::open(path)).await?;
+
+    let start = pack.payload_start().saturating_add(located.offset);
+    file.seek(SeekFrom::Start(start)).await?;
+
+    // Variable width, so read rather than stepped over, and bounded by what is
+    // left of the payload: a header that did not fit there is not this record's
+    // header, and reading on would pull in the snapshot's bytes.
+    let left = pack.payload_len().saturating_sub(located.offset);
+    let head_len = left.min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
+    let mut head = crate::storage::zeroed(
+        head_len,
+        &format!("the record header of chunk {id} in {}", path.display()),
+    )?;
+    file.read_exact(&mut head).await?;
+
+    let Some(header) = crate::storage::decode_header(&head, 0) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to merge: the record {} holds for chunk {id} does not begin with a \
+                 record header: its magic, kind, codec or its own check do not verify",
+                path.display()
+            ),
+        ));
+    };
+
+    let total = header.total_len.saturating_add(header.stored_len);
+    if header.kind != RecordKind::Blob
+        || BlobId::from_bytes(header.hash) != *id
+        || header.raw_len != located.content_len
+        || total > left
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to merge: the record {} holds for chunk {id} is not the one its index \
+                 names: it claims {total} bytes of a {left}-byte payload, and {} bytes of content \
+                 where the index says {}, stored as {:?}",
+                path.display(),
+                header.raw_len,
+                located.content_len,
+                header.codec,
+            ),
+        ));
+    }
+
+    file.seek(SeekFrom::Start(start.saturating_add(header.total_len)))
+        .await?;
+    let mut bytes = crate::storage::zeroed(
+        header.stored_len,
+        &format!("chunk {id} as {} stores it", path.display()),
+    )?;
+    file.read_exact(&mut bytes).await?;
+
+    Ok(Stored {
+        bytes,
+        codec: header.codec,
+        raw_len: header.raw_len,
+    })
 }
 
 /// The pack's file table, and the bytes to store it as.

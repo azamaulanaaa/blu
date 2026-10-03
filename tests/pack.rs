@@ -16,12 +16,16 @@
 
 mod common;
 
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use lepatch::{
     metadata::{Attributes, File, FileChunk, Snapshot},
     pack::{Pack, Range, hash_file},
-    storage::{BlobStore, Plan, StorageGet},
+    storage::{BlobStore, Codec, Plan, StorageGet},
 };
 use std::io::{Read, Seek, SeekFrom};
 use tokio::io::AsyncReadExt;
@@ -2149,9 +2153,13 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
     .await
     .unwrap();
 
-    let error = lepatch::command::merge(&store, &reopened)
-        .await
-        .expect_err("a merge of a pack with a flipped payload byte should be refused");
+    let error = lepatch::command::merge(
+        &store,
+        &reopened,
+        lepatch::command::MergeCompression::Reencode,
+    )
+    .await
+    .expect_err("a merge of a pack with a flipped payload byte should be refused");
     assert!(
         error.to_string().contains("does not hash to"),
         "a flipped payload byte must be caught by the chunk hash, not by the codec, got: {error}"
@@ -2160,4 +2168,366 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
         store.latest().is_none(),
         "and a refused merge must not have published a version"
     );
+}
+
+/// The verbatim write path refuses a damaged record too, and publishes nothing.
+///
+/// The test above pins this for the re-encoding path, where the chunk reaches the
+/// store as content. `keep` is the path where it is *not* obvious: the bytes go in
+/// as the pack carries them, so the store is handed a frame and a pair of lengths
+/// rather than a hash of the thing it can see — and the tempting implementation is
+/// to take the pack's word for it, which is exactly what would let a damaged or
+/// hostile pack store bytes under a name they are not.
+///
+/// So the decode that looks like waste is the property. This test is what says so:
+/// a byte flipped in a *raw* record's payload leaves the codec alone and the
+/// lengths alone, so nothing but hashing the decoded content can catch it.
+///
+/// What would falsify it: a `put_stored` that skips the decode, or that trusts the
+/// pack — the merge would succeed, and the set would hold a record under `id`
+/// whose bytes are not what `id` names. Publishing a version as well as storing
+/// the record is the second half, so the set is checked for having published
+/// nothing.
+#[tokio::test]
+async fn a_flipped_payload_byte_is_refused_on_the_verbatim_path_too() {
+    let built = build(3, 100_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+
+    let bytes = fs::read(&path).unwrap();
+    let raw = pack
+        .chunks()
+        .iter()
+        .find(|chunk| {
+            let at = usize::try_from(pack.payload_start() + chunk.offset).unwrap();
+            bytes[at + 5] == 0
+        })
+        .copied();
+    let raw = raw.expect("the fixture should hold at least one uncompressed record");
+
+    let at = usize::try_from(
+        pack.payload_start() + raw.offset + record_len(&bytes, pack.payload_start(), raw.offset)
+            - 1,
+    )
+    .unwrap();
+    let mut damaged = bytes.clone();
+    damaged[at] ^= 0x01;
+    let at_damaged = built.dir.path().join("damaged-keep.pack");
+    fs::write(&at_damaged, &damaged).unwrap();
+
+    let reopened = Pack::open(&at_damaged).unwrap();
+    let received = built.dir.path().join("received-keep");
+    let store = BlobStore::open_for_writing(
+        &received,
+        lepatch::storage::SegmentLimit::default(),
+        lepatch::storage::Compression::default(),
+    )
+    .await
+    .unwrap();
+
+    let error =
+        lepatch::command::merge(&store, &reopened, lepatch::command::MergeCompression::Keep)
+            .await
+            .expect_err("`keep` must not be a promise to believe the pack");
+    assert!(
+        error.to_string().contains("does not hash to"),
+        "the chunk hash, not the codec, must be what catches a flipped byte: {error}"
+    );
+    assert!(
+        store.latest().is_none(),
+        "and a refused merge must not have published a version"
+    );
+}
+
+/// A frame no smaller than its content is stored raw, on the verbatim path.
+///
+/// The size invariant is the store's, not the pack's: a frame is kept only when it
+/// is strictly smaller than the content it stands for, so a pack carrying a frame
+/// that did not win cannot make the receiving set bigger than the version it
+/// merged. Both lengths are in the record, so the check is two integer comparisons
+/// — and skipping it would be a way for a merge to *grow* a store, which is the one
+/// thing the verbatim path exists not to do.
+///
+/// The fixture is a record rewritten to name `Zstd` about a payload that is a frame
+/// of its content which came out no smaller, which is the only shape that reaches
+/// the rule: a record the store wrote would never carry one.
+///
+/// Two constraints keep the fixture to one splice rather than a rebuilt pack. The
+/// victim is the **last** record in the payload, so nothing after it moves; and its
+/// replacement is the same width of varint, so the payload length can be patched
+/// where it is rather than re-encoded. Both are asserted, so a fixture that stopped
+/// satisfying either says so instead of quietly testing something else.
+///
+/// What would falsify it: a merge that stored the frame as it stood. The tree would
+/// still restore — the frame is a genuine one — so the assertion is on the record
+/// the store wrote. A test that only restored would pass with this rule deleted.
+#[tokio::test]
+async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
+    let built = build(3, 100_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+
+    let bytes = fs::read(&path).unwrap();
+
+    // The last record in payload order, and the one the fixture rewrites.
+    let victim = pack
+        .chunks()
+        .iter()
+        .max_by_key(|chunk| chunk.offset)
+        .copied()
+        .expect("the fixture should hold records");
+    let (at, header_len, stored_len, raw_len, held) =
+        record_claim(&bytes, pack.payload_start(), &victim);
+    assert_eq!(
+        (held, stored_len, raw_len),
+        (0, raw_len, raw_len),
+        "sanity: the victim is an uncompressed record, so its payload is the content \
+         and can be re-encoded into a frame that loses"
+    );
+
+    let mut content = Vec::new();
+    pack.get(&victim.id)
+        .await
+        .unwrap()
+        .read_to_end(&mut content)
+        .await
+        .unwrap();
+    assert_eq!(blake3::hash(&content), victim.id, "sanity: the content");
+
+    // A real frame of that content, asserted not to be smaller. Left to chance it
+    // would compress — the fixture's data is compressible, which is the point: a
+    // frame that won is the ordinary case and would not reach the rule at all.
+    let frame = zstd::bulk::compress(&content, 1).unwrap();
+    let frame_len = u64::try_from(frame.len()).unwrap();
+    assert!(
+        frame_len >= raw_len,
+        "sanity: this fixture's frame must not be smaller than its content, and is \
+         {frame_len} against {raw_len}"
+    );
+    assert_eq!(
+        lepatch::varint::len(frame_len),
+        lepatch::varint::len(stored_len),
+        "sanity: the two stored lengths must be the same width of varint, or the \
+         record header changes width and the splice below moves every byte after it"
+    );
+
+    let mut record = record_header(1, &victim.id, frame_len, raw_len);
+    record.extend_from_slice(&frame);
+
+    // The header's payload length, grown by the difference between the two records
+    // and patched where it already is.
+    let count_at = 4 + 4 + 4 + 32 + 1;
+    let len_at = count_at + varint_len(&bytes, count_at);
+    let old_record_len = u64::try_from(header_len).unwrap() + stored_len;
+    let header = grown_header(
+        &bytes,
+        len_at,
+        decode_varint(&bytes, len_at)
+            .saturating_add(u64::try_from(record.len()).unwrap())
+            .saturating_sub(old_record_len),
+    );
+
+    let mut grown = Vec::with_capacity(bytes.len() + record.len());
+    grown.extend_from_slice(&header);
+    grown.extend_from_slice(&bytes[header.len()..at]);
+    grown.extend_from_slice(&record);
+    grown.extend_from_slice(&bytes[at + usize::try_from(old_record_len).unwrap()..]);
+
+    let at_grown = built.dir.path().join("grown-frame.pack");
+    fs::write(&at_grown, &grown).unwrap();
+
+    // The pack opens and the record still reads back as the chunk it names, so the
+    // only thing wrong with it is that its frame did not win.
+    let reopened = Pack::open(&at_grown).unwrap();
+    let mut read_back = Vec::new();
+    reopened
+        .get(&victim.id)
+        .await
+        .unwrap()
+        .read_to_end(&mut read_back)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_back, content,
+        "sanity: a re-encoded record is still the chunk it names"
+    );
+
+    let received = built.dir.path().join("received-grown");
+    let store = BlobStore::open_for_writing(
+        &received,
+        lepatch::storage::SegmentLimit::default(),
+        lepatch::storage::Compression::default(),
+    )
+    .await
+    .unwrap();
+
+    lepatch::command::merge(&store, &reopened, lepatch::command::MergeCompression::Keep)
+        .await
+        .expect("a merge carrying a frame that lost is not a failure");
+
+    let placement = store.locate(&victim.id).unwrap();
+    assert_eq!(
+        placement.codec,
+        Codec::Raw,
+        "a frame no smaller than its content must be stored raw, and this one was \
+         {frame_len} bytes of frame for {raw_len} bytes of content"
+    );
+    assert_eq!(
+        (placement.stored_len, placement.raw_len),
+        (placement.raw_len, placement.raw_len),
+        "a raw record's two lengths are the same number"
+    );
+}
+
+/// `keep` carries the pack's own records across; anything else re-encodes them.
+///
+/// The routing is what the flag is, and the two halves are opposites: `keep` must
+/// reproduce the codecs the pack arrived with, and a re-encoding merge must produce
+/// whatever the *receiving* set's policy says. Both are checked against the store's
+/// own index rather than against a size, because a size can come out the same either
+/// way and a codec cannot.
+///
+/// The receiving set is opened with compression **off** on purpose. That is what
+/// makes the two answers opposites rather than two views of the same thing: a
+/// re-encoding merge into an uncompressed set stores every chunk raw whatever the
+/// pack carried, while `keep` still brings the frames across. A test whose store
+/// compressed would see `keep` and `Reencode` agree on every chunk that compresses,
+/// and would pass with the routing broken.
+///
+/// What would falsify it: `keep` storing content (every record raw here), or
+/// `Reencode` storing frames (every record compressed here). Either way the flag
+/// would do the same thing twice, and the restores would still be correct.
+#[tokio::test]
+async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+
+    // Half the tree compresses and half cannot, so the pack carries both kinds of
+    // record and neither answer can be right "by accident" on all of them.
+    for i in 0..3 {
+        fs::write(
+            source.join(format!("c{i}.bin")),
+            common::untagged_stream(u8::try_from(i).unwrap(), 300_000 + i * 40_000),
+        )
+        .unwrap();
+        fs::write(
+            source.join(format!("n{i}.bin")),
+            common::noisy(120_000 + i * 10_000),
+        )
+        .unwrap();
+    }
+
+    let origin = dir.path().join("origin");
+    common::run_backup(&source, &origin).await;
+    let pack = Pack::write(
+        &BlobStore::open_for_reading(&origin).await.unwrap(),
+        &plan_of(&origin).await,
+        &snapshot_of(&origin).await,
+        1,
+        &dir.path().join("v1.pack"),
+    )
+    .await
+    .unwrap();
+
+    // What the pack itself carries, chunk by chunk: the answer `keep` must produce.
+    let mut carried = HashMap::new();
+    for chunk in &pack {
+        let mut bytes = Vec::new();
+        pack.get(&chunk.id)
+            .await
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .await
+            .unwrap();
+        let stored = frame_codec(&dir.path().join("v1.pack"), pack.payload_start(), chunk);
+        assert_eq!(
+            bytes.len() as u64,
+            chunk.content_len,
+            "sanity: the fixture's chunk is {} bytes of content",
+            chunk.content_len
+        );
+        carried.insert(chunk.id, stored);
+    }
+    assert!(
+        carried.values().any(|codec| *codec == Codec::Zstd),
+        "sanity: the pack should carry at least one frame, or nothing is being kept"
+    );
+    assert!(
+        carried.values().any(|codec| *codec == Codec::Raw),
+        "sanity: and at least one raw record, or nothing is being re-encoded"
+    );
+
+    for (compression, expected_kept) in [
+        (lepatch::command::MergeCompression::Keep, true),
+        (lepatch::command::MergeCompression::Reencode, false),
+    ] {
+        let name = format!("received-{expected_kept}");
+        let store = BlobStore::open_for_writing(
+            &dir.path().join(&name),
+            lepatch::storage::SegmentLimit::default(),
+            // Off, so a re-encode has somewhere to go: every chunk raw.
+            lepatch::storage::Compression::Off,
+        )
+        .await
+        .unwrap();
+
+        lepatch::command::merge(&store, &pack, compression)
+            .await
+            .unwrap();
+
+        let reader = BlobStore::open_for_reading(&dir.path().join(&name))
+            .await
+            .unwrap();
+        for (id, stored) in &carried {
+            let placement = reader.locate(id).unwrap();
+            assert_eq!(
+                placement.codec,
+                if expected_kept { *stored } else { Codec::Raw },
+                "with {compression:?}, chunk {id} arrived as {:?} and the pack carried \
+                 {stored:?}",
+                placement.codec,
+            );
+        }
+    }
+}
+
+/// A pack's header, up to and including a payload length of `payload_len`.
+///
+/// A patch rather than a rebuild, and it can only be a patch because the number it
+/// writes has the same width of varint as the one already there: a header is at the
+/// front of the file, so a number that changed width would move every byte behind
+/// it and the index with it. Asserted rather than assumed, so a fixture that grew
+/// past a varint boundary says why instead of producing a pack that will not open.
+fn grown_header(bytes: &[u8], len_at: usize, payload_len: u64) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    lepatch::varint::write(&mut encoded, payload_len);
+
+    assert_eq!(
+        encoded.len(),
+        varint_len(bytes, len_at),
+        "sanity: the payload length must keep its varint width, or this splice would \
+         move every offset in the index and the test would be about rebuilding a pack"
+    );
+
+    let mut header = bytes[..len_at].to_vec();
+    header.extend_from_slice(&encoded);
+    header
+}
+
+/// The codec byte in the record at `offset`, read out of the pack's own bytes.
+///
+/// The pack's index says where a chunk is and how much content it has, and neither
+/// says how the record stores it — the record's own header does, and it is the same
+/// header a reader decodes. Read here rather than through a public accessor because
+/// what this test needs is a fact about the *file*, which is what the receiving set
+/// has to reproduce.
+fn frame_codec(path: &Path, payload_start: u64, chunk: &lepatch::pack::Located) -> Codec {
+    let bytes = fs::read(path).unwrap();
+    let at = usize::try_from(payload_start + chunk.offset).unwrap();
+
+    match bytes[at + 5] {
+        0 => Codec::Raw,
+        1 => Codec::Zstd,
+        other => panic!("the record at {at} claims codec {other}, which is not one"),
+    }
 }

@@ -165,26 +165,24 @@ impl storage::StoragePut for Planned {
         _reader: storage::StreamReadSeeker,
         len: u64,
     ) -> io::Result<()> {
-        // The reader is dropped unread. Nothing downstream needs the bytes: the
-        // chunker has already hashed them, and the snapshot records the hashes.
-        let held = match self.store.as_ref() {
-            // `locate` is the store's own index, so this is a lookup and not a
-            // read of the chunk — which is what keeps planning a large set the
-            // cost of a walk rather than the cost of a backup.
-            Some(store) => match store.locate(id) {
-                Ok(_) => true,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-                Err(e) => return Err(e),
-            },
-            None => false,
-        };
+        self.record(id, len)
+    }
 
-        self.asked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Asked { id: *id, len, held });
-
-        Ok(())
+    /// Record what the run would have written from a payload already encoded, and
+    /// drop the bytes.
+    ///
+    /// The verbatim write path, and a plan of it is the same plan: what it would
+    /// store is decided by the content hash, which both paths begin from, so a
+    /// record keyed by the content length is the same record either way.
+    async fn put_stored(
+        &self,
+        id: &storage::BlobId,
+        _reader: storage::StreamReadSeeker,
+        _stored_len: u64,
+        raw_len: u64,
+        _codec: storage::Codec,
+    ) -> io::Result<()> {
+        self.record(id, raw_len)
     }
 
     /// Nothing was written, so there is nothing to make durable.
@@ -205,6 +203,34 @@ impl storage::StoragePut for Planned {
         Ok(u32::try_from(store.versions()?.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1))
+    }
+}
+
+impl Planned {
+    /// Note what one blob would have been written as, and whether the set has it.
+    ///
+    /// The reader has already been dropped unread by the caller. Nothing
+    /// downstream needs the bytes: the chunker has already hashed them, and the
+    /// snapshot records the hashes.
+    fn record(&self, id: &storage::BlobId, len: u64) -> io::Result<()> {
+        let held = match self.store.as_ref() {
+            // `locate` is the store's own index, so this is a lookup and not a
+            // read of the chunk — which is what keeps planning a large set the
+            // cost of a walk rather than the cost of a backup.
+            Some(store) => match store.locate(id) {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e),
+            },
+            None => false,
+        };
+
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Asked { id: *id, len, held });
+
+        Ok(())
     }
 }
 

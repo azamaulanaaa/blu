@@ -677,43 +677,13 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
     /// The payload is hashed on its way through and checked against `id`: a
     /// mismatch fails the run rather than storing content under the wrong name.
     #[instrument(skip_all, err)]
-    async fn put(&self, id: &BlobId, mut reader: StreamReadSeeker, len: u64) -> io::Result<()> {
-        if Contents::lock(&self.contents).blobs.contains_key(id) {
+    async fn put(&self, id: &BlobId, reader: StreamReadSeeker, len: u64) -> io::Result<()> {
+        if self.holds(id) {
             tracing::trace!(already = %id, "already stored");
             return Ok(());
         }
 
-        // The payload is read in full before anything is written: a header cannot
-        // be written twice, and the stored length is not known until the payload
-        // has been compressed. The chunker already materialises each chunk, so
-        // this copies a buffer the caller holds rather than raising the run's
-        // peak.
-        let raw_len = usize::try_from(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("a payload of {len} bytes does not fit in memory"),
-            )
-        })?;
-        let mut raw = Vec::with_capacity(raw_len);
-
-        {
-            let mut source = BufReader::with_capacity(COPY_BUFFER, reader.as_mut().take(len));
-            let read = tokio::io::AsyncReadExt::read_to_end(&mut source, &mut raw).await?;
-            if u64::try_from(read).unwrap_or(u64::MAX) != len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("declared {len} bytes but the reader yielded only {read}"),
-                ));
-            }
-        }
-
-        let mut trailing = [0u8; 1];
-        if reader.read(&mut trailing).await? != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the reader yielded more than the declared {len} bytes"),
-            ));
-        }
+        let raw = read_whole(reader, len).await?;
 
         // Checked before anything is stored, so nothing is written under the wrong
         // name. Hashing the content is also what makes the codec a write policy:
@@ -758,72 +728,87 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
         } else {
             (Codec::Raw, Cow::Borrowed(raw.as_slice()))
         };
-        let stored_len = u64::try_from(stored.len()).unwrap_or(u64::MAX);
 
-        let mut header =
-            Vec::with_capacity(usize::try_from(record::header_len(stored_len, len)).unwrap_or(0));
-        record::encode_header(
-            &mut header,
-            Kind::Blob,
-            codec,
-            id.as_bytes(),
-            stored_len,
-            len,
-        );
+        self.write_record(id, &stored, len, codec).await
+    }
 
-        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + stored_len;
-        let reservation = self.reserve(total)?;
-        let offset = reservation.offset;
+    /// Store a payload that is already encoded, after checking what it decodes to.
+    ///
+    /// The decode is the whole of the verification and is not optional — see
+    /// [`StoragePut::put_stored`], which says why in the terms a caller has. This
+    /// is the part of that method specific to a store: the frame is kept as it
+    /// came in only when it is strictly smaller than the content and names a
+    /// codec the store can decode, and otherwise the content is stored raw, which
+    /// is the same fallback `put` takes and for the same reason.
+    #[instrument(skip_all, err)]
+    async fn put_stored(
+        &self,
+        id: &BlobId,
+        reader: StreamReadSeeker,
+        stored_len: u64,
+        raw_len: u64,
+        codec: Codec,
+    ) -> io::Result<()> {
+        if self.holds(id) {
+            tracing::trace!(already = %id, "already stored");
+            return Ok(());
+        }
 
-        // A handle of its own, never `try_clone`: a dup shares the file offset, so
-        // concurrent puts would interleave headers into each other's payloads and
-        // the store would read back as a shorter prefix of itself.
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.segment_path(reservation.segment))
-            .await?;
+        let mut stored = read_whole(reader, stored_len).await?;
 
-        // Positional, never append: `append` would redirect every write to
-        // wherever the end of the file happened to be, which is the offset just
-        // decided not to use.
-        file.seek(SeekFrom::Start(offset)).await?;
-        file.write_all(&header).await?;
-        file.write_all(&stored).await?;
+        // Both lengths are the caller's claims and neither is measured here, but
+        // the comparison between them is this store's decision rather than the
+        // caller's: a frame is kept only when it is strictly smaller, and only
+        // when this store can decode it. `Zstd` is named rather than asked of the
+        // decoders for the reason `put` gives — `Raw` in a record means "these are
+        // the bytes that hashed to this id" — and it is the fail-closed arm in
+        // exchange, since its decode validates the frame against `raw_len`.
+        let keep = matches!(codec, Codec::Zstd) && stored_len < raw_len;
 
-        // Nothing is synced here: the run's single `sync_data` is the durability
-        // point, and syncing per blob would pay for thousands of them.
-        file.flush().await?;
+        // Decoded through [`Zstd`] rather than by a bare decode call, so there is
+        // one implementation of what a frame must produce rather than two that
+        // can disagree; `raw_len` is the record's claim about the size and is
+        // checked against the frame, never trusted. Which of the three answers
+        // this takes is decided by the two rules above rather than here, and a
+        // `Raw` payload needs no decode at all because it *is* the content.
+        let content: Vec<u8> = if keep {
+            // The frame is written out again below, so the decode gets a copy of
+            // it rather than the thing itself.
+            Decompressor::decompress(&Zstd, stored.clone(), raw_len).await?
+        } else if matches!(codec, Codec::Raw) {
+            // Nothing to decode: a `Raw` payload *is* the content.
+            std::mem::take(&mut stored)
+        } else {
+            // Handed over rather than copied: a frame that is not kept is never
+            // written, so the decode can take the only copy of it.
+            Decompressor::decompress(&Zstd, std::mem::take(&mut stored), raw_len).await?
+        };
 
-        let payload_offset = offset + u64::try_from(header.len()).unwrap_or(u64::MAX);
+        // The identity check `put` makes, on the same terms and for the same
+        // reason: a chunk is named by the hash of its content, so bytes that are
+        // not that content must not be stored under that name however they
+        // arrived. Checked before anything is written, so a failure leaves the
+        // store as it was.
+        if blake3::hash(&content) != *id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the content does not hash to {id}, so it was not stored"),
+            ));
+        }
 
-        // Into the index only once the payload is written, so nothing ever
-        // points at bytes that are not there.
-        Contents::lock(&self.contents).blobs.insert(
-            *id,
-            Placement {
-                segment: reservation.segment,
-                offset: payload_offset,
-                stored_len,
-                // `len` above is the *content* length, which is why the two
-                // fields are named for what they hold rather than for how Rust
-                // spells `Vec::len`.
-                raw_len: len,
-                codec,
-            },
-        );
+        // The record's own content length is what was decoded, rather than the
+        // `raw_len` the caller claimed: the frame was checked against that claim
+        // above, so the two agree, and a `Raw` payload whose two lengths disagree
+        // is stored under the length it actually has.
+        let content_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
 
-        tracing::trace!(
-            segment = reservation.segment,
-            offset,
-            raw_length = len,
-            stored_length = stored_len,
-            ?codec,
-            "stored blob"
-        );
-
-        Ok(())
+        if keep {
+            self.write_record(id, &stored, content_len, Codec::Zstd)
+                .await
+        } else {
+            self.write_record(id, &content, content_len, Codec::Raw)
+                .await
+        }
     }
 
     /// Make every record written so far durable.
@@ -938,6 +923,52 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
 
         Ok(version)
     }
+}
+
+/// Read exactly `len` bytes out of `reader`, and refuse a reader that does not
+/// yield exactly that many.
+///
+/// Both failure modes are refusals rather than tolerances, for the reason
+/// [`storage::StoragePut::put`] gives: a short read leaves a blob that can never
+/// be read back whole, and a long one leaves bytes past the end of the record.
+///
+/// The payload is read in full before anything is written, which is a requirement
+/// of the record layout rather than an implementation convenience: a header
+/// cannot be written twice, and the stored length is not known until the payload
+/// has been compressed.
+///
+/// The buffer this allocates is a copy of one the caller already holds — the
+/// chunker materialises each chunk before offering it — so a run's peak is one
+/// chunk rather than a whole tree either way.
+async fn read_whole(mut reader: StreamReadSeeker, len: u64) -> io::Result<Vec<u8>> {
+    let wanted = usize::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a payload of {len} bytes does not fit in memory"),
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(wanted);
+
+    {
+        let mut source = BufReader::with_capacity(COPY_BUFFER, reader.as_mut().take(len));
+        let read = tokio::io::AsyncReadExt::read_to_end(&mut source, &mut bytes).await?;
+        if u64::try_from(read).unwrap_or(u64::MAX) != len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("declared {len} bytes but the reader yielded only {read}"),
+            ));
+        }
+    }
+
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing).await? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the reader yielded more than the declared {len} bytes"),
+        ));
+    }
+
+    Ok(bytes)
 }
 
 /// Write a version's index file, best-effort.
@@ -1071,6 +1102,99 @@ impl<C: Compressor> BlobStore<Write, C> {
         if !dirty.contains(&segment) {
             dirty.push(segment);
         }
+    }
+
+    /// Whether this set already holds the blob named by `id`.
+    ///
+    /// Asked before a payload is read rather than after: a blob the store holds is
+    /// not written again, so the reader is never even drained. A caller that hands
+    /// over every chunk it read can therefore stop tracking what the set has.
+    fn holds(&self, id: &BlobId) -> bool {
+        Contents::lock(&self.contents).blobs.contains_key(id)
+    }
+
+    /// Append one blob record holding `stored` verbatim, and index it.
+    ///
+    /// Shared by [`storage::StoragePut::put`] and
+    /// [`storage::StoragePut::put_stored`], which differ in how they decide what
+    /// `stored` is and never in how a record is written: one record layout, and
+    /// one place that knows where a blob lands.
+    ///
+    /// `raw_len` is the length of the *content*, which is what the header's second
+    /// length carries and what a reader compares a snapshot's lengths against.
+    async fn write_record(
+        &self,
+        id: &BlobId,
+        stored: &[u8],
+        raw_len: u64,
+        codec: Codec,
+    ) -> io::Result<()> {
+        let stored_len = u64::try_from(stored.len()).unwrap_or(u64::MAX);
+
+        let mut header = Vec::with_capacity(
+            usize::try_from(record::header_len(stored_len, raw_len)).unwrap_or(0),
+        );
+        record::encode_header(
+            &mut header,
+            Kind::Blob,
+            codec,
+            id.as_bytes(),
+            stored_len,
+            raw_len,
+        );
+
+        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + stored_len;
+        let reservation = self.reserve(total)?;
+        let offset = reservation.offset;
+
+        // A handle of its own, never `try_clone`: a dup shares the file offset, so
+        // concurrent puts would interleave headers into each other's payloads and
+        // the store would read back as a shorter prefix of itself.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.segment_path(reservation.segment))
+            .await?;
+
+        // Positional, never append: `append` would redirect every write to
+        // wherever the end of the file happened to be, which is the offset just
+        // decided not to use.
+        file.seek(SeekFrom::Start(offset)).await?;
+        file.write_all(&header).await?;
+        file.write_all(stored).await?;
+
+        // Nothing is synced here: the run's single `sync_data` is the durability
+        // point, and syncing per blob would pay for thousands of them.
+        file.flush().await?;
+
+        let payload_offset = offset + u64::try_from(header.len()).unwrap_or(u64::MAX);
+
+        // Into the index only once the payload is written, so nothing ever
+        // points at bytes that are not there.
+        Contents::lock(&self.contents).blobs.insert(
+            *id,
+            Placement {
+                segment: reservation.segment,
+                offset: payload_offset,
+                stored_len,
+                // The *content* length, which is why the two fields are named for
+                // what they hold rather than for how Rust spells `Vec::len`.
+                raw_len,
+                codec,
+            },
+        );
+
+        tracing::trace!(
+            segment = reservation.segment,
+            offset,
+            raw_length = raw_len,
+            stored_length = stored_len,
+            ?codec,
+            "stored blob"
+        );
+
+        Ok(())
     }
 }
 

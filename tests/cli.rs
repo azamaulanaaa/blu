@@ -4364,3 +4364,225 @@ fn a_merged_version_verifies() {
         "a merged version should verify: {report}"
     );
 }
+
+/// Every `--compression` a merge takes stores the same version, byte for byte.
+///
+/// The option chooses an *encoding*, and the only thing it is allowed to change is
+/// how the records come out on disk. So each one has to restore to exactly what a
+/// restore from the source set gives — and this is the test that would catch an
+/// option honoured in one direction and ignored in the other, which is the failure
+/// a flag like this invites: `keep` writing content while claiming to keep frames
+/// would still restore, and so would a level that quietly re-read the pack's stored
+/// bytes as if they were content.
+///
+/// Every setting is checked against the *same* answer, the source set's own
+/// restore, rather than against each other: two sets that were wrong in the same
+/// way would otherwise agree.
+///
+/// What would falsify it: any setting whose restore differs by a byte, a setting
+/// silently ignored (which passes here, and is why the sizes are checked too — see
+/// below), or a default that changed.
+#[test]
+fn a_merge_restores_the_same_tree_under_every_compression() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    let expected = set_contents(dir.path(), "origin", 1);
+    assert!(
+        !expected.is_empty(),
+        "the fixture should have restored something to compare against"
+    );
+
+    // `keep` is the default and is named explicitly anyway, since the point is that
+    // the flag reaches it rather than the absence of the flag.
+    for (flag, name) in [
+        (vec!["--compression", "keep"], "kept"),
+        (vec!["--compression", "0"], "uncompressed"),
+        (vec!["--compression", "1"], "level-one"),
+        (vec!["--compression", "9"], "level-nine"),
+    ] {
+        let mut args = vec!["merge", "v1.pack", name];
+        args.extend(flag.iter().copied());
+        ok(dir.path(), &args);
+
+        let restored = set_contents(dir.path(), name, 1);
+        assert_eq!(
+            expected,
+            restored,
+            "a set merged with {} restored differently from the set it came from",
+            flag.join(" ")
+        );
+    }
+
+    // And the flag is not a no-op wearing a name: the encodings it chooses are
+    // genuinely different, so a run that ignored it could not have restored
+    // correctly by accident three times over. Measured on the segments, which is
+    // where the encoding shows up at all — `restore` cannot tell them apart, and
+    // that is the point of the first half.
+    let kept = common::set_size(&dir.path().join("kept"));
+    let raw = common::set_size(&dir.path().join("uncompressed"));
+    assert!(
+        kept < raw,
+        "keeping the pack's frames should store less than storing the content raw: \
+         {kept} against {raw}"
+    );
+
+    // Each also verifies, which is the store's own statement that every record it
+    // holds hashes to the name it is addressed by — the property the verbatim path
+    // has to keep while skipping the encode.
+    for name in ["kept", "uncompressed", "level-one", "level-nine"] {
+        let report = ok(dir.path(), &["verify", name]);
+        assert!(
+            report.contains("all chunks match"),
+            "a set merged into {name} should verify: {report}"
+        );
+    }
+}
+
+/// A dry merge reports the same figures whatever `--compression` says, and writes
+/// nothing under any of them.
+///
+/// The figures count chunk *content*, which is the same under every setting, so a
+/// plan is the same plan — a dry run that changed its numbers with the flag would be
+/// telling the user the encoding changes what is merged, which it does not. And it
+/// writes nothing at all, which is the half that is easy to lose by adding a
+/// parameter to a path that used to take none.
+///
+/// Each setting is planned into a *fresh* name, so "already merged" cannot be what
+/// made the second and third runs agree with the first.
+///
+/// What would falsify it: a plan whose figures moved with the flag, a set created
+/// or a version published by a dry run, or a lock taken.
+#[test]
+fn a_dry_merge_reports_the_same_figures_under_every_compression() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    let mut reports = Vec::new();
+    for (flag, name) in [
+        (vec!["--compression", "keep"], "planned-keep"),
+        (vec!["--compression", "0"], "planned-raw"),
+        (vec!["--compression", "9"], "planned-nine"),
+    ] {
+        let mut args = vec!["merge", "v1.pack", name, "--dry-run"];
+        args.extend(flag.iter().copied());
+        let report = ok(dir.path(), &args);
+
+        assert!(
+            report.contains("nothing written"),
+            "a dry merge with {} should say it wrote nothing: {report}",
+            flag.join(" ")
+        );
+
+        // The figures, off the front of the plan's own wording and off the
+        // "nothing written to <name>" tail, so what is compared is the numbers
+        // rather than which set was named or how the two reports are phrased.
+        let figures = figures_of(&report);
+        reports.push(figures.clone());
+
+        assert!(
+            !dir.path().join(format!("{name}.0000.bin")).exists(),
+            "a dry merge with {} created the set",
+            flag.join(" ")
+        );
+        assert!(
+            !dir.path().join(format!("{name}.lock")).exists(),
+            "a dry merge with {} took the lock",
+            flag.join(" ")
+        );
+
+        // And the real run, into the same name, reports the same figures — which
+        // is what makes the plan worth having read. Its wording differs on purpose
+        // (the real line is what a script parses), so only the numbers are held to
+        // the plan's.
+        let mut args = vec!["merge", "v1.pack", name];
+        args.extend(flag.iter().copied());
+        let real = ok(dir.path(), &args);
+        assert!(
+            real.contains("version 1"),
+            "the real merge should publish what the plan reported: {real}"
+        );
+        assert_eq!(
+            figures,
+            figures_of(&real),
+            "a dry merge with {} and the real one disagree about what was stored",
+            flag.join(" ")
+        );
+    }
+
+    for report in &reports[1..] {
+        assert_eq!(
+            reports[0], *report,
+            "the figures should not depend on the encoding: {report}"
+        );
+    }
+}
+
+/// The figures a merge report leads with: chunks, new, already held, bytes.
+///
+/// Pulled out of both reports' wording rather than reformatted, because the two
+/// lines differ deliberately — `report_merge_plan` says why — and a test that
+/// normalised them into one shape would be asserting on its own formatting.
+fn figures_of(report: &str) -> String {
+    let line = report
+        .lines()
+        .map(str::trim)
+        .find(|line| line.contains(" chunks,"))
+        .unwrap_or_else(|| panic!("a merge report should lead with its figures: {report}"));
+
+    let figures: Vec<&str> = line
+        .split(", ")
+        .skip(1)
+        // The plan's byte figure is followed by what it did instead of writing,
+        // which is not a figure and is dropped with the rest of that clause.
+        .take_while(|part| !part.starts_with("nothing"))
+        .map(|part| part.split(' ').next().unwrap_or_default())
+        .collect();
+
+    figures.join(" ")
+}
+
+/// `--compression` names `keep` or a level, and refuses anything else by name.
+///
+/// The vocabulary is the flag's own, and a value outside it has to be a usage error
+/// rather than a policy nobody chose — the same treatment `backup
+/// --compression-level` gives. Asserted for the two ways a user gets this wrong: a
+/// word that is not `keep`, and a number past the top level.
+///
+/// What would falsify it: a parser that accepted anything, which would let
+/// `--compression banana` silently become a default.
+#[test]
+fn a_merge_compression_outside_its_vocabulary_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+    ok(dir.path(), &["pack", "origin", "v1.pack"]);
+
+    // `-1` is not here: clap reads it as a flag rather than as this flag's value,
+    // so it never reaches the parser, and that refusal says so on its own.
+    for bad in ["banana", "10", "1.5", ""] {
+        let output = lepatch(
+            dir.path(),
+            &["merge", "v1.pack", "nowhere", "--compression", bad],
+        );
+        assert!(
+            !output.status.success(),
+            "`--compression {bad}` was accepted\nstdout: {}",
+            stdout(&output)
+        );
+        assert!(
+            stderr(&output).contains("keep"),
+            "the refusal should name the two things the flag accepts, and says: {}",
+            stderr(&output)
+        );
+        assert!(
+            !dir.path().join("nowhere.0000.bin").exists(),
+            "a refused `--compression {bad}` created the set"
+        );
+    }
+}

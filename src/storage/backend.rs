@@ -13,7 +13,7 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncSeek};
 
-use super::BlobId;
+use super::{BlobId, Codec};
 
 /// A stream that is both [`AsyncRead`] and [`AsyncSeek`].
 ///
@@ -96,6 +96,52 @@ pub trait StoragePut: Send + Sync {
         id: &BlobId,
         reader: StreamReadSeeker,
         len: u64,
+    ) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Store `stored_len` bytes read from `reader`, already in the form they are
+    /// stored in, which decode to `raw_len` bytes of content hashing to `id`.
+    ///
+    /// The counterpart to [`StoragePut::put`] for a writer that is handed a
+    /// payload which has already been encoded: a pack carries each chunk as the
+    /// record its source set already holds, and re-encoding that on the way in
+    /// would decode every chunk and compress it again for nothing.
+    ///
+    /// **The content is decoded and hashed anyway.** This looks like the half of
+    /// the work the method exists to avoid, and deliberately is not skipped: a
+    /// chunk's identity is the hash of its *content*, so the bytes this is given
+    /// are a claim about what a chunk is rather than evidence of it, and the only
+    /// thing that could check that claim is the content itself. Trusting the
+    /// caller's hash instead would make `keep` mean "believe this file", so a
+    /// damaged download or a hostile one could store bytes under a name they are
+    /// not — and nothing downstream could tell, because every reader looks the
+    /// chunk up by that name and finds a record that verifies. What is given up is
+    /// one decode per chunk; what is kept is the guarantee `put` makes, on a path
+    /// that exists precisely to be cheaper than `put`.
+    ///
+    /// **A frame is kept only when it is smaller, and only when this store can
+    /// decode it** — the same rule `put` applies to what its own compressor
+    /// returns, and for the same reason: a zstd frame carries a header of its own,
+    /// so storing one that did not shrink its content would grow the set, and a
+    /// codec this store cannot read would be bytes no reader could serve. Both
+    /// lengths are known here, so the check costs two integer comparisons; when it
+    /// fails the decoded content is stored raw instead, which is a correct record
+    /// whatever the caller had.
+    ///
+    /// `reader` must yield exactly `stored_len` bytes, for the reason
+    /// [`StoragePut::put`] gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails, if the length does not match, if the
+    /// bytes do not decode to `raw_len` bytes of them, or if the content does not
+    /// hash to `id`.
+    fn put_stored(
+        &self,
+        id: &BlobId,
+        reader: StreamReadSeeker,
+        stored_len: u64,
+        raw_len: u64,
+        codec: Codec,
     ) -> impl Future<Output = io::Result<()>> + Send;
 
     /// Make every record written so far durable.
