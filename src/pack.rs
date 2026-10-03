@@ -571,6 +571,14 @@ impl Pack {
         file.sync_all().await?;
         drop(file);
 
+        // Sorted by hash for everything that is not the file: the index on disk
+        // keeps payload order, because that is the order the records were written
+        // in and a reader sorts what it needs, while everything in this process
+        // looks a chunk up by hash and wants the two to agree on what order that
+        // is. A pack that was just written and the same pack read back are the
+        // same value, which is a thing callers compare.
+        chunks.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+
         Ok(Self {
             path: path.to_path_buf(),
             payload_start,
@@ -641,7 +649,8 @@ impl Pack {
         file.seek(SeekFrom::Start(index_start))?;
         file.read_exact(&mut index)?;
 
-        let chunks = decode_index(&index)?;
+        let mut chunks = decode_index(&index)?;
+        chunks.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
 
         // The header, for the payload geometry and the snapshot.
         let mut header = [0u8; HEADER + 1];
@@ -868,16 +877,21 @@ impl Pack {
         &self.path
     }
 
-    /// Every chunk, in pack order.
+    /// Every chunk, in hash order.
     #[must_use]
     pub fn chunks(&self) -> &[Located] {
         &self.chunks
     }
 
-    /// The chunks, in pack order.
+    /// The chunks, in hash order.
     ///
     /// [`Pack`] is also [`IntoIterator`] and [`AsRef<[Located]>`], so
     /// `for chunk in &pack` works without the `pack.chunks().iter()` double hop.
+    ///
+    /// **Hash order, not payload order.** It is the order a lookup binary-searches
+    /// and the order [`Pack::open`] reads a pack's index into, whatever order the
+    /// index on disk is written in; a question about byte ranges sorts by offset
+    /// itself rather than reading an order into this.
     pub fn iter(&self) -> std::slice::Iter<'_, Located> {
         self.chunks.iter()
     }
@@ -918,25 +932,34 @@ impl Pack {
     /// client needs are written end to end, so a run of them is one range, and the
     /// record header between two of them is inside the run rather than across it.
     ///
-    /// **A range's end comes from the next entry in the index, not from a length.**
-    /// The index does not carry the record's length — the record's own header does,
-    /// and a range has to be answerable before a byte of payload has been read —
-    /// so a chunk's record runs from its own offset to where the record after it
-    /// begins, and the last one to the end of the payload. That is only sound
-    /// because the records do not overlap, which [`open`] checks and this crate's
-    /// writer is what makes true.
+    /// **A range's end comes from the next record in the payload, not from a
+    /// length.** The index does not carry the record's length — the record's own
+    /// header does, and a range has to be answerable before a byte of payload has
+    /// been read — so a chunk's record runs from its own offset to where the
+    /// record after it begins, and the last one to the end of the payload. That is
+    /// only sound because the records do not overlap, which [`open`] checks and
+    /// this crate's writer is what makes true.
+    ///
+    /// **And so the entries are sorted by offset first, every call.** The index is
+    /// held in hash order — that is what [`Pack::locate`] binary-searches — and
+    /// hash order is not payload order, so a merge that ran along the index would
+    /// find two ranges meeting nowhere and answer with one range per chunk, which
+    /// is the entire cost a pack exists to remove. The sort is per call, over the
+    /// entries this call collected; the index itself is untouched, and it was
+    /// resident in full before this, so nothing here is a second copy of it that
+    /// outlives the answer.
     ///
     /// A set rather than anything ordered, because the set is only ever asked
     /// whether it holds a chunk. The order of the result comes from the order of
-    /// [`Pack::chunks`], not from the set, so nothing observable depends on it —
-    /// and `BlobId` is a `blake3::Hash`, which deliberately has no `Ord`: hash
-    /// order is not content order and pretending otherwise would be a lie a
-    /// caller could come to rely on.
+    /// the payload, not from the set, so nothing observable depends on it — and
+    /// `BlobId` is a `blake3::Hash`, which deliberately has no `Ord`: hash order
+    /// is not content order and pretending otherwise would be a lie a caller could
+    /// come to rely on.
     #[must_use]
     pub fn needed(&self, have: &HashSet<BlobId>) -> Vec<Range> {
         let mut ranges: Vec<Range> = Vec::new();
 
-        for (at, chunk) in self.chunks.iter().enumerate() {
+        for (chunk, end) in self.records() {
             if have.contains(&chunk.id) {
                 continue;
             }
@@ -945,7 +968,6 @@ impl Pack {
             // are over numbers that came out of the index, and this type is what
             // a client is told to add them up with.
             let start = self.payload_start.saturating_add(chunk.offset);
-            let end = start.saturating_add(self.record_span(at));
 
             match ranges.last_mut() {
                 Some(last) if last.end == start => last.end = end,
@@ -954,6 +976,30 @@ impl Pack {
         }
 
         ranges
+    }
+
+    /// Every record in payload order, with the byte range it occupies.
+    ///
+    /// Sorting here rather than in the index is what lets the index be sorted for
+    /// the reason it is sorted — to be searched by hash — without every question
+    /// about ranges having to sort the whole of it again. Two callers walk every
+    /// record and each pays this once; the third, which asks about one record at a
+    /// time, goes through [`Pack::after`] instead.
+    fn records(&self) -> Vec<(Located, u64)> {
+        let mut ordered: Vec<&Located> = self.chunks.iter().collect();
+        ordered.sort_unstable_by_key(|chunk| chunk.offset);
+
+        let mut out: Vec<(Located, u64)> = Vec::with_capacity(ordered.len());
+        for at in 0..ordered.len() {
+            // The next record's start, which for the last one is the payload's end.
+            let end = ordered
+                .get(at + 1)
+                .map_or(self.payload_len, |next| next.offset);
+
+            out.push((*ordered[at], self.payload_start.saturating_add(end)));
+        }
+
+        out
     }
 
     /// Bytes a client already holding `have` still needs.
@@ -967,6 +1013,20 @@ impl Pack {
     }
 
     /// Where a chunk is, if the pack holds it.
+    ///
+    /// A binary search over [`Pack::chunks`], which is why that is sorted by hash.
+    ///
+    /// **Why not a hash map from chunk to position.** The obvious thing for a
+    /// lookup table, and worse on both counts that matter here. Memory first: the
+    /// index is already resident in full after [`Pack::open`] — a client that only
+    /// wants offsets pays for the whole of it either way — so a map would be a
+    /// second copy of every key, not a structure that exists instead of one. The
+    /// index's own memory is not saved by looking things up in something cheaper;
+    /// a second structure is added to it. And speed: a map lookup hashes 32 bytes
+    /// and chases a bucket, where a binary search here compares 32 bytes about
+    /// `log2(n)` times over data already in cache. For the sizes a pack reaches —
+    /// thousands of chunks, tens of thousands — the difference is a handful of
+    /// cache lines, and it is paid on every chunk a restore reads.
     #[must_use]
     pub fn locate(&self, id: &BlobId) -> Option<Located> {
         self.position(id).map(|at| self.chunks[at])
@@ -979,30 +1039,43 @@ impl Pack {
     /// copy of an entry — the span of one record is a fact about where the next
     /// one starts, which an entry no longer says on its own.
     fn position(&self, id: &BlobId) -> Option<usize> {
-        self.chunks.iter().position(|chunk| chunk.id == *id)
+        self.chunks
+            .binary_search_by(|chunk| chunk.id.as_bytes().cmp(id.as_bytes()))
+            .ok()
     }
 
-    /// The bytes the record at `at` of the index occupies.
+    /// Where the record after the one at `offset` begins, or the payload's end.
     ///
-    /// **From where the next record begins, not from a length.** The index does not
-    /// carry each record's length — the record's own header does, and it is read
-    /// by whoever reads the record — so the extent comes from the layout instead:
-    /// records are written end to end and [`Pack::open`] refuses an index whose
-    /// records overlap, so a record runs to the record after it and the last one
-    /// runs to the end of the payload.
+    /// **The next record's offset, not a length.** The index does not carry each
+    /// record's length — the record's own header does, and it is read by whoever
+    /// reads the record — so the extent comes from the layout instead: records are
+    /// written end to end and [`Pack::open`] refuses an index whose records
+    /// overlap, so a record runs to the record after it and the last one runs to
+    /// the end of the payload.
+    ///
+    /// A linear search, where [`Pack::needed`] sorts instead: this is one chunk's
+    /// successor and there is one call per chunk read, so it is `O(n)` for the
+    /// read — the same order as the linear scan it replaces — rather than a sort
+    /// per read. The callers that touch every entry pay one sort between them and
+    /// answer from it, which is why there are two shapes rather than one.
     ///
     /// The last case is where an over-claim rather than a short answer comes from:
     /// a writer that left a gap before the snapshot would have the last record's
     /// range reach past its own end, so a client fetches a few bytes it does not
     /// need. Under-claiming would be the other way round and cannot happen, which
     /// is the direction worth being wrong in.
-    fn record_span(&self, at: usize) -> u64 {
-        let end = self
-            .chunks
-            .get(at + 1)
-            .map_or(self.payload_len, |next| next.offset);
+    fn after(&self, offset: u64) -> u64 {
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.offset)
+            .filter(|start| *start > offset)
+            .min()
+            .unwrap_or(self.payload_len)
+    }
 
-        end.saturating_sub(self.chunks[at].offset)
+    /// The bytes the record at `offset` occupies.
+    fn record_span(&self, offset: u64) -> u64 {
+        self.after(offset).saturating_sub(offset)
     }
 }
 
@@ -1340,14 +1413,14 @@ impl Pack {
     ///
     /// A chunk is recorded only where a range covers its **whole record**, header
     /// included, which — as in [`Pack::needed`] — is the span from its own offset
-    /// to the next record's.
+    /// to the next record's, and for the same reason it is taken in payload order
+    /// rather than in the order the index happens to hold.
     #[must_use]
     pub fn chunks_covering(&self, ranges: &[Range]) -> HashSet<BlobId> {
         let mut out = HashSet::new();
 
-        for (at, chunk) in self.chunks.iter().enumerate() {
+        for (chunk, end) in self.records() {
             let start = self.payload_start.saturating_add(chunk.offset);
-            let end = start.saturating_add(self.record_span(at));
 
             if ranges.iter().any(|r| r.start <= start && end <= r.end) {
                 out.insert(chunk.id);
@@ -1417,7 +1490,7 @@ impl StorageGet for Pack {
             )
         })?;
         let located = self.chunks[at];
-        let span = self.record_span(at);
+        let span = self.record_span(located.offset);
 
         let mut file =
             crate::storage::at_async(self.path(), "open", tfs::File::open(self.path())).await?;

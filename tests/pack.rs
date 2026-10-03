@@ -270,6 +270,102 @@ async fn the_index_is_at_the_end() {
     assert_eq!(reopened.payload_len(), pack.payload_len());
 }
 
+/// A pack's index is held in hash order, and every chunk still resolves from it.
+///
+/// Holding the index in the order chunks are addressed by is what turns a lookup
+/// from a scan of the whole index into a binary search. It is also what forces
+/// the byte-range questions to sort for themselves, because hash order is not the
+/// order the records sit in — so what has to survive the change is both halves: the
+/// lookup still finds every chunk, and a full download is still one range.
+///
+/// The fixture is wide enough that the two orders are visibly different, and that
+/// is asserted rather than assumed: a pack of two or three chunks could come out of
+/// a sort in the same order it went in, and a test that could not tell would be a
+/// test that stops testing anything the moment the fixture changes.
+///
+/// What would falsify it: a `locate` that misses, a `get` that hands back the
+/// wrong bytes, a writer and a reader disagreeing about the order they hold the
+/// index in, or `needed` answering one range per chunk.
+#[tokio::test]
+async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
+    let built = build(12, 180_000).await;
+    let path = built.dir.path().join("v1.pack");
+    let pack = built.pack(&path).await;
+
+    assert!(
+        pack.len() >= 20,
+        "the fixture should hold enough chunks for the two orders to differ, got {}",
+        pack.len()
+    );
+
+    let by_hash = pack
+        .chunks()
+        .windows(2)
+        .all(|pair| pair[0].id.as_bytes() <= pair[1].id.as_bytes());
+    assert!(by_hash, "the index should be held in hash order");
+
+    // And that order is *not* the payload's, which is the reason `needed` cannot
+    // walk the index and merge ranges as it goes.
+    let by_payload = pack
+        .chunks()
+        .windows(2)
+        .all(|pair| pair[0].offset < pair[1].offset);
+    assert!(
+        !by_payload,
+        "a hash-ordered index that also happened to be in payload order would leave the \
+         sort in `needed` untested"
+    );
+
+    // Every chunk resolves to its own entry, and to its own bytes.
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    for planned in built.plan.chunks() {
+        let located = pack
+            .locate(&planned.id)
+            .unwrap_or_else(|| panic!("chunk {} is not in the index", planned.id));
+        assert_eq!(located.offset, pack.locate(&planned.id).unwrap().offset);
+
+        let mut actual = Vec::new();
+        pack.get(&planned.id)
+            .await
+            .unwrap()
+            .read_to_end(&mut actual)
+            .await
+            .unwrap();
+
+        let mut expected = Vec::new();
+        store
+            .get(&planned.id)
+            .await
+            .unwrap()
+            .read_to_end(&mut expected)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            actual, expected,
+            "chunk {} differs from the store",
+            planned.id
+        );
+        assert_eq!(actual.len() as u64, located.content_len);
+    }
+
+    // A pack this build wrote and the same pack read back hold the index in the
+    // same order, so a caller may compare them.
+    assert_eq!(Pack::open(&path).unwrap().chunks(), pack.chunks());
+
+    // And the property a pack exists for is untouched by the sort: the whole
+    // payload, as one range, and a client that records it holds every chunk.
+    let needed = pack.needed(&HashSet::new());
+    assert_eq!(
+        needed.len(),
+        1,
+        "a full download should still be one range, got {}",
+        needed.len()
+    );
+    assert_eq!(pack.needed_bytes(&HashSet::new()), pack.payload_len());
+    assert_eq!(pack.chunks_covering(&needed).len(), pack.len());
+}
+
 /// A client holding nothing needs the whole payload, as one range.
 ///
 /// One request, not one per chunk. That is the whole reason a pack exists.
