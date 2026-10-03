@@ -1021,8 +1021,8 @@ being handed something that can append to the store.
 ## Upgrading across a format change
 
 Two on-disk formats changed in `0.3.0`, and both go one way. Neither direction
-needs a re-backup. `0.4.0` changes no set format at all; it moves the pack format,
-which is derived output and regenerable.
+needs a re-backup. `0.4.0` and `0.5.0` between them change no set format at all;
+they move the pack format, which is derived output and regenerable.
 
 **Sets are readable, but only forwards.** `0.3.0` reads snapshots it did not write
 (`MIN_READABLE_VERSION` is 3), so your existing backup sets keep working. `0.2.0`
@@ -1042,7 +1042,7 @@ $ lepatch pack set v8.pack --version 8     # after upgrading the server
 ```
 
 **The pack format is 6.** `0.4.0` wrote `4`, which carried the recorded version
-described above; this build writes `6`, whose payload is a run of the store's own
+described above; `0.5.0` writes `6`, whose payload is a run of the store's own
 records and whose chunk index holds a content length rather than a record length. A
 `4` pack is refused by name — `it is pack format 4, but this build reads 6` — rather
 than read as though the records it does not have were chunk content.
@@ -1066,6 +1066,27 @@ server goes first.
 `lepatch probe` was removed. What a directory holds is what an apply has to work out
 before it can write anything, so it is a step of the apply rather than a command;
 `apply` reports the same figure on its summary line.
+
+## Two things `0.5.0` changes that are not a format change
+
+Neither asks anything of a backup set, and both are worth knowing about rather than
+discovering.
+
+**`lepatch pack` no longer destroys the pack it is replacing.** It writes to a
+temporary beside the target and renames that into place, so a run that fails part
+way leaves the pack an earlier run wrote exactly as it was, rather than a truncated
+file that cannot be opened. A run killed between the two — a `SIGKILL`, a power cut
+— leaves the temporary beside it; it is named `<pack>.tmp` and nothing reads it. The
+set's lock is what says two runs are not writing the same path, and that is why the
+name is fixed rather than a pid.
+
+**A record header whose lengths are not written in the fewest bytes is refused.**
+Every length this crate writes is a varint in its shortest form, so nothing in a
+store or a pack `lepatch` wrote is affected. A pack or a segment from some other
+writer that pads its numbers is now turned away rather than measured, because a
+number written wide makes its header two sizes at once — and the reader, which
+measures the header once by the widths the lengths take and once by the widths the
+bytes took, would have indexed past the end of one.
 
 ## Releases
 
