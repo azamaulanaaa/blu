@@ -15,8 +15,8 @@ use std::{io, path::Path};
 
 use crate::{
     metadata::Snapshot,
-    pack::Pack,
-    storage::{self, BlobId, Placement, StorageGet},
+    pack::{Pack, StorageStored},
+    storage::{self, BlobId, Placement},
 };
 
 /// Knobs for a single [`pack`] run.
@@ -76,13 +76,19 @@ pub struct Version {
 /// that does not exist yet. Everything else — which chunks, how many, how much
 /// payload, how big the file table — is known before a byte is fetched, and is what
 /// a dry run reports.
+///
+/// `payload` is the *stored* size rather than the content size, and it is knowable
+/// before the pack is written because the plan carries each chunk's placement:
+/// a record is a header plus whatever the set already had for that chunk, so a
+/// compressed set's pack is smaller than its content and the figure is the bytes a
+/// fetch would actually move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Packed {
     /// Chunks in the pack.
     pub chunks: u64,
     /// Chunks the whole version has, which a delta omits some of.
     pub of: u64,
-    /// Bytes of chunk payload in the pack.
+    /// Bytes of chunk records in the pack, headers included.
     pub payload: u64,
     /// Bytes of file table in the pack.
     ///
@@ -126,7 +132,7 @@ pub async fn pack<S, F>(
     options: Options,
 ) -> io::Result<Packed>
 where
-    S: StorageGet + ?Sized,
+    S: StorageStored + ?Sized,
     F: FnMut(&BlobId) -> io::Result<Placement>,
 {
     let Version {
@@ -165,7 +171,18 @@ where
     let mut report = Packed {
         chunks: u64::try_from(plan.len()).unwrap_or(0),
         of,
-        payload: plan.total_bytes(),
+        // The records the file would carry, each a header over the bytes the set
+        // already holds for that chunk. Worked out from the plan's placements
+        // rather than from `Plan::total_bytes`, which is content: the two differ
+        // by every chunk's header and by every frame the set did not have to make.
+        payload: plan.chunks().iter().fold(0u64, |total, chunk| {
+            total
+                .saturating_add(storage::header_len(
+                    chunk.placement.stored_len,
+                    chunk.placement.raw_len,
+                ))
+                .saturating_add(chunk.placement.stored_len)
+        }),
         table,
         base: base.as_ref().map(|base| base.version),
         bytes: None,

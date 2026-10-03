@@ -55,6 +55,15 @@ pub use version_index::VersionIndex;
 /// whichever backend holds the blob.
 pub use record::Placement;
 
+// The record framing itself, for the pack: its payload region is a run of
+// records, written and read through the store's own encoder and decoder rather
+// than through a second copy of either. See the note in `record` on who else
+// frames a record.
+pub(crate) use record::{
+    Kind as RecordKind, MAX_HEADER as MAX_RECORD_HEADER, MIN_HEADER as MIN_RECORD_HEADER,
+    decode_header, encode_header, header_len,
+};
+
 // Crate-internal rather than re-exported from `error` at every call site: `pack`
 // and the store both size a buffer from a length read out of a file, and one
 // refusal for a length this platform cannot address is the whole point of it.

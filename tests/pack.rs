@@ -122,7 +122,16 @@ async fn build(files: usize, size: usize) -> Built {
     }
 }
 
-/// A pack holds every chunk its version needs, and the bytes are the chunks.
+/// A pack holds every chunk its version needs, each as a store record.
+///
+/// The payload is the run of records and nothing else: `offset` is where a
+/// chunk's record starts, `len` covers that record whole, and the records tile
+/// the region with no gap between them — which is what makes a full download one
+/// range.
+///
+/// What each record holds is the chunk, in the form the store already had it, and
+/// `get` hands that back as content: a chunk whose record is a frame comes back
+/// decompressed.
 #[tokio::test]
 async fn a_pack_holds_its_versions_chunks() {
     let built = build(5, 200_000).await;
@@ -132,33 +141,89 @@ async fn a_pack_holds_its_versions_chunks() {
     assert_eq!(pack.len(), built.plan.len());
     assert_eq!(
         pack.payload_len(),
-        built.plan.total_bytes(),
-        "a pack's payload should be exactly the plan's bytes"
+        built
+            .plan
+            .iter()
+            .map(|c| pack.locate(&c.id).unwrap().len)
+            .sum::<u64>(),
+        "the payload should be exactly its records, and no gap between them"
+    );
+    assert!(
+        pack.payload_len() > built.plan.total_bytes(),
+        "a record is its chunk plus a header, so the payload is larger than the content"
     );
 
-    // And the bytes are the chunks, in order, byte for byte.
     let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let mut file = fs::File::open(&path).unwrap();
 
+    let mut at = 0u64;
     for (i, chunk) in built.plan.iter().enumerate() {
         let located = pack.locate(&chunk.id).unwrap();
 
-        let mut from_store = store.get(&chunk.id).await.unwrap();
-        let mut expected = vec![0u8; usize::try_from(chunk.length).unwrap()];
-        tokio::io::AsyncReadExt::read_exact(from_store.as_mut(), &mut expected)
+        // In plan order, and with nothing between them.
+        assert_eq!(
+            located.offset, at,
+            "chunk {i} is not where the one before it ended"
+        );
+        at += located.len;
+
+        // And the record at that offset is one: the store's magic, its kind, its
+        // codec byte, and the chunk's own hash in it.
+        let mut header = [0u8; 48];
+        file.seek(SeekFrom::Start(pack.payload_start() + located.offset))
+            .unwrap();
+        file.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..4], b"LPB1", "chunk {i} does not begin a record");
+        assert_eq!(header[4], 0, "chunk {i}'s record is not a blob record");
+        assert!(
+            header[5] <= 1,
+            "chunk {i}'s record names a codec this crate does not have"
+        );
+        // The hash sits after the two lengths, whose widths depend on the chunk,
+        // so where it is is worked out from the varints rather than assumed.
+        let stored_at = 6;
+        let raw_at = stored_at + varint_len(&header, stored_at);
+        let hash_at = raw_at + varint_len(&header, raw_at);
+        assert_eq!(
+            &header[hash_at..hash_at + 32],
+            chunk.id.as_bytes(),
+            "chunk {i}'s record does not name the chunk the index does"
+        );
+
+        // And what comes back through `get` is the content, whole.
+        let mut actual = Vec::new();
+        pack.get(&chunk.id)
+            .await
+            .unwrap()
+            .read_to_end(&mut actual)
             .await
             .unwrap();
 
-        let mut actual = vec![0u8; usize::try_from(chunk.length).unwrap()];
-        file.seek(SeekFrom::Start(pack.payload_start() + located.offset))
+        let mut expected = Vec::new();
+        store
+            .get(&chunk.id)
+            .await
+            .unwrap()
+            .read_to_end(&mut expected)
+            .await
             .unwrap();
-        file.read_exact(&mut actual).unwrap();
 
         assert_eq!(
             actual, expected,
             "chunk {i} is not its own bytes in the pack"
         );
+        assert_eq!(
+            actual.len() as u64,
+            located.content_len,
+            "and the index says how many bytes of content that is"
+        );
     }
+
+    assert_eq!(
+        at,
+        pack.payload_len(),
+        "the records do not fill the payload"
+    );
 }
 
 /// The index is at the end, so its cost does not grow with the payload.
@@ -526,16 +591,17 @@ fn sections(bytes: &[u8]) -> Sections {
 
 /// The offsets, within a pack's index, where each entry's hash begins.
 ///
-/// Walked rather than computed, because an entry is 32 bytes plus two varints
+/// Walked rather than computed, because an entry is 32 bytes plus three varints
 /// and the varints' widths depend on the offsets the fixture happened to
-/// produce. A test that assumed a width would be asserting about its own
-/// fixture rather than about the pack.
+/// produce. A test that assumed a width would be asserting about its own fixture
+/// rather than about the pack.
 fn index_entries(index: &[u8]) -> Vec<usize> {
     let mut at = 0usize;
     let mut out = Vec::new();
     while at < index.len() {
         out.push(at);
         at += 32;
+        at += varint_len(index, at);
         at += varint_len(index, at);
         at += varint_len(index, at);
     }
@@ -647,34 +713,41 @@ async fn a_pack_records_the_version_it_was_packed_from() {
     );
 }
 
-/// A pack in format `3` is refused by name, before its bytes are read as a `4`.
+/// A pack in format `4` is refused by name, before a byte of it is believed.
 ///
-/// `3` has no version field, so the four bytes this build reads as one are the
-/// first four of its snapshot hash. A reader that carried on past the format
-/// check would take every chunk at an offset four bytes wrong and hand out byte
-/// ranges that look entirely plausible — which is why the refusal has to happen
-/// where it does, and has to name both formats so the person holding the file
-/// knows which `lepatch` produced it.
+/// `4` is the previous format: its payload region is the chunks' content end to
+/// end with nothing between them, where this build's is a run of records. The two
+/// differ in the payload region alone — header, trailer and index framing are the
+/// same shape — so a reader that carried on would go looking for a record header
+/// in the middle of a file's bytes and take the first chunk's content for a record
+/// whose magic is not there.
+///
+/// What this pins is *where* the refusal happens. The trailer and the index are
+/// read before the header is, because that is what makes opening a pack cheap;
+/// the format check then has to come before any field of the header is trusted —
+/// the recorded version and the snapshot hash are read after it — or a `4` would
+/// be reported with this build's numbers and a `5` field would be read out of a
+/// file that has none.
 #[tokio::test]
 async fn a_pack_in_the_previous_format_is_refused_by_name() {
     let built = build(3, 100_000).await;
     let path = built.dir.path().join("v1.pack");
     built.pack(&path).await;
 
-    // Patched rather than built: a real `3` pack is a file this build cannot
+    // Patched rather than built: a real `4` pack is a file this build cannot
     // produce, and patching the four format bytes is the only honest way to hold
-    // one. The rest of the file is a valid `4` pack's, which is the point — the
+    // one. The rest of the file is a valid `5` pack's, which is the point — the
     // only thing wrong with it is the format it claims.
     let mut bytes = fs::read(&path).unwrap();
-    bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
-    let at = built.dir.path().join("v3.pack");
+    bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+    let at = built.dir.path().join("v4.pack");
     fs::write(&at, &bytes).unwrap();
 
     let err = Pack::open(&at).unwrap_err();
     let said = err.to_string();
     assert!(
-        said.contains("pack format 3") && said.contains("reads 4"),
-        "a format 3 pack should be refused naming both formats, got: {said}"
+        said.contains("pack format 4") && said.contains("reads 5"),
+        "a format 4 pack should be refused naming both formats, got: {said}"
     );
     assert!(
         said.contains("not a pack this build can read"),
@@ -682,10 +755,8 @@ async fn a_pack_in_the_previous_format_is_refused_by_name() {
     );
 
     // The same file with the format byte put back is a perfectly good pack again,
-    // which is what shows the refusal was about the format and nothing else: a
-    // reader that had carried on past the check would have been reading the top
-    // of a snapshot hash as a version and believing it.
-    bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+    // which is what shows the refusal was about the format and nothing else.
+    bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
     let at = built.dir.path().join("restored.pack");
     fs::write(&at, &bytes).unwrap();
     assert_eq!(
@@ -1054,8 +1125,8 @@ async fn a_pack_yields_the_bytes_a_store_would() {
         assert_eq!(a, b, "chunk {} differs between pack and store", planned.id);
         assert_eq!(
             a.len() as u64,
-            planned.length,
-            "a pack holds the used prefix of a chunk, not the whole of it"
+            pack.locate(&planned.id).unwrap().content_len,
+            "and the index says how many bytes of content that chunk is"
         );
     }
 }
@@ -1084,7 +1155,11 @@ async fn a_pack_will_not_hand_out_a_chunk_it_does_not_hold() {
     let mut reader = pack.get(&held).await.unwrap();
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).await.unwrap();
-    assert_eq!(bytes.len() as u64, pack.locate(&held).unwrap().len);
+    assert_eq!(
+        bytes.len() as u64,
+        pack.locate(&held).unwrap().content_len,
+        "the stream is bounded to the chunk's content, not to its record"
+    );
     assert_eq!(blake3::hash(&bytes), held);
 }
 

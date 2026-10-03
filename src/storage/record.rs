@@ -28,6 +28,18 @@
 //! format — with probability 2^-64 rather than 2^-32. It is not defending against
 //! an adversary who can write to the file, who can compute a valid check for
 //! anything they like.
+//!
+//! ## Who else frames a record
+//!
+//! [`crate::pack`]'s payload region is a run of these records rather than a run
+//! of bare payloads, so a chunk keeps its codec across a pack and a reader is
+//! handed content rather than a frame. That makes the pack's writer a second
+//! producer of these bytes and its reader a second consumer, and both go through
+//! [`encode_header`] and [`decode_header`] below rather than through a copy of
+//! them: two encoders would be two formats, and they would disagree the first
+//! time a field moved. So the encoder, the decoder, the decoded [`Header`], the
+//! record kind and the two header bounds are crate-visible, and nothing else
+//! here is.
 
 use std::{
     collections::HashMap,
@@ -57,7 +69,7 @@ pub(super) const FORMAT_VERSION: u32 = 2;
 pub(super) const STORE_HEADER: usize = 12;
 
 /// Bytes of record header before the first length: magic, kind and codec.
-const PREFIX: usize = 6;
+pub(crate) const PREFIX: usize = 6;
 
 /// Length of the content hash in a header.
 const HASH: usize = 32;
@@ -70,7 +82,7 @@ const CHECK: usize = 8;
 /// The `2` is those two lengths at their minimum. This is also the smallest
 /// record there is — a header with an empty payload — and `SegmentLimit::new`
 /// uses it as the floor, so it is not a header constant alone.
-pub(super) const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
+pub(crate) const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
 
 /// Bytes in the largest possible header: two varints at their widest.
 ///
@@ -79,7 +91,7 @@ pub(super) const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
 /// varints is 52 bytes against a 48-byte floor, so a record boundary in the last
 /// few bytes of the buffer fails to decode and a good segment is reported as
 /// damaged.
-const MAX_HEADER: usize = PREFIX + 2 * crate::varint::MAX + HASH + CHECK;
+pub(crate) const MAX_HEADER: usize = PREFIX + 2 * crate::varint::MAX + HASH + CHECK;
 
 /// Bytes read at a time while scanning.
 ///
@@ -92,7 +104,7 @@ const SCAN_BUFFER: usize = 1024 * 1024;
 
 /// What a record holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     /// Content, addressed by the BLAKE3 of its payload. Chunks and snapshots are
     /// both this, and are told apart only by what refers to them.
     Blob,
@@ -156,7 +168,7 @@ impl Codec {
 
 /// A record header, decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Header {
+pub(crate) struct Header {
     /// What the record holds.
     pub kind: Kind,
     /// How the payload is stored.
@@ -231,7 +243,7 @@ pub(super) struct Scan {
 /// A writer needs this before writing anything, since the header precedes a
 /// payload that is a stream. `raw_len` is written even for a raw record, where it
 /// equals `stored_len`, rather than inferred from the codec byte.
-pub(super) fn header_len(stored_len: u64, raw_len: u64) -> u64 {
+pub(crate) fn header_len(stored_len: u64, raw_len: u64) -> u64 {
     (PREFIX + varint_len(stored_len) + varint_len(raw_len) + HASH + CHECK) as u64
 }
 
@@ -285,7 +297,7 @@ fn varint_len(value: u64) -> usize {
 /// `stored_len` is what the payload occupies in the file and `raw_len` what it is
 /// once decompressed; for a raw record they are equal. Both must be known first,
 /// because a header cannot be written twice.
-pub(super) fn encode_header(
+pub(crate) fn encode_header(
     out: &mut Vec<u8>,
     kind: Kind,
     codec: Codec,
@@ -326,7 +338,7 @@ fn check(header_without_check: &[u8]) -> [u8; CHECK] {
 /// ran out, the magic is wrong, the kind or codec is unknown, or the check does
 /// not verify. All of them mean the same thing to a scanner — stop here — and
 /// none is distinguishable from a tail torn by a power cut.
-fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
+pub(crate) fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
     if buffer.len() < MIN_HEADER {
         return None;
     }

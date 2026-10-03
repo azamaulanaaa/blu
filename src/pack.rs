@@ -2,28 +2,53 @@
 //!
 //! A store is a deduplicated pool, and the wrong shape for serving one version: a
 //! restore out of a store is a request per chunk. A pack lays the same chunks end
-//! to end with no framing between them, so a version's bytes are contiguous and
-//! are one range request rather than thousands. The measurements behind that are
-//! in the README.
+//! to end, so a version's bytes are contiguous and are one range request rather
+//! than thousands. The measurements behind that are in the README.
+//!
+//! ## The payload is a run of store records
+//!
+//! Each chunk is written as the record the source store already holds for it —
+//! header, codec byte and all — rather than as bare content. The cost is a
+//! header per chunk; the saving is that a chunk arrives in the form it was
+//! deduplicated in, so packing a compressed set copies frames rather than
+//! inflating every one of them, and the receiving side re-encodes under its own
+//! policy instead of carrying the sender's.
+//!
+//! **The bytes are the store's, produced by the store's own encoder.** A second
+//! encoder here would be a second record format that agreed with the first until
+//! the first changed, so [`crate::storage`]'s `encode_header` writes them and its
+//! `decode_header` reads them back.
 //!
 //! ## Determinism
 //!
-//! A pack is a function of its [`crate::storage::Plan`], and a plan is ordered by
-//! the snapshot's chunk table rather than by the order chunks happened to be
+//! A pack is a function of its [`crate::storage::Plan`] **and of the stored form
+//! the chunks had in the set it was packed from**, and a plan is ordered by the
+//! snapshot's chunk table rather than by the order chunks happened to be
 //! written. So the same tree packs to the same bytes every time, which is what
 //! makes a pack nameable by the hash of its own contents: an immutable artifact a
-//! CDN can cache forever and a client can verify with one comparison.
+//! CDN can cache forever and a client can verify with one comparison. The stored
+//! form is part of that function on purpose rather than a leak of the sender's
+//! policy into the artifact: two sets holding one tree at the same compression
+//! produce the same pack, and two sets holding it at different compressions
+//! produce different packs, which is true of the sets themselves.
 //!
 //! ## The index is at the end
 //!
 //! ```text
 //! magic (4) | format version (4) | version (4) | snapshot hash (32) | chunks (varint) |
-//! payload bytes (varint)
-//! ...payloads, end to end, in plan order...
+//! payload bytes (varint) [| base flag (1) | base hash (32)]
+//! ...records, end to end, in plan order: a store record per chunk...
 //! ...snapshot: the encoded snapshot this version is, verbatim...
-//! ...index: per chunk, hash (32) | offset (varint) | length (varint)...
+//! ...index: per chunk, hash (32) | offset (varint) | record length (varint) |
+//! content length (varint)...
 //! index length (8) | snapshot length (8) | magic (4)
 //! ```
+//!
+//! `offset` is where a chunk's *record* starts and `record length` covers the
+//! header with the payload, so a range that covers a chunk covers the whole of
+//! what a client has to have to read it. `content length` is the same number
+//! after decoding, which is what a snapshot's lengths are counted in and what
+//! `put` hashes.
 //!
 //! A player fetches the last twenty bytes, learns where the index is and how long
 //! it is, fetches *that* range, and then knows every chunk's offset without having
@@ -102,29 +127,52 @@ use tokio::{
 };
 use tracing::instrument;
 
-use crate::storage::{BlobId, Plan, StorageGet, StreamReadSeeker};
+use crate::storage::{
+    BlobId, Codec, Decompressor, MAX_RECORD_HEADER, Plan, PlannedChunk, RecordKind, StorageGet,
+    StreamReadSeeker, Zstd,
+};
+
+/// Largest chunk the chunker can produce, and so the most a pack will decode into
+/// memory in one piece.
+///
+/// `ronomon::MAXIMUM_MAX`, the ceiling `ChunkerConfig::validate` enforces on
+/// `max_size`, which makes it the largest content any chunk in a set this crate
+/// wrote can have. The bound is on the *record's claim* rather than on anything
+/// measured: a pack is a file that was downloaded, and a frame that declares a
+/// terabyte would otherwise have this process allocate one to find out.
+///
+/// The largest chunk any named profile cuts is 256 KiB, which is the tighter and
+/// more usual figure; it is not the one used here, because a caller may configure
+/// a chunker with a larger `max_size` and a pack of such a set has to remain
+/// readable.
+const MAX_CHUNK: u64 = fastcdc::ronomon::MAXIMUM_MAX as u64;
 
 /// Magic at the start of a pack, and again at the very end.
 const MAGIC: [u8; 4] = *b"LPK1";
 
 /// Layout version, so a pack this build does not understand is reported as such.
 ///
-/// `4` is a pack that records the number of the version it was packed from, which
-/// `3` and the two before it did not: `3` is a pack that may name a base it is a
-/// delta against, `2` carried its snapshot and did not, and `1` did not either and
-/// has a twelve-byte trailer where these have twenty, so those two cannot be told
-/// apart by their contents and would take their index length from the wrong place.
+/// `5` is a pack whose payload region is a run of store records, one per chunk,
+/// so a chunk keeps its codec across a pack and `get` decodes rather than handing
+/// out a frame. `4` is a pack whose payload region is the chunks' content end to
+/// end with nothing between them; `3` recorded the number of the version it was
+/// packed from, which `4`'s predecessor did not; `2` carried its snapshot and
+/// did not, and `1` did not either and has a twelve-byte trailer where these have
+/// twenty, so those two cannot be told apart by their contents and would take
+/// their index length from the wrong place.
 ///
 /// **Every earlier version is refused rather than guessed at**, and the error names
 /// both — this build's number and the pack's — because a client holding a pack
 /// this build cannot read is otherwise left guessing which command produces one.
-/// That is affordable here for the same reason it was for `3`: a pack is derived
+/// That is affordable here for the same reason it was for `4`: a pack is derived
 /// output, so a pack written by an earlier build is regenerated by re-running
-/// `lepatch pack` and nothing is lost but the file. Reading a `3` as if the four
-/// bytes of version it does not have were part of the snapshot hash would not
-/// refuse anything, it would take every chunk at an offset four bytes wrong, and
-/// that is a corruption this crate's rule is "refuse rather than guess" about.
-const FORMAT_VERSION: u32 = 4;
+/// `lepatch pack` and nothing is lost but the file.
+///
+/// A `4` read as if its payloads were records would not fail at the header: the
+/// first chunk's bytes would be read as a record header and refused for a magic
+/// that is not there, so the damage is loud. It is refused by name anyway,
+/// because the alternative is a reader that works out what a file is by trying.
+const FORMAT_VERSION: u32 = 5;
 
 /// Set in the header when a base snapshot hash follows it, making this a delta.
 const BASE_FLAG: u8 = 0x01;
@@ -154,14 +202,124 @@ const TRAILER: usize = 8 + 8 + 4;
 const COUNTS_MAX: usize = 20;
 
 /// Where a chunk sits in a pack.
+///
+/// The two lengths are different numbers and are named for what they hold, which
+/// is the whole reason this type has not been left with one: with a record per
+/// chunk, the bytes a client fetches are the header and the stored payload
+/// together, and the bytes a snapshot counts and `put` hashes are the same
+/// payload after decoding. Neither is derivable from the other, and a reader that
+/// mixed them up would fetch a frame and hash it as though it were a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Located {
     /// The chunk's content hash.
     pub id: BlobId,
-    /// Byte offset of its payload, relative to [`Pack::payload_start`].
+    /// Byte offset of its record, relative to [`Pack::payload_start`].
     pub offset: u64,
-    /// Length of its payload.
+    /// Bytes the record occupies: its header and its stored payload.
+    ///
+    /// What a byte range has to cover for a client to have the chunk, so this is
+    /// what [`Pack::needed`] adds to an offset.
     pub len: u64,
+    /// Bytes of content the record's payload is once decoded.
+    ///
+    /// What a snapshot's lengths are counted in and what [`StoragePut::put`] is
+    /// told to read, so it is what a merge hands over rather than [`Located::len`].
+    ///
+    /// [`StoragePut::put`]: crate::storage::StoragePut::put
+    pub content_len: u64,
+}
+
+/// A chunk as the store holds it: its record's payload, and what that record
+/// says about it.
+///
+/// The two lengths are the pack's own [`Located::len`] and
+/// [`Located::content_len`] again, kept together because they are what one
+/// chunk's record is: a payload that occupies `bytes.len()` bytes on disk and
+/// decodes to `raw_len` of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    /// The payload exactly as it sits in the source: a frame where the record
+    /// says `Zstd`, and the content itself where it says `Raw`.
+    pub bytes: Vec<u8>,
+    /// How those bytes are stored.
+    pub codec: crate::storage::Codec,
+    /// Bytes of content they decode to, which is what the record's hash covers.
+    pub raw_len: u64,
+}
+
+/// Reading a chunk's **stored** bytes, which is what a pack is written from.
+///
+/// The mirror of [`StorageGet`], and separate from it for the reason the store's
+/// own [`StoragePut`](crate::storage::StoragePut) is: `get` answers a *reader*,
+/// who wants content and is owed a decompressed stream, and a pack is not a
+/// reader. Copying content into a pack and writing it back out as a fresh record
+/// would decode every chunk of a compressed set and re-encode every one of them,
+/// which is the work this format exists to avoid — and it would make a pack's
+/// bytes a function of the reading path rather than of what the set holds.
+///
+/// [`BlobStore`](crate::storage::BlobStore) implements it, which is the only
+/// implementation this crate ships.
+pub trait StorageStored: Send + Sync {
+    /// The blob whose contents hash to `id`, as the store holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store does not hold that blob, or if the bytes
+    /// cannot be read.
+    fn stored(&self, id: &BlobId) -> impl Future<Output = io::Result<Stored>> + Send;
+}
+
+impl<W, C> StorageStored for crate::storage::BlobStore<W, C>
+where
+    W: crate::storage::WriteMode,
+    C: crate::storage::Compressor,
+{
+    /// Read the blob's payload out of the segment it sits in, without decoding.
+    ///
+    /// Bounded to the record's stored length, so a record whose index entry is
+    /// wrong cannot pull in its neighbour, and refused outright if the segment is
+    /// shorter than the index says — the same check `get` makes, for the same
+    /// reason: a blob handed out now has to be the blob that was indexed.
+    #[instrument(skip_all, err)]
+    async fn stored(&self, id: &BlobId) -> io::Result<Stored> {
+        let placement = self.locate(id)?;
+        let path = self.segment_path(placement.segment);
+
+        let mut file = crate::storage::at_async(&path, "open", tfs::File::open(&path)).await?;
+        let len = file.metadata().await?.len();
+        let end = placement
+            .offset
+            .checked_add(placement.stored_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "a blob's range overflows")
+            })?;
+
+        if end > len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "blob at {} in segment {} needs bytes {}..{end} but that segment is \
+                     only {len} bytes long",
+                    path.display(),
+                    placement.segment,
+                    placement.offset
+                ),
+            ));
+        }
+
+        file.seek(io::SeekFrom::Start(placement.offset)).await?;
+        let mut bytes = crate::storage::zeroed(
+            placement.stored_len,
+            &format!("chunk {id} as {} stores it", path.display()),
+        )?;
+        file.read_exact(&mut bytes).await?;
+
+        Ok(Stored {
+            bytes,
+            codec: placement.codec,
+            raw_len: placement.raw_len,
+        })
+    }
 }
 
 /// A half-open byte range of a pack.
@@ -253,26 +411,35 @@ impl Pack {
     /// a `0` in the header of every pack written by a caller that forgot, and a
     /// `0` reads as a real version number to whatever reads it back.
     ///
+    /// **Each chunk is written whole, and in the stored form it has in the set.**
+    /// Whole, because a record's hash is of the chunk's entire content, so a
+    /// record holding only the part a version reads would not hash to the name it
+    /// is addressed by — and a merge hands those bytes straight to `put`, which
+    /// checks that hash. In its stored form, because a pack that decoded every
+    /// chunk on the way out and re-encoded it on the way in would be doing the
+    /// expensive half of the transfer twice over, and would make the artifact's
+    /// bytes depend on the reading path rather than on the set.
+    ///
     /// The header comes first and its counts are the plan's — `plan.len()` chunks
-    /// and `plan.total_bytes()` bytes — while the walk accumulates the same
-    /// totals to build the index, saturating, so the two agree by construction.
+    /// and, for the payload, the sum of the records the plan's placements describe
+    /// — so the header is written before a byte of payload and both agree by
+    /// construction. Every one of those terms is checked against what the store
+    /// actually yields as each chunk is written, so a set that changed underneath
+    /// the run is refused rather than written into a pack whose own counts are
+    /// wrong.
     ///
     /// The snapshot is written as `plan`'s own description of the version, so a
     /// pack *is* the version rather than a reference to it: the hash in the header
-    /// is over exactly the bytes that follow the payloads.
-    ///
-    /// Only the used prefix of each chunk is read: a chunk spanning a file
-    /// boundary is stored whole but used in part.
+    /// is over exactly the bytes that follow the records.
     ///
     /// # Errors
     ///
     /// Returns an error if the snapshot cannot be recorded on this platform, if
-    /// the store cannot yield a chunk the plan names, or if the file cannot be
-    /// written. A store that yields fewer bytes than the plan says is a short
-    /// read, which is an error here rather than a hole in the payload.
+    /// the store cannot yield a chunk the plan names, if what it yields is not
+    /// the stored form the plan resolved, or if the file cannot be written.
     ///
-    /// Generic over [`StorageGet`] because that is the whole of what it needs, and
-    /// because every sibling command already is. It was bound to a concrete
+    /// Generic over [`StorageStored`] because that is the whole of what it needs:
+    /// the bytes and the codec byte beside them. It was bound to a concrete
     /// `&BlobStore<Read>`, which meant `lepatch pack` was the one command that
     /// could not be pointed at any other backend — a read-only store over a
     /// directory, say, or a store held in memory. A pack is derived output, so
@@ -285,7 +452,7 @@ impl Pack {
         path: &Path,
     ) -> io::Result<Self>
     where
-        S: StorageGet + ?Sized,
+        S: StorageStored + ?Sized,
     {
         Self::write_from(store, plan, snapshot, version, None, path).await
     }
@@ -318,7 +485,7 @@ impl Pack {
         path: &Path,
     ) -> io::Result<Self>
     where
-        S: StorageGet + ?Sized,
+        S: StorageStored + ?Sized,
     {
         Self::write_from(store, plan, snapshot, version, Some(base), path).await
     }
@@ -333,7 +500,7 @@ impl Pack {
         path: &Path,
     ) -> io::Result<Self>
     where
-        S: StorageGet + ?Sized,
+        S: StorageStored + ?Sized,
     {
         // Only fails where a path in the snapshot cannot be represented on this
         // platform, which on unix cannot happen. Invalid input rather than damaged
@@ -347,7 +514,7 @@ impl Pack {
         let snapshot_id = blake3::hash(&snapshot_bytes);
 
         let planned_count = u64::try_from(plan.len()).unwrap_or(0);
-        let planned_bytes = plan.total_bytes();
+        let planned_bytes = planned_payload_len(plan);
 
         let mut chunks = Vec::with_capacity(plan.len());
         let mut offset = 0u64;
@@ -367,43 +534,14 @@ impl Pack {
         file.write_all(&header).await?;
 
         for planned in plan.chunks() {
-            // A length that has to be exact, so a conversion that cannot be
-            // represented is an error rather than a zero.
-            //
-            // `unwrap_or(0)` here was the sanctioned way to satisfy `unwrap_used`
-            // and it is the shape the audit called a semantic bug factory: a
-            // zero-length buffer, `read_exact` into it succeeding trivially, and
-            // then `Located::len` recording `planned.length` anyway — so the pack
-            // would be short by every chunk, the index would claim otherwise, and
-            // `lepatch pack` would exit 0 having printed a checksum. `u32` into
-            // `usize` cannot actually fail on any supported target, which is
-            // exactly why the fallback was never going to be noticed.
-            let length = usize::try_from(planned.length).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "chunk {} claims {} bytes, which this platform cannot address",
-                        planned.id, planned.length
-                    ),
-                )
-            })?;
-            let mut buffer = vec![0u8; length];
+            let mut located = write_record(&mut file, store, planned).await?;
+            located.offset = offset;
 
-            let mut reader = store.get(&planned.id).await?;
-            reader.read_exact(&mut buffer).await?;
-
-            file.write_all(&buffer).await?;
-
-            chunks.push(Located {
-                id: planned.id,
-                offset,
-                len: planned.length,
-            });
-
-            // Saturating, to match `Plan::total_bytes`: the header reports one
-            // total and the index is built on the other, and a plain `+=` would
-            // panic where that would have clamped.
-            offset = offset.saturating_add(planned.length);
+            // Saturating, to match the count the header carries: the header
+            // reports one total and the index is built on the other, and a plain
+            // `+=` would panic where both would have clamped.
+            offset = offset.saturating_add(located.len);
+            chunks.push(located);
         }
 
         // Between the payloads and the index, so `index length` alone still
@@ -435,7 +573,6 @@ impl Pack {
             chunks,
         })
     }
-
     /// Open a pack, reading only its trailer and index.
     ///
     /// Cost is proportional to the index and not to the payload, which is the
@@ -767,8 +904,9 @@ impl Pack {
     ///
     /// Stated as what the client lacks: holding every chunk gets nothing, holding
     /// nothing gets the whole payload region as one range. Adjacent ranges are
-    /// merged, which the no-framing layout is what makes worthwhile — chunks a
-    /// client needs are contiguous, so the merged count is small.
+    /// merged, which the payload's layout is what makes worthwhile — chunks a
+    /// client needs are written end to end, so a run of them is one range, and the
+    /// record header between two of them is inside the run rather than across it.
     ///
     /// A set rather than anything ordered, because the set is only ever asked
     /// whether it holds a chunk. The order of the result comes from the order of
@@ -817,6 +955,115 @@ impl Pack {
     }
 }
 
+/// Bytes the records for `plan` will occupy, before a byte of them is read.
+///
+/// Every term comes from the plan's own placement, which the caller resolved
+/// against the store being packed: a record's width is decided by the two lengths
+/// it carries, and those are known from the store's index without reading a
+/// payload. That is what lets the header be written first and still carry the
+/// right total, and it is why the writer checks what it is given against the same
+/// numbers rather than trusting that they still hold.
+///
+/// Saturating throughout, because the header's count and the index built beside
+/// it are both sums of claims.
+fn planned_payload_len(plan: &Plan) -> u64 {
+    plan.chunks().iter().fold(0u64, |total, planned| {
+        total
+            .saturating_add(crate::storage::header_len(
+                planned.placement.stored_len,
+                planned.placement.raw_len,
+            ))
+            .saturating_add(planned.placement.stored_len)
+    })
+}
+
+/// Write one chunk's record and say where it landed.
+///
+/// The offset is left at zero for the caller to fill in, because it is the sum of
+/// every record before this one and this function does not know them.
+///
+/// # Errors
+///
+/// Returns an error if the store cannot yield the chunk, if what it yields is not
+/// the stored form the plan resolved — which is a set that changed while the pack
+/// was being written — or if the file cannot be written.
+async fn write_record<S>(
+    file: &mut tfs::File,
+    store: &S,
+    planned: &PlannedChunk,
+) -> io::Result<Located>
+where
+    S: StorageStored + ?Sized,
+{
+    let stored = store.stored(&planned.id).await?;
+    let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
+
+    // Checked rather than assumed, because the header's payload length was worked
+    // out from the plan's placements and this is the only place the store gets to
+    // disagree with them. It can: a set is appended to while a pack of it is
+    // written, and a store that moved under the run would otherwise produce a
+    // pack whose header contradicts its own records — which `open` refuses, naming
+    // a count, long after the run that caused it had exited successfully.
+    let placement = planned.placement;
+    if stored.codec != placement.codec
+        || stored_len != placement.stored_len
+        || stored.raw_len != placement.raw_len
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "chunk {} is stored as {} bytes of {} decoding to {} here, but the plan \
+             resolved it as {} bytes of {} decoding to {}; the set changed while this \
+             pack was being written",
+                planned.id,
+                stored_len,
+                name_of(stored.codec),
+                stored.raw_len,
+                placement.stored_len,
+                name_of(placement.codec),
+                placement.raw_len,
+            ),
+        ));
+    }
+
+    // The store's own encoder, so these bytes are what a store record would be.
+    // Hand-rolling the header here would make the pack a second record format
+    // that agreed with the first until the first moved.
+    let mut record = Vec::with_capacity(
+        usize::try_from(crate::storage::header_len(stored_len, stored.raw_len)).unwrap_or(0),
+    );
+    crate::storage::encode_header(
+        &mut record,
+        crate::storage::RecordKind::Blob,
+        stored.codec,
+        planned.id.as_bytes(),
+        stored_len,
+        stored.raw_len,
+    );
+
+    file.write_all(&record).await?;
+    file.write_all(&stored.bytes).await?;
+
+    Ok(Located {
+        id: planned.id,
+        offset: 0,
+        len: u64::try_from(record.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(stored_len),
+        content_len: stored.raw_len,
+    })
+}
+
+/// How a codec is named in a message about two of them disagreeing.
+///
+/// Spelled out rather than derived, because `{:?}` would print a variant name that
+/// means nothing to anybody reading an error about a file they downloaded.
+const fn name_of(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Raw => "raw content",
+        Codec::Zstd => "a zstd frame",
+    }
+}
 impl AsRef<[Located]> for Pack {
     fn as_ref(&self) -> &[Located] {
         &self.chunks
@@ -912,11 +1159,12 @@ struct Header {
 
 /// The index: one entry per chunk, in pack order.
 fn encode_index(chunks: &[Located]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * (32 + 18));
+    let mut out = Vec::with_capacity(chunks.len() * (32 + 24));
     for chunk in chunks {
         out.extend_from_slice(chunk.id.as_bytes());
         write_varint(&mut out, chunk.offset);
         write_varint(&mut out, chunk.len);
+        write_varint(&mut out, chunk.content_len);
     }
 
     out
@@ -926,9 +1174,9 @@ fn encode_index(chunks: &[Located]) -> Vec<u8> {
 ///
 /// # Errors
 ///
-/// Returns an error if a 32-byte hash or either varint runs past the end of
-/// `bytes`, if a number is overlong or overflows, or if a hash is repeated —
-/// which would mean two chunks at one offset.
+/// Returns an error if a 32-byte hash or any of the three varints runs past the
+/// end of `bytes`, if a number is overlong or overflows, or if a hash is
+/// repeated — which would mean two chunks at one offset.
 fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -949,6 +1197,8 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
         at = at.checked_add(used).ok_or_else(truncated)?;
         let (len, used) = read_varint(bytes, at)?;
         at = at.checked_add(used).ok_or_else(truncated)?;
+        let (content_len, used) = read_varint(bytes, at)?;
+        at = at.checked_add(used).ok_or_else(truncated)?;
 
         // Two entries for one hash would mean the same chunk at two places, and
         // `locate` answers with the first — so a client asking for a chunk it
@@ -960,7 +1210,12 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
             ));
         }
 
-        out.push(Located { id, offset, len });
+        out.push(Located {
+            id,
+            offset,
+            len,
+            content_len,
+        });
     }
 
     Ok(out)
@@ -1060,23 +1315,38 @@ impl Pack {
 impl StorageGet for Pack {
     /// Open the chunk with this content hash, out of the payload region.
     ///
-    /// The stream yields the chunk's bytes and is bounded to them, so a caller
-    /// comparing against a length the snapshot recorded is comparing like with
-    /// like, and one that reads past the end gets end of stream rather than the
-    /// next chunk's data. It is seekable within those bytes, which is what a
-    /// chunk that a file uses only part of needs — `restore` seeks to the slice's
-    /// offset within the chunk before reading.
+    /// The stream yields the chunk's **content**, decoded if its record is a zstd
+    /// frame, and is bounded to that content — so a caller comparing against a
+    /// length the snapshot recorded is comparing like with like, and one that
+    /// reads past the end gets end of stream rather than the next chunk's data.
+    /// It is seekable within those bytes, which is what a chunk that a file uses
+    /// only part of needs — `restore` seeks to the slice's offset within the chunk
+    /// before reading.
     ///
-    /// Bounded with the same [`SliceAsyncReader`](crate::slice::SliceAsyncReader)
-    /// a slice of a store blob uses, rather than by computing a length and trusting
-    /// it: a `Range` handed out by [`Pack::needed`] covers whole chunks by
-    /// construction, but a pack is a file that was downloaded and the bytes at an
-    /// offset it claims are not this crate's to vouch for.
+    /// **The record's own header is read first, and it is what says how the
+    /// payload is stored.** Nothing in the index duplicates the codec: a pack is a
+    /// file that was downloaded, and a byte at an offset it claims is not this
+    /// crate's to believe. The header is decoded by the store's own decoder, so a
+    /// header whose eight-byte check does not verify stops the chunk here rather
+    /// than being read as content.
+    ///
+    /// A compressed chunk is buffered whole and served from memory, which is the
+    /// same trade the store's read path makes and for the same reason: a frame
+    /// cannot seek backwards, and every consumer of a [`StorageGet`] stream seeks.
+    /// The buffer is one chunk — bounded by [`MAX_CHUNK`], which is the largest
+    /// the chunker can produce — and never the pack.
+    ///
+    /// A raw chunk is streamed straight out of the file, bounded to its content
+    /// length, because there is nothing to decode and a file handle costs nothing
+    /// to keep.
     ///
     /// # Errors
     ///
-    /// Returns an error if the pack does not hold that chunk, or if the file cannot
-    /// be opened or seeked. The stream itself carries any read failure.
+    /// Returns an error if the pack does not hold that chunk, if its record's
+    /// header does not decode or does not agree with the index about the chunk or
+    /// its lengths, if a frame does not decode to the length its record claims, or
+    /// if the file cannot be opened, seeked or read. The stream itself carries any
+    /// later read failure.
     #[instrument(skip_all, err)]
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
         let located = self.locate(id).ok_or_else(|| {
@@ -1095,10 +1365,96 @@ impl StorageGet for Pack {
         let start = self.payload_start.saturating_add(located.offset);
         file.seek(io::SeekFrom::Start(start)).await?;
 
-        Ok(Box::new(crate::slice::SliceAsyncReader::new(
-            file,
-            located.len,
-        )))
+        // The header is variable width, so it is read rather than stepped over, and
+        // bounded by the record's own length: a chunk whose index entry claims
+        // fewer bytes than a header cannot be read as one, and reading past it
+        // would pull in the next chunk's bytes.
+        let head_len = located
+            .len
+            .min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
+        let mut head = crate::storage::zeroed(
+            head_len,
+            &format!(
+                "the record header of chunk {id} in {}",
+                self.path().display()
+            ),
+        )?;
+        file.read_exact(&mut head).await?;
+
+        let Some(header) = crate::storage::decode_header(&head, 0) else {
+            return Err(not_a_pack(
+                self.path(),
+                &format!(
+                    "the record it holds for chunk {id} does not begin with a record header: \
+                     its magic, kind, codec or its own check do not verify"
+                ),
+            ));
+        };
+
+        // The index and the record are two claims about the same bytes, so they
+        // are checked against each other: `needed` hands a client the index's
+        // extent, and a client that fetched it has to have got a whole record.
+        let total = header.total_len.saturating_add(header.stored_len);
+        if header.kind != RecordKind::Blob
+            || BlobId::from_bytes(header.hash) != *id
+            || total != located.len
+            || header.raw_len != located.content_len
+        {
+            return Err(not_a_pack(
+                self.path(),
+                &format!(
+                    "the record it holds for chunk {id} is not the one its index names: the \
+                     record is {total} bytes of {} content stored as {:?}, and the index says \
+                     {} bytes of {}",
+                    header.raw_len, header.codec, located.len, located.content_len,
+                ),
+            ));
+        }
+
+        match header.codec {
+            Codec::Raw => {
+                // Seeked rather than left where the header read finished it: the
+                // buffer holds the widest header a record can have, so where it
+                // ended is not necessarily where this record's payload starts.
+                file.seek(io::SeekFrom::Start(start + header.total_len))
+                    .await?;
+                Ok(Box::new(crate::slice::SliceAsyncReader::new(
+                    file,
+                    header.raw_len,
+                )))
+            }
+            Codec::Zstd => {
+                if header.raw_len > MAX_CHUNK {
+                    return Err(not_a_pack(
+                        self.path(),
+                        &format!(
+                            "chunk {id} claims {} bytes of content, which is more than the \
+                             largest chunk this crate's chunker produces ({MAX_CHUNK})",
+                            header.raw_len
+                        ),
+                    ));
+                }
+
+                file.seek(io::SeekFrom::Start(start + header.total_len))
+                    .await?;
+                let mut frame = crate::storage::zeroed(
+                    header.stored_len,
+                    &format!("the compressed frame of chunk {id}"),
+                )?;
+                file.read_exact(&mut frame).await?;
+
+                // Through [`Zstd`] rather than through `DecompressReader::new`, so
+                // there is one implementation of "what a zstd frame means and what
+                // it must produce" rather than two that can disagree. This is the
+                // match on the codec byte: a read is answered by the record, not by
+                // whatever policy wrote it.
+                let bytes = Decompressor::decompress(&Zstd, frame, header.raw_len).await?;
+
+                Ok(Box::new(crate::slice::DecompressReader::from_decoded(
+                    bytes,
+                )))
+            }
+        }
     }
 }
 
@@ -1110,13 +1466,16 @@ impl StorageGet for Pack {
 /// combines them, `payload_start + offset + len`, would then overflow rather
 /// than fail. Both `needed` and `chunks_covering` do exactly that arithmetic, and
 /// `Range` is the type they hand the answer to, so it is checked here that every
-/// later consumer can add those numbers without re-deriving whether they hold.
+/// later consumer can add those numbers without re-deriving whether they hold. A
+/// length too short to be a record is refused here as well, because `get` reads a
+/// record's header out of exactly these bytes.
 ///
 /// # Errors
 ///
 /// Returns an error naming the chunk that does not fit, and why: either its two
 /// numbers cannot be added at all, or they describe a position past the end of
-/// the payload.
+/// the payload, or they describe a span too short to hold the record header the
+/// chunk is supposed to begin with.
 fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io::Result<()> {
     for chunk in chunks {
         let end = chunk.offset.checked_add(chunk.len).ok_or_else(|| {
@@ -1136,6 +1495,23 @@ fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io
                     "its index places a chunk at {} for {} bytes, past the {payload_len}-byte \
                      payload",
                     chunk.offset, chunk.len
+                ),
+            ));
+        }
+
+        // The other end of the same question: a record cannot be shorter than its
+        // own header, so an index entry covering a handful of bytes names
+        // something that is not a record. `get` would refuse that a chunk at a
+        // time; refusing the pack says it once, before anything is served.
+        if chunk.len < u64::try_from(crate::storage::MIN_RECORD_HEADER).unwrap_or(u64::MAX) {
+            return Err(not_a_pack(
+                path,
+                &format!(
+                    "its index places a chunk at {} for {} bytes, which is less than the {} \
+                     bytes a record header occupies",
+                    chunk.offset,
+                    chunk.len,
+                    crate::storage::MIN_RECORD_HEADER
                 ),
             ));
         }

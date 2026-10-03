@@ -202,10 +202,10 @@ pub struct MergePlan {
     pub fresh: u64,
     /// Bytes of chunk content that would be stored.
     ///
-    /// Content, before compression: a pack's payloads are the chunk bytes as
-    /// they were hashed, so this is what goes in, and how large the records come
-    /// out depends on the set's compression policy, which is chosen when the
-    /// store is opened.
+    /// Content, before compression: a pack hands `put` the chunk's bytes as they
+    /// were hashed, so this is what goes in, and how large the records come out
+    /// depends on the set's compression policy, which is chosen when the store is
+    /// opened.
     pub bytes: u64,
 }
 
@@ -295,13 +295,18 @@ pub async fn merge<C: storage::Compressor>(
         // given against the name that chunk is addressed by, so a prefix would
         // be refused for the very reason the check exists.
         //
+        // The length handed over is the chunk's *content* length, which is not
+        // the length of the pack's record: that one covers the header and, for a
+        // chunk the set held compressed, a frame. `get` decodes, so what comes
+        // back is content and content is what `put` hashes.
+        //
         // The error is wrapped because `put`'s own is a statement about a record
         // and a person reading it has no way to know it came from merging a pack
         // — or that the bytes are the pack's rather than the set's. A damaged
         // pack is the likeliest cause by a long way, and saying so is what tells
         // them to go and look at the file they downloaded.
         store
-            .put(&chunk.id, pack.get(&chunk.id).await?, located.len)
+            .put(&chunk.id, pack.get(&chunk.id).await?, located.content_len)
             .await
             .map_err(|e| {
                 io::Error::new(
@@ -311,7 +316,7 @@ pub async fn merge<C: storage::Compressor>(
             })?;
 
         merged.fresh = merged.fresh.saturating_add(1);
-        merged.bytes = merged.bytes.saturating_add(located.len);
+        merged.bytes = merged.bytes.saturating_add(located.content_len);
     }
 
     // The snapshot is a blob like any other — addressed by the hash of its own
@@ -411,10 +416,10 @@ pub async fn merge_plan<C: storage::Compressor>(
 
         // The check `put` would make, made here instead: this run is not writing,
         // so this is the only thing that can refuse a damaged pack.
-        check_chunk(pack, &chunk.id, located.len).await?;
+        check_chunk(pack, &chunk.id, located.content_len).await?;
 
         merged.fresh = merged.fresh.saturating_add(1);
-        merged.bytes = merged.bytes.saturating_add(located.len);
+        merged.bytes = merged.bytes.saturating_add(located.content_len);
     }
 
     Ok(Planned::Merge(merged))
@@ -577,13 +582,17 @@ fn plan_against<W: storage::WriteMode, C: storage::Compressor>(
 /// A small fiction, and the only place this command bends the store's types: a
 /// [`Placement`] names a segment and an offset because a *store* is several
 /// files, and a pack is one, so every placement in a plan built against a pack
-/// names segment 0 and a file offset. Nothing ever seeks with it — a plan reads
-/// `raw_len`, and the caller goes back to [`Pack::get`] for the bytes — so the
-/// only field that has to be true is the length, and it is.
+/// names segment 0 and a file offset. The `offset` is where the chunk's *record*
+/// starts rather than where its payload does, and `stored_len` covers the header
+/// with the payload, because nothing seeks with it: a plan reads `raw_len`, which
+/// is the one number that has to be right, and the caller goes back to
+/// [`Pack::get`] for the bytes.
 ///
-/// The codec is `Raw` because a pack holds the chunk bytes as they were hashed.
-/// Nothing decodes this placement, and a reader that did would be wrong to
-/// inflate it.
+/// The codec is `Raw`, and it is the one field here that is not a fact about the
+/// bytes: a plan never decodes a placement, and the bytes themselves arrive
+/// through [`Pack::get`], which reads the codec out of the record itself rather
+/// than from here. Naming a codec in an index that is not read to decode anything
+/// would be a second claim to keep in step with the record's own.
 fn in_pack(pack: &Pack, id: &BlobId) -> Option<Placement> {
     let located = pack.locate(id)?;
 
@@ -591,7 +600,7 @@ fn in_pack(pack: &Pack, id: &BlobId) -> Option<Placement> {
         segment: 0,
         offset: pack.payload_start().saturating_add(located.offset),
         stored_len: located.len,
-        raw_len: located.len,
+        raw_len: located.content_len,
         codec: Codec::Raw,
     })
 }
