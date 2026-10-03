@@ -400,8 +400,21 @@ pub struct Pack {
     snapshot_start: u64,
     /// How many bytes of snapshot the pack carries.
     snapshot_len: u64,
-    /// Every chunk, in pack order.
+    /// Every chunk, in hash order.
     chunks: Vec<Located>,
+    /// Where each chunk sits in `chunks`, in payload order.
+    ///
+    /// The index is held in hash order because that is what [`Pack::locate`]
+    /// binary-searches, and hash order is not payload order — so every question
+    /// about byte ranges has to get from one to the other, and this is the map it
+    /// does it with. Positions rather than a second copy of the entries, because
+    /// the entries are 32 bytes of hash and two numbers each and duplicating them
+    /// to answer a question about offsets would cost more than the index itself.
+    ///
+    /// Built once, where the offsets are already known: a pack written records
+    /// are appended in, and a pack read is checked for tiling by walking them in
+    /// offset order, which produces exactly this. Nothing downstream sorts.
+    order: Vec<usize>,
 }
 
 impl Pack {
@@ -579,6 +592,13 @@ impl Pack {
         // same value, which is a thing callers compare.
         chunks.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
 
+        // `order` is the way back, and it is built from the sort rather than
+        // from the appends before it: it holds positions into `chunks`, which the
+        // sort has just moved. The same two lines run in `open`, so a pack read
+        // back has the same `order` as the one that was written.
+        let mut order: Vec<usize> = (0..chunks.len()).collect();
+        order.sort_unstable_by_key(|at| chunks[*at].offset);
+
         Ok(Self {
             path: path.to_path_buf(),
             payload_start,
@@ -589,6 +609,7 @@ impl Pack {
             snapshot_start,
             snapshot_len: u64::try_from(snapshot_bytes.len()).unwrap_or(0),
             chunks,
+            order,
         })
     }
     /// Open a pack, reading only its trailer and index.
@@ -736,7 +757,7 @@ impl Pack {
             ));
         }
 
-        check_index_geometry(path, &chunks, payload_len)?;
+        let order = check_index_geometry(path, &chunks, payload_len)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -748,6 +769,7 @@ impl Pack {
             snapshot_start,
             snapshot_len,
             chunks,
+            order,
         })
     }
 
@@ -941,14 +963,12 @@ impl Pack {
     /// checks and
     /// this crate's writer is what makes true.
     ///
-    /// **And so the entries are sorted by offset first, every call.** The index is
-    /// held in hash order — that is what [`Pack::locate`] binary-searches — and
-    /// hash order is not payload order, so a merge that ran along the index would
-    /// find two ranges meeting nowhere and answer with one range per chunk, which
-    /// is the entire cost a pack exists to remove. The sort is per call, over the
-    /// entries this call collected; the index itself is untouched, and it was
-    /// resident in full before this, so nothing here is a second copy of it that
-    /// outlives the answer.
+    /// **And so the entries are walked in payload order.** The index is held in
+    /// hash order — that is what [`Pack::locate`] binary-searches — and hash
+    /// order is not payload order, so a merge that ran along the index would find
+    /// two ranges meeting nowhere and answer with one range per chunk, which is
+    /// the entire cost a pack exists to remove. The order to walk is
+    /// [`Pack::order`], which was built when the pack was opened or written.
     ///
     /// A set rather than anything ordered, because the set is only ever asked
     /// whether it holds a chunk. The order of the result comes from the order of
@@ -981,26 +1001,21 @@ impl Pack {
 
     /// Every record in payload order, with the byte range it occupies.
     ///
-    /// Sorting here rather than in the index is what lets the index be sorted for
-    /// the reason it is sorted — to be searched by hash — without every question
-    /// about ranges having to sort the whole of it again. Two callers walk every
-    /// record and each pays this once; the third, which asks about one record at a
-    /// time, goes through [`Pack::after`] instead.
-    fn records(&self) -> Vec<(Located, u64)> {
-        let mut ordered: Vec<&Located> = self.chunks.iter().collect();
-        ordered.sort_unstable_by_key(|chunk| chunk.offset);
-
-        let mut out: Vec<(Located, u64)> = Vec::with_capacity(ordered.len());
-        for at in 0..ordered.len() {
+    /// Over [`Pack::order`] rather than over the index, which is in hash order:
+    /// the entries are the same ones either way and only the order differs, so
+    /// nothing here copies an entry to walk it. Nothing is collected either — the
+    /// two callers walk every record once between them, and the third, which asks
+    /// about one record at a time, goes through [`Pack::after`].
+    fn records(&self) -> impl Iterator<Item = (Located, u64)> + '_ {
+        self.order.iter().enumerate().map(|(at, chunk)| {
             // The next record's start, which for the last one is the payload's end.
-            let end = ordered
+            let end = self
+                .order
                 .get(at + 1)
-                .map_or(self.payload_len, |next| next.offset);
+                .map_or(self.payload_len, |next| self.chunks[*next].offset);
 
-            out.push((*ordered[at], self.payload_start.saturating_add(end)));
-        }
-
-        out
+            (self.chunks[*chunk], self.payload_start.saturating_add(end))
+        })
     }
 
     /// Bytes a client already holding `have` still needs.
@@ -1054,11 +1069,13 @@ impl Pack {
     /// overlap, so a record runs to the record after it and the last one runs to
     /// the end of the payload.
     ///
-    /// A linear search, where [`Pack::needed`] sorts instead: this is one chunk's
-    /// successor and there is one call per chunk read, so it is `O(n)` for the
-    /// read — the same order as the linear scan it replaces — rather than a sort
-    /// per read. The callers that touch every entry pay one sort between them and
-    /// answer from it, which is why there are two shapes rather than one.
+    /// A binary search over [`Pack::order`], which is the shape [`Pack::records`]
+    /// walks: both ask the same question of the same list, and there is one list
+    /// because it was built when the pack was opened. It used to be a linear scan
+    /// for the smallest offset above this one, on the argument that it is one call
+    /// per chunk read and so `O(n)` overall — which is true of a scan and false of
+    /// a restore, where the chunks of a whole version are read one after another
+    /// and every one of them paid the whole index again.
     ///
     /// The last case is where an over-claim rather than a short answer comes from:
     /// a writer that left a gap before the snapshot would have the last record's
@@ -1066,12 +1083,13 @@ impl Pack {
     /// need. Under-claiming would be the other way round and cannot happen, which
     /// is the direction worth being wrong in.
     fn after(&self, offset: u64) -> u64 {
-        self.chunks
-            .iter()
-            .map(|chunk| chunk.offset)
-            .filter(|start| *start > offset)
-            .min()
-            .unwrap_or(self.payload_len)
+        let next = self
+            .order
+            .partition_point(|at| self.chunks[*at].offset <= offset);
+
+        self.order
+            .get(next)
+            .map_or(self.payload_len, |at| self.chunks[*at].offset)
     }
 
     /// The bytes the record at `offset` occupies.
@@ -1600,7 +1618,7 @@ impl StorageGet for Pack {
 }
 
 /// Check that the records the index names are inside the payload and do not
-/// overlap.
+/// overlap, and say in what order they sit.
 ///
 /// The index is a claim about where each chunk sits, and `open` checks only the
 /// payload's *extent*. What the index no longer carries is each record's length —
@@ -1619,22 +1637,33 @@ impl StorageGet for Pack {
 /// taken as the payload's, which over-claims rather than under-claims if a writer
 /// left a gap.
 ///
+/// The walk is in offset order because that is the order the question is about,
+/// and the order it produces is [`Pack::order`] rather than something thrown
+/// away: this is the one place a pack is already paying to know it. A sort every
+/// later caller would otherwise repeat — and `after` repeated per chunk read, in
+/// linear time, which is `O(n²)` over a restore.
+///
 /// # Errors
 ///
 /// Returns an error naming the offset that does not fit and why.
-fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io::Result<()> {
+fn check_index_geometry(
+    path: &Path,
+    chunks: &[Located],
+    payload_len: u64,
+) -> io::Result<Vec<usize>> {
     let min_header = u64::try_from(crate::storage::MIN_RECORD_HEADER).unwrap_or(u64::MAX);
 
     // Sorted by offset, not walked in index order: what has to hold is a fact
     // about the payload, and the order the index happens to keep its entries in
     // is the index's own business.
-    let mut placed: Vec<&Located> = chunks.iter().collect();
-    placed.sort_unstable_by_key(|chunk| chunk.offset);
+    let mut order: Vec<usize> = (0..chunks.len()).collect();
+    order.sort_unstable_by_key(|at| chunks[*at].offset);
 
     // Where the record before this one has to have ended, at the least.
     let mut earliest = 0u64;
 
-    for chunk in placed {
+    for at in &order {
+        let chunk = &chunks[*at];
         if chunk.offset < earliest {
             return Err(not_a_pack(
                 path,
@@ -1675,7 +1704,7 @@ fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io
         ));
     }
 
-    Ok(())
+    Ok(order)
 }
 
 /// The hash of a pack's contents, for naming it.

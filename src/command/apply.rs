@@ -213,8 +213,15 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     establish_base(root, pack, &snapshot, &mut established)?;
 
     let probed = super::probe::probe_skipping(root, &snapshot, pack.clone(), &established).await?;
-    let fetched = pack.needed_bytes(&probed.held);
-    let ranges = pack.needed(&probed.held).len();
+
+    // One walk of the records, two figures from it. Asked separately it was two
+    // walks of every record, which is the whole index twice over for a pair of
+    // numbers describing the same ranges.
+    let needed = pack.needed(&probed.held);
+    let fetched = needed
+        .iter()
+        .fold(0u64, |total, range| total.saturating_add(range.len()));
+    let ranges = needed.len();
 
     // Before the first byte. See the module docs: a damaged pack would otherwise
     // be written over a correct directory, because a probe against a damaged pack
