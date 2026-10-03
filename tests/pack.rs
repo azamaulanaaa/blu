@@ -330,6 +330,17 @@ async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
         .all(|pair| pair[0].id.as_bytes() <= pair[1].id.as_bytes());
     assert!(by_hash, "the index should be held in hash order");
 
+    // The three ways a caller reads an index without naming the field: the slice
+    // the pack dereferences to, an iterator over the pack by reference, and the
+    // pack by value. They exist because a pack is a collection and callers should
+    // not have to know that, and they say nothing the `chunks()` calls above do
+    // not — which is why they are asserted here, in the one place that already
+    // knows what a pack holds, rather than in three.
+    let as_slice: &[lepatch::pack::Located] = pack.as_ref();
+    assert_eq!(as_slice.len(), pack.len());
+    assert_eq!(pack.clone().into_iter().count(), pack.len());
+    assert_eq!(pack.iter().count(), pack.len());
+
     // And that order is *not* the payload's, which is the reason `needed` cannot
     // walk the index and merge ranges as it goes.
     let by_payload = pack
@@ -579,21 +590,31 @@ async fn writing_a_version_twice_produces_the_same_bytes() {
     assert_eq!(fs::read(a.path()).unwrap(), fs::read(b.path()).unwrap());
 }
 
-/// A store that hands a pack one byte more than the plan resolved.
+/// A store that hands one named chunk a byte more than the plan resolved.
 ///
 /// The set the pack was planned against moving underneath the run, which is the
 /// only thing that can make the store disagree with the plan: a set is appended
 /// to while a pack of it is written, and a record's header carries a count worked
 /// out before the run began.
-struct GrowsByOne<S>(S);
+///
+/// One chunk rather than every chunk, and named rather than the first one the
+/// writer reaches, because the refusal says which form the store yielded and in
+/// which form the plan had it — so the chunk that disagrees is chosen to be a
+/// frame, and a refusal that never mentions one would pin half the sentence.
+struct GrowsByOne<S> {
+    store: S,
+    chunk: lepatch::storage::BlobId,
+}
 
 impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOne<S> {
     async fn stored(
         &self,
         id: &lepatch::storage::BlobId,
     ) -> std::io::Result<lepatch::pack::Stored> {
-        let mut stored = self.0.stored(id).await?;
-        stored.bytes.push(0);
+        let mut stored = self.store.stored(id).await?;
+        if id == &self.chunk {
+            stored.bytes.push(0);
+        }
         Ok(stored)
     }
 }
@@ -606,7 +627,30 @@ impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOn
 /// is a count of records that have not been written yet.
 #[tokio::test]
 async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
-    let built = build(4, 60_000).await;
+    // Its own tree rather than `build`'s: the disagreement below is reported in
+    // both codecs' words, and `noisy` is incompressible by construction, so every
+    // record of a set built from it is raw and half of that sentence would never
+    // be written.
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    for i in 0..4 {
+        fs::write(
+            source.join(format!("c{i}.bin")),
+            common::untagged_stream(u8::try_from(i).unwrap(), 90_000 + i * 10_000),
+        )
+        .unwrap();
+    }
+    let blob = dir.path().join("store");
+    common::run_backup_compressed(&source, &blob, lepatch::storage::Compression::zstd(1)).await;
+
+    let plan = plan_of(&blob).await;
+    let built = Built {
+        dir,
+        blob,
+        plan,
+        version: 1,
+    };
+
     let out = built.dir.path().join("out");
     fs::create_dir_all(&out).unwrap();
     let path = out.join("photos.lpk");
@@ -620,8 +664,20 @@ async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
 
     let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let snapshot = snapshot_of(&built.blob).await;
+    let frame = built
+        .plan
+        .iter()
+        .find(|chunk| chunk.placement.codec == Codec::Zstd)
+        .expect(
+            "the fixture should hold at least one frame, or the refusal below is half a \
+                 sentence",
+        )
+        .id;
     let refused = Pack::write(
-        &GrowsByOne(store),
+        &GrowsByOne {
+            store,
+            chunk: frame,
+        },
         &built.plan,
         &snapshot,
         built.version,
@@ -635,6 +691,10 @@ async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
             .to_string()
             .contains("the set changed while this pack"),
         "a store that disagrees with the plan must be refused by name, and not: {refused}"
+    );
+    assert!(
+        refused.to_string().contains("a zstd frame"),
+        "and it should name the form the store yielded, which is a frame here: {refused}"
     );
     assert_eq!(
         fs::read(&path).unwrap(),
@@ -1249,6 +1309,20 @@ async fn a_damaged_index_is_refused() {
     assert!(
         Pack::open(&path).is_err(),
         "an index ending mid-number was accepted"
+    );
+
+    // An index whose last number starts at the very end of it, which is the
+    // other way a number can run out — the one above shortens a number rather
+    // than removing all of it, and a reader gets far enough along either way.
+    // Left as a continuation bit so the number *starts* and cannot finish.
+    let mut ends_mid = good.clone();
+    ends_mid[sections.index_start + index_len - 1] = 0x80;
+    let path = built.dir.path().join("ends-mid.pack");
+    fs::write(&path, &ends_mid).unwrap();
+    let error = Pack::open(&path).unwrap_err();
+    assert!(
+        error.to_string().contains("ends mid-number"),
+        "an index whose last number runs off the end should say so: {error}"
     );
 
     // An index that stops partway into an entry's hash.
