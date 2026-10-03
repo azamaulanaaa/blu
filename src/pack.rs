@@ -158,6 +158,14 @@ use crate::storage::{
 /// readable.
 pub(crate) const MAX_CHUNK: u64 = fastcdc::ronomon::MAXIMUM_MAX as u64;
 
+/// Most chunks a pack's order can name, which is `u32::MAX`.
+///
+/// A consequence of [`Pack::order`] being positions in a `u32`, and not a limit
+/// anybody would notice hitting: four billion records is over two hundred
+/// gigabytes of payload, and the file would have to be read to be opened. Stated
+/// because the refusal that enforces it has to name the number.
+const MAX_PACK_CHUNKS: u32 = u32::MAX;
+
 /// Magic at the start of a pack, and again at the very end.
 const MAGIC: [u8; 4] = *b"LPK1";
 
@@ -411,10 +419,20 @@ pub struct Pack {
     /// the entries are 32 bytes of hash and two numbers each and duplicating them
     /// to answer a question about offsets would cost more than the index itself.
     ///
+    /// **`u32` rather than `usize`, and a pack with more entries than that is
+    /// refused.** Four bytes per chunk against eight, over an index of fifty-six,
+    /// which is the difference between a pack's bookkeeping costing a tenth of its
+    /// index and a fifth of it. The price is one branch that no test can reach —
+    /// [`MAX_PACK_CHUNKS`] chunks is four billion records, over two hundred
+    /// gigabytes of payload — and it is an error rather than a wrapped number,
+    /// because a position that silently wrapped would hand a client every range in
+    /// the pack from the wrong end of it. A line coverage report will list it as
+    /// missed; that is the honest reading of it.
+    ///
     /// Built once, where the offsets are already known: a pack written records
     /// are appended in, and a pack read is checked for tiling by walking them in
     /// offset order, which produces exactly this. Nothing downstream sorts.
-    order: Vec<usize>,
+    order: Vec<u32>,
 }
 
 impl Pack {
@@ -612,10 +630,9 @@ impl Pack {
 
         // `order` is the way back, and it is built from the sort rather than
         // from the appends before it: it holds positions into `chunks`, which the
-        // sort has just moved. The same two lines run in `open`, so a pack read
+        // sort has just moved. The same four lines run in `open`, so a pack read
         // back has the same `order` as the one that was written.
-        let mut order: Vec<usize> = (0..chunks.len()).collect();
-        order.sort_unstable_by_key(|at| chunks[*at].offset);
+        let order = payload_order(&chunks, path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1027,13 +1044,14 @@ impl Pack {
     /// about one record at a time, goes through [`Pack::after`].
     fn records(&self) -> impl Iterator<Item = (Located, u64)> + '_ {
         self.order.iter().enumerate().map(|(at, chunk)| {
+            let chunk = position(*chunk);
             // The next record's start, which for the last one is the payload's end.
             let end = self
                 .order
                 .get(at + 1)
-                .map_or(self.payload_len, |next| self.chunks[*next].offset);
+                .map_or(self.payload_len, |next| self.chunks[position(*next)].offset);
 
-            (self.chunks[*chunk], self.payload_start.saturating_add(end))
+            (self.chunks[chunk], self.payload_start.saturating_add(end))
         })
     }
 
@@ -1104,11 +1122,11 @@ impl Pack {
     fn after(&self, offset: u64) -> u64 {
         let next = self
             .order
-            .partition_point(|at| self.chunks[*at].offset <= offset);
+            .partition_point(|at| self.chunks[position(*at)].offset <= offset);
 
         self.order
             .get(next)
-            .map_or(self.payload_len, |at| self.chunks[*at].offset)
+            .map_or(self.payload_len, |at| self.chunks[position(*at)].offset)
     }
 
     /// The bytes the record at `offset` occupies.
@@ -1450,7 +1468,6 @@ fn read_varint(bytes: &[u8], at: usize) -> io::Result<(u64, usize)> {
             match e {
                 crate::varint::Error::Truncated => "a pack index ends mid-number",
                 crate::varint::Error::Overlong => "a pack index has an overlong number",
-                crate::varint::Error::Overflow => "a pack index number overflows",
             },
         )
     })
@@ -1785,6 +1802,42 @@ impl Pack {
     }
 }
 
+/// The positions of `chunks`, in payload order, as the narrow numbers [`Pack`] holds.
+///
+/// Both constructors call this, and it is the only place a position becomes a
+/// `u32`: one call rather than the same conversion in two places, where one of
+/// them would eventually be missed.
+fn payload_order(chunks: &[Located], path: &Path) -> io::Result<Vec<u32>> {
+    let mut order: Vec<u32> = (0..chunks.len())
+        .map(|at| {
+            u32::try_from(at).map_err(|_| {
+                not_a_pack(
+                    path,
+                    &format!(
+                        "it names more chunks than a pack can order ({MAX_PACK_CHUNKS}), and a \
+                         position past the end of the index would name the wrong record"
+                    ),
+                )
+            })
+        })
+        .collect::<io::Result<_>>()?;
+
+    order.sort_unstable_by_key(|at| chunks[position(*at)].offset);
+
+    Ok(order)
+}
+
+/// A position in [`Pack::order`] as an index into the index itself.
+///
+/// `usize::from` is not defined for `u32` — it is not lossless on every platform
+/// this compiles for — so this is a cast, and the cast cannot truncate: every
+/// position came out of a `usize` range over this pack's own chunk count, which
+/// [`payload_order`] refused to build above [`MAX_PACK_CHUNKS`]. A position that
+/// did not fit a `usize` would be a chunk count no array could have held.
+const fn position(at: u32) -> usize {
+    at as usize
+}
+
 /// Check that the records the index names are inside the payload and do not
 /// overlap, and say in what order they sit.
 ///
@@ -1814,24 +1867,19 @@ impl Pack {
 /// # Errors
 ///
 /// Returns an error naming the offset that does not fit and why.
-fn check_index_geometry(
-    path: &Path,
-    chunks: &[Located],
-    payload_len: u64,
-) -> io::Result<Vec<usize>> {
+fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io::Result<Vec<u32>> {
     let min_header = u64::try_from(crate::storage::MIN_RECORD_HEADER).unwrap_or(u64::MAX);
 
     // Sorted by offset, not walked in index order: what has to hold is a fact
     // about the payload, and the order the index happens to keep its entries in
     // is the index's own business.
-    let mut order: Vec<usize> = (0..chunks.len()).collect();
-    order.sort_unstable_by_key(|at| chunks[*at].offset);
+    let order = payload_order(chunks, path)?;
 
     // Where the record before this one has to have ended, at the least.
     let mut earliest = 0u64;
 
     for at in &order {
-        let chunk = &chunks[*at];
+        let chunk = &chunks[position(*at)];
         if chunk.offset < earliest {
             return Err(not_a_pack(
                 path,
