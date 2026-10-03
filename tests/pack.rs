@@ -601,12 +601,12 @@ async fn writing_a_version_twice_produces_the_same_bytes() {
 /// writer reaches, because the refusal says which form the store yielded and in
 /// which form the plan had it — so the chunk that disagrees is chosen to be a
 /// frame, and a refusal that never mentions one would pin half the sentence.
-struct GrowsByOne<S> {
-    store: S,
+struct GrowsByOne<'a, S> {
+    store: &'a S,
     chunk: lepatch::storage::BlobId,
 }
 
-impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOne<S> {
+impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOne<'_, S> {
     async fn stored(
         &self,
         id: &lepatch::storage::BlobId,
@@ -664,38 +664,42 @@ async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
 
     let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let snapshot = snapshot_of(&built.blob).await;
-    let frame = built
-        .plan
-        .iter()
-        .find(|chunk| chunk.placement.codec == Codec::Zstd)
-        .expect(
-            "the fixture should hold at least one frame, or the refusal below is half a \
-                 sentence",
-        )
-        .id;
-    let refused = Pack::write(
-        &GrowsByOne {
-            store,
-            chunk: frame,
-        },
-        &built.plan,
-        &snapshot,
-        built.version,
-        &path,
-    )
-    .await
-    .unwrap_err();
 
-    assert!(
-        refused
-            .to_string()
-            .contains("the set changed while this pack"),
-        "a store that disagrees with the plan must be refused by name, and not: {refused}"
-    );
-    assert!(
-        refused.to_string().contains("a zstd frame"),
-        "and it should name the form the store yielded, which is a frame here: {refused}"
-    );
+    // Once per codec the fixture holds, because the refusal names which form the
+    // store yielded and which the plan had — and a fixture of one kind would leave
+    // half of that sentence unwritten.
+    for (codec, named) in [(Codec::Zstd, "a zstd frame"), (Codec::Raw, "raw content")] {
+        let chunk = built
+            .plan
+            .iter()
+            .find(|planned| planned.placement.codec == codec)
+            .unwrap_or_else(|| panic!("the fixture should hold a record stored as {codec:?}"))
+            .id;
+
+        let refused = Pack::write(
+            &GrowsByOne {
+                store: &store,
+                chunk,
+            },
+            &built.plan,
+            &snapshot,
+            built.version,
+            &path,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            refused
+                .to_string()
+                .contains("the set changed while this pack"),
+            "a store that disagrees with the plan must be refused by name, and not: {refused}"
+        );
+        assert!(
+            refused.to_string().contains(named),
+            "and it should name the form the store yielded, which is {named} here: {refused}"
+        );
+    }
     assert_eq!(
         fs::read(&path).unwrap(),
         before,
@@ -805,6 +809,22 @@ async fn a_header_that_contradicts_its_index_is_refused() {
     assert!(
         err.to_string().contains("payload ends at"),
         "a wrong payload length was not caught: {err}"
+    );
+
+    // A snapshot length that runs past the start of the file. The two lengths in
+    // the trailer are how the index and the snapshot are found, and they are
+    // subtracted from the end of the file rather than added to a computed offset
+    // precisely so a file can lie about them; this is the other end of that lie,
+    // where the claim is larger than what it is subtracted from.
+    let mut wrong_snapshot = good.clone();
+    let trailer = wrong_snapshot.len() - 20;
+    wrong_snapshot[trailer + 8..trailer + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+    let path = built.dir.path().join("wrong-snapshot.pack");
+    fs::write(&path, &wrong_snapshot).unwrap();
+    let err = Pack::open(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("snapshot length runs past"),
+        "a snapshot length that runs past the start of the file was not caught: {err}"
     );
 }
 
