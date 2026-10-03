@@ -107,6 +107,14 @@ pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
     }
 
     // Ten groups and the last one still had its continuation bit set.
+    //
+    // **Unreachable, and kept as an error rather than removed.** A tenth byte with
+    // its continuation bit set is more than the one bit a `u64` has left, so the
+    // check inside the loop has already answered `Overlong` for it. The function
+    // still has to produce something here, and an error is the only thing it can
+    // be: a number that does not fit is not a number, and nothing else in this
+    // signature says so. If a future encoding makes this reachable, the coverage
+    // report starts listing this line and the answer is already right.
     Err(Error::Overlong)
 }
 
@@ -182,6 +190,24 @@ mod tests {
         write(&mut out, 300);
         assert_eq!(read(&out[..1], 0), Err(Error::Truncated));
         assert_eq!(read(&out, out.len()), Err(Error::Truncated));
+    }
+
+    /// What a refusal says, since it is what a caller shows.
+    ///
+    /// Not a formatting test for its own sake: these two strings are the whole of
+    /// what a caller of this crate learns about a damaged file from the error
+    /// alone, and the distinction between them is the distinction between "cut
+    /// short" and "not a number".
+    #[test]
+    fn a_refusal_says_which_half_of_the_number_is_missing() {
+        assert_eq!(
+            Error::Truncated.to_string(),
+            "it ends in the middle of a number"
+        );
+        assert_eq!(
+            Error::Overlong.to_string(),
+            "it is longer than a number can be"
+        );
     }
 
     #[test]
