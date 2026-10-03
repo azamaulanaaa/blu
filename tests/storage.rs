@@ -8,6 +8,7 @@ mod common;
 use lepatch::{
     command::load_snapshot,
     layout::IndexSet,
+    pack::StorageStored,
     storage::{BlobId, BlobStore, Compression, Read, SegmentLimit, StorageGet, StoragePut},
 };
 use std::fs;
@@ -276,6 +277,62 @@ async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
     assert!(
         error.to_string().contains("damaged"),
         "the error should say the segment is damaged, got: {error}"
+    );
+}
+
+/// A segment that is shorter than its own index is refused, not read short.
+///
+/// `stored` is the path a merge takes when it keeps the frames it was sent, and
+/// it answers with bytes the pack handed over rather than bytes the store already
+/// held. It bounds the read by the record's own stored length so a wrong index
+/// cannot pull in a neighbour, and it refuses outright when the segment is
+/// shorter than that length — because a blob handed out now has to be the blob
+/// that was indexed.
+///
+/// The bound had no test, and it is the only thing standing between a hand-edited
+/// store and a `put_stored` that writes a frame nobody hashed. The index is built
+/// when the store opens, so cutting the segment afterwards is what it takes to
+/// have one: a store opened *after* the cut is refused much earlier, as damage,
+/// which is what the test above pins.
+#[tokio::test]
+async fn a_segment_shorter_than_its_index_is_refused_when_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store");
+
+    let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
+        .await
+        .unwrap();
+    let payload = common::noisy(200_000);
+    let id = common::id_of(&payload);
+    store
+        .put(
+            &id,
+            common::reader(payload.clone()),
+            common::len_of(&payload),
+        )
+        .await
+        .unwrap();
+    store.sync_data().await.unwrap();
+    drop(store);
+
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let placement = store.locate(&id).unwrap();
+
+    // Cut the segment where the record begins, which leaves the index saying a
+    // record is there and the file not having it.
+    let segment = IndexSet::new(&blob).segment_path(placement.segment);
+    let file = fs::OpenOptions::new().write(true).open(&segment).unwrap();
+    file.set_len(placement.offset).unwrap();
+    drop(file);
+
+    let error = store
+        .stored(&id)
+        .await
+        .expect_err("a record the segment no longer holds must be refused");
+
+    assert!(
+        error.to_string().contains("segment"),
+        "the refusal should say which segment is short, got: {error}"
     );
 }
 
