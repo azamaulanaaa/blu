@@ -130,6 +130,51 @@ pub struct IndexSet {
     base: PathBuf,
 }
 
+/// The set's own name inside `full`, and the digits between the tail's tag and
+/// its extension — if the rest of it is a tail at all.
+///
+/// `<base>.<tag>NNNN.<ext>`, where `tag` is empty for a segment and `v` for an
+/// index file. **The whole grammar of a set's naming, in one place**, because
+/// there are two readers of it and they used to spell it between them: the scan
+/// that numbers the files a directory holds, and the name a caller gives to open
+/// one. The shapes are the same shape, so a change to the scheme is one edit
+/// rather than two in two different languages.
+///
+/// As **bytes**, because one reader must handle a name that is not UTF-8 — the
+/// set's own name is not required to be, and [`IndexSet::numbered_file`] went to
+/// lengths precisely because it had to. The caller that has a `&str` converts
+/// what comes back, which refuses a base that fell inside a character rather than
+/// handing back half of one.
+///
+/// Returns `None` for anything else, which every caller treats as "not a name of
+/// ours": most of what is in a set's directory is not part of the set.
+fn tail_of<'a>(full: &'a [u8], tag: &str, ext: &str) -> Option<(&'a [u8], &'a [u8])> {
+    // The name is the base, then a fixed-shape tail. Checking the whole length up
+    // front means the slices below are known to be in bounds, and it rejects a
+    // name carrying a longer base than this set's.
+    let tail = 1 + tag.len() + SEGMENT_DIGITS + 1 + ext.len();
+    let (base, rest) = full.split_at_checked(full.len().checked_sub(tail)?)?;
+
+    // `.`, then the tag — empty for a segment, `v` for an index file.
+    if rest.first() != Some(&b'.') || &rest[1..=tag.len()] != tag.as_bytes() {
+        return None;
+    }
+
+    let after_tag = 1 + tag.len();
+    let digits = rest.get(after_tag..after_tag + SEGMENT_DIGITS)?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+
+    // `.`, then the extension, which is whatever is left.
+    let suffix = rest.get(after_tag + SEGMENT_DIGITS..)?;
+    if suffix.first() != Some(&b'.') || &suffix[1..] != ext.as_bytes() {
+        return None;
+    }
+
+    Some((base, digits))
+}
+
 /// The set a segment file belongs to, or `path` itself when it is not one.
 ///
 /// Unwraps the same fixed-shape tail that a segment listing matches, and nothing
@@ -145,29 +190,21 @@ fn strip_segment_tail(path: PathBuf) -> PathBuf {
     let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return path;
     };
-    let Some(cut) = name
-        .len()
-        .checked_sub(1 + SEGMENT_DIGITS + 1 + SEGMENT_EXTENSION.len())
+    // `None` where the offset the tail's arithmetic works out is not a character
+    // boundary, which a name can put there by having a multi-byte character
+    // under it: `café` is three characters and four bytes, and the fourth is in
+    // the middle of the last one. Splitting there would panic, so the name is
+    // left as it was given — which is what every name this function does not
+    // recognise gets, and the same answer a name that is not UTF-8 got above.
+    let Some((base, _)) = tail_of(name.as_bytes(), "", SEGMENT_EXTENSION) else {
+        return path;
+    };
+    let Some(base) = std::str::from_utf8(base)
+        .ok()
+        .filter(|base| !base.is_empty())
     else {
         return path;
     };
-    // `None` where the offset is not a character boundary, which a name can put
-    // there by having a multi-byte character under the tail's arithmetic: `café`
-    // is three characters and four bytes, and the fourth is in the middle of the
-    // last one. `split_at` would panic on it, and the set it names is one this
-    // build could read perfectly well — so the name is left as it was given,
-    // which is what every other name this function does not recognise gets.
-    let Some((base, rest)) = name.split_at_checked(cut) else {
-        return path;
-    };
-
-    if base.is_empty()
-        || !rest.starts_with('.')
-        || !rest[1..=SEGMENT_DIGITS].bytes().all(|b| b.is_ascii_digit())
-        || rest.get(1 + SEGMENT_DIGITS + 1..) != Some(SEGMENT_EXTENSION)
-    {
-        return path;
-    }
 
     // The directory is the caller's and is kept exactly as it was given; only
     // the file name is read as naming something inside the set.
@@ -218,7 +255,6 @@ impl IndexSet {
     /// Callers should hold `segment` to [`MAX_SEGMENT`]; the store refuses to
     /// roll over past it.
     ///
-    /// This was `blob_path`, which named a segment file as though it held one
     /// This was `blob_path`, which named a segment file as though it held one
     /// blob. It does not: it holds whatever records the run wrote into it, and a
     /// segment boundary is a write policy rather than anything the content
@@ -420,31 +456,9 @@ impl IndexSet {
     /// support. It is not a claim about what the bytes mean.
     fn numbered_file(path: &Path, base: &OsStr, tag: &str, ext: &str) -> Option<u32> {
         let full = path.file_name()?.as_encoded_bytes();
-
-        // The name is the base, then a fixed-shape tail. Checking the whole
-        // length up front means the slices below are known to be in bounds, and
-        // it rejects a name carrying a longer base than this set's.
-        let tail = 1 + tag.len() + SEGMENT_DIGITS + 1 + ext.len();
-        let (name, rest) = full.split_at_checked(full.len().checked_sub(tail)?)?;
+        let (name, digits) = tail_of(full, tag, ext)?;
 
         if name != base.as_encoded_bytes() {
-            return None;
-        }
-
-        // `.`, then the tag — empty for a segment, `v` for an index file.
-        if rest.first() != Some(&b'.') || &rest[1..=tag.len()] != tag.as_bytes() {
-            return None;
-        }
-
-        let after_tag = 1 + tag.len();
-        let digits = rest.get(after_tag..after_tag + SEGMENT_DIGITS)?;
-        if !digits.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-
-        // `.`, then the extension, which is whatever is left.
-        let suffix = rest.get(after_tag + SEGMENT_DIGITS..)?;
-        if suffix.first() != Some(&b'.') || &suffix[1..] != ext.as_bytes() {
             return None;
         }
 
