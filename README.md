@@ -180,38 +180,63 @@ it and a repair command should not manufacture the thing it was asked to repair.
 A store is the right shape for *holding* versions and the wrong shape for *serving*
 one. Restoring a new version out of a store is a request per chunk, because each
 chunk sits between two record headers and nothing makes the ones a client needs
-adjacent. A **pack** is one version's chunks concatenated into a single file with no
-framing between them, so the bytes a client needs are contiguous.
+adjacent. A **pack** is one version's chunk records laid end to end in a single
+file, so the bytes a client needs are contiguous.
 
-Measured on a synthetic tree of 8 binaries and 6 asset blobs, patching one 500 KB
-binary:
+**The payload region is a run of the store's own records.** A chunk travels in the
+form the set already held it — a zstd frame, or the bytes themselves — behind the
+same header and the same one-byte codec a store record carries, written by the
+store's own encoder rather than a second one that would agree with it until it
+changed. The cost is a header per chunk; the saving is that a chunk arrives in the
+form it was deduplicated in, so packing a compressed set copies frames rather than
+inflating every one of them first.
+
+Measured on a synthetic tree of 8 binaries of 500 KB and 6 asset blobs of 120 KB,
+4,720,000 bytes of content in all, patching one binary:
 
 ```text
-v1 from nothing      1,309,726 bytes in  1 request
-v2 having v1           25,325 bytes in  1 request   (1.9% of the pack)
+v1 from nothing      4,731,204 bytes of payload in  1 range
+v2 having v1           509,890 bytes in  1 range   (10.8% of the pack)
 ```
 
-One request in both cases, including the patch. The same delta served out of the
-store is 25,325 requests. That is the whole argument for packing, and it is why the
-8 KiB average chunk size is not a problem: the concern about thousands of tiny
-ranges was a property of the store's framing, which a pack does not have.
+One range in both cases, including the patch. Served out of the store instead, that
+same patch is 22 requests — one per chunk it does not already hold. That is the whole
+argument for packing, and it is why the 16 KiB average chunk size is not a problem:
+the worry about thousands of tiny ranges was never about the chunk size at all.
 
-**The 1.9% is a best case; the one request is the real result.** That fixture is
-built from a generator that is a function of position only, so every file in it is
-a *prefix* of the next, and "rewriting" one leaves the original byte stream
-truncated — the most favourable thing that can happen to content-defined chunking.
-On a tree with no such relationship, the same one-file patch measures **6.1% of the
-pack, still in a single request**. The request count is the property that holds; the
-fraction is fixture-dependent, and `tests/pack.rs` asserts the robust one on
-content that is not a special case.
+**The fraction is fixture-dependent; the range count is the result.** A localised
+4 KB edit inside one of those binaries — the most favourable thing that can happen
+to content-defined chunking, because the boundaries either side resynchronise and
+only the chunk spanning the edit moves — measures **22,226 bytes, still in a single
+range**. The 10.8% above replaces the whole 500 KB file with new bytes, which is
+the ordinary case and the one `tests/pack.rs` asserts on content that is not a
+special case.
 
 ```text
-magic | format version | version | snapshot hash | chunk count | payload bytes
-...payloads, end to end, in plan order...
+magic (4) | format version (4) | version (4) | snapshot hash (32)
+          | base flag (1) | base hash (32, a delta only)
+          | chunk count (varint) | payload bytes (varint)
+...records, end to end, in plan order: a store record per chunk...
 ...the snapshot, encoded: the file table that gives the payload meaning...
-...index: per chunk, hash | offset | length...
-index length | snapshot length | magic
+...index: per chunk, hash (32) | offset (varint) | content length (varint)...
+index length (8) | snapshot length (8) | magic (4)
 ```
+
+**The index carries the content length and not the record's own.** How long a
+chunk's record is, the record's header already says — the header is the first thing
+in the record, so a range has to be answerable before a byte of payload has been
+read. Two copies of one number in one file are two claims that can disagree, and a
+pack is a file somebody downloaded. What the index does keep is the length *after*
+decoding, because that is the one a snapshot's lengths are counted in and the one a
+reader wants; the header's own lengths are the payload on disk and its bytes once
+decoded.
+
+**The index is held in hash order, and the ranges are computed by offset.** Those
+are two different orders and the distinction is load-bearing. A lookup for one
+chunk binary-searches the hash order, which is why it is in that order; a question
+about byte ranges sorts its own answer by offset, because hash order is not payload
+order and a merge that ran along the index would find two ranges meeting nowhere
+and answer with one range per chunk — the entire cost a pack exists to remove.
 
 **The index is at the end.** A client fetches the last twenty bytes, learns where the
 index is and how long it is, fetches *that* range, and now knows every chunk's
@@ -227,7 +252,7 @@ are needed to place a chunk, so the pack carries both rather than expecting the
 holder to have the store that produced it. That is what makes a single file
 sufficient to hand a version to someone: no set, no server, no second request. The
 snapshot sits between the payload and the index so the index length alone still
-locates the index — the one-request property above does not depend on knowing where
+locates the index — the one-range property above does not depend on knowing where
 the payload ends.
 
 **A pack is a function of the tree, so it is byte-identical every time.** The order
@@ -236,6 +261,13 @@ two backups of one tree produce the same bytes even though their stores lay the
 chunks out differently. That is what makes a pack nameable by the hash of its own
 contents: an immutable artifact a CDN can cache forever and a client can verify with
 one comparison.
+
+It is a function of the tree *and of the stored form the set held its chunks in*,
+which is a deliberate part of that function rather than a leak of the sender's
+policy into the artifact. Two sets holding one tree at the same compression produce
+the same pack; two holding it at different compressions produce different packs,
+which is true of the sets themselves and is exactly what `--compression` below is
+for.
 
 **A pack is derived, never authoritative.** It is output, regenerable from the store
 and the snapshot alone, and losing one loses nothing. The store's commit records
@@ -246,6 +278,24 @@ that.
 name, since the same tree packs to the same bytes. `--version N` packs a specific
 version, and re-packing version 1 after version 2 exists reproduces the original
 bytes exactly.
+
+**`--compression keep|0..9` says what the records on the wire should look like.**
+`keep`, the default, writes each chunk in the form the set already holds it, which
+is the whole point of the format: a chunk the set deduplicated as a frame is copied
+as that frame rather than decoded and compressed again. `0` writes the content as
+it is, and 1 to 9 decode and write a frame at that level, for a pack built *for
+delivery* — a smaller one to send, or one recompressed out of a set that stores raw.
+
+What it does **not** do is change what the pack holds. A chunk is named by the hash
+of its content, every form decodes to the same content, and so the hash in the index
+and the one in the record header are the same number whichever route was taken.
+Everything downstream — `merge`, `apply`, a restore — sees the same version. Nor
+does it rewrite the set it packed from, and nor does it rewrite a pack that already
+exists: it is a policy for what leaves the set now, exactly as
+`backup --compression-level` is a policy for what enters it. It does cost a decode
+per chunk, and under a level an encode too, because a record's length is in its
+header and that header is written before any payload — which is why `keep` is the
+default and the other two are asked for.
 
 Where a header's counts and its own index could disagree, the pack is refused rather
 than one of them believed: the index is what locates chunks, so if the two disagree
@@ -472,6 +522,26 @@ a chunk's name, and a snapshot naming a chunk that neither the pack nor the set
 holds is refused before a byte is written. A refused merge leaves the name exactly
 as it was.
 
+**`--compression keep|0..9` says how each arriving chunk is stored, and it is the
+same option `pack` takes.** `keep`, the default, writes the stored form the pack
+already carries, so a frame the sender's set deduplicated a chunk into is copied
+across rather than decoded and compressed again — which is what makes a merge of a
+compressed pack cheap. `0` writes the content as it is and 1 to 9 re-encode it at
+that level, for a receiving set with a compression policy of its own: under `keep` it
+would be holding the *sender's* frames. Neither rewrites anything already in the set,
+because every record names the codec it was written with, so this is a policy for
+what arrives from now on, exactly as `backup --compression-level` is one for what
+goes in.
+
+What it does **not** do is skip the check. This is the option that looks most like a
+promise to believe the pack, and it is not one: every chunk is still decoded and
+hashed on the way in, so a pack whose bytes do not match the names it carries is
+refused on `keep` exactly as it is on any other setting. What `keep` saves is the
+encode; what it keeps is the guarantee every other path has. It also cannot grow the
+set — a frame that came out no smaller than the content it stands for, or one naming
+a codec this build cannot read, is stored raw instead, and both lengths are in the
+record, so the decision is two integer comparisons.
+
 ### Chunk profiles
 
 How big a chunk should be is a trade, and the trade depends on the tree. Fine cuts
@@ -565,6 +635,28 @@ bytes. So three things follow, and each is asserted in `tests/compression.rs`:
 `FORMAT_VERSION` is **2**: a record header now carries a codec byte and two lengths,
 and a store written by version 1 is *refused* rather than misparsed.
 
+**Compression travels through a pack, and that is what the two `--compression`
+options are for.** A pack's payload is a run of the store's own records, so a chunk
+goes into it in the form the set held it and arrives at the far end in that form
+too — nothing inflates every frame in the middle. Measured on a synthetic tree of
+4,720,000 bytes of compressible text, packed three ways from the same set:
+
+| | pack payload | vs the content |
+|---|---|---|
+| `--compression 0` | 4,730,834 | 0.2% larger |
+| **`keep` (default)** | **1,461,820** | **69% smaller** |
+| `--compression 9` | 1,450,574 | 69% smaller |
+
+So a pack of compressible data is now *smaller* than the content it carries, where a
+pack of decoded content was the same size as the tree plus its framing. On
+incompressible data, where every record is stored raw and the only overhead is the
+header, a pack is **0.24% larger** than the content — the record header is 46 bytes
+before either length and a varint more for each of the two, so 11,332 bytes of
+framing across 220 chunks on that fixture. That is the cost of the format and it is
+not worth optimising away:
+it buys the compression column above, and a pack whose records were decoded on the
+way out would pay an inflate and a deflate per chunk to get the same tree.
+
 ### Dry runs
 
 `backup`, `restore`, `apply`, `pack`, `merge` and `reindex` take `--dry-run`. A dry
@@ -596,7 +688,10 @@ same comparison against what is already stored that the real run uses. So
   chunk against the hash it is addressed by, which is most of a restore's work.
 - `apply --dry-run` still probes the destination against the version and reads every
   chunk back out of the pack to check it — so a damaged pack is still refused.
-- `pack --dry-run` still resolves the version and locates every chunk.
+- `pack --dry-run` still resolves the version and locates every chunk, and under
+  `--compression` of 1 to 9 it encodes each one, because a record's length is in its
+  header and the header goes out before the payload. That is what makes its byte
+  totals the ones the run would write rather than the ones the set happens to hold.
 - `merge --dry-run` still resolves the pack against the set and reads back every
   chunk a merge would store to check it, and still refuses a delta for a set that
   does not hold its base. A pack the set already holds is reported as already
@@ -936,23 +1031,27 @@ has no way to interpret one.
 
 **Packs are refused, and that costs nothing.** A pack is derived output: it is a
 function of the tree, so an old-format one is regenerated by re-running
-`lepatch pack` rather than recovered. Any version in the set can be packed at any
-time, so nothing has to be backed up again to bring a client up to date.
+`lepatch pack` rather than recovered. That is the whole of what a pack-format change
+asks of you, and it is worth being exact about because it is the only thing:
+**re-run `lepatch pack` for whatever versions clients are fetching.** Nothing has to
+be backed up again, and nothing in a set is rewritten — a pack is output, so the
+rule that has always governed losing one governs an unreadable one.
 
 ```console
 $ lepatch pack set v8.pack --version 8     # after upgrading the server
 ```
 
-The pack format moved to `4` in `0.4.0`, with the recorded version described above, so
-a `3` pack is refused by name — `it is pack format 3, but this build reads 4` —
-rather than read as though the four bytes it does not have were part of its
-snapshot hash.
+**The pack format is 6.** `0.4.0` wrote `4`, which carried the recorded version
+described above; this build writes `6`, whose payload is a run of the store's own
+records and whose chunk index holds a content length rather than a record length. A
+`4` pack is refused by name — `it is pack format 4, but this build reads 6` — rather
+than read as though the records it does not have were chunk content.
 Every earlier pack format is refused the same way, and the reason is the same: a
 pack this build cannot parse would otherwise produce byte ranges that look
 entirely plausible and point at the wrong bytes.
 
-**Order matters if clients fetch packs from a server you are upgrading.** A `0.4.0`
-client refuses a `0.3.0` pack, so the server has to go first:
+**Order matters if clients fetch packs from a server you are upgrading.** A client
+on an older build refuses a pack this one writes, so the server goes first:
 
 1. Upgrade the server. It now writes snapshots and packs this build understands.
 2. Re-run `lepatch pack` for whatever versions clients are fetching, and let them
