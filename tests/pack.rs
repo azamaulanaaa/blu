@@ -922,8 +922,11 @@ fn nudgeable<'a>(
 /// fires first and that is worth pinning as well.
 ///
 /// Fixture: [`common::untagged_stream`], whose second half is a repeated block and
-/// so compresses. `noisy` is incompressible by construction, so every record of a
-/// pack built from it is raw and this test would have nothing to work with.
+/// so compresses, backed up under zstd rather than under whatever the default
+/// happens to be — the two records this damages have to be of different kinds, and
+/// that is a statement about the fixture rather than about the policy. `noisy` is
+/// incompressible by construction, so every record of a pack built from it is raw
+/// and this test would have nothing to work with.
 ///
 /// What would falsify it: a `get` that answered at all, or one that answered with
 /// the wrong bytes — a record served a byte too long reads the next record's
@@ -942,7 +945,7 @@ async fn an_index_and_a_record_header_cannot_disagree() {
         )
         .unwrap();
     }
-    common::run_backup(&source, &blob).await;
+    common::run_backup_compressed(&source, &blob, lepatch::storage::Compression::zstd(1)).await;
 
     let store = BlobStore::open_for_reading(&blob).await.unwrap();
     let plan = plan_of(&blob).await;
@@ -2828,6 +2831,19 @@ fn mixed_source(dir: &Path) -> std::path::PathBuf {
     source
 }
 
+/// The same tree, backed up into a set under a policy that is named rather than
+/// defaulted.
+///
+/// `Compression::zstd(1)` is what the default is today, and that is the point of
+/// writing it out: every test that uses this asserts the set holds at least one
+/// frame, and a default that moved would fail them with "the fixture should hold a
+/// record stored as codec 1" — a complaint about the fixture rather than about the
+/// policy that changed under a test about codecs.
+async fn mixed_set(dir: &Path, at: &Path) {
+    let source = mixed_source(dir);
+    common::run_backup_compressed(&source, at, lepatch::storage::Compression::zstd(1)).await;
+}
+
 /// Pack a set's latest version under one of the three forms.
 async fn packed_with(
     blob: &Path,
@@ -2889,9 +2905,8 @@ async fn packed_with(
 #[tokio::test]
 async fn every_pack_form_restores_through_every_merge_form() {
     let dir = tempfile::tempdir().unwrap();
-    let source = mixed_source(dir.path());
     let origin = dir.path().join("origin");
-    common::run_backup(&source, &origin).await;
+    mixed_set(dir.path(), &origin).await;
 
     // The answer every cell is measured against: what the set itself restores.
     let expected = dir.path().join("expected");
@@ -2967,9 +2982,8 @@ async fn every_pack_form_restores_through_every_merge_form() {
 #[tokio::test]
 async fn keep_carries_the_frames_across_and_zero_does_not() {
     let dir = tempfile::tempdir().unwrap();
-    let source = mixed_source(dir.path());
     let origin = dir.path().join("origin");
-    common::run_backup(&source, &origin).await;
+    mixed_set(dir.path(), &origin).await;
 
     // What the source set holds, chunk by chunk: the answer `keep` must reproduce.
     let held: HashMap<_, _> = plan_of(&origin)
@@ -3068,9 +3082,8 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
 #[tokio::test]
 async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
     let dir = tempfile::tempdir().unwrap();
-    let source = mixed_source(dir.path());
     let origin = dir.path().join("origin");
-    common::run_backup(&source, &origin).await;
+    mixed_set(dir.path(), &origin).await;
 
     let mut payloads = Vec::new();
     for (form, compression) in pack_forms() {
