@@ -278,14 +278,10 @@ where
         // already holds for that chunk. Worked out from the plan's placements
         // rather than from `Plan::total_bytes`, which is content: the two differ
         // by every chunk's header and by every frame the set did not have to make.
-        payload: plan.chunks().iter().fold(0u64, |total, chunk| {
-            total
-                .saturating_add(storage::header_len(
-                    chunk.placement.stored_len,
-                    chunk.placement.raw_len,
-                ))
-                .saturating_add(chunk.placement.stored_len)
-        }),
+        // The writer works this out too, and it is that figure rather than this
+        // one that ends up in the file — see [`crate::pack::planned_payload_len`], which
+        // is one function rather than the two this was.
+        payload: crate::pack::planned_payload_len(&plan),
         table,
         base: base.as_ref().map(|base| base.version),
         bytes: None,

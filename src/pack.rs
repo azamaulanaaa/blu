@@ -1101,6 +1101,10 @@ impl Pack {
 
 /// Bytes the records for `plan` will occupy, before a byte of them is read.
 ///
+/// Also what `lepatch pack --dry-run` reports, which is why it is not folded
+/// into the writer: a figure the report gives and a figure the file carries are
+/// only the same figure if they are computed once.
+///
 /// Every term comes from the plan's own placement, which the caller resolved
 /// against the store being packed: a record's width is decided by the two lengths
 /// it carries, and those are known from the store's index without reading a
@@ -1110,7 +1114,7 @@ impl Pack {
 ///
 /// Saturating throughout, because the header's count and the index built beside
 /// it are both sums of claims.
-fn planned_payload_len(plan: &Plan) -> u64 {
+pub(crate) fn planned_payload_len(plan: &Plan) -> u64 {
     plan.chunks().iter().fold(0u64, |total, planned| {
         total
             .saturating_add(crate::storage::header_len(
