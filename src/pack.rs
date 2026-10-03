@@ -420,8 +420,12 @@ pub struct Pack {
 impl Pack {
     /// Write a pack of `plan` to `path`, reading payloads from `store`.
     ///
-    /// Written in place and complete when this returns; a pack is derived output,
-    /// so a partial one is a file to write again rather than a thing to recover.
+    /// Written to a sibling temporary and renamed into place when it is whole,
+    /// so a run that fails part-way leaves the pack that was already at `path`
+    /// alone rather than replacing it with a file that cannot be opened. A pack
+    /// is derived output, so a partial one is a file to write again rather than a
+    /// thing to recover — but the pack a *previous* run wrote is not this run's
+    /// to lose, and `--out` usually names one.
     /// One chunk is buffered at a time, never a whole version, though the index
     /// and the snapshot both grow with what is being packed.
     ///
@@ -536,6 +540,12 @@ impl Pack {
         })?;
         let snapshot_id = blake3::hash(&snapshot_bytes);
 
+        let temporary = temporary_for(path);
+        // Removed however this function leaves, because a temporary beside a
+        // finished pack is a file with no meaning and one beside a failed run is
+        // the same file.
+        let mut unfinished = Temporary(Some(temporary.clone()));
+
         let planned_count = u64::try_from(plan.len()).unwrap_or(0);
         let planned_bytes = planned_payload_len(plan);
 
@@ -553,7 +563,8 @@ impl Pack {
         });
         let payload_start = u64::try_from(header.len()).unwrap_or(u64::MAX);
 
-        let mut file = crate::storage::at_async(path, "create", tfs::File::create(path)).await?;
+        let mut file =
+            crate::storage::at_async(&temporary, "create", tfs::File::create(&temporary)).await?;
         file.write_all(&header).await?;
 
         for planned in plan.chunks() {
@@ -583,6 +594,13 @@ impl Pack {
         file.write_all(&MAGIC).await?;
         file.sync_all().await?;
         drop(file);
+
+        // Into place only once it is whole, so a run that fails part-way leaves
+        // the pack that was already at this path alone rather than replacing it
+        // with a file that cannot be opened. `lepatch pack` overwrites, so the
+        // path is usually one a previous run wrote and somebody wants back.
+        crate::storage::at_async(path, "rename into place", tfs::rename(&temporary, path)).await?;
+        unfinished.disarm();
 
         // Sorted by hash for everything that is not the file: the index on disk
         // keeps payload order, because that is the order the records were written
@@ -1205,6 +1223,44 @@ where
             .unwrap_or(u64::MAX)
             .saturating_add(stored_len),
     ))
+}
+
+/// A sibling path to write a pack to first, before renaming it.
+///
+/// In the same directory, because `rename` is only atomic within one filesystem.
+///
+/// A fixed suffix rather than a pid or a counter: two runs cannot be writing the
+/// same pack to the same path at once, because the set they are packing holds its
+/// lock.
+fn temporary_for(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string);
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// The temporary a pack is written to, removed unless it was renamed into place.
+///
+/// The lock file makes the same trade for the same reason: however the run ends,
+/// the temporary does not outlive it. A `Drop` rather than a cleanup at each
+/// exit, because the exits are one rename that may fail and a dozen errors that
+/// may come from anywhere in between.
+struct Temporary(Option<PathBuf>);
+
+impl Temporary {
+    /// The run has renamed this into place, so there is nothing left to remove.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// How a codec is named in a message about two of them disagreeing.

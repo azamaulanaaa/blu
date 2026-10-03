@@ -557,6 +557,86 @@ async fn writing_a_version_twice_produces_the_same_bytes() {
     assert_eq!(fs::read(a.path()).unwrap(), fs::read(b.path()).unwrap());
 }
 
+/// A store that hands a pack one byte more than the plan resolved.
+///
+/// The set the pack was planned against moving underneath the run, which is the
+/// only thing that can make the store disagree with the plan: a set is appended
+/// to while a pack of it is written, and a record's header carries a count worked
+/// out before the run began.
+struct GrowsByOne<S>(S);
+
+impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOne<S> {
+    async fn stored(
+        &self,
+        id: &lepatch::storage::BlobId,
+    ) -> std::io::Result<lepatch::pack::Stored> {
+        let mut stored = self.0.stored(id).await?;
+        stored.bytes.push(0);
+        Ok(stored)
+    }
+}
+
+/// A pack is renamed into place, so a failed run leaves the previous one alone.
+///
+/// `lepatch pack` overwrites, so the path is nearly always one a previous run
+/// wrote and somebody wants back. Writing in place destroyed it before the run
+/// knew it could finish — the header goes first, and the header's payload length
+/// is a count of records that have not been written yet.
+#[tokio::test]
+async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
+    let built = build(4, 60_000).await;
+    let out = built.dir.path().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let path = out.join("photos.lpk");
+
+    let written = built.pack(&path).await;
+    let before = fs::read(&path).unwrap();
+
+    // Overwriting is the ordinary case, and it must not leave the temporary
+    // behind either: the rename consumed it.
+    built.pack(&path).await;
+
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let snapshot = snapshot_of(&built.blob).await;
+    let refused = Pack::write(
+        &GrowsByOne(store),
+        &built.plan,
+        &snapshot,
+        built.version,
+        &path,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        refused
+            .to_string()
+            .contains("the set changed while this pack"),
+        "a store that disagrees with the plan must be refused by name, and not: {refused}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "a run that failed took the pack an earlier run wrote"
+    );
+    assert_eq!(
+        Pack::open(&path).unwrap(),
+        written,
+        "the pack left behind is not the one the last good run wrote"
+    );
+
+    let leftovers: Vec<_> = fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "photos.lpk")
+        .collect();
+
+    assert!(
+        leftovers.is_empty(),
+        "writing a pack left {leftovers:?} beside it"
+    );
+}
+
 /// Truncating a pack is detected rather than read as a shorter one.
 ///
 /// The trailing magic is what does it: a truncated file's last bytes are payload,
