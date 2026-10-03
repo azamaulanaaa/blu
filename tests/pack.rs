@@ -2531,3 +2531,416 @@ fn frame_codec(path: &Path, payload_start: u64, chunk: &lepatch::pack::Located) 
         other => panic!("the record at {at} claims codec {other}, which is not one"),
     }
 }
+
+/// The three forms a pack can be built in, as a command line would name them.
+///
+/// The same three answers `merge --compression` gives, at the other end of the
+/// transfer, and deliberately the same list: the matrix below is a product of two
+/// choices from one vocabulary, and a fixture that listed a fourth case here and a
+/// different third case there would be testing two features rather than one.
+fn pack_forms() -> [(&'static str, Option<lepatch::storage::Compression>); 3] {
+    [
+        ("keep", None),
+        ("zero", Some(lepatch::storage::Compression::Off)),
+        ("level", Some(lepatch::storage::Compression::zstd(9))),
+    ]
+}
+
+/// The same three answers, as what a merge takes.
+///
+/// A level is not in [`lepatch::command::MergeCompression`] and cannot be: which
+/// frames a merge writes is the *receiving store's* policy, not an argument, since
+/// the store's compressor is a type parameter the command does not get to change.
+/// So "under a level" here is `Reencode` into a store opened at one, and the two
+/// are the same run as far as anything observable is concerned.
+fn merge_forms() -> Vec<(
+    &'static str,
+    lepatch::command::MergeCompression,
+    lepatch::storage::Compression,
+)> {
+    vec![
+        (
+            "keep",
+            lepatch::command::MergeCompression::Keep,
+            lepatch::storage::Compression::Off,
+        ),
+        (
+            "zero",
+            lepatch::command::MergeCompression::Reencode,
+            lepatch::storage::Compression::Off,
+        ),
+        (
+            "level",
+            lepatch::command::MergeCompression::Reencode,
+            lepatch::storage::Compression::zstd(9),
+        ),
+    ]
+}
+
+/// A source set holding both kinds of record, packed and merged through the matrix.
+///
+/// The fixture is half compressible and half not, and that is load-bearing rather
+/// than decoration: a frame is stored only where it is strictly smaller than its
+/// content, so a tree of one kind gives an answer that every codec agrees with by
+/// accident and a test over it cannot tell `keep` from `0`. With both, the codecs
+/// recorded in the matrix's sets are genuinely different and a routing mistake
+/// shows up as a difference rather than as nothing.
+fn mixed_source(dir: &Path) -> std::path::PathBuf {
+    let source = common::source(dir);
+
+    for i in 0..3 {
+        fs::write(
+            source.join(format!("c{i}.bin")),
+            common::untagged_stream(u8::try_from(i).unwrap(), 200_000 + i * 20_000),
+        )
+        .unwrap();
+        fs::write(
+            source.join(format!("n{i}.bin")),
+            common::noisy(120_000 + i * 10_000),
+        )
+        .unwrap();
+    }
+
+    source
+}
+
+/// Pack a set's latest version under one of the three forms.
+async fn packed_with(
+    blob: &Path,
+    at: &Path,
+    compression: Option<lepatch::storage::Compression>,
+) -> Pack {
+    let store = BlobStore::open_for_reading(blob).await.unwrap();
+    let snapshot = snapshot_of(blob).await;
+    // sanity: the version resolves at all, so a later failure is about the option.
+    assert!(
+        !Plan::from_snapshot(&snapshot, |id| store.locate(id))
+            .unwrap()
+            .is_empty()
+    );
+
+    lepatch::command::pack(
+        &store,
+        &lepatch::command::Version {
+            number: 1,
+            snapshot,
+        },
+        |id| store.locate(id),
+        None,
+        at,
+        lepatch::command::PackOptions {
+            dry_run: false,
+            compression,
+        },
+    )
+    .await
+    .unwrap();
+
+    Pack::open(at).unwrap()
+}
+
+/// Every pack form restores through every merge form, byte for byte.
+///
+/// The option chooses an *encoding*, and the only thing it is allowed to change is
+/// the bytes in the records. So each of the nine combinations has to restore to
+/// exactly what a restore from the source set gives — and each is checked against
+/// that same answer rather than against each other, because two sets that were
+/// wrong in the same way would otherwise agree.
+///
+/// Every setting is checked against the *source set's own restore*, taken once
+/// before the matrix runs. This is the test that would catch an option honoured in
+/// one direction and ignored in the other, which is the failure a flag like this
+/// invites: `keep` writing content while claiming to keep frames would still
+/// restore, and so would a level that re-read a pack's stored bytes as if they
+/// were content.
+///
+/// **What this cannot see, and what the test below it is for.** Restoring is
+/// invariant under the encoding: every form decodes to the same content, so all
+/// nine rows here would pass with the routing wired up wrongly — a routing bug that
+/// passed a restore-only test, once already, in this same feature. The matrix
+/// proves the option is safe. It does not prove the option does anything.
+///
+/// What would falsify it: any cell restoring differently by a byte, a form that
+/// refused to build or merge, or a merge that published no version.
+#[tokio::test]
+async fn every_pack_form_restores_through_every_merge_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = mixed_source(dir.path());
+    let origin = dir.path().join("origin");
+    common::run_backup(&source, &origin).await;
+
+    // The answer every cell is measured against: what the set itself restores.
+    let expected = dir.path().join("expected");
+    common::run_restore_version(&origin, &expected, 1).await;
+    assert!(
+        !common::describe(&expected).is_empty(),
+        "the fixture should have restored something to compare against"
+    );
+
+    for (pack_form, pack_compression) in pack_forms() {
+        let pack_path = dir.path().join(format!("v-{pack_form}.pack"));
+        let pack = packed_with(&origin, &pack_path, pack_compression).await;
+
+        for (merge_form, merge_route, store_policy) in merge_forms() {
+            let name = dir.path().join(format!("m-{pack_form}-{merge_form}"));
+            let store = BlobStore::open_for_writing(
+                &name,
+                lepatch::storage::SegmentLimit::default(),
+                store_policy,
+            )
+            .await
+            .unwrap();
+
+            lepatch::command::merge(&store, &pack, merge_route)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a pack built as {pack_form} must merge as {merge_form}: {e}")
+                });
+
+            // Every cell also re-reads every chunk through the merged set and checks
+            // it against the hash it is addressed by: the store's own statement that
+            // what it holds is what it says it holds, which is the property the
+            // verbatim paths keep while skipping the encode.
+            let reopened = BlobStore::open_for_reading(&name).await.unwrap();
+            let report = lepatch::command::verify(reopened.snapshot(1).unwrap(), reopened)
+                .await
+                .unwrap_or_else(|e| panic!("{pack_form} into {merge_form} should verify: {e}"));
+            assert!(
+                report.chunks > 0,
+                "{pack_form} into {merge_form} verified nothing, so it checked nothing: \
+                 {report:?}"
+            );
+
+            let restored = dir.path().join(format!("out-{pack_form}-{merge_form}"));
+            common::run_restore_version(&name, &restored, 1).await;
+            common::assert_same_tree(&expected, &restored);
+        }
+    }
+}
+
+/// `keep` is not the same as `0`, and the codecs recorded say which is which.
+///
+/// The matrix above cannot tell the two apart, and that is not a gap in it: every
+/// form decodes to the same content, so a restore is invariant under the encoding
+/// and a routing bug passes a restore-only test. This is the test that closes that
+/// door, and it asserts on **the codecs actually recorded in the merged set** rather
+/// than on the restore or on a size.
+///
+/// Sizes would be nearly as weak: a frame at level 9 of content that compresses is
+/// smaller than the same content raw, but "nearly smaller" is a range, and a
+/// fixture at one end of it would let a level silently do nothing. A codec is a
+/// single bit that cannot come out the same way twice by accident.
+///
+/// The receiving store is opened with compression **off** on purpose, so the codecs
+/// in the merged set are the ones the *pack* chose rather than ones the receiving
+/// policy overwrote: with `keep` the pack's own frames arrive, and with `0` every
+/// record is raw however well it would compress. A test whose receiving store
+/// compressed would see the two agree on every chunk that compresses.
+///
+/// What would falsify it: `keep` writing content (every record raw), or `0`
+/// writing frames (every record compressed). Either way the flag would be doing the
+/// same thing twice, and every restore in the matrix above would still be correct.
+#[tokio::test]
+async fn keep_carries_the_frames_across_and_zero_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = mixed_source(dir.path());
+    let origin = dir.path().join("origin");
+    common::run_backup(&source, &origin).await;
+
+    // What the source set holds, chunk by chunk: the answer `keep` must reproduce.
+    let held: HashMap<_, _> = plan_of(&origin)
+        .await
+        .iter()
+        .map(|chunk| (chunk.id, chunk.placement.codec))
+        .collect();
+    assert!(
+        held.values().any(|codec| *codec == Codec::Zstd),
+        "sanity: the set should hold at least one frame, or nothing is being kept"
+    );
+    assert!(
+        held.values().any(|codec| *codec == Codec::Raw),
+        "sanity: and at least one raw record, or nothing is being re-encoded"
+    );
+
+    let mut sizes = Vec::new();
+    for (form, compression, expected_frames) in [
+        ("keep", None, true),
+        ("zero", Some(lepatch::storage::Compression::Off), false),
+        ("level", Some(lepatch::storage::Compression::zstd(9)), true),
+    ] {
+        let pack_path = dir.path().join(format!("v-{form}.pack"));
+        let pack = packed_with(&origin, &pack_path, compression).await;
+        let name = dir.path().join(format!("received-{form}"));
+
+        // Off, so what is recorded is the pack's choice and not the store's.
+        let store = BlobStore::open_for_writing(
+            &name,
+            lepatch::storage::SegmentLimit::default(),
+            lepatch::storage::Compression::Off,
+        )
+        .await
+        .unwrap();
+        lepatch::command::merge(&store, &pack, lepatch::command::MergeCompression::Keep)
+            .await
+            .unwrap();
+
+        let reader = BlobStore::open_for_reading(&name).await.unwrap();
+        for (id, held_codec) in &held {
+            let placement = reader.locate(id).unwrap();
+            if expected_frames && *held_codec == Codec::Zstd {
+                assert_eq!(
+                    placement.codec,
+                    Codec::Zstd,
+                    "a pack built as {form} lost the frame the set held for {id}"
+                );
+            } else {
+                assert_eq!(
+                    placement.codec,
+                    Codec::Raw,
+                    "a pack built as {form} framed {id} raw, which {form} must not do"
+                );
+            }
+        }
+
+        // And the size moves with the choice, which is the same claim about the
+        // encodings that the codecs make about the records: a set built from a pack
+        // of raw content is larger than one built from a pack of the frames the set
+        // already held.
+        sizes.push((form, common::set_size(&name)));
+    }
+
+    let size_of = |form: &str| sizes.iter().find(|(f, _)| *f == form).unwrap().1;
+    assert!(
+        size_of("zero") > size_of("keep"),
+        "a set merged from a pack built as zero should be larger than one from keep: \
+         {} against {}",
+        size_of("zero"),
+        size_of("keep")
+    );
+    assert!(
+        size_of("level") < size_of("zero"),
+        "and one from a pack built at a level should be smaller than raw: {} against {}",
+        size_of("level"),
+        size_of("zero")
+    );
+}
+
+/// A dry pack under a level reports the figures the real run produces, and writes
+/// nothing.
+///
+/// Two claims, and the second is the one that is easy to lose by adding a parameter
+/// to a path that used to take none. The figures: under a level the plan is
+/// resolved through the same encoder the writer uses, so `payload` is the size of
+/// the records that *would* be written rather than the size of the ones the set
+/// holds — which is what makes the plan worth reading. The absence: no file at
+/// `--out`, created or overwritten.
+///
+/// The plan and the run are compared figure for figure, on every number the report
+/// carries. A plan that reported the source set's sizes would be reporting about a
+/// file that was not written, and the only way to see that is to compare.
+///
+/// What would falsify it: a plan whose figures differ from the run's, a file at the
+/// output path afterwards, or a plan whose payload did not move with the flag.
+#[tokio::test]
+async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = mixed_source(dir.path());
+    let origin = dir.path().join("origin");
+    common::run_backup(&source, &origin).await;
+
+    let mut payloads = Vec::new();
+    for (form, compression) in pack_forms() {
+        let store = BlobStore::open_for_reading(&origin).await.unwrap();
+        let snapshot = snapshot_of(&origin).await;
+        let version = lepatch::command::Version {
+            number: 1,
+            snapshot,
+        };
+        let at = dir.path().join(format!("v-{form}.pack"));
+
+        let plan = lepatch::command::pack(
+            &store,
+            &version,
+            |id| store.locate(id),
+            None,
+            &at,
+            lepatch::command::PackOptions {
+                dry_run: true,
+                compression,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            plan.bytes, None,
+            "a plan is not a file, and should not claim a size on disk"
+        );
+        assert_eq!(
+            plan.content, None,
+            "a plan is not a file, and should not claim a content hash"
+        );
+        assert!(
+            !at.exists(),
+            "a dry pack as {form} wrote the file it was asked about"
+        );
+
+        let run = lepatch::command::pack(
+            &store,
+            &version,
+            |id| store.locate(id),
+            None,
+            &at,
+            lepatch::command::PackOptions {
+                dry_run: false,
+                compression,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            at.exists(),
+            "the real run as {form} should have written its pack"
+        );
+        assert_eq!(
+            plan.chunks, run.chunks,
+            "the chunk count must not depend on the encoding"
+        );
+        assert_eq!(plan.of, run.of, "nor must the version's own count");
+        assert_eq!(
+            plan.table, run.table,
+            "nor the file table, which the option does not touch"
+        );
+        assert_eq!(plan.base, run.base, "nor the delta's base");
+        assert_eq!(
+            plan.payload, run.payload,
+            "a plan as {form} must report the payload the run writes, not one it \
+             did not: the plan said {} and the run wrote {}",
+            plan.payload, run.payload,
+        );
+        assert_eq!(
+            run.bytes,
+            Some(at.metadata().unwrap().len()),
+            "and the run's own figure is the file's"
+        );
+        assert_eq!(
+            run.content,
+            Some(lepatch::pack::hash_file(&at).await.unwrap()),
+            "and its content hash is the pack's own"
+        );
+
+        payloads.push((form, plan.payload));
+    }
+
+    // The figure is *meant* to move with the option — that is the resolution this
+    // crate made of what `payload` means under a non-default one — so a plan that
+    // reported one number for all three would be the bug, not the fix.
+    let by = |form: &str| payloads.iter().find(|(f, _)| *f == form).unwrap().1;
+    assert!(
+        by("zero") > by("keep"),
+        "raw records should be larger than the frames the set holds: {} against {}",
+        by("zero"),
+        by("keep")
+    );
+}

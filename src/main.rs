@@ -132,8 +132,8 @@ enum Command {
         /// meanings turns a mistyped option into a confusing one rather than an
         /// obvious one.
         #[arg(long, value_name = "KEEP_OR_LEVEL", default_value = "keep",
-              value_parser = parse_merge_compression)]
-        compression: MergeCompression,
+              value_parser = parse_keep_or_level)]
+        compression: KeepOrLevel,
         /// Say what this merge would store, and store none of it.
         ///
         /// Affects what is written and nothing else: the pack is still resolved
@@ -264,6 +264,26 @@ enum Command {
         /// and correct for any client — which is what makes it the one worth caching.
         #[arg(long)]
         full: bool,
+        /// How each chunk is written into the pack: `keep` (the default) writes
+        /// the stored form the set already has, `0` writes the content as it is,
+        /// and 1 to 9 decode and write a zstd frame at that level.
+        ///
+        /// `keep` is what makes packing a compressed set cheap: a chunk the set
+        /// deduplicated as a frame is copied as that frame rather than decoded and
+        /// compressed again. A level is for a pack built *for delivery* — a
+        /// re-compressed pack of a set that stores raw, or a smaller one to send —
+        /// and it changes only the bytes in the records. A chunk is named by the
+        /// hash of its content, so every form decodes to the same content and
+        /// everything downstream — `merge`, `apply`, a restore — sees the same
+        /// version. It does not rewrite the set either, and neither does it rewrite
+        /// a pack: this is a policy for what leaves the set now.
+        ///
+        /// The same vocabulary as `merge --compression`, parsed by the same parser,
+        /// because it is the same question at the two ends of a transfer: what these
+        /// records should look like on the wire.
+        #[arg(long, value_name = "KEEP_OR_LEVEL", default_value = "keep",
+              value_parser = parse_keep_or_level)]
+        compression: KeepOrLevel,
         /// Say what this pack would hold, and write none of it.
         ///
         /// Affects the file and nothing else: the version is still resolved and
@@ -271,6 +291,11 @@ enum Command {
         /// pack's own. `--out` is neither created nor overwritten. The size on disk
         /// and the content hash are not reported, because both are properties of a
         /// file this run does not write.
+        ///
+        /// Under a level the byte totals are the re-encoded ones, so the plan
+        /// reports what that run would write rather than what the set holds: a dry
+        /// run of `--compression 9` costs an encode per chunk, and that cost is
+        /// what makes its figures the real run's.
         #[arg(long)]
         dry_run: bool,
     },
@@ -497,8 +522,19 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             version,
             from,
             full,
+            compression,
             dry_run,
-        } => run_pack(&name, &out, version, effective_from(from, full), dry_run).await,
+        } => {
+            run_pack(
+                &name,
+                &out,
+                version,
+                effective_from(from, full),
+                compression,
+                dry_run,
+            )
+            .await
+        }
         Command::Apply {
             pack,
             destination,
@@ -773,24 +809,37 @@ fn compression_policy(level: Option<u8>) -> storage::Compression {
     }
 }
 
-/// What `merge --compression` asked for.
+/// What a `--compression` flag asked for, on `pack` or on `merge`.
 ///
-/// Two answers rather than a policy on its own, because a level is both: it says
-/// which write path a merge takes *and* what the receiving set is opened with, and
-/// the two cannot be allowed to disagree — a merge told to re-encode into a set
-/// opened at a different level would store frames at a level nobody asked for.
+/// **One type and one parser for both commands, deliberately.** The two flags ask
+/// the same question at the two ends of a transfer — what should the records of
+/// this chunk look like on the wire — and a user who learns `keep` on one of them
+/// has learned it on the other. Two types would let the vocabularies drift: one
+/// command could come to accept a bare number, or spell the default differently,
+/// and the drift would show up as a flag that is accepted somewhere it is not
+/// meant. It is a little repetition of the *routing*, which is genuinely
+/// different — a merge re-encodes on the way into a set it also has to open under
+/// a policy, and a pack re-encodes on the way out of a set it only reads — and
+/// none of the repetition is the parsing or the vocabulary, which is the part a
+/// user meets.
+///
+/// Two answers rather than a policy on its own, because a level is both for a
+/// merge: it says which write path the run takes *and* what the receiving set is
+/// opened with, and the two cannot be allowed to disagree — a merge told to
+/// re-encode into a set opened at a different level would store frames at a level
+/// nobody asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MergeCompression {
+enum KeepOrLevel {
     /// Store what the pack carries, frame and all.
     Keep,
     /// Decode every chunk and store it at this zstd level, 0 meaning as-is.
     Level(u8),
 }
 
-impl MergeCompression {
+impl KeepOrLevel {
     /// The policy the receiving set is opened with.
     ///
-    /// The default under [`MergeCompression::Keep`], where it decides almost
+    /// The default under [`KeepOrLevel::Keep`], where it decides almost
     /// nothing: the verbatim path does not compress, so the only record it writes
     /// through the store's own policy is the snapshot. It is still a real choice
     /// rather than `Off`, because a set opened for writing has to be opened with
@@ -809,9 +858,23 @@ impl MergeCompression {
             Self::Level(_) => lepatch::command::MergeCompression::Reencode,
         }
     }
+
+    /// The policy a pack writes each record under, or `None` to keep the form
+    /// the set already holds.
+    ///
+    /// The one place the flag becomes a route, for this command: `keep` is the
+    /// absence of a policy because it is the absence of any work, and the two
+    /// non-default answers are both a policy the pack's records are encoded under.
+    fn pack_policy(self) -> Option<storage::Compression> {
+        match self {
+            Self::Keep => None,
+            Self::Level(level) => Some(storage::Compression::from_level(level)),
+        }
+    }
 }
 
-/// The `--compression` argument of `merge`: `keep`, or a level from 0 to 9.
+/// The `--compression` argument of `pack` and `merge`: `keep`, or a level from 0
+/// to 9.
 ///
 /// Its own vocabulary rather than a bare number, so the default is a word that says
 /// what it does. `keep` is the only non-numeric answer, and anything else that is
@@ -819,9 +882,11 @@ impl MergeCompression {
 /// `backup --compression-level` gives an out-of-range level, because a value this
 /// parser does not recognise must never be turned into a policy that looks like
 /// one the user chose.
-fn parse_merge_compression(what: &str) -> Result<MergeCompression, String> {
+///
+/// The name says `keep` rather than either command, because it is both commands'.
+fn parse_keep_or_level(what: &str) -> Result<KeepOrLevel, String> {
     if what.eq_ignore_ascii_case("keep") {
-        return Ok(MergeCompression::Keep);
+        return Ok(KeepOrLevel::Keep);
     }
 
     let level: u8 = what
@@ -835,7 +900,7 @@ fn parse_merge_compression(what: &str) -> Result<MergeCompression, String> {
         ));
     }
 
-    Ok(MergeCompression::Level(level))
+    Ok(KeepOrLevel::Level(level))
 }
 
 /// Snapshot a tree into a new version of the set at `name`.
@@ -1388,6 +1453,7 @@ async fn run_pack(
     out: &std::path::Path,
     version: Option<u32>,
     from: Option<u32>,
+    compression: KeepOrLevel,
     dry_run: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
@@ -1399,6 +1465,7 @@ async fn run_pack(
         version,
         from,
         out = %out.display(),
+        compression = ?compression,
         dry_run,
         "packing"
     );
@@ -1433,7 +1500,10 @@ async fn run_pack(
         |id| store.locate(id),
         base,
         out,
-        lepatch::command::PackOptions { dry_run },
+        lepatch::command::PackOptions {
+            dry_run,
+            compression: compression.pack_policy(),
+        },
     )
     .await?;
 
@@ -1521,13 +1591,13 @@ fn report_pack(
 /// is new" rather than create it in order to find out.
 ///
 /// `compression` is both the write path and the policy the set is opened with,
-/// from one value — see [`MergeCompression`]. **A dry run uses only the first**,
+/// from one value — see [`KeepOrLevel`]. **A dry run uses only the first**,
 /// and reports the same figures either way, because it counts chunk content and
 /// content does not depend on how it is stored.
 async fn run_merge(
     pack: &std::path::Path,
     name: &std::path::Path,
-    compression: MergeCompression,
+    compression: KeepOrLevel,
     dry_run: bool,
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);

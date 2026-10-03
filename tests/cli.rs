@@ -4586,3 +4586,189 @@ fn a_merge_compression_outside_its_vocabulary_is_refused() {
         );
     }
 }
+
+/// `pack --compression` is the same vocabulary `merge --compression` takes, and
+/// refuses the same things by name.
+///
+/// Asserted for `pack` as well as `merge` because sharing the parser is a claim
+/// about the two flags, and a claim is only worth what a test holds it to: a second
+/// parser that accepted a bare number, or spelled `keep` differently, would leave
+/// every existing test green and make the two commands disagree in front of a user.
+///
+/// So this runs the same refusals against `pack`, and — the half that a refusal
+/// cannot show — asserts the two commands *accept* the same values, which the
+/// matrix below does cell by cell.
+///
+/// What would falsify it: a `pack` that accepted `--compression banana`, or one
+/// whose refusal did not say what it does accept.
+#[test]
+fn a_pack_compression_outside_its_vocabulary_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    merge_tree(dir.path());
+    ok(dir.path(), &["backup", "source", "origin"]);
+
+    // `-1` is not here for the reason `merge`'s is not: clap reads it as a flag.
+    for bad in ["banana", "10", "1.5", ""] {
+        let output = lepatch(
+            dir.path(),
+            &["pack", "origin", "v1.pack", "--compression", bad],
+        );
+        assert!(
+            !output.status.success(),
+            "`pack --compression {bad}` was accepted\nstdout: {}",
+            stdout(&output)
+        );
+        assert!(
+            stderr(&output).contains("keep"),
+            "the refusal should name what the flag accepts, and says: {}",
+            stderr(&output)
+        );
+        assert!(
+            !dir.path().join("v1.pack").exists(),
+            "a refused `--compression {bad}` wrote the pack"
+        );
+    }
+}
+
+/// Every pack form, through the binary, through every merge form.
+///
+/// The matrix as a user meets it: three pack options by three merge options, and
+/// every one of the nine has to restore to what the source set restores. The
+/// library-level matrix in `tests/pack.rs` proves the routing; this proves the
+/// *flags* reach it, which is the half a routing test cannot see — a `--compression`
+/// parsed and then dropped on the floor restores perfectly and reports perfectly,
+/// and nothing but running the nine combinations through the real binary would say
+/// so.
+///
+/// Each cell is checked against the source set's own restore, taken once, rather
+/// than against the others. What would falsify it: any cell restoring differently
+/// from that, or a cell that failed to run at all.
+#[test]
+fn every_pack_compression_restores_through_every_merge_compression() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = merge_tree(dir.path());
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+
+    let expected = set_contents(dir.path(), "origin", 1);
+    assert!(
+        !expected.is_empty(),
+        "the fixture should have restored something to compare against"
+    );
+
+    for pack_form in ["keep", "0", "9"] {
+        let pack = format!("v-{pack_form}.pack");
+        ok(
+            dir.path(),
+            &["pack", "origin", &pack, "--compression", pack_form],
+        );
+
+        for merge_form in ["keep", "0", "9"] {
+            let name = format!("m-{pack_form}-{merge_form}");
+            ok(
+                dir.path(),
+                &["merge", &pack, &name, "--compression", merge_form],
+            );
+
+            let restored = set_contents(dir.path(), &name, 1);
+            assert_eq!(
+                expected, restored,
+                "a pack built with --compression {pack_form} and merged with \
+                 --compression {merge_form} restored differently from the set it \
+                 came from"
+            );
+        }
+    }
+}
+
+/// A dry `pack --compression N` reports the figures that run would produce, and
+/// writes nothing.
+///
+/// The figures are the point and the absence is the easy half to lose. A plan is
+/// resolved through the same encoder the writer uses, so `payload` is the size of
+/// the records that *would* be written — which is the only way a plan of a
+/// re-encoding run can be worth reading — and the plan and the run are compared
+/// number for number to say so. Under `keep` the same comparison holds for free,
+/// which is why every form is run here rather than only the new ones.
+///
+/// What would falsify it: figures that differ between the plan and the run, a file
+/// at `--out` afterwards, or a `payload` that did not move with the flag.
+#[test]
+fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    // Half compressible and half not. `merge_tree`'s fixture is entirely
+    // `noisy`, which zstd cannot shrink, so every chunk in it takes the store's
+    // fallback and `keep` and `0` write the same records — the figures would agree
+    // for the wrong reason and the assertion below would prove nothing.
+    for i in 0..3 {
+        fs::write(
+            source.join(format!("c{i}.bin")),
+            common::untagged_stream(u8::try_from(i).unwrap(), 200_000 + i * 20_000),
+        )
+        .unwrap();
+        fs::write(
+            source.join(format!("n{i}.bin")),
+            common::noisy(120_000 + i * 10_000),
+        )
+        .unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "origin"]);
+
+    let mut payloads = Vec::new();
+    for form in ["keep", "0", "9"] {
+        let at = format!("v-{form}.pack");
+        let plan = ok(
+            dir.path(),
+            &["pack", "origin", &at, "--compression", form, "--dry-run"],
+        );
+
+        assert!(
+            !dir.path().join(&at).exists(),
+            "a dry pack as {form} wrote the file it was asked about"
+        );
+        assert!(
+            plan.contains("nothing written"),
+            "a dry pack as {form} should say it wrote nothing: {plan}"
+        );
+
+        // The figures, off the front of the sentence, so what is compared is the
+        // numbers rather than which file was named.
+        let planned = numbers(
+            plan.lines()
+                .last()
+                .expect("a summary line")
+                .split("; nothing")
+                .next()
+                .unwrap_or_default(),
+        );
+
+        let written = ok(dir.path(), &["pack", "origin", &at, "--compression", form]);
+        let actual = numbers(written.lines().last().expect("a summary line"));
+
+        assert!(
+            !planned.is_empty(),
+            "the plan should report figures: {plan}"
+        );
+        assert_eq!(
+            actual.get(..planned.len()),
+            Some(planned.as_slice()),
+            "a dry pack as {form} should report the figures that run has:\n{plan}\n{written}"
+        );
+
+        // The third figure is `payload` — version number, chunk count, then payload —
+        // and it is the one the option moves: a
+        // plan holding the source set's numbers would be reporting about a file it
+        // does not write.
+        payloads.push((form, planned[2]));
+    }
+
+    let payload_of = |form: &str| payloads.iter().find(|(f, _)| *f == form).unwrap().1;
+    assert!(
+        payload_of("0") > payload_of("keep"),
+        "raw records should be larger than the frames the set holds: {} against {}",
+        payload_of("0"),
+        payload_of("keep")
+    );
+}
