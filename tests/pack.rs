@@ -24,7 +24,7 @@ use std::{
 
 use lepatch::{
     metadata::{Attributes, File, FileChunk, Snapshot},
-    pack::{Pack, Range, hash_file},
+    pack::{Pack, Range, StorageStored, hash_file},
     storage::{BlobStore, Codec, Plan, StorageGet},
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -265,6 +265,28 @@ async fn the_index_is_at_the_end() {
         "the snapshot should begin where the index length says it does"
     );
     assert_eq!(u64::try_from(sections.file_len).unwrap(), file_len);
+
+    // **In payload order, on disk as well as in memory.** A client reading this
+    // file rather than this crate walks the index itself, and the order it finds
+    // is the one the records were written in — which is what makes a run of
+    // adjacent records one range for it too. The reader here sorts for itself,
+    // so nothing in this crate would notice if the writer sorted the other way.
+    let bytes = fs::read(&path).unwrap();
+    let index = &bytes[sections.index_start..sections.index_start + sections.index_len];
+    let offsets: Vec<u64> = index_entries(index)
+        .iter()
+        .map(|at| decode_varint(index, at + 32))
+        .collect();
+
+    assert_eq!(
+        offsets.first().copied(),
+        Some(0),
+        "the first record is at 0"
+    );
+    assert!(
+        offsets.windows(2).all(|pair| pair[0] < pair[1]),
+        "the index on disk should be in payload order, and it is {offsets:?}"
+    );
 
     // Opening costs the index and nothing else, and gives the same answer as the
     // pack that was just written.
@@ -1245,9 +1267,11 @@ async fn a_damaged_index_is_refused() {
 /// that — so accepting it means the arithmetic that consumes a pack can hand a
 /// client a range outside the file rather than failing.
 ///
-/// The index carries no record length, so these are the two claims it does make:
-/// every record starts inside the payload, and no record starts before the one
-/// before it has ended.
+/// This is the "starts inside the payload" half of what the index claims. The
+/// other half — that no record starts before the one before it has ended — is
+/// `records_that_overlap_are_refused`, which builds the index to say so; the two
+/// fixtures here set the offset past the end or past what the type can add, which
+/// is a different claim again.
 #[tokio::test]
 async fn a_chunk_outside_the_payload_is_refused() {
     let built = build(4, 150_000).await;
@@ -1310,6 +1334,75 @@ async fn a_chunk_outside_the_payload_is_refused() {
     assert!(
         Pack::open(&path).is_err(),
         "a chunk whose offset cannot be added to the payload's start was accepted"
+    );
+}
+
+/// Records that do not tile the payload are refused when the pack opens.
+///
+/// The index carries no record length, so a record's extent is "where the next
+/// one begins" — which is a range only if the records do not overlap. Everything
+/// that answers with bytes reads it that way: `needed` turns a chunk into a byte
+/// range, `chunks_covering` asks the same question, and `get` bounds a record's
+/// header by its own span. So an index naming one record inside the one before it
+/// does not produce a refused read; it produces ranges that overlap, a header
+/// read out of a neighbour, and a client with no way to tell.
+///
+/// What is built here is an index that says a record starts one byte into the one
+/// before it. The offset is rewritten **in place**, which needs the two entries
+/// to agree on the width of that one number — a wider rewrite would move every
+/// entry after it, and the pack would then be refused for a truncation rather
+/// than for the overlap. Nothing else in the file changes, which is what makes
+/// the refusal the one under test.
+#[tokio::test]
+async fn records_that_overlap_are_refused() {
+    let built = build(4, 150_000).await;
+    let path = built.dir.path().join("v1.pack");
+    built.pack(&path).await;
+
+    let good = fs::read(&path).unwrap();
+    let sections = sections(&good);
+    let index = &good[sections.index_start..sections.index_start + sections.index_len];
+
+    // The entry whose offset is rewritten, and the one before it: a pair whose
+    // offsets are written the same width, and where this one's plus one is still
+    // that width.
+    let pairs: Vec<(usize, usize)> = index_entries(index)
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
+
+    let chosen = pairs.iter().find(|(before, after)| {
+        decode_varint(index, after + 32) > decode_varint(index, before + 32)
+            && varint_len(index, after + 32) == varint_len(index, before + 32)
+            && lepatch::varint::len(decode_varint(index, before + 32).saturating_add(1))
+                == varint_len(index, before + 32)
+    });
+
+    let Some((before, after)) = chosen.copied() else {
+        panic!("the fixture should hold two adjacent entries whose offsets are the same width")
+    };
+
+    let at = sections.index_start + after + 32;
+    let width = varint_len(index, after + 32);
+    let overlapping = decode_varint(index, before + 32).saturating_add(1);
+
+    let mut bytes = good.clone();
+    let mut written = Vec::new();
+    lepatch::varint::write(&mut written, overlapping);
+    assert_eq!(
+        written.len(),
+        width,
+        "sanity: the rewritten offset is the width the entry already used"
+    );
+    bytes[at..at + width].copy_from_slice(&written);
+
+    let path = built.dir.path().join("overlapping.pack");
+    fs::write(&path, &bytes).unwrap();
+    let error = Pack::open(&path).unwrap_err();
+
+    assert!(
+        error.to_string().contains("do not tile"),
+        "an index naming a record inside the one before it was accepted: {error}"
     );
 }
 
@@ -1437,6 +1530,57 @@ async fn a_pack_of_an_empty_version_opens() {
     assert!(pack.is_empty());
     assert_eq!(pack.payload_len(), 0);
     assert_eq!(pack.len(), 0);
+}
+
+/// An index that names nothing over a payload that is not empty is refused.
+///
+/// The one case the geometry check has that is not about an offset: a pack whose
+/// count and index agree — both zero — and whose payload length says there are
+/// records in it anyway. Nothing walks that payload, because a reader locates
+/// chunks through the index and the index says there are none, so the file would
+/// open as an empty version while carrying bytes this crate wrote and cannot
+/// account for. An empty *plan* is fine and is written by this crate; this is
+/// that file with its count and index taken away.
+#[tokio::test]
+async fn an_empty_index_over_a_payload_is_refused() {
+    /// The header's chunk count: the first of the two varints after the magic, the
+    /// format, the version, the snapshot hash and the delta flag.
+    const COUNT_AT: usize = 4 + 4 + 4 + 32 + 1;
+
+    let built = build(3, 100_000).await;
+    let path = built.dir.path().join("v1.pack");
+    built.pack(&path).await;
+
+    let mut bytes = fs::read(&path).unwrap();
+    let sections = sections(&bytes);
+
+    // The header's chunk count, and the index the trailer points at.
+    let count_len = varint_len(&bytes, COUNT_AT);
+    assert!(
+        count_len == 1,
+        "the fixture's chunk count is written in one byte"
+    );
+
+    bytes[COUNT_AT] = 0;
+
+    // The index goes out of the file as well as out of the trailer, and from the
+    // middle rather than the end: the trailer's two lengths are how `open` finds
+    // the index and the snapshot, so a trailer claiming no index while the bytes
+    // were still there would be refused first for a payload that does not reach
+    // its own snapshot — a different question, and one asked elsewhere.
+    let start = sections.index_start;
+    bytes.drain(start..start + sections.index_len);
+    let trailer = bytes.len() - 20;
+    bytes[trailer..trailer + 8].copy_from_slice(&0u64.to_le_bytes());
+
+    let path = built.dir.path().join("no-chunks.pack");
+    fs::write(&path, &bytes).unwrap();
+    let error = Pack::open(&path).unwrap_err();
+
+    assert!(
+        error.to_string().contains("names no chunks"),
+        "a payload described by an index that names nothing was accepted: {error}"
+    );
 }
 
 /// A pack carries the version it was built from, and names it correctly.
@@ -3046,7 +3190,11 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
 ///
 /// It also pins that a refused merge publishes nothing, which the earlier refusal
 /// tests already established and this one re-checks on the route that bypasses
-/// the reading path.
+/// the reading path — and, now that the reading path reads the same record
+/// through the same code, that *it* refuses the same fixture for the same reason.
+/// The bound used to be on one route and not the other, and the commit that added
+/// it to the second said neither had a test, which is how one of the two routes
+/// came to be the only thing this fixture ever exercised.
 #[tokio::test]
 async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first() {
     const CEILING: u64 = (1 << 30) + 1; // one past it: the bound is "more than"
@@ -3113,6 +3261,23 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
         store.latest().is_none(),
         "and a refused merge must not have published a version"
     );
+
+    // The same fixture through the two routes a reader takes. `get` is what a
+    // restore and an apply call; `stored` is what a merge that keeps the frame
+    // calls, and it is the route that was already refusing it above. Both bound
+    // the claim before anything reserves it, and both must say so by name.
+    for (route, error) in [
+        ("get", pack.get(&id).await.err()),
+        ("stored", pack.stored(&id).await.err()),
+    ] {
+        let error = error.unwrap_or_else(|| {
+            panic!("{route} must refuse a record claiming more content than the chunker produces")
+        });
+        assert!(
+            error.to_string().contains("more than the largest chunk"),
+            "{route} should name the ceiling, got: {error}"
+        );
+    }
 }
 
 /// The varint the format's own lengths are written in: seven bits per byte, least
