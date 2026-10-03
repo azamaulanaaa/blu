@@ -29,9 +29,17 @@ pub enum Error {
     Truncated,
     /// More than [`MAX`] groups, or a tenth group contributing more than the one
     /// bit a `u64` has left.
+    ///
+    /// **This is the only way a number can fail to fit**, and it was not always
+    /// said: there was an `Error::Overflow` beside this one for "the groups did
+    /// not fit a `u64`", which `read` cannot return. Ten groups of seven bits are
+    /// sixty-four, so the tenth group is the one place a bit can fall off the end,
+    /// and the tenth byte contributing more than that single bit is what this arm
+    /// says. A `u64` cannot be overfilled by any other route, so the two answers
+    /// were one answer with two names, and a caller matching on them had a case
+    /// that never came. Coverage said so, and the coverage of the enum's own
+    /// `Display` was the tell.
     Overlong,
-    /// The groups did not fit in a `u64`.
-    Overflow,
 }
 
 impl fmt::Display for Error {
@@ -39,7 +47,6 @@ impl fmt::Display for Error {
         let what = match self {
             Self::Truncated => "it ends in the middle of a number",
             Self::Overlong => "it is longer than a number can be",
-            Self::Overflow => "it is too large to be a number",
         };
         f.write_str(what)
     }
@@ -71,9 +78,10 @@ pub fn write(out: &mut Vec<u8>, value: u64) {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Truncated`] if the bytes run out first, [`Error::Overlong`]
-/// if the encoding is longer than a `u64` can be, and [`Error::Overflow`] if the
-/// groups do not fit one.
+/// Returns [`Error::Truncated`] if the bytes run out first, and [`Error::Overlong`]
+/// if the encoding is longer than a `u64` can be — which is the one failure a
+/// number has here, since ten groups of seven bits are sixty-four and a tenth
+/// group contributing more than the single bit left over is what makes it not fit.
 pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
     let mut out: u64 = 0;
     let mut shift: u32 = 0;
@@ -83,14 +91,13 @@ pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
 
         // The tenth group can contribute only the last bit of a u64; more than
         // that is an overlong encoding of something shorter, and accepting it
-        // would let a caller believe a number it was never sent.
+        // would let a caller believe a number it was never sent. This is also what
+        // makes the shift below infallible: it never passes 63.
         if index == MAX - 1 && byte > 1 {
             return Err(Error::Overlong);
         }
 
-        out |= u64::from(byte & 0x7f)
-            .checked_shl(shift)
-            .ok_or(Error::Overflow)?;
+        out |= u64::from(byte & 0x7f) << shift;
 
         if byte & 0x80 == 0 {
             return Ok((out, index + 1));
