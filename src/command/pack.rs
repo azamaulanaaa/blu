@@ -242,10 +242,18 @@ where
             let whole = storage::Plan::from_snapshot(version_snapshot, |id| match forms.get(id) {
                 // Measured: this is what the record will be.
                 Some(placement) => Ok(*placement),
-                // Not measured, because a delta does not carry it. Its placement is
-                // never written and never counted, and the `since` below drops it
-                // again; the original one is the only thing that can be said about it
-                // without reading a chunk this run is not going to pack.
+                // Not measured, because a delta does not carry it. The plan above
+                // is already the delta's, and this one is the whole version before
+                // `since` drops the chunks a holder of the base already has — so
+                // every chunk the version reads is here and not every chunk here
+                // is in the plan. The `since` below drops the ones that were never
+                // measured, and their placement is never written and never
+                // counted, so the store's own answer is only ever a placeholder.
+                //
+                // Read as dead code once: every `--compression` test used a full
+                // pack, and every `--from` test used the default, so nothing ran
+                // through the pair. `a_delta_packed_with_a_compression_level_
+                // applies_and_merges` is the fixture that does.
                 None => locate(id),
             })?;
 

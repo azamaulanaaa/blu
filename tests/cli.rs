@@ -1773,6 +1773,97 @@ fn a_delta_pack_is_refused_for_a_client_on_another_version() {
     );
 }
 
+/// A delta written with a compression level is still a delta, and still applies.
+///
+/// `--compression` on `pack` re-encodes every chunk it writes rather than copying
+/// the frame the set holds, so a delta and a level meet on one code path: the plan
+/// is built from the chunks a delta omits, and the forms are measured against that
+/// smaller set. Every `--compression` test uses a full pack and every `--from` test
+/// uses the default, so the quadrant between them — where the plan is a subset and
+/// every form is recomputed — had nothing at all running through it.
+///
+/// Both consumers of that pack are here as well, because they read it differently:
+/// `apply` resolves the delta against a directory, and `merge` against a set, which
+/// has to hold the delta's base before the delta can mean anything.
+#[test]
+fn a_delta_packed_with_a_compression_level_applies_and_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    for i in 0..6 {
+        fs::write(source.join(format!("f{i}.bin")), noisy(150_000)).unwrap();
+    }
+    ok(dir.path(), &["backup", "source", "set"]);
+    ok(dir.path(), &["pack", "set", "v1.pack", "--version", "1"]);
+
+    // The client is on version 1 before the change, which is what makes the pack
+    // below a delta rather than a second copy.
+    let target = dir.path().join("target");
+    ok(dir.path(), &["apply", "v1.pack", "target"]);
+    common::assert_same_tree(&source, &target);
+
+    fs::write(source.join("f3.bin"), noisy(210_000)).unwrap();
+    fs::write(source.join("fresh.bin"), noisy(20_000)).unwrap();
+    ok(dir.path(), &["backup", "source", "set"]);
+
+    let said = ok(
+        dir.path(),
+        &[
+            "pack",
+            "set",
+            "v2.delta",
+            "--version",
+            "2",
+            "--from",
+            "1",
+            "--compression",
+            "9",
+        ],
+    );
+    assert!(
+        said.contains("since 1"),
+        "re-encoding every chunk should not stop the pack being a delta, got: {said}"
+    );
+
+    ok(dir.path(), &["apply", "v2.delta", "target"]);
+    common::assert_same_tree(&source, &target);
+
+    // And into a set that holds the base on its own terms. A merge refuses a delta
+    // unless the receiving set holds the version it names, and what it matches is
+    // the base *snapshot* — so this set is built from the version 1 tree, restored
+    // rather than saved a second time, and the numbering works out on its own.
+    let base_tree = dir.path().join("v1-tree");
+    ok(
+        dir.path(),
+        &["apply", "v1.pack", &base_tree.to_string_lossy()],
+    );
+
+    let receiving = dir.path().join("receiving");
+    ok(
+        dir.path(),
+        &[
+            "backup",
+            &base_tree.to_string_lossy(),
+            &receiving.to_string_lossy(),
+        ],
+    );
+    ok(
+        dir.path(),
+        &["merge", "v2.delta", &receiving.to_string_lossy()],
+    );
+
+    let restored = dir.path().join("from-merge");
+    ok(
+        dir.path(),
+        &[
+            "restore",
+            &restored.to_string_lossy(),
+            &receiving.to_string_lossy(),
+        ],
+    );
+    common::assert_same_tree(&source, &restored);
+}
+
 /// `--full` wins over `--from`, and says so.
 ///
 /// Two flags that contradict, in a script that has both. `--full` is the promise
