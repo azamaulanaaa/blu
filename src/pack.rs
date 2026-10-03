@@ -156,7 +156,7 @@ use crate::storage::{
 /// more usual figure; it is not the one used here, because a caller may configure
 /// a chunker with a larger `max_size` and a pack of such a set has to remain
 /// readable.
-const MAX_CHUNK: u64 = fastcdc::ronomon::MAXIMUM_MAX as u64;
+pub(crate) const MAX_CHUNK: u64 = fastcdc::ronomon::MAXIMUM_MAX as u64;
 
 /// Magic at the start of a pack, and again at the very end.
 const MAGIC: [u8; 4] = *b"LPK1";

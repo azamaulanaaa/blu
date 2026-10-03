@@ -592,6 +592,24 @@ async fn stored_chunk(
     };
 
     let total = header.total_len.saturating_add(header.stored_len);
+    // The claim is bounded before it is believed, here as it is on the reading
+    // path, and for the same reason: a pack is a file that was downloaded, and
+    // a frame declaring more content than the chunker can ever produce would
+    // have the decode reserve that much before finding out. `stored_len` is
+    // bounded already, by what is left of the payload; `raw_len` is only
+    // bounded by the index, which is as untrusted as the header it agrees with.
+    if header.raw_len > crate::pack::MAX_CHUNK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "chunk {id} claims {} bytes of content, which is more than the largest chunk \
+                 this crate's chunker produces ({})",
+                header.raw_len,
+                crate::pack::MAX_CHUNK
+            ),
+        ));
+    }
+
     if header.kind != RecordKind::Blob
         || BlobId::from_bytes(header.hash) != *id
         || header.raw_len != located.content_len
