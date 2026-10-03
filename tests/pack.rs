@@ -2944,3 +2944,107 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
         by("keep")
     );
 }
+
+/// A record claiming more content than the chunker can ever produce is refused
+/// before anything is decoded.
+///
+/// The ceiling is `fastcdc`'s maximum, which is 2^30, and a varint that can hold
+/// it is five bytes wide — which is why this builds its pack rather than
+/// patching one. Widening a real record's length would shift everything after it
+/// by a byte, and each thing that shift touches (the index entry's own length, the
+/// trailer's index length, the header's payload total) is separately checked, so a
+/// splice that got one of them wrong would be refused for a reason that has
+/// nothing to do with the ceiling. This way every width is chosen, and the only
+/// thing wrong with the file is the claim.
+///
+/// What it pins is the **order**, not merely that a merge fails. The frame here
+/// is a stand-in rather than a real one, so with the bound in place the refusal
+/// names the ceiling, and with it removed the decode is reached and the refusal
+/// names the frame instead. A real frame declaring that size would reserve a
+/// gigabyte before finding out, and a failed reserve aborts rather than returning
+/// an error — which is the reason the bound is here at all.
+///
+/// It also pins that a refused merge publishes nothing, which the earlier refusal
+/// tests already established and this one re-checks on the route that bypasses
+/// the reading path.
+#[tokio::test]
+async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first() {
+    const CEILING: u64 = (1 << 30) + 1; // one past it: the bound is "more than"
+    const FRAME: &[u8] = &[0x5au8; 40];
+
+    let id = lepatch::storage::BlobId::from_bytes([0xABu8; 32]);
+    let table = one_file(&[id]).to_bytes().unwrap();
+
+    // The record: the store's own framing, with a claim no chunker makes.
+    let mut record = Vec::new();
+    record.extend_from_slice(b"LPB1");
+    record.push(0); // a blob record
+    record.push(1); // stored as a zstd frame
+    push_varint(&mut record, u64::try_from(FRAME.len()).unwrap());
+    push_varint(&mut record, CEILING); // ...of more than a gigabyte of content
+    record.extend_from_slice(id.as_bytes());
+    let check = blake3::hash(&record).as_bytes()[..8].to_vec();
+    record.extend_from_slice(&check);
+    record.extend_from_slice(FRAME);
+    let payload_len = u64::try_from(record.len()).unwrap();
+
+    let mut index = Vec::new();
+    index.extend_from_slice(id.as_bytes());
+    push_varint(&mut index, 0); // at the start of the payload
+    push_varint(&mut index, CEILING); // and the index agrees with the header
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"LPK1");
+    bytes.extend_from_slice(&6u32.to_le_bytes()); // the pack format this build reads
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // version 1 of the set it came from
+    bytes.extend_from_slice(blake3::hash(&table).as_bytes());
+    bytes.push(0); // not a delta
+    push_varint(&mut bytes, 1); // one chunk
+    push_varint(&mut bytes, payload_len);
+    bytes.extend_from_slice(&record);
+    bytes.extend_from_slice(&table);
+    bytes.extend_from_slice(&index);
+    bytes.extend_from_slice(&u64::try_from(index.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&u64::try_from(table.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(b"LPK1");
+
+    let built = build(1, 1024).await;
+    let path = built.dir.path().join("overclaimed.pack");
+    fs::write(&path, &bytes).unwrap();
+
+    let pack = Pack::open(&path).expect("the fixture is a pack this build can open");
+    let received = built.dir.path().join("received");
+    let store = BlobStore::open_for_writing(
+        &received,
+        lepatch::storage::SegmentLimit::default(),
+        lepatch::storage::Compression::default(),
+    )
+    .await
+    .unwrap();
+
+    let error = lepatch::command::merge(&store, &pack, lepatch::command::MergeCompression::Keep)
+        .await
+        .expect_err("a chunk claiming more content than the chunker produces must be refused");
+    assert!(
+        error.to_string().contains("more than the largest chunk"),
+        "the refusal should name the ceiling, got: {error}"
+    );
+    assert!(
+        store.latest().is_none(),
+        "and a refused merge must not have published a version"
+    );
+}
+
+/// The varint the format's own lengths are written in: seven bits per byte, least
+/// significant first, with the top bit set on every byte but the last.
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = u8::try_from(value & 0x7f).unwrap();
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
