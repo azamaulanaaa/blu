@@ -3556,46 +3556,57 @@ fn a_packs_version_is_not_the_numbering_of_the_set_it_is_merged_into() {
 /// Merging a mixed run of packs leaves the destination's numbering gapless.
 ///
 /// Every version in a store is a commit record, and the store is the only thing
-/// that allocates the number — so the sequence is a set of paths that could each
-/// consume a number without publishing one. A merge of a pack the set already
-/// holds and a merge refused for a missing base are the two: the first used to
-/// publish a duplicate, and either would leave the sequence as `1, 3` rather
-/// than `1, 2, 3`, which is the shape a set is easy to be in and hard to notice
-/// — nothing reads a version by number except a person, and a gap means the
-/// versions around it still restore while the set's history reads as though a
-/// version went missing.
+/// that allocates the number. So the sequence below is a run of paths that could
+/// each consume a number without publishing one: a merge of a pack the set
+/// already holds, and a merge refused for a base it lacks. Either would leave
+/// the destination reading as `1, 3` over two versions rather than `1, 2` —
+/// which is the shape a set is easy to be in and hard to notice, because
+/// nothing but a person reads a version by number, and the versions either side
+/// of a gap still restore perfectly.
 ///
-/// What would falsify it: any gap or repeat in the listing, or a count that
-/// disagrees with the three merges that published.
+/// The packs' own numbers are 4, 5, 6 and 2, and none of them is what the
+/// destination publishes, so a destination that adopted the sender's numbering
+/// would publish 4, 5 and 6 here and read as a set of six holding three. Gapless
+/// is not enough if the numbers in the gap came from somewhere else.
+///
+/// What would falsify it: a gap or a repeat in the listing, a count that
+/// disagrees with the three merges that published, or a report naming a number
+/// the set never reached.
 #[test]
 fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
     let dir = tempfile::tempdir().unwrap();
     let source = merge_tree(dir.path());
 
+    // A delta against origin version 1, which the destination below never
+    // holds: the refusal that must not consume a number. Origin version 2 is
+    // made and then never delivered, which is what leaves the base absent
+    // however many versions the destination holds.
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
-    ok(dir.path(), &["pack", "origin", "one.pack"]);
-    fs::write(source.join("f0.bin"), noisy(210_000)).unwrap();
+    fs::write(source.join("f4.bin"), noisy(205_000)).unwrap();
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     ok(
         dir.path(),
         &[
             "pack",
             "origin",
-            "two.delta",
+            "stale.delta",
             "--version",
             "2",
             "--from",
             "1",
         ],
     );
+
+    // Then versions 3, 4 and 5, so the packs the destination does accept carry
+    // numbers of 4, 5 and 6 — well above the three it will hold.
+    fs::write(source.join("f0.bin"), noisy(210_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     fs::write(source.join("f1.bin"), noisy(220_000)).unwrap();
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     ok(
         dir.path(),
-        &["pack", "origin", "three.pack", "--version", "3"],
+        &["pack", "origin", "four.pack", "--version", "4"],
     );
-    // Version 4 packed as a delta against version 3, which the destination below
-    // never holds — the refusal that must not consume a number.
     fs::write(source.join("f2.bin"), noisy(230_000)).unwrap();
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     ok(
@@ -3603,21 +3614,36 @@ fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
         &[
             "pack",
             "origin",
-            "four.delta",
+            "five.delta",
             "--version",
-            "4",
+            "5",
             "--from",
-            "3",
+            "4",
         ],
+    );
+    fs::write(source.join("f3.bin"), noisy(240_000)).unwrap();
+    ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
+    ok(
+        dir.path(),
+        &["pack", "origin", "six.pack", "--version", "6"],
     );
 
     // A full pack, then a delta against a base the set now holds: two versions.
-    ok(dir.path(), &["merge", "one.pack", "received"]);
-    ok(dir.path(), &["merge", "two.delta", "received"]);
+    let first = ok(dir.path(), &["merge", "four.pack", "received"]);
+    assert!(
+        first.contains("version 1"),
+        "a pack from origin version 4 is the destination's version 1: {first}"
+    );
+    let second = ok(dir.path(), &["merge", "five.delta", "received"]);
+    assert!(
+        second.contains("version 2"),
+        "a pack from origin version 5 is the destination's version 2: {second}"
+    );
 
-    // The same delta again. A retry is a transfer's ordinary second delivery, and
-    // it is the shape the old design turned into a second copy of one version.
-    let repeat = ok(dir.path(), &["merge", "two.delta", "received"]);
+    // The same delta again. A retry is a transfer's ordinary second delivery,
+    // and it is the shape the old design turned into a second copy of one
+    // version.
+    let repeat = ok(dir.path(), &["merge", "five.delta", "received"]);
     assert!(
         repeat.contains("already merged"),
         "the fixture should have made the repeat a no-op: {repeat}"
@@ -3625,15 +3651,15 @@ fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
     assert_eq!(
         ok(dir.path(), &["versions", "received", "--numbers-only"])
             .lines()
-            .count(),
-        2,
+            .collect::<Vec<_>>(),
+        ["1", "2"],
         "merging a pack the set already holds must not publish a version"
     );
 
     // A delta whose base the set does not hold, refused. The set holds versions
-    // 1 and 2 of the origin's content but has never seen version 3, so the base
+    // 4 and 5 of the origin's content and has never seen version 1, so the base
     // is absent however many versions there are.
-    let refused = fails(dir.path(), &["merge", "four.delta", "received"]);
+    let refused = fails(dir.path(), &["merge", "stale.delta", "received"]);
     assert!(
         refused.contains("is a delta against"),
         "a delta for a base the set lacks should be refused: {refused}"
@@ -3641,16 +3667,16 @@ fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
     assert_eq!(
         ok(dir.path(), &["versions", "received", "--numbers-only"])
             .lines()
-            .count(),
-        2,
+            .collect::<Vec<_>>(),
+        ["1", "2"],
         "a refused merge must not publish a version"
     );
 
     // And a pack the set genuinely lacks, which is the third publication.
-    let report = ok(dir.path(), &["merge", "three.pack", "received"]);
+    let last = ok(dir.path(), &["merge", "six.pack", "received"]);
     assert!(
-        report.contains("version 3"),
-        "the last merge should be the third version: {report}"
+        last.contains("version 3"),
+        "a pack from origin version 6 is the destination's version 3: {last}"
     );
 
     assert_eq!(
@@ -3662,7 +3688,6 @@ fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
          with no gap and no repeat"
     );
 }
-
 /// A delta merges into a set that holds its base, and does not re-send what the
 /// base already has.
 ///
