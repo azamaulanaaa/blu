@@ -346,6 +346,62 @@ async fn bytes_that_are_not_the_payload_are_not_stored_under_its_name() {
     );
 }
 
+/// A `Raw` payload is stored under the length it has, not the one it was claimed
+/// to be.
+///
+/// `put_stored` is the path a merge takes when it keeps the frames it was sent,
+/// and it takes two lengths from the caller: the bytes on disk and the bytes of
+/// content. For a frame the second is checked against the first by the decode. For
+/// `Raw` there is nothing to check against — the payload *is* the content — so the
+/// only honest record of it is the length of what arrived.
+///
+/// This is the one arm of that function with no direct test. It was reached only
+/// through a merge, where the record's own header and the index agree by
+/// construction, so a store that believed the claim instead would have gone
+/// unnoticed: the record would say a chunk is longer than it is, and a restore
+/// comparing a slice's end against a snapshot would be off by exactly the
+/// difference between the two lengths.
+#[tokio::test]
+async fn a_raw_payload_is_stored_under_its_own_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store");
+
+    let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::Off)
+        .await
+        .unwrap();
+
+    let payload = compressible(120_000);
+    let id = blake3::hash(&payload);
+    let claimed = u64::try_from(payload.len()).unwrap() + 10_000;
+
+    store
+        .put_stored(
+            &id,
+            Box::new(std::io::Cursor::new(payload.clone())),
+            u64::try_from(payload.len()).unwrap(),
+            claimed,
+            Codec::Raw,
+        )
+        .await
+        .unwrap();
+
+    let placement = store.locate(&id).unwrap();
+    assert_eq!(
+        placement.raw_len,
+        u64::try_from(payload.len()).unwrap(),
+        "the record should carry the content's own length, not the {claimed} it was claimed to have"
+    );
+    assert_eq!(placement.stored_len, placement.raw_len);
+
+    // A second record, so a stored length short of the payload would run into
+    // another record's bytes rather than into end of file.
+    put(&store, &incompressible(11, 100_000)).await;
+
+    drop(store);
+    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
+    assert_eq!(read(&reader, &id).await, payload);
+}
+
 /// A policy that returns exactly as many bytes as it was given is not believed
 /// either.
 ///
