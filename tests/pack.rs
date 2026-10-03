@@ -625,6 +625,116 @@ impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOn
 /// wrote and somebody wants back. Writing in place destroyed it before the run
 /// knew it could finish — the header goes first, and the header's payload length
 /// is a count of records that have not been written yet.
+/// A pack whose first record does not begin with a record header, or has no room
+/// for one.
+///
+/// Two refusals in one file, because they are the same refusal seen from two
+/// sides: either the bytes at the offset the index names are not a header at all,
+/// or they are one that does not fit in the room the index gives the record. Both
+/// stop at `decode_header` and neither is a magic check — a header is only read
+/// whole if it fits, so a record whose header is wider than its own slot is
+/// refused before its magic, kind or codec is ever looked at.
+///
+/// **Built rather than patched**, because a real record's header cannot be widened
+/// without changing a length, and this fixture is about the room rather than about
+/// any length: the first record declares two two-byte lengths, so its header is
+/// fifty bytes, and the index gives it forty-eight. Forty-eight is also the most
+/// room a record can be given and still tile — one byte less and `open` refuses
+/// the whole pack as overlapping, which is the other test.
+#[tokio::test]
+async fn a_record_header_that_does_not_fit_its_room_is_refused() {
+    const PAYLOAD: u64 = 200;
+    const HEADER: usize = 50; // 6 + two two-byte lengths + 32 + 8
+    /// Magic, format, version, snapshot hash, the delta flag, a one-byte chunk
+    /// count and a two-byte payload length — where the payload, and so the first
+    /// record's magic, begins.
+    const PACK_HEADER: usize = 4 + 4 + 4 + 32 + 1 + 1 + 2;
+
+    let first = lepatch::storage::BlobId::from_bytes([0x11u8; 32]);
+    let second = lepatch::storage::BlobId::from_bytes([0x22u8; 32]);
+    let table = one_file(&[first, second]).to_bytes().unwrap();
+
+    let mut record = Vec::new();
+    record.extend_from_slice(b"LPB1");
+    record.push(0);
+    record.push(0); // raw, so the payload is the content
+    push_varint(&mut record, PAYLOAD);
+    push_varint(&mut record, PAYLOAD);
+    record.extend_from_slice(first.as_bytes());
+    let check = blake3::hash(&record).as_bytes()[..8].to_vec();
+    record.extend_from_slice(&check);
+    assert_eq!(
+        record.len(),
+        HEADER,
+        "the fixture's header is 50 bytes wide"
+    );
+    record.extend(std::iter::repeat_n(0u8, usize::try_from(PAYLOAD).unwrap()));
+
+    let mut index = Vec::new();
+    index.extend_from_slice(first.as_bytes());
+    push_varint(&mut index, 0);
+    push_varint(&mut index, PAYLOAD);
+    index.extend_from_slice(second.as_bytes());
+    push_varint(&mut index, u64::try_from(HEADER - 2).unwrap()); // one entry inside the first record
+    push_varint(&mut index, PAYLOAD);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"LPK1");
+    bytes.extend_from_slice(&6u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(blake3::hash(&table).as_bytes());
+    bytes.push(0);
+    push_varint(&mut bytes, 2);
+    push_varint(&mut bytes, u64::try_from(record.len()).unwrap());
+    bytes.extend_from_slice(&record);
+    bytes.extend_from_slice(&table);
+    bytes.extend_from_slice(&index);
+    bytes.extend_from_slice(&u64::try_from(index.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&u64::try_from(table.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(b"LPK1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("no-room.pack");
+    fs::write(&path, &bytes).unwrap();
+
+    // The pack is otherwise sound: a second entry gives the first record forty-eight
+    // bytes of room and the index it holds still opens, so what is refused below is
+    // the room rather than the file.
+    let pack = Pack::open(&path).expect("the fixture is a pack this build can open");
+
+    let error =
+        pack.get(&first).await.err().expect(
+            "a record header that does not fit the room the index gives it must be refused",
+        );
+    assert!(
+        error
+            .to_string()
+            .contains("does not begin with a record header"),
+        "the refusal should name the header, not the payload: {error}"
+    );
+
+    // And the same file with the first record's own magic broken, which is the
+    // other side of the same refusal: there is room, and what is in it is not a
+    // header. Nothing else moved, so the only difference is those four bytes.
+    let mut wrong_magic = bytes.clone();
+    wrong_magic[PACK_HEADER..PACK_HEADER + 4].copy_from_slice(b"XXXX");
+    let path = dir.path().join("wrong-magic.pack");
+    fs::write(&path, &wrong_magic).unwrap();
+
+    let pack = Pack::open(&path).expect("breaking a record's magic does not break the pack");
+    let error = pack
+        .get(&first)
+        .await
+        .err()
+        .expect("a record that does not begin with a header must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("does not begin with a record header"),
+        "the refusal should name the header: {error}"
+    );
+}
+
 #[tokio::test]
 async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
     // Its own tree rather than `build`'s: the disagreement below is reported in

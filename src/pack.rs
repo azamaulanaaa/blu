@@ -1755,7 +1755,8 @@ impl Pack {
                 self.path(),
                 &format!(
                     "the record it holds for chunk {id} does not begin with a record header: \
-                     its magic, kind, codec or its own check do not verify"
+                     the {head_len} bytes the index leaves for it hold no header — its magic, \
+                     kind and codec are not there, or its own check does not verify",
                 ),
             ));
         };
