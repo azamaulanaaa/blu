@@ -1,20 +1,20 @@
 //! How large a segment gets before a new one is started.
 //!
-//! One value, and it is a write policy rather than part of the format: nothing
-//! in a record says where a boundary fell, so a set written under one limit
-//! reads back under any other. It is its own file rather than part of
-//! `compression` because it decides something different — how the log is cut
-//! into files, rather than what is inside a record — and because the one caller
-//! that wants both takes them as two arguments while a reader takes neither.
+//! One value, and it is a write policy rather than part of the format. No record
+//! says where a boundary fell. A set written under one limit reads back under any
+//! other. This value has its own file rather than living in `compression`. The two
+//! files decide different things. This one decides how the log is cut into files.
+//! `compression` decides what goes inside a record. The one caller that wants both
+//! takes them as two arguments, while a reader takes neither.
 
 use super::record;
 
 /// How large a store segment may get before a new one is started.
 ///
-/// A write policy, not part of the format: a set written under one limit reads
+/// A write policy, not part of the format. A set written under one limit reads
 /// back under any other, because no record depends on where a segment boundary
 /// fell. A reader is given a limit only so one value can be passed to both
-/// constructors, and ignores it.
+/// constructors. The reader ignores it.
 ///
 /// The default is 4 GiB, under what FAT32 and several older archive formats
 /// refuse, and small enough that no single file needs 64-bit offsets.
@@ -71,11 +71,11 @@ impl Default for SegmentLimit {
 
 /// The smallest record that can be written: a header and an empty payload.
 ///
-/// Derived from the record format's own constant rather than re-spelling its
-/// parts. It was `6 + 2 + 32 + 8`, one module over from the `PREFIX + 2 + HASH +
-/// CHECK` it is a copy of, with the `2` — two one-byte lengths of zero —
-/// documented in the original and here. A header that grew a field would move
-/// `MIN_HEADER` and leave this behind, and the only thing it would break is
-/// `SegmentLimit::new`'s floor, silently, on the way to a store that refuses its
-/// own records.
+/// This value comes from the record format's own constant rather than a
+/// restatement of its parts. The constant was `6 + 2 + 32 + 8`. That value sits
+/// one module away from the `PREFIX + 2 + HASH + CHECK` it copies. The `2` counts
+/// two one-byte lengths of zero. The original documented that `2`, and this
+/// comment does too. A header that grew a field would move `MIN_HEADER` and leave
+/// this value behind. Only `SegmentLimit::new`'s floor would break, and it would
+/// break silently, on the way to a store that refuses its own records.
 const MIN_RECORD: u64 = record::MIN_HEADER as u64;

@@ -1,10 +1,10 @@
 //! Capture and restoration of platform-specific file attributes.
 //!
-//! Unix and Windows expose different attribute sets, so everything that
-//! cannot be expressed portably is funnelled through this module and compiled
-//! per platform. An attribute a platform does not model is reported as `None`,
-//! as `0`, or as a no-op rather than as a fabricated value, so a restore never
-//! writes a bogus mode or timestamp.
+//! Unix and Windows expose different attribute sets, so every attribute that
+//! cannot be expressed portably goes through this module. The build compiles
+//! this module once per platform. A platform that does not model an attribute
+//! reports it as `None`, as `0`, or as a no-op. The module never reports a
+//! fabricated value. A restore never writes a bogus mode or timestamp.
 
 use std::{fs, io, path::Path};
 
@@ -12,11 +12,11 @@ use crate::metadata::Timestamp;
 
 /// Unix permission bits, or `None` on a platform that has none.
 ///
-/// `None` rather than `0`, because "this platform has no permission bits" and "the
-/// permissions are the empty set" are different facts and a restore acts on them
-/// differently — one is a no-op, the other is a set of permissions nobody has.
-/// A `0` could not say which, so it was a sentinel, and a sentinel in a public
-/// field is a thing every reader has to be told about.
+/// `None` rather than `0`. "This platform has no permission bits" and "the
+/// permissions are the empty set" are different facts. A restore acts on them
+/// differently. One is a no-op. The other is a set of permissions nobody has.
+/// A `0` could not say which. A `0` was a sentinel instead. A sentinel in a
+/// public field is a thing that every reader has to be told about.
 #[must_use]
 pub fn mode_of(meta: &fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
@@ -55,13 +55,13 @@ pub fn mtime_of(meta: &fs::Metadata) -> Option<Timestamp> {
 
 /// The user and group that own a file, or `None` where the platform has neither.
 ///
-/// A pair rather than two functions, because they come from one `stat` and are
-/// recorded together or not at all: an entry that has an owner has a group, and
-/// splitting them would let a caller record one and not the other.
+/// A pair rather than two functions. They come from one `stat`, and the code
+/// records them together or not at all. An entry that has an owner has a group.
+/// Splitting them would let a caller record one and not the other.
 ///
 /// `None` on a platform with no users or groups, which is Windows. There is no
-/// sensible substitute — a made-up id would be a claim about the filesystem that
-/// the filesystem never made.
+/// sensible substitute. A made-up id would be a claim about the filesystem.
+/// The filesystem never made that claim.
 #[must_use]
 pub fn owner_of(meta: &fs::Metadata) -> Option<(u32, u32)> {
     #[cfg(unix)]
@@ -84,21 +84,21 @@ pub fn owner_of(meta: &fs::Metadata) -> Option<(u32, u32)> {
 /// and what a snapshot taken on one records.
 ///
 /// **Order matters, and this has to come before the mode.** On Linux, changing a
-/// file's owner clears its set-user-ID and set-group-ID bits, so a caller that sets
+/// file's owner clears its set-user-ID and set-group-ID bits. A caller that sets
 /// the mode first and the owner second silently strips setuid from everything it
-/// restores. [`Attributes::apply`](crate::metadata::Attributes::apply) is where that
-/// ordering is enforced; a caller applying attributes by hand is the risk.
+/// restores. [`Attributes::apply`](crate::metadata::Attributes::apply) enforces
+/// that order. A caller that applies attributes by hand is the risk.
 ///
-/// Symbolic links are skipped, like [`set_mtime`]. Their owner is a property of the
-/// link itself and only `lchown` could set it, which is not what a backup restores
-/// — a snapshot records a link's *target*, and following the link to chown its
-/// destination would be a different and much larger claim.
+/// Symbolic links are skipped, like [`set_mtime`]. Their owner is a property of
+/// the link itself. Only `lchown` could set it, and a backup does not restore it.
+/// A snapshot records a link's *target*. Following the link to change the owner
+/// of its destination would be a different and much larger claim.
 ///
 /// # Errors
 ///
-/// Returns an error if the path cannot be found, or the owner cannot be changed —
-/// which for an unprivileged caller is the ordinary case, and is not a problem with
-/// the path.
+/// Returns an error if the path cannot be found, or the owner cannot be
+/// changed. For an unprivileged caller, a failed change is the ordinary case.
+/// That failure is not a problem with the path.
 pub fn set_owner(path: &Path, owner: Option<(u32, u32)>) -> io::Result<()> {
     let Some((uid, gid)) = owner else {
         return Ok(());
@@ -124,13 +124,13 @@ pub fn set_owner(path: &Path, owner: Option<(u32, u32)>) -> io::Result<()> {
 
 /// Apply permission bits captured by [`mode_of`].
 ///
-/// A no-op where `mode` is `None` — which is what a platform without permission
-/// bits reports, and what a snapshot taken on one records.
+/// A no-op where `mode` is `None`. A platform without permission bits reports
+/// `None`. A snapshot taken on one records `None`.
 ///
 /// # Errors
 ///
-/// Returns an error if the path cannot be found, or its permissions cannot be
-/// changed — for instance because the caller does not own the file.
+/// Returns an error if the path cannot be found, or if its permissions cannot be
+/// changed. One cause is that the caller does not own the file.
 pub fn set_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -171,13 +171,14 @@ pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
 
 /// Create a symbolic link at `link` pointing at `target`.
 ///
-/// The caller does not say whether `target` is a directory, and that is the point:
-/// only Windows needs to know, and it is a question about the filesystem rather
-/// than about the snapshot being restored. The old signature took a
-/// `target_is_dir: bool`, which meant the caller had to answer it on every
-/// platform — paying a `stat` per symbolic link to produce a value that unix then
-/// discarded with `let _ =`. So a restore of a tree with a thousand links paid a
-/// thousand `stat` calls to build an argument nobody read.
+/// The caller does not say whether `target` is a directory, and that is the
+/// point. Only Windows needs to know. The question is about the filesystem, not
+/// about the snapshot being restored. The old signature took a
+/// `target_is_dir: bool`. That signature required the caller to answer the
+/// question on every platform. The caller paid a `stat` per symbolic link. The
+/// caller used the result to build a value that unix then discarded with
+/// `let _ =`. So a restore of a tree with a thousand links paid a thousand
+/// `stat` calls to build an argument nobody read.
 ///
 /// The probe moves here instead, behind a `cfg`, where it is both used and
 /// compiled. A relative target is resolved against the *link's* directory, which
@@ -185,9 +186,9 @@ pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if `link` already exists, if its parent directory is
-/// missing, if the platform does not support symbolic links, or — on Windows —
-/// if the caller lacks the privilege required to create one.
+/// Returns an error if `link` already exists. The call also fails if the parent
+/// directory is missing, or the platform does not support symbolic links. On
+/// Windows, the call fails if the caller lacks the privilege that creates one.
 pub fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -234,9 +235,9 @@ fn points_at_directory(link: &Path, target: &Path) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an error if `existing` does not exist, if `link` already exists, or
-/// if the two paths are on different filesystems — which is the usual reason a
-/// restore fails to recreate a hard link.
+/// Returns an error if `existing` does not exist, or if `link` already exists.
+/// The call also fails if the two paths are on different filesystems. That layout
+/// is the usual reason a restore fails to recreate a hard link.
 pub fn hard_link(existing: &Path, link: &Path) -> io::Result<()> {
     fs::hard_link(existing, link)
 }

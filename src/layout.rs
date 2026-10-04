@@ -1,16 +1,16 @@
 //! On-disk layout of a versioned backup set.
 //!
-//! Named for what it is. This was `src/index.rs`, and it contains no index: the
+//! Named for what it is. This was `src/index.rs`, and it contains no index. The
 //! per-version index files are read by [`crate::storage::VersionIndex`] and
-//! checked by [`crate::storage::resolve`]. What is here is the *set* — the
+//! checked by [`crate::storage::resolve`]. What is here is the *set*: the
 //! segments, the index file names, the lock, and the numbering that ties them
-//! together — which is the layout, and which the module's own first line has said
-//! all along. A module called `index` holding `IndexSet`, next to a `storage`
-//! module holding the actual `VersionIndex`, is the kind of thing a reader
-//! navigates around instead of through.
+//! together. That is the layout, and the first line of this module has said so
+//! all along. A module called `index` holding `IndexSet` sits next to a `storage`
+//! module holding the actual `VersionIndex`. A reader navigates around that kind
+//! of thing instead of through it.
 //!
 //! A backup set is a sequence of numbered segments plus a lock, all named after a
-//! common base path:
+//! common base path.
 //!
 //! ```text
 //! photos.0000.bin     segment 0: the first N bytes of records
@@ -22,43 +22,43 @@
 //!
 //! ## Segments
 //!
-//! Each file is under a fixed limit, so nothing here meets a maximum file size,
-//! a tool that cannot read the set, or a transfer that has to succeed in one
-//! piece, and a segment can be moved, verified or replaced on its own.
+//! Each file is under a fixed limit. So nothing here meets a maximum file size,
+//! or a tool that cannot read the set, or a transfer that must succeed in one
+//! piece. A segment can be moved, verified, or replaced on its own.
 //!
-//! A full segment is **sealed** and never written again, so a torn write can only
-//! be in the last one: a failure inside any other is permanent and detectable
-//! rather than something the next open papers over by truncating it.
+//! A full segment is **sealed** and never written again. So a torn write can
+//! only be in the last one. A failure inside any other segment is permanent and
+//! detectable. The next open does not paper over that failure by truncating it.
 //!
-//! Every segment's header carries its own number, and a file whose header does
-//! not match the number in its name is refused rather than read as though it
-//! belonged — a segment copied in from elsewhere is caught that way. Segments
-//! are numbered from zero with no gaps; a gap is refused too, because a set
-//! missing a segment in the middle cannot be read as though the missing chunk
-//! data were simply not there.
+//! Every segment's header carries its own number. A file whose header does not
+//! match the number in its name is refused. The code does not read that file as
+//! though it belonged. A segment copied in from elsewhere is caught that way.
+//! Segments are numbered from zero with no gaps. A gap is refused too. A set
+//! that misses a segment in the middle cannot be read as though the missing
+//! chunk data were not there.
 //!
 //! ## Index files
 //!
-//! One small file per version, saying which segment that version's snapshot is
-//! in — so answering "where is version 7's snapshot" costs a file name rather
-//! than the headers of every record in the set.
+//! One small file per version. It says which segment holds that version's
+//! snapshot. So answering "where is version 7's snapshot" costs a file name. It
+//! does not cost the headers of every record in the set.
 //!
 //! **They are a cache, not a second source of truth.** The store's commit records
-//! are the record of what versions exist; an index file is derived from them and
-//! can be lost, stale, or wrong without the store disagreeing about anything. If
-//! the two conflict, the store wins and the index is rebuilt. The commit record
-//! is the commit, a single append to a single file, and the index is written
-//! after it, best-effort, so losing one costs a scan rather than a backup.
-//! `lepatch reindex` rebuilds them from the store.
+//! are the record of what versions exist. An index file is derived from them. An
+//! index file can be lost, stale, or wrong without the store disagreeing about
+//! anything. If the two conflict, the store wins and the index is rebuilt. The
+//! commit record is the commit, a single append to a single file. The index is
+//! written after it, best-effort. So losing one costs a scan rather than a
+//! backup. `lepatch reindex` rebuilds them from the store.
 //!
-//! The `v` in `photos.v0001.idx` separates the two kinds of file: without it,
+//! The `v` in `photos.v0001.idx` separates the two kinds of file. Without it,
 //! `photos.0001.idx` and `photos.0001.bin` would name different things in the
-//! same directory, and a glob or a person clearing out old index files would hit
-//! both.
+//! same directory. A glob would then hit both. So would a person clearing out
+//! old index files.
 //!
-//! The base path is treated as an opaque prefix rather than a stem, so a base
-//! of `photos.tar` yields `photos.tar.0000.bin` instead of silently losing the
-//! extension the way `Path::with_extension` would.
+//! The base path is treated as an opaque prefix, not a stem. So a base of
+//! `photos.tar` yields `photos.tar.0000.bin`, and it keeps the extension
+//! instead of losing it silently the way `Path::with_extension` does.
 
 use std::{
     ffi::OsStr,
@@ -68,10 +68,10 @@ use std::{
 
 /// Extension of a store segment.
 ///
-/// Named for the segment rather than for a blob, because that is what it is: a
-/// segment is a run of records, and "blob" already means a chunk's content
-/// everywhere else in this crate. A `blob_path` returning `photos.0000.bin` was
-/// naming a file that holds thousands of blobs, or none.
+/// Named for the segment, not for a blob. A segment is a run of records, and
+/// "blob" already means a chunk's content everywhere else in this crate. A
+/// `blob_path` that returns `photos.0000.bin` names a file that holds thousands
+/// of blobs, or none.
 pub const SEGMENT_EXTENSION: &str = "bin";
 /// Extension of a per-version index file.
 pub const INDEX_EXTENSION: &str = "idx";
@@ -80,20 +80,21 @@ pub const LOCK_EXTENSION: &str = "lock";
 
 /// Digits in a segment's number.
 ///
-/// The width is what makes lexical order over a directory listing the same as
-/// numeric order, so a listing is already in order. It also means the naming
-/// scheme can only express so many segments: [`MAX_SEGMENT`] is the last one
-/// whose number fits, and a run that needs another is refused rather than
-/// writing a file that [`IndexSet::segments`] would not find.
+/// The width makes lexical order over a directory listing the same as numeric
+/// order. So a listing is already in order. The width also limits the naming
+/// scheme. [`MAX_SEGMENT`] is the last segment number that fits. A run that
+/// needs another number is refused. The run does not write a file that
+/// [`IndexSet::segments`] would not find.
 pub const SEGMENT_DIGITS: usize = 4;
 
 /// The highest segment number the naming scheme can express.
 ///
 /// `10^SEGMENT_DIGITS - 1`. A segment's number is zero-padded to
-/// [`SEGMENT_DIGITS`], which pads but never truncates, so the number just past
-/// this one is *written* as a five-digit name and then *rejected* by
-/// the reader that numbers the set's files, which the file would exist, the set would not see it,
-/// and any commit record inside it would be invisible to every later run.
+/// [`SEGMENT_DIGITS`], which pads but never truncates. So the number just past
+/// this one is *written* as a five-digit name. The reader that numbers the set's
+/// files then *rejects* that name. If a run wrote that name anyway, the file
+/// would exist and the set would not see it, and any commit record inside it
+/// would be invisible to every later run.
 pub const MAX_SEGMENT: u32 = 9_999;
 
 /// A backup set rooted at a base path.
@@ -101,13 +102,13 @@ pub const MAX_SEGMENT: u32 = 9_999;
 /// # Example
 ///
 /// The names are the whole contract, so they are worth pinning in something that
-/// runs. The base path is treated as an opaque *prefix* rather than a stem, so a
-/// base of `photos.tar` yields `photos.tar.0000.bin` — losing the extension the
-/// way [`Path::with_extension`] would — and the `v` in `photos.v0001.idx` keeps
-/// the two kinds of file from ever naming the same thing in one directory.
+/// runs. The base path is treated as an opaque *prefix*, not a stem. A base of
+/// `photos.tar` yields `photos.tar.0000.bin`, which keeps the extension that
+/// [`Path::with_extension`] loses. The `v` in `photos.v0001.idx` keeps the two
+/// kinds of file from ever naming the same thing in one directory.
 ///
-/// This example is not `no_run`: it touches no disk outside a path that does not
-/// exist, so it runs and its assertions are checked.
+/// This example is not `no_run`. It touches no disk outside a path that does not
+/// exist, so it runs and the build checks its assertions.
 ///
 /// ```
 /// # fn main() -> std::io::Result<()> {
@@ -130,32 +131,34 @@ pub struct IndexSet {
     base: PathBuf,
 }
 
-/// The set's own name inside `full`, and the digits between the tail's tag and
-/// its extension — if the rest of it is a tail at all.
+/// The set's own name inside `full`. The return value also gives the digits
+/// between the tail's tag and its extension. The function returns those digits
+/// only if the rest of the name is a tail at all.
 ///
 /// `<base>.<tag>NNNN.<ext>`, where `tag` is empty for a segment and `v` for an
-/// index file. **The whole grammar of a set's naming, in one place**, because
-/// there are two readers of it and they used to spell it between them: the scan
-/// that numbers the files a directory holds, and the name a caller gives to open
-/// one. The shapes are the same shape, so a change to the scheme is one edit
-/// rather than two in two different languages.
+/// index file. **The whole grammar of a set's naming, in one place.** Two readers
+/// need that grammar. The first is the scan that numbers the files a directory
+/// holds. The second is the name a caller gives to open one file. The two used
+/// to spell the grammar between them. Both shapes are the same shape, so a change
+/// to the scheme is one edit rather than two in two languages.
 ///
-/// As **bytes**, because one reader must handle a name that is not UTF-8 — the
-/// set's own name is not required to be, and [`IndexSet::numbered_file`] went to
-/// lengths precisely because it had to. The caller that has a `&str` converts
-/// what comes back, which refuses a base that fell inside a character rather than
-/// handing back half of one.
+/// The name is compared as **bytes**, because one reader must handle a name that
+/// is not UTF-8. The set's own name need not be UTF-8 either.
+/// [`IndexSet::numbered_file`] went to lengths precisely because it had to. The
+/// caller that has a `&str` converts what comes back. That conversion refuses a
+/// base that fell inside a character. The conversion does not hand back half of
+/// one character.
 ///
-/// Returns `None` for anything else, which every caller treats as "not a name of
-/// ours": most of what is in a set's directory is not part of the set.
+/// Returns `None` for anything else. Every caller treats that as "not a name of
+/// ours". Most of what is in a set's directory is not part of the set.
 fn tail_of<'a>(full: &'a [u8], tag: &str, ext: &str) -> Option<(&'a [u8], &'a [u8])> {
-    // The name is the base, then a fixed-shape tail. Checking the whole length up
-    // front means the slices below are known to be in bounds, and it rejects a
-    // name carrying a longer base than this set's.
+    // The name is the base, then a fixed-shape tail. Checking the whole length
+    // up front means the slices below are known to be in bounds. It also rejects
+    // a name that carries a longer base than this set has.
     let tail = 1 + tag.len() + SEGMENT_DIGITS + 1 + ext.len();
     let (base, rest) = full.split_at_checked(full.len().checked_sub(tail)?)?;
 
-    // `.`, then the tag — empty for a segment, `v` for an index file.
+    // `.`, then the tag. The tag is empty for a segment, and `v` for an index file.
     if rest.first() != Some(&b'.') || &rest[1..=tag.len()] != tag.as_bytes() {
         return None;
     }
@@ -178,24 +181,24 @@ fn tail_of<'a>(full: &'a [u8], tag: &str, ext: &str) -> Option<(&'a [u8], &'a [u
 /// The set a segment file belongs to, or `path` itself when it is not one.
 ///
 /// Unwraps the same fixed-shape tail that a segment listing matches, and nothing
-/// else: a name is a set's name until it is shaped exactly like one of the files
-/// that set is made of.
+/// else. A name is a set's name until it is shaped exactly like one of the files
+/// that the set is made of.
 ///
 /// A name that is not valid UTF-8 is left exactly as it was given. Building an
 /// `OsStr` from a truncated byte slice needs `from_encoded_bytes_unchecked`,
-/// which is `unsafe`, and this crate forbids unsafe code — so a set whose base
-/// name is not valid UTF-8 keeps the spelling it always had rather than being
-/// addressed by a lossy one.
+/// which is `unsafe`. This crate forbids unsafe code. So a set whose base name
+/// is not valid UTF-8 keeps the spelling it always had. It does not get a lossy
+/// name instead.
 fn strip_segment_tail(path: PathBuf) -> PathBuf {
     let Some(name) = path.file_name().and_then(OsStr::to_str) else {
         return path;
     };
     // `None` where the offset the tail's arithmetic works out is not a character
-    // boundary, which a name can put there by having a multi-byte character
-    // under it: `café` is three characters and four bytes, and the fourth is in
-    // the middle of the last one. Splitting there would panic, so the name is
-    // left as it was given — which is what every name this function does not
-    // recognise gets, and the same answer a name that is not UTF-8 got above.
+    // boundary. A name can put an offset there by having a multi-byte character
+    // under it. `café` is three characters and four bytes. The fourth byte is in
+    // the middle of the last character. Splitting there would panic, so the name
+    // is left as it was given. Every name this function does not recognise gets
+    // that answer. So does a name that is not UTF-8, as the code above shows.
     let Some((base, _)) = tail_of(name.as_bytes(), "", SEGMENT_EXTENSION) else {
         return path;
     };
@@ -206,15 +209,15 @@ fn strip_segment_tail(path: PathBuf) -> PathBuf {
         return path;
     };
 
-    // The directory is the caller's and is kept exactly as it was given; only
-    // the file name is read as naming something inside the set.
+    // The directory is the caller's, and the code keeps it exactly as it was
+    // given. Only the file name is read as naming something inside the set.
     match path.parent() {
         Some(parent) => parent.join(base),
-        // Unreachable while the `to_str` above answered: a path with no parent is
-        // a root, and a root has no file name for the tail to be cut from. Kept
-        // rather than folded into the other arm, because it returns the right
-        // thing — the same path with the tail off — and a future caller reaching
-        // it should get that rather than the name it was given.
+        // Unreachable while the `to_str` above answered. A path with no parent is
+        // a root. A root has no file name for the tail to be cut from. The code
+        // keeps this arm rather than folding it into the other arm. This arm
+        // returns the same path with the tail off. A future caller that reaches
+        // it should get that path, not the name it was given.
         None => PathBuf::from(base),
     }
 }
@@ -223,22 +226,22 @@ impl IndexSet {
     /// A backup set whose files are named after `base`.
     ///
     /// `base` may name the set or one of its segments. `photos` and
-    /// `photos.0000.bin` are one set, and the second is the name a directory
-    /// listing shows and the one a person copies, so both should work wherever a
-    /// set is named rather than only the one this tool invented.
+    /// `photos.0000.bin` are one set. The second name is the one a directory
+    /// listing shows, and the one a person copies. Both should work wherever a
+    /// set is named, not only the one this tool invented.
     ///
-    /// The tail is stripped on **shape**, not on what happens to be on disk, so a
-    /// set that does not exist yet behaves exactly like one that does, and a
-    /// mistyped segment path opens the set the user meant rather than a second
-    /// one under a name they did not say. The cost is that a set genuinely named
-    /// `report.2024.bin` cannot be addressed — its name reads as a segment of
-    /// `report`. That is the same trade every command makes about a path shaped
-    /// like one of its own files, and the alternative, probing the disk, makes
-    /// the answer depend on what exists, which is worse to explain.
+    /// The tail is stripped on **shape**, not on what happens to be on disk. So a
+    /// set that does not exist yet behaves exactly like one that does. A mistyped
+    /// segment path opens the set the user meant. It does not open a second set
+    /// under a name the user did not say. The cost is that a set genuinely named
+    /// `report.2024.bin` cannot be addressed. The name reads as a segment of
+    /// `report`. Every command makes the same trade about a path shaped like one
+    /// of its own files. The alternative, probing the disk, makes the answer
+    /// depend on what exists. That is worse to explain.
     ///
     /// Only a segment's tail is unwrapped. An index file or a lock names the set
-    /// just as well, and taking those too would be three shapes to get right and
-    /// three ways to be wrong; they are refused instead.
+    /// just as well. Taking those too would mean three shapes to get right and
+    /// three ways to be wrong. The code refuses them instead.
     pub fn new(base: impl Into<PathBuf>) -> Self {
         Self {
             base: strip_segment_tail(base.into()),
@@ -253,40 +256,40 @@ impl IndexSet {
 
     /// Path of segment `segment` of the store.
     ///
-    /// Zero-padded to [`SEGMENT_DIGITS`], so lexical order over the files in a
-    /// directory is numeric order over the segments. Padding is not truncation:
-    /// a number wider than the width is named with its own digits, which no
-    /// longer sorts, and which the set's own file-numbering reader will not read back.
-    /// Callers should hold `segment` to [`MAX_SEGMENT`]; the store refuses to
-    /// roll over past it.
+    /// Zero-padded to [`SEGMENT_DIGITS`]. So lexical order over the files in a
+    /// directory is numeric order over the segments. Padding is not truncation.
+    /// A number wider than the width is named with its own digits. Those digits
+    /// no longer sort. The set's own file-numbering reader does not read them
+    /// back. Callers should hold `segment` to [`MAX_SEGMENT`]. The store
+    /// refuses to roll over past it.
     ///
     /// This was `blob_path`, which named a segment file as though it held one
-    /// blob. It does not: it holds whatever records the run wrote into it, and a
-    /// segment boundary is a write policy rather than anything the content
-    /// implies, so there is no "the blob" for such a path to belong to.
+    /// blob. It does not. It holds whatever records the run wrote into it. A
+    /// segment boundary is a write policy, not anything the content implies. So
+    /// there is no "the blob" for such a path to belong to.
     ///
     /// **A `Segment` newtype is the safer signature and is not used here.** This
-    /// and [`IndexSet::index_path`] both take a `u32` and mean different things, so
-    /// `set.index_path(index.segment)` would name a real file in the wrong series
-    /// and nothing would object. A newtype would make that a compile error.
+    /// and [`IndexSet::index_path`] both take a `u32` and mean different things.
+    /// So `set.index_path(index.segment)` would name a real file in the wrong
+    /// series. Nothing would object. A newtype would make that a compile error.
     ///
-    /// It is declined on the arithmetic, which was counted: 78 call sites across
-    /// the crate and its tests, 164 once the `segment:` fields in
-    /// [`Placement`](crate::storage::Placement), `VersionIndex` and the test
-    /// fixtures are included. The mistake does not exist today — no caller passes a
-    /// version here — and the audit that proposed the newtype called its own item
-    /// "real, but low value-per-churn".
+    /// It is declined on the arithmetic, which was counted. The count is 78 call
+    /// sites across the crate and its tests. The count is 164 once the `segment:`
+    /// fields in [`Placement`](crate::storage::Placement), `VersionIndex` and the
+    /// test fixtures are included. The mistake does not exist today. No caller
+    /// passes a version here. The audit that proposed the newtype called its own
+    /// item "real, but low value-per-churn".
     ///
     /// The same reasoning retired `AsyncReadSeek`'s proposed `pub(crate)` and
-    /// `BlobStore<true>`'s proposed `Read`/`Write` in reverse: that one was 15
-    /// sites after `open_for_writing` removed the rest, and it was done. What is
-    /// left here is what it was before.
+    /// `BlobStore<true>`'s proposed `Read`/`Write` in reverse. That one counted
+    /// 15 sites after `open_for_writing` removed the rest. The change was done.
+    /// What is left here is what it was before.
     ///
-    /// So the argument is recorded on the two functions whose signatures are the
-    /// whole of it, in the expectation that the next person to want this will read
-    /// the count rather than re-derive it. 78 sites is a day's mechanical churn
-    /// with the compiler checking every one, and it is worth doing the day a caller
-    /// is caught mixing them.
+    /// The argument is recorded on the two functions whose signatures are the
+    /// whole of it. The next person to want this can read the count instead of
+    /// deriving it again. 78 sites is a day of mechanical churn. The compiler
+    /// checks every one of those sites. The change is worth doing the day a
+    /// caller is caught mixing them.
     #[must_use]
     pub fn segment_path(&self, segment: u32) -> PathBuf {
         self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{SEGMENT_EXTENSION}"))
@@ -295,9 +298,9 @@ impl IndexSet {
     /// Every segment of the set that is on disk, in order.
     ///
     /// Reads the directory rather than probing for `0`, `1`, `2` until one is
-    /// missing, and takes only files named exactly `base.NNNN.bin` — this reads a
-    /// directory a person can put things in. A base path whose directory does not
-    /// exist yet is an empty set rather than an error.
+    /// missing. It takes only files named exactly `base.NNNN.bin`. This reads a
+    /// directory that a person can put things in. A base path whose directory
+    /// does not exist yet is an empty set, not an error.
     ///
     /// # Errors
     ///
@@ -329,8 +332,8 @@ impl IndexSet {
 
         found.sort_by_key(|(number, _)| *number);
 
-        // A gap is refused rather than tolerated: the segments are the only place
-        // the data is, so a missing one would read as though those chunks had
+        // A gap is refused rather than tolerated. The segments are the only place
+        // the data is. A missing one would read as though those chunks had
         // never been stored.
         for (index, (number, _)) in found.iter().enumerate() {
             let expected = u32::try_from(index).unwrap_or(u32::MAX);
@@ -352,11 +355,11 @@ impl IndexSet {
 
     /// Path of the index file for `version`.
     ///
-    /// Takes the same `u32` [`IndexSet::segment_path`] does and means something
-    /// else, so it is the second half of the pair whose signatures a `Segment` and
-    /// a `Version` newtype would fix. The count and the reasoning are on that one;
-    /// this is here so neither signature can be changed without the other being
-    /// read.
+    /// Takes the same `u32` that [`IndexSet::segment_path`] takes. It means
+    /// something else. So it is the second half of the pair that a `Segment` and
+    /// a `Version` newtype would fix. The count and the reasoning are on that
+    /// function. This doc is here so that neither signature changes without the
+    /// other being read.
     #[must_use]
     pub fn index_path(&self, version: u32) -> PathBuf {
         self.suffixed(&format!("v{version:0SEGMENT_DIGITS$}.{INDEX_EXTENSION}"))
@@ -364,8 +367,8 @@ impl IndexSet {
 
     /// Every version that has an index file, in order.
     ///
-    /// The names, not the contents: which of them are *current* is the store's
-    /// business, not this function's.
+    /// The names, not the contents. Which of them are *current* is the store's
+    /// business. It is not this function's business.
     ///
     /// # Errors
     ///
@@ -404,12 +407,12 @@ impl IndexSet {
 
     /// The base path's file name, which every file of this set is named after.
     ///
-    /// An [`OsStr`], not a `String`. This is the user's path and it is not
-    /// necessarily UTF-8: a set at `/data/\xFFphotos` has segments named
-    /// `\xFFphotos.0000.bin`, and every one of them is a legal file name. Reading
-    /// it as a `String` needs a choice — reject it, or replace what is not UTF-8
-    /// — and the code was making that choice twice, inconsistently, and getting
-    /// it wrong both ways.
+    /// An [`OsStr`], not a `String`. This is the user's path, and it is not
+    /// necessarily UTF-8. A set at `/data/\xFFphotos` has segments named
+    /// `\xFFphotos.0000.bin`. Every one of them is a legal file name. Reading the
+    /// name as a `String` needs a choice: reject it, or replace what is not
+    /// UTF-8. The code made that choice twice. The code made it inconsistently.
+    /// The code got it wrong both ways.
     fn base_name(&self) -> &OsStr {
         self.base.file_name().unwrap_or(OsStr::new(""))
     }
@@ -442,23 +445,23 @@ impl IndexSet {
     /// empty for a segment and `v` for an index file. Both have the same shape
     /// and differed only in those two literals, so they are one function.
     ///
-    /// Returns `None` for anything else, which is skipped rather than reported:
-    /// this reads a directory a person can put things in, and most of what is in
-    /// it is not part of the set.
+    /// Returns `None` for anything else, and the caller skips it. This reads a
+    /// directory that a person can put things in. Most of what is in it is not
+    /// part of the set.
     ///
-    /// The name is compared as **bytes**, not decoded. That is the whole point:
-    /// `to_str` answers `None` for a name that is not UTF-8, and the set's own
-    /// name is not required to be. A set at a non-UTF-8 base path used to be
-    /// written by [`IndexSet::suffixed`], which keeps the bytes, and then
-    /// invisible to the scan, which decoded them — so `lepatch` wrote a store it
-    /// could not read back, and a second run failed with `File exists` against
-    /// the segment it had already made. The two ends disagreed about a name they
-    /// had both just agreed on.
+    /// The name is compared as **bytes**, not decoded. That is the whole point.
+    /// `to_str` answers `None` for a name that is not UTF-8. The set's own name
+    /// is not required to be. A set at a non-UTF-8 base path used to be written
+    /// by [`IndexSet::suffixed`], which keeps the bytes. The same set was then
+    /// invisible to the scan, which decoded those bytes. So `lepatch` wrote a
+    /// store that it could not read back. A second run then failed with `File
+    /// exists` against the segment it had already made. The two ends disagreed
+    /// about a name they had both just agreed on.
     ///
-    /// [`OsStr::as_encoded_bytes`] is the right tool despite the encoding being
-    /// formally unspecified: both sides go through it, so the comparison is
-    /// between two views produced the same way, which is what it is defined to
-    /// support. It is not a claim about what the bytes mean.
+    /// [`OsStr::as_encoded_bytes`] is the right tool, although the encoding is
+    /// formally unspecified. Both sides go through it. So the comparison is
+    /// between two views produced the same way, which is what the method is
+    /// defined to support. This is not a claim about what the bytes mean.
     fn numbered_file(path: &Path, base: &OsStr, tag: &str, ext: &str) -> Option<u32> {
         let full = path.file_name()?.as_encoded_bytes();
         let (name, digits) = tail_of(full, tag, ext)?;

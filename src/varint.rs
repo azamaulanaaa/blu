@@ -1,19 +1,17 @@
-//! LEB128, the variable-width integer all three of this crate's encodings use.
+//! LEB128, the variable-width integer that all three of this crate's encodings use.
 //!
-//! There are three of them — the store's record format, a pack's index, and the
-//! snapshot encoding — and they share this and almost nothing else. Their field
-//! orders, framing, trust postures and error models are unrelated, and their
-//! failure modes are deliberately different: a record decoder treats a bad
-//! number as the end of a torn tail and stops, a pack decoder has to name what
-//! went wrong to a person, and a snapshot decoder has to bound an allocation
-//! before it makes it. Merging the *formats* would blur exactly the distinction
-//! worth keeping.
+//! There are three of them. They are the record format of the store, a pack index,
+//! and the snapshot encoding. They share this module and almost nothing else.
+//! Their field orders, framing, trust postures, and error models are unrelated.
+//! Their failure modes differ by design. A record decoder treats a bad number as
+//! the end of a torn tail and stops. A pack decoder must name what went wrong to a
+//! person. A snapshot decoder must bound an allocation before it makes it. Merging
+//! the *formats* would blur exactly the distinction worth keeping.
 //!
-//! The *number* is not one of those distinctions, and having three copies of it
-//! meant three copies of the one piece of logic here that is security-relevant:
-//! a tenth byte may contribute only the last bit of a `u64`, and an encoding
-//! that says otherwise is either an overflow or a way to spend ten bytes
-//! saying zero.
+//! The *number* is not one of those distinctions. Three copies of it meant three
+//! copies of the one piece of logic here that is security-relevant. A tenth byte
+//! may contribute only the last bit of a `u64`. An encoding that says otherwise is
+//! either an overflow or a way to spend ten bytes saying zero.
 
 use std::fmt;
 
@@ -30,14 +28,14 @@ pub enum Error {
     /// More than [`MAX`] groups, or a tenth group contributing more than the one
     /// bit a `u64` has left.
     ///
-    /// **This is the only way a number can fail to fit**, and it was not always
-    /// said: there was an `Error::Overflow` beside this one for "the groups did
-    /// not fit a `u64`", which `read` cannot return. Ten groups of seven bits are
-    /// sixty-four, so the tenth group is the one place a bit can fall off the end,
-    /// and the tenth byte contributing more than that single bit is what this arm
-    /// says. A `u64` cannot be overfilled by any other route, so the two answers
-    /// were one answer with two names, and a caller matching on them had a case
-    /// that never came. Coverage said so, and the coverage of the enum's own
+    /// **This is the only way a number can fail to fit.** The text did not always
+    /// say so. An `Error::Overflow` sat beside this one for "the groups did not
+    /// fit a `u64`". `read` cannot return that error. Ten groups of seven bits are
+    /// sixty-four. The tenth group is the one place where a bit can fall off the
+    /// end. The tenth byte contributes more than that single bit when the number
+    /// does not fit. A `u64` cannot be overfilled by any other route. The two
+    /// answers were one answer with two names. A caller that matched on them had a
+    /// case that never came. Coverage said so. The coverage of the enum's own
     /// `Display` was the tell.
     Overlong,
 }
@@ -59,8 +57,8 @@ pub fn write(out: &mut Vec<u8>, value: u64) {
     let mut value = value;
     loop {
         // `value & 0x7f` is in 0..=127, so this cannot fail. It used to be a
-        // `u8::try_from(..).unwrap_or(0)`, which was both unreachable and the
-        // worst possible fallback: a wider mask would have written a zero-length
+        // `u8::try_from(..).unwrap_or(0)`. That fallback was unreachable and was the
+        // worst possible fallback. A wider mask would have written a zero-length
         // number into a record header rather than refusing.
         let byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -78,10 +76,11 @@ pub fn write(out: &mut Vec<u8>, value: u64) {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Truncated`] if the bytes run out first, and [`Error::Overlong`]
-/// if the encoding is longer than a `u64` can be — which is the one failure a
-/// number has here, since ten groups of seven bits are sixty-four and a tenth
-/// group contributing more than the single bit left over is what makes it not fit.
+/// Returns [`Error::Truncated`] if the bytes run out first. It returns
+/// [`Error::Overlong`] if the encoding is longer than a `u64` can be. That error
+/// is the one failure a number has here. Ten groups of seven bits are sixty-four.
+/// A tenth group that contributes more than the single bit left over makes the
+/// number not fit.
 pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
     let mut out: u64 = 0;
     let mut shift: u32 = 0;
@@ -89,10 +88,10 @@ pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
     for index in 0..MAX {
         let byte = *bytes.get(at + index).ok_or(Error::Truncated)?;
 
-        // The tenth group can contribute only the last bit of a u64; more than
-        // that is an overlong encoding of something shorter, and accepting it
-        // would let a caller believe a number it was never sent. This is also what
-        // makes the shift below infallible: it never passes 63.
+        // The tenth group can contribute only the last bit of a u64. More than that
+        // is an overlong encoding of something shorter. Accepting it would let a
+        // caller believe a number it was never sent. This check also makes the
+        // shift below infallible. The shift never passes 63.
         if index == MAX - 1 && byte > 1 {
             return Err(Error::Overlong);
         }
@@ -109,19 +108,20 @@ pub fn read(bytes: &[u8], at: usize) -> Result<(u64, usize), Error> {
     // Ten groups and the last one still had its continuation bit set.
     //
     // **Unreachable, and kept as an error rather than removed.** A tenth byte with
-    // its continuation bit set is more than the one bit a `u64` has left, so the
-    // check inside the loop has already answered `Overlong` for it. The function
-    // still has to produce something here, and an error is the only thing it can
-    // be: a number that does not fit is not a number, and nothing else in this
-    // signature says so. If a future encoding makes this reachable, the coverage
-    // report starts listing this line and the answer is already right.
+    // its continuation bit set is more than the one bit a `u64` has left. The check
+    // inside the loop has already answered `Overlong` for it. The function still
+    // must produce something here. An error is the only thing it can produce. A
+    // number that does not fit is not a number. Nothing else in this signature says
+    // so. If a future encoding makes this reachable, the coverage report starts
+    // listing this line. The answer is already right.
     Err(Error::Overlong)
 }
 
 /// Bytes `value` occupies as LEB128.
 ///
-/// The same count [`write()`] produces, and checked against it: a disagreement
-/// between the two would mean a header sized one way and written another.
+/// The same count [`write()`] produces. This function is checked against that count.
+/// A disagreement between the two would mean a header sized one way and written
+/// another.
 #[must_use]
 pub fn len(value: u64) -> usize {
     let mut value = value;
@@ -192,11 +192,11 @@ mod tests {
         assert_eq!(read(&out, out.len()), Err(Error::Truncated));
     }
 
-    /// What a refusal says, since it is what a caller shows.
+    /// What a refusal says, since a caller shows it.
     ///
-    /// Not a formatting test for its own sake: these two strings are the whole of
-    /// what a caller of this crate learns about a damaged file from the error
-    /// alone, and the distinction between them is the distinction between "cut
+    /// This is not a formatting test for its own sake. These two strings are the
+    /// whole of what a caller of this crate learns about a damaged file from the
+    /// error alone. The distinction between them is the distinction between "cut
     /// short" and "not a number".
     #[test]
     fn a_refusal_says_which_half_of_the_number_is_missing() {

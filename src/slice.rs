@@ -1,15 +1,15 @@
 //! Bounded async reads and writes.
 //!
-//! A blob store hands out a slice of a larger file, and a restore copies a slice
+//! A blob store hands out a slice of a larger file. A restore copies a slice
 //! of a blob into a slice of a destination file. Both need a stream that stops
 //! after exactly `limit` bytes rather than running to the end of what it wraps.
 //!
 //! [`SliceAsyncReader`] bounds the read side and [`SliceAsyncWriter`] the write
-//! side. They are used together by [`tokio::io::copy`], which stops when either
-//! side reports end of stream, so wrapping both ends of a copy pins it to one
-//! blob's worth of one file's worth of bytes.
+//! side. [`tokio::io::copy`] uses them together. That call stops when either side
+//! reports end of stream. Wrapping both ends of a copy therefore pins the copy
+//! to one blob's worth of one file's worth of bytes.
 //!
-//! Neither type is specific to chunking or to any storage backend; they are
+//! Neither type is specific to chunking or to any storage backend. Both are
 //! general adapters.
 
 use std::{
@@ -31,8 +31,8 @@ const SCRATCH: usize = 8 * 1024;
 
 /// An [`AsyncRead`] over at most the first `limit` bytes of `inner`.
 ///
-/// Reads stop at the limit, which is reported as end of stream in the usual way
-/// — a `Ready(Ok(()))` that fills nothing.
+/// Reads stop at the limit. The code reports the limit as end of stream in the
+/// usual way, as a `Ready(Ok(()))` that fills nothing.
 pub struct SliceAsyncReader<R> {
     inner: R,
     position: u64,
@@ -86,17 +86,17 @@ where
         let offered = u64::try_from(buf.remaining()).unwrap_or(u64::MAX);
         let wanted = self.remaining().min(offered);
 
-        // `usize::MAX`, not zero. The minimum is at most `offered`, which is a
-        // real `usize` widened, so the conversion cannot actually fail — but the
-        // fallback is what decides what happens if it ever did, and a zero here
-        // means `Ok(())` on the next line: a reader reporting end of stream while
-        // it still owes bytes. `usize::MAX` means "as much as you can take",
-        // which is what the scratch clamp below does with it anyway.
+        // `usize::MAX`, not zero. The minimum is at most `offered`, and `offered`
+        // is a real `usize` widened. The conversion cannot actually fail. The
+        // fallback still decides what happens if it ever did. A zero here means
+        // `Ok(())` on the next line. That reports end of stream while the reader
+        // still owes bytes. `usize::MAX` means "as much as you can take". The
+        // scratch clamp below does the same with it.
         let wanted = usize::try_from(wanted).unwrap_or(usize::MAX);
 
         // The caller has no room. Polling the inner reader with an empty buffer
-        // would make it report end of stream, and keep doing so, so the inner
-        // reader is left untouched.
+        // would make it report end of stream. It would keep doing so. So the
+        // inner reader is left untouched.
         if wanted == 0 {
             return Poll::Ready(Ok(()));
         }
@@ -129,8 +129,9 @@ where
 {
     /// # Errors
     ///
-    /// Returns an error for a seek before the start of the slice, one past its
-    /// limit, or one whose delta is too large to express as a relative seek.
+    /// Returns an error for a seek before the start of the slice, or one past the
+    /// limit. It also returns an error when the delta is too large to express as
+    /// a relative seek.
     #[tracing::instrument(level = "trace", skip(self), err)]
     fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
         let new_position = match position {
@@ -186,10 +187,10 @@ where
 /// write as an error, so this type is for `copy` and similar.
 ///
 /// The `AsyncWrite + Unpin` bound is on the impls rather than here, as it is for
-/// [`SliceAsyncReader`] above. On the struct it would be a second thing to keep in
-/// step with the impls, and it already was: three of them repeated it, and the
-/// type could not be *named* without satisfying it — which is a bound on a type
-/// that holds an `AsyncWrite` and does nothing else with it yet.
+/// [`SliceAsyncReader`] above. On the struct, the bound would be a second thing
+/// to keep in step with the impls, and it already was. Three impls repeated it.
+/// The type could not be *named* without satisfying the bound. The bound
+/// restricts a type that holds an `AsyncWrite` and does nothing else with it yet.
 pub struct SliceAsyncWriter<W> {
     inner: W,
     remaining: u64,
@@ -239,9 +240,9 @@ where
             return Poll::Ready(Ok(0));
         }
 
-        // Clamped in `usize` space, where `buf.len()` already is: taking the
-        // minimum in `u64` and narrowing after would be lossy on a 32-bit target.
-        // A limit above `usize::MAX` can only mean "more than any buffer".
+        // Clamped in `usize` space, where `buf.len()` already is. Taking the
+        // minimum in `u64` and narrowing after would be lossy on a 32-bit
+        // target. A limit above `usize::MAX` can only mean "more than any buffer".
         let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
         let limit = std::cmp::min(remaining, buf.len());
 
@@ -273,7 +274,7 @@ where
 /// decompressed in one go on a blocking thread and served from memory.
 ///
 /// It is seekable because [`crate::storage::AsyncReadSeek`] is part of the reader
-/// every storage backend hands out, and a streaming zstd frame cannot seek
+/// that every storage backend hands out. A streaming zstd frame cannot seek
 /// backwards without an index.
 pub struct DecompressReader {
     bytes: Vec<u8>,
@@ -292,11 +293,12 @@ impl std::fmt::Debug for DecompressReader {
 impl DecompressReader {
     /// Decompress a zstd frame into a reader, on a blocking thread.
     ///
-    /// The codec is not a parameter: this is the reader for a zstd frame and
+    /// The codec is not a parameter. This is the reader for a zstd frame and
     /// nothing else. The decode behind it is [`Zstd`], the one [`Decompressor`]
-    /// this crate ships, so the validation of the frame against `raw_len` lives
-    /// with the codec rather than here — this used to hold a second copy of it,
-    /// one that could disagree with the copy the store used.
+    /// this crate ships. The validation of the frame against `raw_len` lives with
+    /// the codec rather than here. This function used to hold a second copy of
+    /// that validation. The second copy could disagree with the copy the store
+    /// used.
     ///
     /// # Errors
     ///
@@ -311,10 +313,10 @@ impl DecompressReader {
     /// Serve already-decoded payload bytes.
     ///
     /// The other half of [`DecompressReader::new`], for a caller that has decoded
-    /// through [`Decompressor`] itself — which is what the store does,
-    /// because it is the store that reads the codec byte and so is the place that
-    /// knows which decompressor applies. Two constructors rather than one taking
-    /// a decompressor, because a reader does not choose how its bytes were made.
+    /// through [`Decompressor`] itself. The store does that. The store reads the
+    /// codec byte, so the store knows which decompressor applies. There are two
+    /// constructors rather than one that takes a decompressor. A reader does not
+    /// choose how its bytes were made.
     #[must_use]
     pub fn from_decoded(bytes: Vec<u8>) -> Self {
         Self { bytes, position: 0 }
@@ -327,9 +329,10 @@ impl AsyncRead for DecompressReader {
         _cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // `unwrap_or(self.bytes.len())` rather than `unwrap_or(0)`: a position
-        // this process cannot index is past the end by definition, so it reads
-        // as empty. Falling back to 0 would replay the payload from the start.
+        // `unwrap_or(self.bytes.len())` rather than `unwrap_or(0)`. A position
+        // that this process cannot index is past the end by definition, so it
+        // reads as empty. Falling back to 0 would replay the payload from the
+        // start.
         let Some(at) = usize::try_from(self.position)
             .ok()
             .filter(|at| *at < self.bytes.len())
@@ -361,10 +364,11 @@ impl tokio::io::AsyncSeek for DecompressReader {
 
         // The `i128` target makes a negative position impossible to convert, so
         // the conversion is the sign check. The upper bound is a separate
-        // question, and this reader is handed out by `StorageGet::get`, which
-        // promises a stream "bounded to the blob" — so a position past the
-        // payload is refused here rather than left to underflow in `poll_read`.
-        // `SliceAsyncReader` bounds its seek the same way, for the same reason.
+        // question. The `StorageGet::get` method hands out this reader and
+        // promises a stream "bounded to the blob". So a position past the payload
+        // is refused here. The code does not leave that position to underflow in
+        // `poll_read`. `SliceAsyncReader` bounds its seek the same way, for the
+        // same reason.
         let target = u64::try_from(target).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

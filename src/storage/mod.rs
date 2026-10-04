@@ -1,31 +1,30 @@
 //! Where chunk and snapshot data is kept.
 //!
 //! Blobs are addressed by the BLAKE3 hash of their contents, and the backend is
-//! responsible for deduplicating them: a `put` of content the store already
-//! holds writes nothing and returns success. That is what lets a backup
-//! deduplicate against every version the store has ever held rather than only
-//! against the one before it, and it is why the caller does not have to know
-//! what is already there.
+//! responsible for deduplicating them. A `put` of content the store already
+//! holds writes nothing and returns success. A backup can then deduplicate
+//! against every version the store has ever held, not only against the one before
+//! it. That is also why the caller does not have to know what is already there.
 //!
 //! # Layout
 //!
 //! One file per thing, so that reading one does not mean reading the others.
-//! These are private: the crate's whole surface to a caller is the list of
+//! These files are private. The crate's whole surface to a caller is the list of
 //! re-exports below.
 //!
-//! * `backend` — what a store can be asked to do, split into reading and writing
-//!   so a restore cannot be handed something that appends.
-//! * `blob` — the store itself: segments, records, and deduplication.
-//! * `record` — the framing of a record, and how a store is read back.
-//! * `hash` — what a chunk is named by, and the truncated digest a header checks
-//!   itself with.
-//! * `compression` — the seams for how a payload becomes stored bytes and how
-//!   they come back, and the write policy this crate ships.
-//! * `segment` — the write policy for how large a segment may get.
-//! * `plan` — a snapshot turned into the ordered list of chunks a store holds.
-//! * `locate` — finding a version's snapshot without scanning the whole set.
-//! * `version_index` — the per-version index file that makes that cheap.
-//! * `error` — what a filesystem call's error says.
+//! * `backend` says what a store can be asked to do. It splits into reading and
+//!   writing, so a restore cannot be handed something that appends.
+//! * `blob` is the store itself: segments, records, and deduplication.
+//! * `record` holds the framing of a record, and how a store is read back.
+//! * `hash` holds what a chunk is named by, and the truncated digest a header
+//!   checks itself with.
+//! * `compression` holds the seams for how a payload becomes stored bytes and
+//!   how they come back. It also holds the write policy this crate ships.
+//! * `segment` holds the write policy for how large a segment may get.
+//! * `plan` turns a snapshot into the ordered list of chunks a store holds.
+//! * `locate` finds a version's snapshot without scanning the whole set.
+//! * `version_index` holds the per-version index file that makes that cheap.
+//! * `error` says what a filesystem call's error reports.
 
 mod backend;
 mod blob;
@@ -51,20 +50,20 @@ pub use version_index::VersionIndex;
 
 /// Where a blob's payload sits in a store.
 ///
-/// A location in this file, an object key there: an implementation detail of
-/// whichever backend holds the blob.
+/// A location in this file, an object key there. Both are an implementation
+/// detail of whichever backend holds the blob.
 pub use record::Placement;
 
 // The record framing itself, for the pack: its payload region is a run of
-// records, written and read through the store's own encoder and decoder rather
-// than through a second copy of either. See the note in `record` on who else
-// frames a record.
+// records. The store writes and reads them through its own encoder and decoder.
+// The pack does not keep a second copy of either. See the note in `record` on who
+// else frames a record.
 pub(crate) use record::{
     Header as RecordHeader, Kind as RecordKind, MAX_HEADER as MAX_RECORD_HEADER,
     MIN_HEADER as MIN_RECORD_HEADER, decode_header, encode_header, header_len,
 };
 
 // Crate-internal rather than re-exported from `error` at every call site: `pack`
-// and the store both size a buffer from a length read out of a file, and one
-// refusal for a length this platform cannot address is the whole point of it.
+// and the store both size a buffer from a length read out of a file. One refusal
+// for a length this platform cannot address is the whole point of it.
 pub(crate) use error::zeroed;

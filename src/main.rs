@@ -357,29 +357,31 @@ async fn main() -> ExitCode {
         Err(e) => {
             // The message, not the `Debug` form.
             //
-            // There is no cause chain to walk. `lepatch` has one error type —
-            // `io::Error` — at all ninety-odd sites where it fails, and each of
-            // those messages is a complete sentence naming the file, the offset
-            // and the expectation, because that is what a user has to act on.
+            // There is no cause chain to walk. `lepatch` has one error type,
+            // `io::Error`, at all ninety-odd sites where it fails. Each of those
+            // messages is a complete sentence. Each one names the file, the
+            // offset, and the expectation, because that is what a user has to act
+            // on.
             //
             // This loop used to walk `source()` here and print `caused by:`
             // lines. It never printed anything, and could not have:
             //
             // * nothing in the crate implements `std::error::Error::source`, so
-            //   the first `source()` call returned `None` at every one of them;
+            //   the first `source()` call returned `None` at every one of them.
             // * and `io::Error` cannot carry the chain in the first place. Its
-            //   `source()` returns the *source of* a wrapped custom error, not
-            //   the error itself, so `io::Error::new(kind, e)` drops `e` from
-            //   the walk even when `e` has a cause. The one site that wraps
-            //   another error — a snapshot that will not decode — loses it here
-            //   too, while `Display` still shows it, since `io::Error` delegates
-            //   to the wrapped error's `Display`.
+            //   `source()` returns the *source of* a wrapped custom error. It does
+            //   not return the error itself. So `io::Error::new(kind, e)` drops
+            //   `e` from the walk even when `e` has a cause. The one site that
+            //   wraps
+            //   another error loses it here too. That site is a snapshot that
+            //   will not decode. Meanwhile `Display` still shows it, since
+            //   `io::Error` delegates to the wrapped error's `Display`.
             //
-            // So the code was a promise the type system could not keep, and a
+            // So the code was a promise that the type system could not keep. A
             // contributor adding an error with a cause would reasonably assume
-            // the output was already wired up. If a future change introduces a
-            // bespoke error type with a live chain, this walk comes back with it
-            // — and then it has something to print.
+            // that the output was already wired up. If a future change
+            // introduces a bespoke error type with a live chain, then this walk
+            // comes back with it. Then it has something to print.
             eprintln!("error: {e}");
 
             // 130 for Ctrl-C, 143 for `kill`.
@@ -406,7 +408,7 @@ fn init_tracing(verbose: bool, quiet: bool) {
         .with_default_directive(default.into())
         .from_env_lossy();
 
-    // Data on stdout, diagnostics on stderr, so every command is pipeable
+    // Data on stdout, diagnostics on stderr. So every command is pipeable
     // without `--quiet`.
     let _ = fmt()
         .with_env_filter(filter)
@@ -420,19 +422,19 @@ static STOP_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::n
 
 /// Print one line of a command's output to stdout, reporting whether it went.
 ///
-/// `println!` cannot be used: `SIGPIPE` is ignored at startup, so a write to a
-/// pipe whose reader has gone returns `EPIPE` and the print macros panic on a
-/// write error. That case is a *success* — the reader leaving is what `head`
-/// does on purpose — so it is `Ok(())` and the command carries on to its own
-/// result. Any other write failure is an error.
+/// `println!` cannot be used. `SIGPIPE` is ignored at startup. So a write to a
+/// pipe whose reader has gone returns `EPIPE`, and the print macros panic on a
+/// write error. That case is a *success*. The reader leaving is what `head` does
+/// on purpose. So the macro returns `Ok(())`, and the command carries on to its
+/// own result. Any other write failure is an error.
 ///
-/// This deliberately does not decide the exit code. It used to call
-/// `process::exit` directly, which meant a command that printed its summary
-/// before computing its result could exit 0 with a result it had not looked at
-/// yet: `lepatch verify set | true` reported success on a store that had failed
+/// This deliberately does not decide the exit code. The macro used to call
+/// `process::exit` directly. That meant a command could print its summary before
+/// computing its result, then exit 0 with a result that it had not looked at
+/// yet. `lepatch verify set | true` reported success on a store that had failed
 /// verification, because the write failed before `into_result` was ever called.
-/// It also skipped every `Drop` in scope, which is how a `Lock` or a
-/// `DestinationLock` releases its claim file, so any command that both held a
+/// The macro also skipped every `Drop` in scope. A `Drop` is how a `Lock` or a
+/// `DestinationLock` releases its claim file. So any command that both held a
 /// claim and printed would have leaked it.
 macro_rules! say {
     ($($arg:tt)*) => {{
@@ -461,8 +463,8 @@ async fn run(command: Command) -> std::io::Result<()> {
 
 /// Parse a human size like `4GiB`, `512MiB`, `1G`, or a plain byte count.
 ///
-/// Units are the powers of 1024 with an optional `i`; anything else is refused
-/// rather than guessed at. A byte count with no unit is taken literally.
+/// Units are the powers of 1024 with an optional `i`. Anything else is
+/// refused rather than guessed at. A byte count with no unit is taken literally.
 fn parse_size(raw: &str) -> std::result::Result<u64, String> {
     let text = raw.trim();
 
@@ -553,8 +555,8 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
     }
 }
 
-/// Resolve when the process is asked to stop: `SIGTERM` as well as Ctrl-C, since
-/// that is what a supervisor, a container stop or a closing laptop sends.
+/// Resolve when the process is asked to stop. `SIGTERM` as well as Ctrl-C.
+/// A supervisor sends that, and so does a container stop or a closing laptop.
 ///
 /// A second Ctrl-C is left to the default handler, so a user who wants out
 /// immediately can still have it.
@@ -566,7 +568,7 @@ async fn stop_signal() -> std::io::Error {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(stream) => stream,
             Err(_e) => {
-                // No `SIGTERM` on this platform; Ctrl-C is all there is.
+                // No `SIGTERM` on this platform. Ctrl-C is all there is.
                 let _ = tokio::signal::ctrl_c().await;
                 STOP_SIGNAL.store(2, Ordering::Relaxed);
                 return interrupted();
@@ -595,17 +597,17 @@ async fn stop_signal() -> std::io::Error {
     interrupted()
 }
 
-/// The error a stopped run reports. Not a success and not a silent exit: the work
-/// was abandoned. What is guaranteed is that nothing was *published* — a backup's
-/// index is filled in only on completion, and a restore's claim is released.
+/// The error a stopped run reports. Not a success, and not a silent exit. The
+/// work was abandoned. What is guaranteed is that nothing was *published*. A
+/// backup's index is filled in only on completion. A restore's claim is released.
 ///
-/// `Interrupted` is worth the scrutiny because the crate is wary of naming a kind
-/// it does not mean: `NotFound` is what the operating system returns for a file
-/// that has gone, so a caller cannot tell one of ours from a real one, and that
+/// `Interrupted` is worth the scrutiny, because the crate is wary of naming a
+/// kind it does not mean. `NotFound` is what the operating system returns for a
+/// file that has gone. So a caller cannot tell one of ours from a real one. That
 /// ambiguity has cost a swallowed error before. `Interrupted` has no such
-/// collision — `std` retries `EINTR` itself, so no filesystem call in this crate
-/// ever produces it. Whoever gets this error knows it means a deliberate stop and
-/// nothing else, which is exactly what the message says.
+/// collision. `std` retries `EINTR` itself, so no filesystem call in this crate
+/// ever produces it. Whoever gets this error knows it means a deliberate stop,
+/// and nothing else. That is exactly what the message says.
 fn interrupted() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Interrupted,
@@ -637,25 +639,25 @@ fn select_version(
 
 /// Rebuild every per-version index file from the store's commit records.
 ///
-/// Opened for writing, which is what makes this a repair: a torn tail in the last
-/// segment is reclaimed on the way, and the lock is taken so no run is appending
-/// while the records are read.
+/// Opened for writing, and that is what makes this a repair. A torn tail in the
+/// last segment is reclaimed on the way. The lock is taken, so no run is
+/// appending while the records are read.
 ///
-/// A dry run takes neither. Both of them are writes — the lock is a file, and
-/// reclaiming a tail is the repair — and the version count it reports is the same
-/// one either way, because the count is read out of the commit records rather than
-/// taken from what the open did to the set.
+/// A dry run takes neither. Both of them are writes. The lock is a file, and
+/// reclaiming a tail is the repair. The version count that a dry run reports is
+/// the same one either way. The count comes out of the commit records rather than
+/// out of what the open did to the set.
 ///
-/// Which leaves a consequence worth stating rather than leaving to be found: a set
-/// left behind by a killed run has a torn tail, and its dry run fails where its
-/// real reindex succeeds and repairs the store. That is the right way round,
-/// because deciding a tail is damage is itself a write.
+/// Which leaves a consequence worth stating rather than leaving to be found. A
+/// set left behind by a killed run has a torn tail. Its dry run fails. Its real
+/// reindex succeeds and repairs the store. That is the right way round, because
+/// deciding a tail is damage is itself a write.
 async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
-    // Before taking the lock and before opening: opening for writing *creates* a
-    // set that is not there, so a mistyped name would be repaired and reported as
-    // a success.
+    // Before taking the lock and before opening. Opening for writing
+    // *creates* a set that is not there. So a mistyped name would be repaired
+    // and reported as a success.
     if set.segments()?.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -673,13 +675,14 @@ async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<(
         let store = storage::BlobStore::open_for_reading(set.base()).await?;
         let versions = store.versions()?;
 
-        // `write_index_files` writes one file per version it can resolve a snapshot
-        // for and skips the rest, returning the lower count, so the plan applies
-        // the same test rather than counting the commit records. A version whose
-        // snapshot does not resolve is not counted here for the same reason a real
-        // reindex writes no index file for it: a plan reports what the run does, and
-        // it does not write one. The index files are a cache either way, so
-        // rewriting one is how they are brought back to date.
+        // `write_index_files` writes one file per version that it can resolve a
+        // snapshot for. The function skips the rest and returns the lower count.
+        // So the plan applies the same test rather than counting the commit
+        // records. A version whose snapshot does not resolve is not counted here.
+        // A real reindex writes no index file for that version either. A plan
+        // reports what the run does, and it does not write one. The index files
+        // are a cache either way, so rewriting one is how they are brought back
+        // to date.
         let writable = versions
             .iter()
             .filter(|version| store.snapshot(**version).is_ok())
@@ -731,16 +734,18 @@ fn plural_versions(count: usize) -> String {
 
 /// List the versions a backup set holds, oldest first, each with its snapshot hash.
 ///
-/// The count is a **lower bound**: a version whose index file was never written
-/// still exists and still restores, so this may report fewer than the set holds
-/// and never more. A set with no index files lists nothing rather than failing,
-/// and `lepatch reindex` brings it up to date. A real set with no committed
-/// version lists empty; a name that is not a set is an error.
+/// The count is a **lower bound**. A version whose index file was never
+/// written still exists and still restores. So this may report fewer than the set
+/// holds, and never more. A set with no index files lists nothing rather than
+/// failing. The command `lepatch reindex` rebuilds the index of such a set. A real
+/// set with no committed version lists empty. A name that is not a set is an
+/// error.
 async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
-    // No segments at all is a mistyped name, not an empty set: answering "no
-    // versions" to a name that names nothing would be a failure a script acts on.
+    // No segments at all is a mistyped name, not an empty set. Answering "no
+    // versions" to a name that names nothing would be a failure that a script
+    // acts on.
     if set.segments()?.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -755,34 +760,35 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     let versions = set.indexed_versions()?;
 
     // The hashes, which the file names cannot supply. Opened read-only, because
-    // opening for writing truncates an unfinished run and listing must not be the
+    // opening for writing truncates an unfinished run. A listing must not be the
     // thing that discards it. A set with every segment but no committed version
-    // lists empty rather than erroring, and that falls out: the open succeeds, the
-    // loop below has nothing to iterate, and nothing is printed.
+    // lists empty rather than erroring, and that falls out. The open succeeds.
+    // The loop below has nothing to iterate, and nothing is printed.
     //
     // Which is why there is no arm for "no set here". This used to be
     // `Err(e) if e.kind() == NotFound => return Ok(())`, and the kind was doing
-    // two jobs. The one it was meant for is unreachable — the check above already
-    // established that the set has segments, and that is the only condition which
-    // makes the open report `NotFound` — so it never fired on the case it was
-    // written for. The other job is the problem: `NotFound` is what the operating
-    // system returns for a file that has gone, so a segment removed between that
-    // check and the open would have been swallowed too, and `lepatch versions`
+    // two jobs. The one it was meant for is unreachable. The check above already
+    // established that the set has segments. That is the only condition which
+    // makes the open report `NotFound`. So the arm never fired on the case it was
+    // written for. The other job is the problem. `NotFound` is what the operating
+    // system returns for a file that has gone. So a segment removed between that
+    // check and the open would have been swallowed too. Then `lepatch versions`
     // would exit 0 having printed nothing about a set that was being deleted.
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
 
     for version in versions {
-        // Through the store, which checks the file against itself: an index that
-        // is stale, foreign or edited is a reason to fall back to a scan, never a
-        // reason to name the version. One that does not resolve is skipped rather
-        // than reported, because a listing must not name a version the store
-        // cannot serve.
+        // Through the store, which checks the file against itself. An index that
+        // is stale, foreign, or edited is a reason to fall back to a scan. It is
+        // never a reason to name the version. One that does not resolve is
+        // skipped rather than reported. A listing must not name a version that
+        // the store cannot serve.
         //
         // Both modes go through `resolve` for that reason. `--numbers-only` used
-        // to read the index file on its own, which checksums one file and never
-        // consults the store — so a leftover index in a set with fewer versions
-        // would be named by `versions --numbers-only` and omitted by `versions`,
-        // from the same directory, at the same moment.
+        // to read the index file on its own. That path checksums one file and
+        // never consults the store. So a leftover index in a set with fewer
+        // versions would be named by `versions --numbers-only`. The same index
+        // would be omitted by `versions`. Both commands ran from the same
+        // directory at the same moment.
         let Ok(snapshot) = store.snapshot_via_index(version) else {
             continue;
         };
@@ -799,9 +805,9 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
 
 /// The compression policy from `--compression-level`, where 0 means "as-is".
 ///
-/// clap rejects anything outside 0–9 as a usage error rather than letting it be
-/// clamped, so a level is never silently turned into a store that disagrees with
-/// the command that wrote it.
+/// clap rejects anything outside 0 to 9 as a usage error rather than letting it
+/// be clamped. So a level is never silently turned into a store that disagrees
+/// with the command that wrote it.
 fn compression_policy(level: Option<u8>) -> storage::Compression {
     match level {
         Some(level) => storage::Compression::from_level(level),
@@ -812,22 +818,23 @@ fn compression_policy(level: Option<u8>) -> storage::Compression {
 /// What a `--compression` flag asked for, on `pack` or on `merge`.
 ///
 /// **One type and one parser for both commands, deliberately.** The two flags ask
-/// the same question at the two ends of a transfer — what should the records of
-/// this chunk look like on the wire — and a user who learns `keep` on one of them
-/// has learned it on the other. Two types would let the vocabularies drift: one
-/// command could come to accept a bare number, or spell the default differently,
-/// and the drift would show up as a flag that is accepted somewhere it is not
-/// meant. It is a little repetition of the *routing*, which is genuinely
-/// different — a merge re-encodes on the way into a set it also has to open under
-/// a policy, and a pack re-encodes on the way out of a set it only reads — and
-/// none of the repetition is the parsing or the vocabulary, which is the part a
+/// the same question at the two ends of a transfer. That question is what the
+/// records of this chunk should look like on the wire. A user who learns `keep`
+/// on one of them has learned it on the other. Two types would let the
+/// vocabularies drift. One command could come to accept a bare number. One
+/// command could spell the default differently. The drift would then show up as a
+/// flag that is accepted somewhere it is not meant. This is a little repetition
+/// of the *routing*, which is genuinely different. A merge re-encodes on the way
+/// into a set, and it has to open that set under a policy. A pack re-encodes on
+/// the way out of a set, and it only reads that set. None of the repetition is
+/// the parsing or the vocabulary. The parsing and the vocabulary are the part a
 /// user meets.
 ///
 /// Two answers rather than a policy on its own, because a level is both for a
-/// merge: it says which write path the run takes *and* what the receiving set is
-/// opened with, and the two cannot be allowed to disagree — a merge told to
+/// merge. The level says which write path the run takes *and* what the receiving
+/// set is opened with. The two cannot be allowed to disagree. A merge told to
 /// re-encode into a set opened at a different level would store frames at a level
-/// nobody asked for.
+/// that nobody asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeepOrLevel {
     /// Store what the pack carries, frame and all.
@@ -839,11 +846,11 @@ enum KeepOrLevel {
 impl KeepOrLevel {
     /// The policy the receiving set is opened with.
     ///
-    /// The default under [`KeepOrLevel::Keep`], where it decides almost
-    /// nothing: the verbatim path does not compress, so the only record it writes
-    /// through the store's own policy is the snapshot. It is still a real choice
-    /// rather than `Off`, because a set opened for writing has to be opened with
-    /// something and the default is what every other command opens one with.
+    /// The default under [`KeepOrLevel::Keep`], where it decides almost nothing.
+    /// The verbatim path does not compress. So the only record that it writes
+    /// through the store's own policy is the snapshot. This is still a real
+    /// choice rather than `Off`. A set opened for writing has to be opened with
+    /// something. The default is what every other command opens a set with.
     fn policy(self) -> storage::Compression {
         match self {
             Self::Keep => storage::Compression::default(),
@@ -862,9 +869,10 @@ impl KeepOrLevel {
     /// The policy a pack writes each record under, or `None` to keep the form
     /// the set already holds.
     ///
-    /// The one place the flag becomes a route, for this command: `keep` is the
-    /// absence of a policy because it is the absence of any work, and the two
-    /// non-default answers are both a policy the pack's records are encoded under.
+    /// The one place the flag becomes a route for this command. `keep` is the
+    /// absence of a policy, because it is the absence of any work. Both
+    /// non-default answers are a policy that the pack's records are encoded
+    /// under.
     fn pack_policy(self) -> Option<storage::Compression> {
         match self {
             Self::Keep => None,
@@ -876,12 +884,12 @@ impl KeepOrLevel {
 /// The `--compression` argument of `pack` and `merge`: `keep`, or a level from 0
 /// to 9.
 ///
-/// Its own vocabulary rather than a bare number, so the default is a word that says
-/// what it does. `keep` is the only non-numeric answer, and anything else that is
-/// not a number in range is a usage error naming both — the same treatment
-/// `backup --compression-level` gives an out-of-range level, because a value this
-/// parser does not recognise must never be turned into a policy that looks like
-/// one the user chose.
+/// Its own vocabulary rather than a bare number, so the default is a word
+/// that says what it does. `keep` is the only non-numeric answer. Anything else
+/// that is not a number in range is a usage error naming both. That is the same
+/// treatment `backup --compression-level` gives an out-of-range level. A value
+/// that this parser does not recognise must never become a policy that looks
+/// like one the user chose.
 ///
 /// The name says `keep` rather than either command, because it is both commands'.
 fn parse_keep_or_level(what: &str) -> Result<KeepOrLevel, String> {
@@ -905,18 +913,18 @@ fn parse_keep_or_level(what: &str) -> Result<KeepOrLevel, String> {
 
 /// Snapshot a tree into a new version of the set at `name`.
 ///
-/// The chunk profile is the run's own policy rather than the store's, like
-/// `--segment-size` and `--compression-level` it is a write policy for what
-/// comes next, and what is already there is never rewritten — so it is logged
-/// with the sizes it resolved to rather than only as the name that was typed,
-/// since the name is a shorthand for three numbers a user cannot see.
+/// The chunk profile is the run's own policy, not the store's. Like
+/// `--segment-size` and `--compression-level`, it is a write policy for what
+/// comes next. What is already there is never rewritten. So the profile is
+/// logged with the sizes it resolved to, not only as the name that was typed.
+/// The name is a shorthand for three numbers that a user cannot see.
 ///
-/// A dry run does the whole of that and writes none of it: no lock, no segment,
-/// no index file, and not the set's directory when there is not one already. The
-/// set is opened for reading and only if it is there — opening for writing to
-/// find out whether a set exists would create it, which is the one thing a dry
-/// run must never do — so the first backup of a location plans as an all-new
-/// version rather than failing.
+/// A dry run does the whole of that and writes none of it. It takes no lock. It
+/// writes no segment and no index file. It does not create the set's directory
+/// when there is not one already. The run opens the set for reading, and only if
+/// it is there. Opening for writing to learn whether a set exists would create
+/// it. That is the one thing a dry run must never do. So the first backup of a
+/// location plans as an all-new version rather than failing.
 async fn run_backup(
     source: &std::path::Path,
     name: &std::path::Path,
@@ -927,9 +935,9 @@ async fn run_backup(
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
 
-    // The store is append-only with one commit point at the end of a run, so two
-    // runs interleaving would publish versions over each other. A dry run takes no
-    // lock: the claim is a file, and a file is a write.
+    // The store is append-only with one commit point at the end of a run. So two
+    // runs interleaving would publish versions over each other. A dry run takes
+    // no lock, because the claim is a file and a file is a write.
     let _lock = if dry_run { None } else { Some(set.lock()?) };
 
     let limit = match segment_size {
@@ -940,26 +948,27 @@ async fn run_backup(
 
     let segments = set.segments()?;
 
-    // The set and its lock live next to the tree being read and grow while it is
-    // read, so neither may be swept into the backup.
+    // The set and its lock live next to the tree being read. Both grow while
+    // the tree is read. So neither may be swept into the backup.
     let mut exclude = vec![lock_path];
     for segment in &segments {
         exclude.push(segment.clone());
     }
-    // A segment this run has yet to create is named too: segment 0 of a fresh set,
-    // and the one a roll-over opens during the run.
+    // A segment that this run has yet to create is named too. That is
+    // segment 0 of a fresh set. It is also the segment that a roll-over opens
+    // during the run.
     for segment in 0..u32::try_from(segments.len()).unwrap_or(0).saturating_add(4) {
         exclude.push(set.segment_path(segment));
     }
 
     let chunker = profile.config();
 
-    // The chunker's sizes are the only thing about this run that a later run will
-    // not be able to work out from the store, and the one whose consequences are
-    // not visible on disk: a set whose runs disagree about chunk sizes restores
-    // perfectly and deduplicates badly. Saying which profile cut this run is the
-    // only warning the user gets, so it goes in the run's own log line rather than
-    // behind `--verbose`.
+    // The chunker's sizes are the only thing about this run that a later run
+    // cannot work out from the store. They are also the one thing whose
+    // consequences are not visible on disk. A set whose runs disagree about
+    // chunk sizes restores perfectly and deduplicates badly. Naming the profile
+    // that cut this run is the only warning the user gets. So the profile goes
+    // in the run's own log line rather than behind `--verbose`.
     tracing::info!(
         profile = %profile,
         min = chunker.min_size,
@@ -987,7 +996,8 @@ async fn run_backup(
         return report_backup_plan(&set, &plan, fresh);
     }
 
-    // Opening discards a torn tail in the last segment: an unfinished run, not data.
+    // Opening discards a torn tail in the last segment. A torn tail is an
+    // unfinished run, not data.
     let store = storage::BlobStore::open_for_writing(set.base(), limit, compression).await?;
 
     if let Some(previous) = store.versions()?.last() {
@@ -1016,9 +1026,9 @@ async fn run_backup(
 
 /// Say what a backup would have stored, on stdout, and that it stored nothing.
 ///
-/// On stdout rather than the log because this is the whole output of the run: a
-/// dry run produces no progress worth following and no summary about work that
-/// happened — what it produces is a report, and a report is data.
+/// On stdout rather than the log, because this is the whole output of the run.
+/// A dry run produces no progress worth following. It produces no summary about
+/// work that happened. What it produces is a report, and a report is data.
 fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io::Result<()> {
     tracing::info!(name = %set.base().display(), "dry run: nothing was written");
 
@@ -1051,11 +1061,11 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
 
 /// Rebuild a tree from the set at `name` into `destination`.
 ///
-/// A dry run reads the version and checks it exactly as a restore does, and then
-/// stops. Nothing is created — no file, no directory, no attribute, no
-/// `.partial` beside the destination — and nothing is removed, which under
-/// `--clean` is the part worth being sure about. No claim is taken either, so a
-/// plan can be taken against a destination a restore is currently using.
+/// A dry run reads the version and checks it exactly as a restore does. Then it
+/// stops. Nothing is created. There is no file, no directory, and no attribute.
+/// There is no `.partial` beside the destination. Nothing is removed, which
+/// under `--clean` is the part worth being sure about. No claim is taken either,
+/// so a plan can be taken against a destination that a restore is using now.
 async fn run_restore(
     destination: &std::path::Path,
     name: &std::path::Path,
@@ -1076,15 +1086,15 @@ async fn run_restore(
         "restoring"
     );
 
-    // Checked before the claim is taken, so a destination that can never be
+    // Checked before the claim is taken. So a destination that can never be
     // cleaned reports why before anything is created for it. The removal itself
     // happens after, so two runs cannot both decide to empty it.
     if clean {
         check_clean_destination(destination, &set)?;
     }
 
-    // Before the claim rather than instead of it: a dry run takes none, and this
-    // is where the claim would be taken.
+    // Before the claim rather than instead of it. A dry run takes no claim,
+    // and this is where the claim would be taken.
     if dry_run {
         return report_restore_plan(
             version,
@@ -1104,9 +1114,9 @@ async fn run_restore(
         let restored = restore(destination, snapshot, store).await?;
         report_restored(&restored);
 
-        // A merging restore cannot say which extra files are there — the snapshot
-        // is inside the library call by then — so it says the one thing that is
-        // both true and actionable.
+        // A merging restore cannot say which extra files are there. The snapshot
+        // is inside the library call by then. So the restore says the one thing
+        // that is both true and actionable.
         tracing::info!(
             "the destination may also hold files that are not in this snapshot; \
              pass --clean to restore into an exact copy"
@@ -1116,16 +1126,17 @@ async fn run_restore(
     Ok(())
 }
 
-/// Restore into a sibling directory, then swap it in, so a run that dies part-way
-/// leaves the destination exactly as it was rather than holding a prefix of the
-/// snapshot. Costs the disk space for two trees at once.
+/// Restore into a sibling directory, then swap it in. So a run that dies part-way
+/// leaves the destination exactly as it was. The destination does not hold a
+/// prefix of the snapshot. This costs the disk space for two trees at once.
 ///
-/// Takes the claim rather than the path, because "beside the destination" is
-/// resolved by the claim and must be asked of it. This used to re-derive the
-/// rule with its own `sibling`, which did not canonicalise — so restoring through
-/// a symlink staged the tree beside the *link* while the claim's cleanup removed
-/// things beside the *target*, and a failed run left a half-written tree behind
-/// that the claim could not reach. One definition, and it is the claim's.
+/// The function takes the claim rather than the path. The claim resolves
+/// "beside the destination", so the caller must ask the claim. This used to
+/// re-derive the rule with its own `sibling`, which did not canonicalise. So a
+/// restore through a symlink staged the tree beside the *link*. The claim's
+/// cleanup removed things beside the *target*. A failed run then left a
+/// half-written tree behind that the claim could not reach. There is now one
+/// definition, and it is the claim's.
 async fn restore_atomically<S: storage::StorageGet + 'static>(
     claim: &lepatch::command::DestinationLock,
     snapshot: storage::BlobId,
@@ -1176,7 +1187,7 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
 
     if let Err(e) = std::fs::rename(&partial, destination) {
         if had_previous {
-            // Best effort: the old tree is on disk either way, and saying where
+            // Best effort. The old tree is on disk either way, and saying where
             // is more use than a second failure.
             let restored_back = std::fs::rename(&previous, destination);
             tracing::error!(
@@ -1220,8 +1231,8 @@ fn report_restore_plan(
         plan.bytes
     )?;
 
-    // Both forms say what would happen to everything the snapshot does not record,
-    // because under `--clean` that is the whole of the destructive part and a plan
+    // Both forms say what would happen to everything that the snapshot does not
+    // record. Under `--clean` that is the whole of the destructive part. A plan
     // that did not mention it would be the least useful thing it could do.
     if clean {
         say!(
@@ -1237,8 +1248,8 @@ fn report_restore_plan(
     }
 
     if plan.unowned > 0 {
-        // The figure is a bound, not a count: it is how many entries record an
-        // owner at all, and only trying to set one says whether this process can.
+        // The figure is a bound, not a count. It is how many entries record an
+        // owner at all. Only trying to set one says whether this process can.
         // Claiming either outcome would be a guess.
         eprintln!(
             "note: {} entr{} in this version record an owner, which a restore may not be \
@@ -1268,11 +1279,12 @@ fn report_restored(restored: &lepatch::command::Restored) {
 
 /// Say that some entries could not be given the owner the version records.
 ///
-/// On stderr, and unconditionally, because the alternative is a tree that looks
-/// complete and has the wrong owner on part of it. A restore of a system tree as an
-/// unprivileged user always hits this — it is not an edge case to be phrased as one —
-/// so the wording says what is true (the files are right, the owners are not) and
-/// what would fix it, rather than leading with a failure the run did not have.
+/// On stderr, and unconditionally. The alternative is a tree that looks complete
+/// and has the wrong owner on part of it. A restore of a system tree as an
+/// unprivileged user always hits this. It is not an edge case to be phrased as
+/// one. So the wording says what is true, and what would fix it. The files are
+/// right, and the owners are not. The wording does not lead with a failure that
+/// the run did not have.
 fn report_unowned(count: u64, what: &str) {
     eprintln!(
         "note: {count} entr{} in this {what} recorded an owner this process could not set, \
@@ -1284,10 +1296,10 @@ fn report_unowned(count: u64, what: &str) {
 
 /// Check that a destination is safe to empty, without touching it.
 ///
-/// Paths are compared absolute, because a relative store path never "starts with"
-/// a relative destination and the check would silently never fire. Refuses an
-/// empty path, a destination holding the set being restored from, `$HOME`, the
-/// working directory, and the filesystem root.
+/// Paths are compared absolute. A relative store path never "starts with" a
+/// relative destination, so the check would silently never fire. The check
+/// refuses an empty path. It also refuses a destination that holds the set being
+/// restored from, `$HOME`, the working directory, and the filesystem root.
 fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std::io::Result<()> {
     if destination.as_os_str().is_empty() {
         return Err(std::io::Error::new(
@@ -1298,8 +1310,8 @@ fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std
 
     let target = absolutise(destination);
 
-    // Every segment, not just the first: a set that has rolled over holds the
-    // rest of the backup in files a clean restore would delete while leaving
+    // Every segment, not just the first. A set that has rolled over holds the
+    // rest of the backup in files that a clean restore would delete, while leaving
     // segment 0 behind.
     let segments = set.segments()?;
     for segment in &segments {
@@ -1318,8 +1330,8 @@ fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std
         ));
     }
 
-    // The segment a run would write next: not yet on disk, but part of the set
-    // and created inside the destination.
+    // The segment that a run would write next. It is not yet on disk. It is
+    // part of the set, and a run creates it inside the destination.
     if absolutise(&set.segment_path(u32::try_from(segments.len()).unwrap_or(u32::MAX)))
         .starts_with(&target)
     {
@@ -1360,7 +1372,7 @@ fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std
         ));
     }
 
-    // Checked before the claim is taken: `/` would otherwise be refused for
+    // Checked before the claim is taken. Otherwise `/` would be refused for
     // having no sibling to put a claim beside.
     if target.parent().is_none() || target.components().count() <= 1 {
         return Err(std::io::Error::new(
@@ -1416,17 +1428,18 @@ async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Re
         }
     )?;
 
-    // After the summary, and not before it: the exit code is this, and a summary
-    // that could terminate the process first would be able to answer for it.
+    // After the summary, and not before it. The exit code is this line. A
+    // summary that could terminate the process first would be able to answer
+    // for it.
     report.into_result()
 }
 
 /// The base version a pack should omit, with `--full` overriding `--from`.
 ///
-/// Two flags that contradict each other, and resolving it here rather than in clap
-/// so the message is ours: `--full` is the promise that the artifact suits any
-/// client, and letting a stale `--from` in a script quietly narrow it would break
-/// that promise without anyone noticing.
+/// Two flags that contradict each other. The code resolves the conflict here
+/// rather than in clap, so the message is ours. `--full` is the promise that the
+/// artifact suits any client. Letting a stale `--from` in a script quietly narrow
+/// that promise would break it without anyone noticing.
 fn effective_from(from: Option<u32>, full: bool) -> Option<u32> {
     if full {
         if let Some(from) = from {
@@ -1439,15 +1452,16 @@ fn effective_from(from: Option<u32>, full: bool) -> Option<u32> {
 
 /// Write one version's chunks to a single file.
 ///
-/// Opened for reading and no lock taken: a pack does not touch the set. The
-/// version is resolved before the plan is built, so a set that grows under the run
-/// packs the version asked for rather than whatever is newest when it finishes.
+/// Opened for reading, and no lock taken. A pack does not touch the set. The
+/// version is resolved before the plan is built. So a set that grows under the
+/// run packs the version that was asked for, not whatever is newest when the run
+/// finishes.
 ///
-/// A dry run builds the same plan and stops before the file is touched, so
-/// `--out` is neither created nor overwritten. The size on disk and the content
-/// hash are absent from a plan rather than guessed: the first depends on the
-/// header and the chunk index, and the second is the hash of the file, and a file
-/// this run does not write is the only thing either could be about.
+/// A dry run builds the same plan and stops before the file is touched. So the
+/// run neither creates nor overwrites `--out`. The size on disk and the content
+/// hash are absent from a plan rather than guessed. The size depends on the
+/// header and the chunk index. The hash is the hash of the file. A file that
+/// this run does not write is the only thing either figure could be about.
 async fn run_pack(
     name: &std::path::Path,
     out: &std::path::Path,
@@ -1470,15 +1484,15 @@ async fn run_pack(
         "packing"
     );
 
-    // The decoded snapshot is needed on both paths, because the plan is resolved
-    // from it rather than from the store's records: a dry run that counted records
-    // would be counting the wrong thing.
+    // The decoded snapshot is needed on both paths. The plan is resolved
+    // from it rather than from the store's records. A dry run that counted
+    // records would be counting the wrong thing.
     let snapshot = load_snapshot(&store, snapshot_id).await?;
 
-    // A delta is the same pack with fewer chunks in it, and the base it assumes is
-    // part of what has to be worked out before the contents are: it is what decides
-    // which chunks survive, and what an apply will later check the destination
-    // against.
+    // A delta is the same pack with fewer chunks in it. The base that it
+    // assumes is part of what has to be worked out before the contents are. The
+    // base decides which chunks survive. It is also what an apply later checks
+    // the destination against.
     let base = match from {
         None => None,
         Some(base_version) => {
@@ -1507,16 +1521,16 @@ async fn run_pack(
     )
     .await?;
 
-    // A plan reports and stops. It has read the version and every chunk it would
-    // write, so everything after this point on the real path would only be saying
-    // what the plan has already worked out.
+    // A plan reports and stops. It has read the version and every chunk that
+    // it would write. So everything after this point on the real path would only
+    // say what the plan has already worked out.
     if dry_run {
         report_pack(version, out, &packed)?;
         return Ok(());
     }
 
-    // Matched rather than unwrapped, because the pair belongs to a written pack and
-    // this line is only reachable for one.
+    // Matched rather than unwrapped. The pair belongs to a written pack,
+    // and this line is only reachable for one.
     let (Some(bytes), Some(content)) = (packed.bytes, packed.content) else {
         return Err(std::io::Error::other(
             "the pack was written but reported neither a length nor a content hash",
@@ -1544,8 +1558,8 @@ async fn run_pack(
 
 /// Say what a pack holds, on stdout.
 ///
-/// Both figures for a delta, because the fraction is fixture-dependent and the
-/// request count is not: the whole version is one range either way.
+/// Both figures appear for a delta. The fraction depends on the fixture, and
+/// the request count does not. The whole version is one range either way.
 fn report_pack(
     version: u32,
     out: &std::path::Path,
@@ -1561,7 +1575,7 @@ fn report_pack(
 
     match packed.bytes {
         // No file, so no size on disk. Saying "0 bytes on disk" would be a claim
-        // about a file that does not exist, so the figure is left out and what did
+        // about a file that does not exist. So the figure is left out. What did
         // happen is said instead.
         None => say!(
             "dry run: {held}, {} bytes of payload, {} bytes of file table; nothing written \
@@ -1580,19 +1594,19 @@ fn report_pack(
 
 /// Apply `pack` into the set at `name` as a new version.
 ///
-/// Opened for writing, which creates the set when there is not one already: a
-/// full pack carries its snapshot and every chunk it reads, so a set with
-/// nothing behind it is not a reason to refuse — it is the "receive the first
-/// version into a new set" case. The lock is taken because the run appends to the
-/// store, and a store is append-only with one publish point, so two merges
+/// Opened for writing, which creates the set when there is not one already. A
+/// full pack carries its snapshot and every chunk that it reads. So a set with
+/// nothing behind it is not a reason to refuse. That set is the "receive the
+/// first version into a new set" case. The lock is taken because the run appends
+/// to the store. A store is append-only with one publish point, so two merges
 /// interleaving would publish versions over each other. A dry run takes neither,
-/// since the claim is a file and opening for writing creates a set: a plan has to
-/// be able to run against a set that does not exist yet, and answer "everything
-/// is new" rather than create it in order to find out.
+/// since the claim is a file and opening for writing creates a set. A plan has
+/// to be able to run against a set that does not exist yet. The plan answers
+/// "everything is new" rather than create the set in order to learn that.
 ///
-/// `compression` is both the write path and the policy the set is opened with,
-/// from one value — see [`KeepOrLevel`]. **A dry run uses only the first**,
-/// and reports the same figures either way, because it counts chunk content and
+/// `compression` is both the write path and the policy that the set is opened
+/// with, from one value. See [`KeepOrLevel`]. **A dry run uses only the first**,
+/// and reports the same figures either way. A dry run counts chunk content, and
 /// content does not depend on how it is stored.
 async fn run_merge(
     pack: &std::path::Path,
@@ -1614,10 +1628,11 @@ async fn run_merge(
     );
 
     if dry_run {
-        // Read-only, and only if the set is there. Opened for writing to find out
-        // would create it, which is the one thing a dry run must never do — so a
-        // full pack into a name with nothing behind it plans as an all-new
-        // version instead of failing, or creating the set in order to succeed.
+        // Read-only, and only if the set is there. Opening for writing to find
+        // out would create the set. That is the one thing a dry run must never
+        // do. So a full pack into a name with nothing behind it plans as an
+        // all-new version. The plan does not fail, and it does not create the
+        // set in order to succeed.
         let existing = if set.segments()?.is_empty() {
             None
         } else {
@@ -1627,10 +1642,10 @@ async fn run_merge(
 
         let planned = merge_plan(&pack, existing.as_ref()).await?;
 
-        // Only when there is going to be a merge to warn about. A pack the set
-        // already holds publishes nothing, so telling the user what version it
-        // would publish is telling them about a version that will not exist —
-        // and the report one line later is going to say so.
+        // Only when there is going to be a merge to warn about. A pack that the
+        // set already holds publishes nothing. So telling the user what version
+        // it would publish is telling them about a version that will not exist.
+        // The report one line later is going to say so.
         if let (Some(store), Planned::Merge(_)) = (&existing, &planned) {
             warn_behind_tip(&set, &pack, store)?;
         }
@@ -1639,18 +1654,18 @@ async fn run_merge(
     }
 
     // Checked before the lock and before the open for writing, because both of
-    // those create: a delta refused for a set that does not hold its base must
-    // leave the name exactly as it was, and opening for writing is how a merge
-    // into a new set would create one. The check is repeated inside `merge`
-    // against the store the run actually writes to, which is the one that counts
-    // and the only one taken under the lock.
+    // those create. A delta that is refused for a set that does not hold its
+    // base must leave the name exactly as it was. Opening for writing is how a
+    // merge into a new set would create one. The check is repeated inside
+    // `merge`, against the store that the run actually writes to. That store is
+    // the one that counts, and the only one taken under the lock.
     //
-    // So this one is for the name with nothing behind it, where there is no store
-    // to ask and the refusal has to come from here: `None` cannot hold the base
-    // by anything, and the open below would have made a set to refuse. Where a
-    // set *is* there, asking it here would be a read open, and a reader does not
-    // repair — so a set left on a torn tail by a killed run would be refused by
-    // the one operation that could put it right.
+    // So this check is for the name with nothing behind it. There is no store
+    // to ask there, and the refusal has to come from here. `None` cannot hold
+    // the base by anything. The open below would have made a set to refuse.
+    // Where a set *is* there, asking it here would be a read open. A reader does
+    // not repair. So a set left on a torn tail by a killed run would be refused
+    // by the one operation that could put it right.
     if let Some(base) = pack.base()
         && set.segments()?.is_empty()
     {
@@ -1669,25 +1684,25 @@ async fn run_merge(
     )
     .await?;
 
-    // Before the already-merged answer below, because that answer is about the
-    // set and this is about the pack: a pre-check that reports "already merged"
-    // from a pack it has not verified is answering for a file neither `merge`
-    // nor `merge_plan` would accept, so a damaged pack whose header names a
-    // snapshot the set holds would succeed here and be refused by the dry run.
-    // The two paths must not disagree about one file.
+    // Before the already-merged answer below, because that answer is about
+    // the set and this is about the pack. A pre-check that reports "already
+    // merged" from a pack it has not verified is answering for a file that
+    // neither `merge` nor `merge_plan` would accept. So a damaged pack whose
+    // header names a snapshot that the set holds would succeed here. The dry run
+    // would refuse it. The two paths must not disagree about one file.
     //
-    // [`Pack::snapshot`] rather than a check of our own — it is the same
-    // verification `merge` and `merge_plan` start with, hashing the section
-    // against the hash its header names, and the repo would rather have one
-    // answer to "does this file table hash to this snapshot" than two that
+    // [`Pack::snapshot`] rather than a check of our own. It is the same
+    // verification that `merge` and `merge_plan` start with. It hashes the
+    // section against the hash that its header names. The repo would rather have
+    // one answer to "does this file table hash to this snapshot" than two that
     // agree today.
     let _ = pack.snapshot()?;
 
     // Before the warning and before the merge, and before the merge on both
-    // counts: the warning says what a merge would publish, and a pack the set
-    // already holds publishes nothing. Asked again inside `merge`, under the
-    // lock and against the store this run writes to, which is the check that
-    // counts; this one is what lets the report be right.
+    // counts. The warning says what a merge would publish. A pack that the set
+    // already holds publishes nothing. `merge` asks again, under the lock and
+    // against the store that this run writes to. That is the check that counts.
+    // This check is what lets the report be right.
     if let Some(version) = version_holding(&store, &pack.snapshot_id())? {
         tracing::info!(
             name = %set.base().display(),
@@ -1698,9 +1713,10 @@ async fn run_merge(
         return report_already_merged(&set, version);
     }
 
-    // Before the merge and before the commit, so the tip is the one the merge
-    // publishes onto rather than one that has already counted this version. Taken
-    // under the lock with everything else that reads the set's commit list.
+    // Before the merge and before the commit. So the tip is the one that the
+    // merge publishes onto, not one that has already counted this version.
+    // Taken under the lock with everything else that reads the set's commit
+    // list.
     warn_behind_tip(&set, &pack, &store)?;
 
     let merged = merge(&store, &pack, compression.route()).await?;
@@ -1736,19 +1752,20 @@ async fn run_merge(
 
 /// Say on stderr that the pack was built from a version behind the set's tip.
 ///
-/// The one thing the pack's recorded version is for. The two numbers are
-/// different sets' numbering and comparing them is exactly the point — the tip is
-/// *this* set's most recent version and the pack's is where its version sat in
-/// the set that made it — so the message names both and says what the merge is
-/// about to do instead, because "this pack is version 1" on its own reads as a
-/// complaint about the pack rather than as a fact about the sender being behind.
+/// The one thing the pack's recorded version is for. The two numbers use
+/// different sets' numbering, and comparing them is exactly the point. The tip is
+/// *this* set's most recent version. The pack's number is where its version sat
+/// in the set that made it. So the message names both numbers, and it says what
+/// the merge is about to do instead. "This pack is version 1" on its own reads
+/// as a complaint about the pack. It does not read as a fact about a sender that
+/// is behind.
 ///
-/// A warning and not a refusal: the pack's chunks are the chunks its own snapshot
-/// names, and merging them produces a version that restores exactly what the pack
-/// holds. What is stale is the sender's *view*, not the artifact, and refusing
-/// would refuse a file that is not wrong.
+/// A warning and not a refusal. The pack's chunks are the chunks that its own
+/// snapshot names. Merging them produces a version that restores exactly what
+/// the pack holds. What is stale is the sender's *view*, not the artifact.
+/// Refusing would refuse a file that is not wrong.
 ///
-/// On stderr because stdout is the report channel — a script reading the merge
+/// On stderr because stdout is the report channel. A script reading the merge
 /// report must not have to skip a line to find the line it wanted.
 fn warn_behind_tip<W: storage::WriteMode, C: storage::Compressor>(
     set: &IndexSet,
@@ -1756,20 +1773,21 @@ fn warn_behind_tip<W: storage::WriteMode, C: storage::Compressor>(
     store: &storage::BlobStore<W, C>,
 ) -> std::io::Result<()> {
     let versions = store.versions()?;
-    // Bounded by the call above, which is why the `try_from` cannot fail here:
-    // `versions` returns an error rather than a count it cannot represent, so a
-    // store with more versions than `u32` has already been refused by the `?` on
-    // the line above. The fallback is dead code kept for the type, not a second
-    // answer to a case it once handled — an uncountable set is an error to
-    // propagate, not a set with a tip at the maximum.
+    // Bounded by the call above, which is why the `try_from` cannot fail here.
+    // `versions` returns an error rather than a count that it cannot represent.
+    // So a store with more versions than `u32` has already been refused by the
+    // `?` on the line above. The fallback is dead code kept for the type. It is
+    // not a second answer to a case that it once handled. An uncountable set is
+    // an error to propagate, not a set with a tip at the maximum.
     //
-    // `try_from` rather than `as u32`, which `clippy::pedantic`'s
-    // `cast_possible_truncation` denies.
+    // `try_from` rather than `as u32`. The lint `clippy::pedantic`'s
+    // `cast_possible_truncation` denies `as u32`.
     let tip = u32::try_from(versions.len()).unwrap_or(u32::MAX);
     let from = pack.version();
 
-    // Strictly below. A pack from the tip's own version is a sender exactly up to
-    // date, which is the ordinary case and not worth a word.
+    // Strictly below. A pack from the tip's own version means a sender that
+    // is exactly up to date. That is the ordinary case, and it is not worth a
+    // word.
     if from >= tip {
         return Ok(());
     }
@@ -1786,11 +1804,11 @@ fn warn_behind_tip<W: storage::WriteMode, C: storage::Compressor>(
 
 /// Report a pack the set already holds, and that nothing was done.
 ///
-/// On stdout, because it is the run's answer and a script that pushed a pack and
-/// then checked the exit code is entitled to know why the set did not move. It
-/// names the version the set holds it as, because "already merged" on its own
-/// leaves the one question a retried transfer actually has — *which* version, so
-/// a client can ask for that one by number — unanswered.
+/// On stdout, because it is the run's answer. A script that pushed a pack and
+/// then checked the exit code is entitled to know why the set did not move. The
+/// message names the version that the set holds the pack as. "Already merged" on
+/// its own leaves the one question of a retried transfer unanswered. That
+/// question is *which* version, so a client can ask for that one by number.
 fn report_already_merged(set: &IndexSet, version: u32) -> std::io::Result<()> {
     say!(
         "already merged: {} holds this version as version {version}; nothing to do",
@@ -1800,15 +1818,15 @@ fn report_already_merged(set: &IndexSet, version: u32) -> std::io::Result<()> {
 
 /// Say what a merge committed, and what it left out.
 ///
-/// Two lines: what went in, and the name the new version is known by — the same
-/// hash `pack` printed when it was written, since a pack is a function of the
-/// version it carries and both sides hash the same bytes.
+/// Two lines: what went in, and the name that the new version is known by. The
+/// name is the same hash that `pack` printed when it was written. A pack is a
+/// function of the version that it carries, and both sides hash the same bytes.
 ///
-/// Every number here is *this* set's. The version is the one the commit record
-/// published, and the "since N" is the version of this set that holds the pack's
-/// base, looked up by snapshot hash rather than taken from the pack — which is
-/// the only way it can be right, since the pack's base is a hash and a hash says
-/// nothing about what this set calls it.
+/// Every number here is *this* set's. The version is the one that the commit
+/// record published. The "since N" is the version of this set that holds the
+/// pack's base. The code looks that version up by snapshot hash rather than
+/// taking it from the pack. That is the only way it can be right. The pack's
+/// base is a hash, and a hash says nothing about what this set calls it.
 fn report_merge(
     set: &IndexSet,
     version: u32,
@@ -1835,15 +1853,16 @@ fn report_merge(
 /// Say what a merge would have committed, on stdout, and that it committed
 /// nothing.
 ///
-/// The same wording as the real report with the verbs changed, for the reason
-/// `report_applied` gives: the real run's line is what a script parses, and
-/// interpolating "would" into it would change bytes nobody asked to change.
+/// The same wording as the real report, with the verbs changed. The reason is
+/// the one that `report_applied` gives. The real run's line is what a script
+/// parses. Interpolating "would" into that line would change bytes that nobody
+/// asked to change.
 ///
-/// A pack the set already holds is reported exactly as the real run would report
-/// it, with "dry run" nowhere in the line. There is nothing to plan: the real run
-/// writes nothing either, so a dry-run-prefixed version of the answer would be
-/// the more qualified of two statements about the same event, and the qualified
-/// one is the less true.
+/// A pack that the set already holds is reported exactly as the real run would
+/// report it, with "dry run" nowhere in the line. There is nothing to plan. The
+/// real run writes nothing either. So a dry-run-prefixed version of the answer
+/// would be the more qualified of two statements about the same event. The
+/// qualified one is the less true.
 fn report_merge_plan(set: &IndexSet, planned: &Planned, fresh: bool) -> std::io::Result<()> {
     tracing::info!(name = %set.base().display(), "dry run: nothing was written");
 
@@ -1883,13 +1902,13 @@ fn report_merge_plan(set: &IndexSet, planned: &Planned, fresh: bool) -> std::io:
 
 /// Bring `destination` up to the version `pack` carries.
 ///
-/// The destination is claimed for the length of the run, on the same terms a
-/// restore claims one: two applies into one directory would interleave, and the
-/// claim is a file *beside* it so it never appears in the result.
+/// The destination is claimed for the length of the run, on the same terms that
+/// a restore claims one. Two applies into one directory would interleave. The
+/// claim is a file *beside* the directory, so it never appears in the result.
 ///
-/// A dry run takes no claim and writes nothing — no file opened, no entry pruned,
-/// no manifest recorded — having already probed the destination against the
-/// version and read back every chunk it was about to write.
+/// A dry run takes no claim and writes nothing. It opens no file, prunes no
+/// entry, and records no manifest. It has already probed the destination against
+/// the version, and read back every chunk that it was about to write.
 async fn run_apply(
     pack: &std::path::Path,
     destination: &std::path::Path,
@@ -1938,17 +1957,17 @@ async fn run_apply(
 
 /// Say what an apply changed, or what it would have changed.
 ///
-/// Two wordings rather than one with the verbs filled in, because the real run's
-/// line is what a script parses and interpolating into it would change bytes
-/// nobody asked to change.
+/// Two wordings rather than one with the verbs filled in. The real run's
+/// line is what a script parses. Interpolating into that line would change bytes
+/// that nobody asked to change.
 fn report_applied(
     applied: &lepatch::command::Applied,
     pack: &Pack,
     destination: &std::path::Path,
     dry_run: bool,
 ) -> std::io::Result<()> {
-    // The bytes a fetch would have needed, which is the number that says whether
-    // this was an update or a whole tree.
+    // The bytes a fetch would have needed. That figure says whether this
+    // was an update or a whole tree.
     if dry_run {
         say!(
             "dry run: would fetch {} of {} bytes in {} range(s); {} of {} chunks are already \
@@ -1975,8 +1994,9 @@ fn report_applied(
         )?;
     }
 
-    // Named on stderr, because stdout is data. Left in place unless `--prune`, and
-    // said so either way: silence here would read as "nothing there".
+    // Named on stderr, because stdout is data. Entries are left in place unless
+    // `--prune`. The run says so either way, because silence here would read as
+    // "nothing there".
     if applied.extra > 0 {
         let what = match (dry_run, applied.removed) {
             (true, 0) => "would be left alone; pass --prune to remove them",
@@ -2002,9 +2022,9 @@ fn report_applied(
 
     if applied.unowned > 0 {
         if dry_run {
-            // The figure is a bound, not a count: it is how many entries record an
-            // owner at all, and only trying to set one says whether this process
-            // can. Claiming either outcome would be a guess.
+            // The figure is a bound, not a count. It is how many entries record an
+            // owner at all. Only trying to set one says whether this process can.
+            // Claiming either outcome would be a guess.
             eprintln!(
                 "note: {} entr{} in this version record an owner, which an apply may not be \
                  able to set without privilege",

@@ -1,22 +1,22 @@
 //! Turning a snapshot into an ordered list of chunks in a store.
 //!
-//! A [`crate::metadata::Snapshot`] is a location-free recipe: which chunks exist,
-//! which file each slice of each chunk belongs in, and where in that file. This
-//! module is the step that asks the store and produces the answer.
+//! A [`crate::metadata::Snapshot`] is a location-free recipe. It names the chunks
+//! that exist. It names which file each slice of each chunk belongs in, and where
+//! in that file. This module asks the store and produces the answer.
 //!
 //! **The order is the point.** Chunks reach a store in whatever order concurrent
-//! uploads finish, so a list taken from the store directly differs between runs
-//! and anything built from it would differ too. [`Plan::from_snapshot`] therefore
-//! orders by the snapshot's own chunk table, a function of read order and nothing
-//! else: two backups of one tree produce the same plan.
+//! uploads finish. A list taken from the store directly therefore differs between
+//! runs, and anything built from it would differ too. [`Plan::from_snapshot`]
+//! orders by the snapshot's own chunk table instead. That table is a function of
+//! read order and nothing else. Two backups of one tree produce the same plan.
 //!
 //! That determinism is why a plan is a list of *chunks* and not a list of ranges.
 //! A store range has to stop at every record header, so a range list taken against
 //! a store coalesces almost never. A pack has no framing between its payloads, so
-//! the same chunks end to end *are* contiguous — see [`crate::pack`].
+//! the same chunks end to end *are* contiguous. See [`crate::pack`].
 //!
-//! [`Plan::total_bytes`] is therefore the size of a pack, not of a store byte
-//! range, and is computable before reading a byte.
+//! [`Plan::total_bytes`] is therefore the size of a pack. It is not the size of a
+//! store byte range. A caller can compute it before reading a byte.
 
 use std::io;
 
@@ -25,9 +25,9 @@ use crate::storage::{BlobId, Placement};
 
 /// Where one distinct chunk lives, and how much of it a version actually uses.
 ///
-/// `length` is what a restore reads for this chunk, not the chunk's whole length:
-/// one spanning two files is stored whole and used in part, and one spanned by
-/// repeated content may be used at several offsets.
+/// `length` is what a restore reads for this chunk, not the chunk's whole length.
+/// A chunk that spans two files is stored whole and used in part. A chunk that
+/// repeated content spans may be used at several offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannedChunk {
     /// The chunk's content hash, and its identity.
@@ -47,32 +47,32 @@ pub struct Plan {
 impl Plan {
     /// The chunks, in order.
     ///
-    /// [`Plan`] is also [`IntoIterator`] and [`AsRef<[PlannedChunk]>`], so
-    /// `for chunk in &plan` and `plan.as_ref().len()` both work and the
-    /// `plan.chunks().iter()` double hop is not needed. Both spellings were in
-    /// the tree, and the double hop reads like a mistake.
+    /// [`Plan`] is also [`IntoIterator`] and [`AsRef<[PlannedChunk]>`]. Both
+    /// `for chunk in &plan` and `plan.as_ref().len()` work. The double hop
+    /// `plan.chunks().iter()` is not needed. Both spellings were in the tree, and
+    /// the double hop reads like a mistake.
     pub fn iter(&self) -> std::slice::Iter<'_, PlannedChunk> {
         self.chunks.iter()
     }
 
     /// Resolve `snapshot` against the placements `locate` reports.
     ///
-    /// `locate` is given a chunk hash and returns where it is, or
-    /// [`io::ErrorKind::NotFound`] if the store does not hold it. A callback
-    /// rather than a store, so this works for any backend.
+    /// `locate` receives a chunk hash. It returns where that chunk is, or
+    /// [`io::ErrorKind::NotFound`] if the store does not hold it. The function
+    /// takes a callback rather than a store, so this works for any backend.
     ///
     /// # Errors
     ///
-    /// Returns an error if `locate` fails for any chunk the snapshot names, or if
-    /// a slice names a **chunk** index that does not exist.
+    /// Returns an error if `locate` fails for any chunk that the snapshot names.
+    /// Returns an error if a slice names a **chunk** index that does not exist.
     ///
-    /// A slice naming a *file* index that does not exist is not refused here, and
-    /// used to be claimed to be. Nothing in a `Plan` consumes `file_index` — the
-    /// tables are flattened to one entry per distinct chunk — so checking it would
-    /// be this function reaching into a table it does not read. It is checked
-    /// where it is used, by
-    /// [`Snapshot::verify_file_lengths`](crate::metadata::Snapshot::verify_file_lengths),
-    /// which a restore runs before it writes anything.
+    /// A slice that names a *file* index that does not exist is not refused here.
+    /// An older version of this comment claimed otherwise. Nothing in a `Plan`
+    /// consumes `file_index`. The tables are flattened to one entry per distinct
+    /// chunk. A check on the file index would make this function read a table that
+    /// it does not read. The index is checked where it is used, by
+    /// [`Snapshot::verify_file_lengths`](crate::metadata::Snapshot::verify_file_lengths).
+    /// A restore runs that check before it writes anything.
     pub fn from_snapshot<F>(snapshot: &Snapshot, mut locate: F) -> io::Result<Self>
     where
         F: FnMut(&BlobId) -> io::Result<Placement>,
@@ -102,10 +102,10 @@ impl Plan {
 
             let placement = locate(id)?;
 
-            // Against the *raw* length: a snapshot records its slices in content
-            // bytes, while a compressed placement's `len` is the frame's size on
-            // disk. Comparing content to storage would accept a chunk that is
-            // genuinely too short, or reject a good one.
+            // Against the *raw* length. A snapshot records its slices in content
+            // bytes. A compressed placement's `len` is the frame's size on disk.
+            // Comparing content to storage would accept a chunk that is genuinely
+            // too short, or reject a good one.
             let held = placement.raw_len;
 
             if length > held {
@@ -129,28 +129,28 @@ impl Plan {
 
     /// The chunks a holder of `base` does not already have, per *placement*.
     ///
-    /// A delta: what `target` needs that a holder of `base` does not. Deterministic,
-    /// because the surviving chunks keep `target`'s own chunk order rather than
-    /// acquiring one of their own — so two packs of the same delta are the same bytes,
-    /// which is the property a pack's content hash rests on.
+    /// A delta: what `target` needs and a holder of `base` does not. The delta is
+    /// deterministic. The surviving chunks keep `target`'s own chunk order instead
+    /// of acquiring an order of their own. Two packs of the same delta are then
+    /// the same bytes. A pack's content hash rests on that property.
     ///
     /// **Placements, not chunk sets.** The first version subtracted `base`'s chunk
-    /// hashes, and that is wrong in a way that only shows up with shared content: a
-    /// chunk the base holds *somewhere* is not thereby held *everywhere*. A tree where
-    /// every file happens to have identical bytes, or a new file whose content repeats
-    /// an existing one, produces a chunk that is in the base and absent from a file the
-    /// base knows nothing about. Subtracting by hash drops it, and the delta then
-    /// omits a file's only content — the client skips it, never creates it, and reports
-    /// success.
+    /// hashes. That is wrong in a way that only shows up with shared content. A
+    /// chunk that the base holds *somewhere* is not thereby held *everywhere*. A
+    /// tree where every file happens to have identical bytes produces such a chunk.
+    /// So does a new file whose content repeats an existing one. That chunk is in
+    /// the base and absent from a file that the base knows nothing about. Subtracting
+    /// by hash drops it, and the delta then omits a file's only content. The client
+    /// skips that file, never creates it, and reports success.
     ///
-    /// So a chunk survives unless the base places *every* one of its slices identically:
-    /// same path, same offset in the file, same offset in the chunk, same length. That
-    /// is the only thing which can mean "the directory already has this", because the
+    /// A chunk therefore survives unless the base places *every* one of its slices
+    /// identically. The placements must agree on path, file offset, chunk offset,
+    /// and length. Only that can mean "the directory already has this". The
     /// directory holds bytes at paths, and a chunk is not a place.
     ///
-    /// The consequence for a reader: a chunk absent from the delta is one every one of
-    /// the target's placements for it is already in place. That is what makes skipping
-    /// it sound, and it is a property of the *file*, not of the content.
+    /// A reader must then know that a chunk absent from the delta is one in
+    /// place at every one of the target's placements. That is what makes
+    /// skipping it sound. It is a property of the *file*, not of the content.
     #[must_use]
     pub fn since(&self, target: &Snapshot, base: &Snapshot) -> Self {
         let covered: std::collections::HashSet<Site<'_>> = base
@@ -166,8 +166,8 @@ impl Plan {
                 .copied()
                 .filter(|chunk| {
                     // Kept if *any* slice of it is not already placed. One uncovered
-                    // placement is enough to make the whole chunk necessary, because the
-                    // delta has to be able to supply that slice.
+                    // placement is enough to make the whole chunk necessary, because
+                    // the delta has to be able to supply that slice.
                     target
                         .chunks
                         .iter()
@@ -207,10 +207,10 @@ impl Plan {
     }
 
     /// Bytes a concatenation of every distinct chunk would occupy, counting each
-    /// chunk once — the size of a *pack*, not of the tree.
+    /// chunk once. This is the size of a *pack*, not of the tree.
     ///
-    /// Not a store byte range: a caller fetching from a store cannot use this
-    /// number, because the chunks are separated by record headers.
+    /// This is not a store byte range. A caller fetching from a store cannot use
+    /// this number, because the chunks are separated by record headers.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {
         self.chunks
@@ -260,11 +260,12 @@ fn reach(slice: &FileChunk) -> io::Result<u64> {
 
 /// The error for a slice naming a chunk the snapshot does not contain.
 ///
-/// Names only the chunk index, because that is the only one checked — see
-/// [`Plan::from_snapshot`]. It used to name the file index too, and to say
-/// "cannot be resolved", which read as though both were being resolved. A message
-/// that reports a check the function does not perform is worse than a short one:
-/// it tells a reader the snapshot was fully validated when it was not.
+/// Names only the chunk index, because that is the only one checked. See
+/// [`Plan::from_snapshot`]. This error used to name the file index too, and to say
+/// "cannot be resolved". That wording read as though both were being resolved. A
+/// message that reports a check the function does not perform is worse than a
+/// short one. Such a message tells a reader the snapshot was fully validated when
+/// it was not.
 fn bad_index(snapshot: &Snapshot, slice: &FileChunk) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -281,10 +282,10 @@ type Site<'a> = (&'a std::path::Path, u64, u32, u32);
 
 /// A slice's placement, or `None` if it names a table the snapshot does not have.
 ///
-/// Returning `None` rather than refusing is deliberate and matches
-/// [`Plan::from_snapshot`], which drops what it cannot resolve rather than failing:
-/// a chunk whose only slice is unresolvable is never read anywhere, so where it
-/// would have gone cannot matter.
+/// Returning `None` rather than refusing is deliberate. It matches
+/// [`Plan::from_snapshot`], which drops what it cannot resolve instead of failing.
+/// A chunk whose only slice is unresolvable is never read anywhere. Where it would
+/// have gone therefore cannot matter.
 fn placement_of<'a>(snapshot: &'a Snapshot, slice: &FileChunk) -> Option<Site<'a>> {
     let file = usize::try_from(slice.file_index).ok()?;
     let path = snapshot.files.get(file)?.path.as_path();

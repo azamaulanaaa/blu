@@ -1,165 +1,209 @@
 //! Applying a pack *into* a backup set, as a new version of it.
 //!
-//! [`super::apply`] is the other half and works the other way round: a pack
-//! brings a directory up to a version, and this brings a *set* up to a version.
-//! The receiving side of a future push protocol, built first and tested entirely
-//! with the packs `lepatch pack` already writes, so the protocol has something
-//! real to be designed around rather than a guess about it.
+//! [`super::apply`] is the other half and works the other way round.
+//! A pack brings a directory up to a version, and this brings a *set* up to a
+//! version.
+//! This is the receiving side of a future push protocol.
+//! It is built first and tested entirely with the packs `lepatch pack` already
+//! writes, so the protocol has something real to be designed around rather than
+//! a guess about it.
 //!
 //! ## Where the chunks come from
 //!
 //! A pack is already a [`StorageGet`], so it is already a store as far as this
-//! command is concerned, and nothing here knows a pack is a file. The chunks
-//! reach `put` through the ordinary path a backup uses, with one difference: the
-//! plan is resolved against *two* sources — the set, which may already hold some
-//! of them, and the pack, which carries the rest.
+//! command is concerned.
+//! Nothing here knows a pack is a file.
+//! The chunks reach `put` through the ordinary path a backup uses.
+//! The plan is resolved against *two* sources.
+//! One source is the set, which may already hold some of them.
+//! The other source is the pack, which carries the rest.
 //!
-//! That resolution is not a convenience, it is the integrity check. A snapshot
-//! names every chunk it reads, so resolving it against "the set or the pack"
-//! fails for any chunk neither holds, and a pack that is short of a chunk its own
-//! snapshot needs is refused before anything is written. For a full pack that is
-//! the whole completeness check — the pack claims to be self-contained, and this
-//! is where the claim is cashed. For a delta it is the check that the chunks the
-//! pack left out really are in the set, which the base containment check below
-//! only implies.
+//! That resolution is not a convenience, it is the integrity check.
+//! A snapshot names every chunk it reads, so resolving it against "the set or the
+//! pack" fails for any chunk neither holds.
+//! A pack that is short of a chunk its own snapshot needs is refused before
+//! anything is written.
+//! For a full pack that is the whole completeness check.
+//! The pack claims to be self-contained, and this is where the claim is cashed.
+//! For a delta it is the check that the chunks the pack left out really are in
+//! the set.
+//! The base containment check below only implies that.
 //!
 //! ## A delta is refused unless the set holds its base
 //!
-//! A delta pack omits the chunks its base already has, and it cannot check that
-//! its reader has them: the bytes that would prove it are exactly the bytes it
-//! left out. So the reader has to establish the base itself.
+//! A delta pack omits the chunks its base already has.
+//! It cannot check that its reader has them.
+//! The bytes that would prove it are exactly the bytes it left out.
+//! The reader therefore has to establish the base itself.
 //!
 //! **The test here is containment of the base snapshot among the set's committed
-//! versions, and nothing about the set's current state.** That is the one place
-//! where [`super::apply`]'s logic would be wrong here, and it is worth spelling
-//! out because the two holders are not alike. Apply establishes its base against
-//! a *directory*, and a directory is not a store: it may hold extra files, or be
-//! a half-applied tree from a killed run, so what apply has to establish is that
-//! the tree is clean and exactly the base version. A backup set is append-only —
-//! there is no command in this crate that removes a chunk or a version, and a
-//! commit record is never rewritten — so a set at a *later* version still holds
-//! every chunk of every earlier one. A set that holds the base at all is a set
-//! that can merge the delta, and a set that is ahead, full of unrelated versions,
-//! or sitting on a torn tail from a killed run is no different from one that is
-//! exactly on the base. Importing apply's check would refuse merges that are
-//! perfectly safe and, worse, would read as though the set had to be pristine,
-//! which is a property of the holder and not of the store.
+//! versions. It says nothing about the set's current state.**
+//! That is the one place where [`super::apply`]'s logic would be wrong here.
+//! The two holders are not alike, so it is worth spelling out.
+//! Apply establishes its base against a *directory*, and a directory is not a
+//! store.
+//! A directory may hold extra files, or be a half-applied tree from a killed run.
+//! What apply has to establish is that the tree is clean and is exactly the base
+//! version.
+//! A backup set is append-only.
+//! No command in this crate removes a chunk or a version, and a commit record is
+//! never rewritten.
+//! A set at a *later* version therefore still holds every chunk of every earlier
+//! one.
+//! A set that holds the base at all is a set that can merge the delta.
+//! A set that is ahead is no different from one exactly on the base.
+//! So is a set full of unrelated versions, or one sitting on a torn tail from a
+//! killed run.
+//! Importing apply's check would refuse merges that are perfectly safe.
+//! Worse, it would read as though the set had to be pristine.
+//! Purity is a property of the holder and not of the store.
 //!
 //! So the check is: some committed version of the set names the base's snapshot
-//! hash. `versions()` and `snapshot(v)` are the store's own commit list, which is
-//! the record of what exists; the index files are a cache of it and are not
-//! consulted, for the same reason `versions` is not a count of them.
+//! hash.
+//! `versions()` and `snapshot(v)` are the store's own commit list, which is the
+//! record of what exists.
+//! The index files are a cache of it and are not consulted, for the same reason
+//! `versions` is not a count of them.
 //!
 //! ## A full pack may create the set
 //!
 //! Merging a full pack into a name with no set behind it **creates the set**.
-//! A full pack carries its snapshot and every chunk that snapshot reads, so there
-//! is nothing to check it against and nothing that could be missing; refusing
-//! would mean merge could only ever add to a set `lepatch backup` had made, and
-//! this command's whole reason to exist is receiving a version into a set that
-//! need not have one — a new machine, a new location, a set rebuilt from packs
-//! after the original was lost. The create is the same one any backup does: the
-//! open makes segment 0 and the commit record publishes the version.
+//! A full pack carries its snapshot and every chunk that snapshot reads.
+//! There is then nothing to check it against and nothing that could be missing.
+//! Refusing would mean merge could only ever add to a set `lepatch backup` had
+//! made.
+//! This command exists to receive a version into a set that need not have one.
+//! Such a set is a new machine, a new location, or a set rebuilt from packs
+//! after the original was lost.
+//! The create is the same one any backup does: the open makes segment 0 and the
+//! commit record publishes the version.
 //!
 //! ## No rollback, and none is needed
 //!
-//! Every chunk is stored, then `sync_data`, then `commit`. The commit record is
-//! the only thing that makes a version exist, so a run that fails before it
-//! leaves records in the last segment that no version references: wasted space,
-//! and no corruption, because nothing names those records and a store that
-//! holds a record nobody reads is still a store whose every named version
-//! restores. The space is not reclaimed, and deliberately not: recovery
-//! truncates only what is *past* the last valid record, so a record that was
-//! written whole and never referenced is a perfectly valid record that outlives
-//! every later run, while one cut short by the crash is the tail recovery does
-//! discard. So the cost of a failed merge is bounded by what it wrote and
-//! permanent, and that is a fair trade for never having to know which records a
-//! later run can safely drop. That is the store's existing guarantee — the same
-//! one a backup has — and this command does not
-//! invent a second mechanism on top of it. There is nothing to undo, because
-//! nothing was published: a version either exists or it does not, and the record
-//! that says so is written once.
+//! Every chunk is stored, then `sync_data`, then `commit`.
+//! The commit record is the only thing that makes a version exist.
+//! A run that fails before it leaves records in the last segment that no version
+//! references.
+//! That costs wasted space, and no corruption.
+//! Nothing names those records, and a store that holds a record nobody reads is
+//! still a store whose every named version restores.
+//! The space is not reclaimed, and deliberately not.
+//! Recovery truncates only what is *past* the last valid record.
+//! A record that was written whole and never referenced is a perfectly valid
+//! record that outlives every later run.
+//! One cut short by the crash is the tail recovery does discard.
+//! The cost of a failed merge is therefore bounded by what it wrote and
+//! permanent.
+//! That is a fair trade for never having to know which records a later run can
+//! safely drop.
+//! This is the store's existing guarantee, the same one a backup has.
+//! This command does not invent a second mechanism on top of it.
+//! There is nothing to undo, because nothing was published.
+//! A version either exists or it does not, and the record that says so is written
+//! once.
 //!
 //! ## Merging the same pack twice
 //!
-//! **A no-op, reported and successful.** A pack whose snapshot the set already
-//! holds changes nothing: no version is published and no chunk is stored, and the
-//! run says which version the set is already holding it as.
+//! **A no-op, reported and successful.**
+//! A pack whose snapshot the set already holds changes nothing.
+//! No version is published and no chunk is stored.
+//! The run says which version the set is already holding it as.
 //!
-//! The alternatives were considered and both are worse:
+//! The alternatives were considered. Both are worse.
 //!
-//! * *Refuse it.* A transfer may be retried, and a client that merged a pack and
-//!   lost the reply has to be able to ask again. A refusal cannot be told from
-//!   "never merged" by the client that has to decide whether to send, so the
-//!   retry protocol would need an out-of-band answer to a question the set can
-//!   answer itself in one scan of its commit list.
+//! * *Refuse it.* A transfer may be retried.
+//!   A client that merged a pack and lost the reply has to be able to ask again.
+//!   The client that has to decide whether to send cannot tell a refusal from
+//!   "never merged".
+//!   The retry protocol would then need an out-of-band answer to a question the
+//!   set can answer itself in one scan of its commit list.
 //! * *Make a second version.* It was what this did, and it is what a log does by
-//!   default: the second arrival records again, deduplicates every chunk, and
-//!   publishes a version number nobody asked for. That number then competes with
-//!   real ones — a script that pushes and then verifies against the latest
-//!   version reads a duplicate as the most recent thing that happened — and it is
-//!   a *fact about the receiving set* being manufactured by a transfer that
-//!   happened to be repeated. Nothing was learned the second time.
+//!   default.
+//!   The second arrival records again, deduplicates every chunk, and publishes a
+//!   version number nobody asked for.
+//!   That number then competes with real ones.
+//!   A script that pushes and then verifies against the latest version reads a
+//!   duplicate as the most recent thing that happened.
+//!   Such a number is a *fact about the receiving set* being manufactured by a
+//!   transfer that happened to be repeated.
+//!   Nothing was learned the second time.
 //!
 //! What it costs is one scan of the commit list, which the run does anyway to
-//! find a delta's base, and it is the reason [`version_holding`] is a public-ish
-//! seam rather than a detail of planning: the check has to happen before any
-//! planning or writing at all, and identically under a dry run. A dry run that
-//! reported a merge of something already merged would be telling the user their
-//! set is about to grow a version it is not.
+//! find a delta's base.
+//! It is the reason [`version_holding`] is a public-ish seam rather than a detail
+//! of planning.
+//! The check has to happen before any planning or writing at all, and identically
+//! under a dry run.
+//! A dry run that reported a merge of something already merged would tell the
+//! user their set is about to grow a version.
+//! Their set would not grow one.
 //!
 //! ## An older pack is warned about, not refused
 //!
-//! The pack records the version it was built from ([`Pack::version`]), and a
-//! merge compares it against the set's tip. A pack from below the tip means the
-//! sender's view is behind: the version it carries was built from an older one, so
-//! whatever they changed since has not left. That is worth saying out loud and it
-//! is not worth refusing, because the two sets number independently and there is
-//! nothing a refusal could assert — the pack is internally consistent, its chunks
-//! are the chunks its snapshot names, and merging it produces a version that
-//! restores exactly what the pack holds.
+//! The pack records the version it was built from ([`Pack::version`]).
+//! A merge compares it against the set's tip.
+//! A pack from below the tip means the sender's view is behind.
+//! The version it carries was built from an older one, so whatever they changed
+//! since has not left.
+//! That is worth saying out loud, and it is not worth refusing.
+//! The two sets number independently, and there is nothing a refusal could
+//! assert.
+//! The pack is internally consistent, and its chunks are the chunks its snapshot
+//! names.
+//! Merging it produces a version that restores exactly what the pack holds.
 //!
-//! It goes to **stderr** rather than stdout because stdout is the report channel:
-//! the warning is about what the merge is about to do, not a figure the run
-//! produced, and a script reading the report must not have to skip a line to find
-//! the one it wants.
+//! It goes to **stderr** rather than stdout because stdout is the report channel.
+//! The warning is about what the merge is about to do, not a figure the run
+//! produced.
+//! A script reading the report must not have to skip a line to find the one it
+//! wants.
 //!
-//! **Equal is not lower.** A pack from the tip's own version is the ordinary case
-//! of a sender who is exactly up to date, and warning about it would train people
-//! to ignore the warning.
+//! **Equal is not lower.**
+//! A pack from the tip's own version is the ordinary case of a sender who is
+//! exactly up to date.
+//! Warning about it would train people to ignore the warning.
 //!
 //! ## What form a chunk arrives in
 //!
-//! A pack carries each chunk as the record its source set already held — a zstd
-//! frame, or the content itself — so a merge has a choice about what it does with
-//! that form, and it is [`Compression`]'s to make.
+//! A pack carries each chunk as the record its source set already held.
+//! That record is a zstd frame, or the content itself.
+//! A merge therefore has a choice about what it does with that form, and it is
+//! [`Compression`]'s to make.
 //!
 //! **The default is to keep it**, and the reason is that the alternative is work
-//! done twice: decoding every frame of a compressed pack only to compress the
-//! result again under the receiving set's own policy, which is the expensive half
-//! of a transfer performed for nothing. Keeping the form is what the pack format
-//! was built for, and it is what a set that already compresses wants — it holds
-//! frames, and a frame is a frame whichever set wrote it.
+//! done twice.
+//! Decoding every frame of a compressed pack only to compress the result again
+//! is the expensive half of a transfer.
+//! The receiving set's own policy governs that second compression.
+//! Such a transfer is performed for nothing.
+//! Keeping the form is what the pack format was built for.
+//! It is also what a set that already compresses wants.
+//! Such a set holds frames, and a frame is a frame whichever set wrote it.
 //!
-//! **The frame is still decoded, and this is the part that looks like waste.** A
-//! chunk is named by the hash of its content, so what a pack says about a chunk is
-//! a claim, and the only thing that could check it is the content itself; see
-//! [`StoragePut::put_stored`], which says why at the length it deserves. What the
-//! default saves is the encode, and what it keeps is the guarantee every other
-//! path has: a damaged or hostile pack is refused on this path exactly as on any
-//! other, and a merge that refuses it publishes no version.
+//! **The frame is still decoded, and this is the part that looks like waste.**
+//! A chunk is named by the hash of its content.
+//! What a pack says about a chunk is a claim.
+//! The only thing that could check it is the content itself.
+//! See [`StoragePut::put_stored`], which says why at the length it deserves.
+//! What the default saves is the encode.
+//! What it keeps is the guarantee every other path has: a damaged or hostile
+//! pack is refused on this path exactly as on any other.
+//! A merge that refuses it publishes no version.
 //!
-//! **A frame is kept only if it earned its place**, which the store decides rather
-//! than this command: a frame no smaller than its content, or one naming a codec
-//! this build cannot read, is stored raw instead. Both lengths are in the record,
-//! so the check is two integer comparisons, and without it a pack could grow the
-//! set it is merged into.
+//! **A frame is kept only if it earned its place**, and the store decides that
+//! rather than this command.
+//! A frame no smaller than its content is stored raw instead.
+//! So is a frame naming a codec this build cannot read.
+//! Both lengths are in the record, so the check is two integer comparisons.
+//! Without it a pack could grow the set it is merged into.
 //!
 //! A level re-encodes, for the set that has a compression policy of its own and
-//! does not want the sender's frames. It changes what is stored and nothing else —
-//! the same chunks are read, the same hashes checked, the same figures reported —
-//! and it cannot rewrite what the set already holds, because every record names
-//! the codec it was written with.
+//! does not want the sender's frames.
+//! It changes what is stored and nothing else.
+//! The same chunks are read, the same hashes checked, and the same figures
+//! reported.
+//! It cannot rewrite what the set already holds, because every record names the
+//! codec it was written with.
 
 use std::io::{self, Cursor};
 
@@ -171,8 +215,9 @@ use crate::{
     storage::{self, BlobId, Codec, Placement, StorageGet, StoragePut},
 };
 
-/// Scratch size for hashing a chunk out of a pack, so a plan never holds a whole
-/// chunk and an unexpectedly large blob costs reads rather than allocation.
+/// Scratch size for hashing a chunk out of a pack.
+/// A plan never holds a whole chunk, and an unexpectedly large blob costs reads
+/// rather than allocation.
 const SCRATCH: usize = 64 * 1024;
 
 /// What a [`merge`] run did.
@@ -235,45 +280,53 @@ pub struct MergePlan {
     pub fresh: u64,
     /// Bytes of chunk content that would be stored.
     ///
-    /// Content, before compression: a pack hands the chunk's bytes as they were
-    /// hashed, so this is what goes in, and how large the records come out
-    /// depends on the set's compression policy, which is chosen when the store is
-    /// opened.
+    /// Content, before compression.
+    /// A pack hands the chunk's bytes as they were hashed, so this is what goes
+    /// in.
+    /// How large the records come out depends on the set's compression policy.
+    /// The store chooses that policy when it is opened.
     ///
-    /// **The same figure under every [`Compression`], and that is deliberate.** It
-    /// counts what the version *is* rather than what a particular policy makes of
-    /// it, so a report does not change its meaning with a flag and a script
-    /// comparing two merges is comparing the two runs rather than the two
-    /// encodings. A run that kept a pack's frames stored fewer bytes on disk than
-    /// this says, and the on-disk size is the segment file's to be measured from.
+    /// **The same figure under every [`Compression`], and that is deliberate.**
+    /// It counts what the version *is* rather than what a particular policy makes
+    /// of it.
+    /// A report therefore does not change its meaning with a flag.
+    /// A script comparing two merges is comparing the two runs rather than the
+    /// two encodings.
+    /// A run that kept a pack's frames stored fewer bytes on disk than this says.
+    /// The segment file's size on disk is the thing to measure.
     pub bytes: u64,
 }
 
 /// What a merge does with each chunk's stored form.
 ///
 /// The two are the whole of the choice, and the second one is the set's own write
-/// policy rather than anything this command decides: a re-encoded chunk goes to
-/// [`StoragePut::put`], which encodes it under the policy the set was opened
-/// with. So a caller asking for a level opens the set with it and passes
-/// [`Compression::Reencode`] — the two are not separate arguments because they
-/// cannot be allowed to disagree, and the store's compressor is a type parameter
-/// this command does not get to change.
+/// policy rather than anything this command decides.
+/// A re-encoded chunk goes to [`StoragePut::put`], which encodes it under the
+/// policy the set was opened with.
+/// So a caller asking for a level opens the set with it and passes
+/// [`Compression::Reencode`].
+/// The two are not separate arguments because they cannot be allowed to
+/// disagree.
+/// The store's compressor is a type parameter this command does not get to
+/// change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
     /// Store each chunk's stored form as the pack carries it.
     ///
     /// A chunk that reached the source set as a zstd frame is written as that same
-    /// frame, so a merge of a compressed pack copies frames rather than inflating
-    /// every chunk and compressing it again. **The frame is still decoded** to
-    /// check the chunk's hash — see [`StoragePut::put_stored`] — because a pack's
-    /// claim about what a chunk is is not evidence of it, and this is the one path
-    /// where a chunk's bytes are not hashed on the way in.
+    /// frame.
+    /// A merge of a compressed pack therefore copies frames rather than inflating
+    /// every chunk and compressing it again.
+    /// **The frame is still decoded** to check the chunk's hash.
+    /// See [`StoragePut::put_stored`].
+    /// A pack's claim about what a chunk is is not evidence of it.
+    /// This is the one path where a chunk's bytes are not hashed on the way in.
     ///
     /// Read through [`crate::pack::StorageStored`], which is [`StorageGet`] without
     /// the decode: the same record, opened and held to the index by the same code.
-    /// This path used to open the record itself, and a copy of that is a second
-    /// answer to "which bytes is this chunk" — the one question a damaged pack
-    /// makes expensive to get wrong.
+    /// This path used to open the record itself.
+    /// A copy of that is a second answer to "which bytes is this chunk".
+    /// That is the one question a damaged pack makes expensive to get wrong.
     #[default]
     Keep,
     /// Decode each chunk and store it under the set's own compression policy.
@@ -284,27 +337,34 @@ pub enum Compression {
 ///
 /// The store is a concrete [`BlobStore`](storage::BlobStore) rather than a bare
 /// [`StoragePut`](storage::StoragePut), and that is not a narrowing for taste.
-/// A merge has to answer "which versions does this set hold", to check a delta's
-/// base against and to report what the merge would have committed, and that
-/// question is about a set's commit list — which the storage traits do not carry
-/// and could not, since a `StoragePut` may be any backend at all. It is also
-/// what lets the counts below come from the store's own index rather than from
-/// what `put` happened to decide.
+/// A merge has to answer "which versions does this set hold".
+/// It uses that answer to check a delta's base and to report what the merge would
+/// have committed.
+/// That question is about a set's commit list, which the storage traits do not
+/// carry and could not.
+/// A `StoragePut` may be any backend at all.
+/// The store is also what lets the counts below come from the store's own index
+/// rather than from what `put` happened to decide.
 ///
 /// `compression` chooses between [`StoragePut::put_stored`] and
-/// [`StoragePut::put`] per chunk, and changes nothing else: the same chunks are
-/// read, the same hashes are checked and the same figures are reported, because
+/// [`StoragePut::put`] per chunk, and changes nothing else.
+/// The same chunks are read, the same hashes are checked, and the same figures
+/// are reported.
 /// [`MergePlan::bytes`] counts content rather than stored bytes.
 ///
 /// # Errors
 ///
 /// Returns an error if the pack's snapshot cannot be read, does not hash to the
-/// one its header names, or does not decode; if the pack is a delta and no
-/// committed version of the set names its base; if a chunk the version reads is
-/// in neither the pack nor the set; if a chunk the pack does hold does not hash
-/// to the hash it is addressed by, which both [`StoragePut::put`] and
-/// [`StoragePut::put_stored`] check per record; or if the set cannot be written
-/// or committed.
+/// one its header names, or does not decode.
+/// Returns an error if the pack is a delta and no committed version of the set
+/// names its base.
+/// Returns an error if a chunk the version reads is in neither the pack nor the
+/// set.
+/// Returns an error if a chunk the pack does hold does not hash to the hash it is
+/// addressed by.
+/// Both [`StoragePut::put`] and [`StoragePut::put_stored`] check that hash per
+/// record.
+/// Returns an error if the set cannot be written or committed.
 ///
 /// A failure before the commit record leaves the set with no new version. See
 /// this module's docs on why there is no rollback.
@@ -314,17 +374,19 @@ pub async fn merge<C: storage::Compressor>(
     pack: &Pack,
     compression: Compression,
 ) -> io::Result<Merged> {
-    // Both before a byte is written, and in that order: the snapshot says what
-    // the version is, and the base check decides whether this version can be put
-    // here at all.
+    // Both before a byte is written, and in that order.
+    // The snapshot says what the version is.
+    // The base check decides whether this version can be put here at all.
     let (snapshot, table) = checked_snapshot(pack)?;
     let snapshot_id = pack.snapshot_id();
 
     // Before the base check and before the plan, because a pack the set already
-    // holds has nothing to decide: it would publish a version number nobody asked
-    // for, over a version the set can name already. Doing it first also means a
-    // delta that is itself already merged is reported as such rather than refused
-    // for a base it will never need.
+    // holds has nothing to decide.
+    // It would publish a version number nobody asked for, over a version the set
+    // can name already.
+    // Doing it first also means a delta that is itself already merged is reported
+    // as such.
+    // Otherwise such a delta is refused for a base it will never need.
     if let Some(version) = version_holding(store, &snapshot_id)? {
         return Ok(Merged::Already { version });
     }
@@ -335,7 +397,8 @@ pub async fn merge<C: storage::Compressor>(
     };
 
     // The plan is what makes a merge refuse a pack that is short of a chunk its
-    // own snapshot reads, and it is where the counts come from.
+    // own snapshot reads.
+    // It is also where the counts come from.
     let plan = plan_against(Some(store), pack, &snapshot)?;
 
     let mut merged = MergePlan {
@@ -368,16 +431,19 @@ pub async fn merge<C: storage::Compressor>(
             )
         })?;
 
-        // The *whole* chunk, not the length this version reads of it: a pack
-        // stores a chunk whole, and both write paths check the hash of everything
-        // they are given against the name that chunk is addressed by, so a prefix
-        // would be refused for the very reason the check exists.
+        // The *whole* chunk, not the length this version reads of it.
+        // A pack stores a chunk whole, and both write paths check the hash of
+        // everything they are given.
+        // Both check that hash against the name the chunk is addressed by.
+        // A prefix would therefore be refused for the very reason the check exists.
         //
         // The error is wrapped because the store's own is a statement about a
-        // record and a person reading it has no way to know it came from merging a
-        // pack — or that the bytes are the pack's rather than the set's. A damaged
-        // pack is the likeliest cause by a long way, and saying so is what tells
-        // them to go and look at the file they downloaded.
+        // record.
+        // A person reading it has no way to know it came from merging a pack.
+        // Such a reader also cannot tell that the bytes are the pack's rather than
+        // the set's.
+        // A damaged pack is the likeliest cause by a long way.
+        // Saying so tells them to go and look at the file they downloaded.
         let refused = |e: io::Error| {
             io::Error::new(
                 e.kind(),
@@ -386,10 +452,11 @@ pub async fn merge<C: storage::Compressor>(
         };
 
         match compression {
-            // The chunk's stored form goes in as it stands, so the frame a source
-            // set deduplicated it into is copied rather than decoded and built
-            // again. The store still decodes it — see [`StoragePut::put_stored`] —
-            // so this saves the encode and nothing else.
+            // The chunk's stored form goes in as it stands.
+            // The frame a source set deduplicated it into is therefore copied
+            // rather than decoded and built again.
+            // The store still decodes it. See [`StoragePut::put_stored`].
+            // This saves the encode and nothing else.
             Compression::Keep => {
                 let stored = pack.stored(&chunk.id).await?;
                 let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
@@ -406,10 +473,12 @@ pub async fn merge<C: storage::Compressor>(
                     .map_err(refused)?;
             }
             // Today's path: the chunk's *content* is handed over, and the length
-            // handed with it is the content length, which is not the length of the
-            // pack's record — that one covers the header and, for a chunk the set
-            // held compressed, a frame. `get` decodes, so what comes back is
-            // content and content is what `put` hashes.
+            // handed with it is the content length.
+            // That is not the length of the pack's record.
+            // The record's length covers the header and, for a chunk the set held
+            // compressed, a frame.
+            // `get` decodes, so what comes back is content and content is what
+            // `put` hashes.
             Compression::Reencode => store
                 .put(&chunk.id, pack.get(&chunk.id).await?, located.content_len)
                 .await
@@ -420,18 +489,20 @@ pub async fn merge<C: storage::Compressor>(
         merged.bytes = merged.bytes.saturating_add(located.content_len);
     }
 
-    // The snapshot is a blob like any other — addressed by the hash of its own
-    // bytes, which is what the commit record names — so it is stored before the
-    // commit rather than carried by it.
+    // The snapshot is a blob like any other, addressed by the hash of its own
+    // bytes. The commit record names that hash.
+    // The snapshot is therefore stored before the commit rather than carried by
+    // it.
     let table_len = u64::try_from(table.len())
         .map_err(|_| io::Error::other("the snapshot is too large to store"))?;
     store
         .put(&snapshot_id, Box::new(Cursor::new(table)), table_len)
         .await?;
 
-    // The run's one data sync, then the commit that publishes it. The order is
-    // the store's contract, not this command's: a version that exists before the
-    // data it names is durable is a version nothing can be restored from.
+    // The run's one data sync, then the commit that publishes it.
+    // The order is the store's contract, not this command's.
+    // A version that exists before the data it names is durable is a version
+    // nothing can be restored from.
     store.sync_data().await?;
     let version = store.commit(&snapshot_id).await?;
 
@@ -443,29 +514,34 @@ pub async fn merge<C: storage::Compressor>(
 
 /// Say what merging `pack` into `set` would store, and store none of it.
 ///
-/// `set` is `None` for a name with no set behind it, which is the first version
-/// arriving somewhere and the case where this has to answer "everything is new"
-/// rather than fail the way opening a store for reading would. Opening for
-/// writing to find out is not an option: that *creates* the set, and a dry run
-/// that created one would be the one thing it promised not to do.
+/// `set` is `None` for a name with no set behind it.
+/// That is the first version arriving somewhere, and it is the case where
+/// this has to answer "everything is new".
+/// A dry run must not fail the way opening a store for reading would.
+/// Opening for writing to find out is not an option, because that *creates*
+/// the set.
+/// A dry run that created one would be the one thing it promised not to do.
 ///
-/// The plan is the one a real merge builds — the same resolution against the
-/// same two sources — and every chunk that would be written is read out of the
-/// pack and hashed, because `put` is what performs that check on the real path
-/// and a plan that skipped it would report success for a pack a real merge
-/// refuses. So this costs what the merge costs and mutates nothing.
+/// The plan is the one a real merge builds, with the same resolution against
+/// the same two sources.
+/// Every chunk that would be written is read out of the pack and hashed.
+/// `put` is what performs that check on the real path.
+/// A plan that skipped it would report success for a pack a real merge
+/// refuses.
+/// This therefore costs what the merge costs and mutates nothing.
 ///
-/// **It takes no [`Compression`], and reports the same figures under every one.**
-/// A chunk is hashed as content whichever path stores it, so the check a plan
-/// makes is the check both paths make, and [`MergePlan::bytes`] counts content
-/// rather than stored bytes — there is nothing about the encoding for a plan to
-/// decide differently.
+/// **It takes no [`Compression`], and reports the same figures under every
+/// one.**
+/// A chunk is hashed as content whichever path stores it.
+/// The check a plan makes is the check both paths make.
+/// [`MergePlan::bytes`] counts content rather than stored bytes.
+/// There is nothing about the encoding for a plan to decide differently.
 ///
 /// # Errors
 ///
-/// As [`merge`], and for the same reasons at the same points: a delta whose base
-/// the set does not hold is refused by a plan too, since the plan is what would
-/// decide that.
+/// As [`merge`], and for the same reasons at the same points.
+/// A delta whose base the set does not hold is refused by a plan too.
+/// The plan is what would decide that.
 pub async fn merge_plan<C: storage::Compressor>(
     pack: &Pack,
     set: Option<&storage::BlobStore<storage::Read, C>>,
@@ -474,9 +550,10 @@ pub async fn merge_plan<C: storage::Compressor>(
     let snapshot_id = pack.snapshot_id();
 
     // The same check, in the same place relative to the base and the plan, as
-    // `merge`'s — and for the same reason. A plan that reported a merge of
-    // something already merged would be telling the user their set is about to
-    // grow a version it is not, which is the one lie a dry run cannot tell.
+    // `merge`'s, and for the same reason.
+    // A plan that reported a merge of something already merged would tell the
+    // user their set is about to grow a version it is not.
+    // That is the one lie a dry run cannot tell.
     if let Some(version) = match set {
         Some(store) => version_holding(store, &snapshot_id)?,
         None => None,
@@ -535,19 +612,22 @@ pub async fn merge_plan<C: storage::Compressor>(
 /// The pack's file table, and the bytes to store it as.
 ///
 /// Read once and hashed here rather than calling [`Pack::snapshot`] and then
-/// [`Pack::snapshot_bytes`], which would read the same section twice and let the
-/// two reads disagree on a file that is being written underneath. What is stored
-/// has to be the bytes that were verified, and this is the only way to arrange
-/// that.
+/// [`Pack::snapshot_bytes`].
+/// That pair would read the same section twice and let the two reads disagree on
+/// a file that is being written underneath.
+/// What is stored has to be the bytes that were verified, and this is the only
+/// way to arrange that.
 ///
 /// The hash check is `Pack::snapshot`'s, restated because the value it returns is
-/// not what is wanted here: a decoded snapshot cannot be stored, since
-/// re-encoding one is a promise that it encodes to the same bytes.
+/// not what is wanted here.
+/// A decoded snapshot cannot be stored, since re-encoding one is a promise that
+/// it encodes to the same bytes.
 ///
 /// # Errors
 ///
-/// Returns an error if the section cannot be read, if its bytes do not hash to
-/// the snapshot the header names, or if they do not decode.
+/// Returns an error if the section cannot be read.
+/// Returns an error if its bytes do not hash to the snapshot the header
+/// names, or if they do not decode.
 fn checked_snapshot(pack: &Pack) -> io::Result<(Snapshot, Vec<u8>)> {
     let bytes = pack.snapshot_bytes()?;
 
@@ -570,22 +650,24 @@ fn checked_snapshot(pack: &Pack) -> io::Result<(Snapshot, Vec<u8>)> {
 
 /// The version of the set holding `base`, or a refusal naming why not.
 ///
-/// `set` is `None` for a name with no set behind it, which is a refusal rather
-/// than an empty answer: there is no committed version, so no version holds the
-/// base.
+/// `set` is `None` for a name with no set behind it.
+/// That is a refusal rather than an empty answer.
+/// There is no committed version, so no version holds the base.
 ///
 /// See this module's docs for why this is containment among committed versions
-/// and not a check that the set is exactly the base. Public because a caller
-/// needs it *before* opening the set for writing, which creates a set that does
-/// not exist: a delta refused against a name with nothing behind it must leave
-/// that name alone, and the store handle that would answer the question is the
-/// thing being created.
+/// and not a check that the set is exactly the base.
+/// This is public because a caller needs it *before* opening the set for
+/// writing, which creates a set that does not exist.
+/// A delta refused against a name with nothing behind it must leave that name
+/// alone.
+/// The store handle that would answer the question is the thing being
+/// created.
 ///
 /// # Errors
 ///
 /// Returns an error if the set cannot list its versions or read a version's
-/// snapshot, or if no committed version holds `base` — naming the hash and what
-/// to do instead.
+/// snapshot, or if no committed version holds `base`.
+/// The error names the hash and what to do instead.
 pub fn establish_base<W: storage::WriteMode, C: storage::Compressor>(
     store: Option<&storage::BlobStore<W, C>>,
     base: BlobId,
@@ -612,18 +694,22 @@ pub fn establish_base<W: storage::WriteMode, C: storage::Compressor>(
 /// The committed version of `store` whose snapshot is `id`, if there is one.
 ///
 /// The commit list is the record of what exists, so this is a scan of a few
-/// hashes rather than a lookup: the store names a version's snapshot by number
-/// and nothing names a snapshot by the version that has it. The index files are
-/// not consulted either — they are a cache of the same answer, and `lepatch
-/// versions` already treats a stale or missing one as a scan rather than as a
-/// fact.
+/// hashes rather than a lookup.
+/// The store names a version's snapshot by number and nothing names a snapshot
+/// by the version that has it.
+/// The index files are not consulted either.
+/// They are a cache of the same answer.
+/// `lepatch versions` already treats a stale or missing one as a scan rather
+/// than as a fact.
 ///
-/// Public because a caller has to answer this *before* deciding what the run is:
-/// whether a merge is going to write anything, and therefore whether the warning
-/// about a pack from behind is about anything, is decided by this and nothing
-/// else. Doing it here and in [`merge`] is deliberate — the run under the lock is
-/// the one that counts, and this is the one that lets the CLI report without
-/// taking one.
+/// Public because a caller has to answer this *before* deciding what the run is.
+/// This answer decides whether a merge is going to write anything.
+/// It therefore decides whether the warning about a pack from behind is about
+/// anything.
+/// Nothing else decides either question.
+/// Doing it here and in [`merge`] is deliberate.
+/// The run under the lock is the one that counts, and this is the one that lets
+/// the CLI report without taking one.
 ///
 /// # Errors
 ///
@@ -644,16 +730,17 @@ pub fn version_holding<W: storage::WriteMode, C: storage::Compressor>(
 
 /// Resolve the snapshot against the set and the pack together, as one store.
 ///
-/// The plan is what a backup would build if its chunks arrived from both places,
-/// and it is the whole of the merge's completeness check: a chunk the version
-/// reads that neither source holds fails here, naming itself, before anything is
-/// written.
+/// The plan is what a backup would build if its chunks arrived from both places.
+/// It is also the whole of the merge's completeness check.
+/// A chunk the version reads that neither source holds fails here, naming
+/// itself, before anything is written.
 ///
 /// # Errors
 ///
-/// Returns an error if a chunk the version reads cannot be resolved, or if the
-/// source holding it has too little of it — a store or a pack that has a chunk
-/// shorter than the version reads.
+/// Returns an error if a chunk the version reads cannot be resolved.
+/// Returns an error if the source holding it has too little of it.
+/// That source is a store or a pack that has a chunk shorter than the version
+/// reads.
 fn plan_against<W: storage::WriteMode, C: storage::Compressor>(
     set: Option<&storage::BlobStore<W, C>>,
     pack: &Pack,
@@ -663,9 +750,9 @@ fn plan_against<W: storage::WriteMode, C: storage::Compressor>(
         if let Some(store) = set {
             match store.locate(id) {
                 Ok(placement) => return Ok(placement),
-                // `NotFound` is the whole of what this is for; anything else is
-                // a set that cannot be asked and is reported rather than treated
-                // as holding nothing.
+                // `NotFound` is the whole of what this is for.
+                // Anything else is a set that cannot be asked.
+                // Such a set is reported rather than treated as holding nothing.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
@@ -686,21 +773,28 @@ fn plan_against<W: storage::WriteMode, C: storage::Compressor>(
 
 /// Where a chunk sits in a pack, as a [`Placement`].
 ///
-/// A small fiction, and the only place this command bends the store's types: a
-/// [`Placement`] names a segment and an offset because a *store* is several
-/// files, and a pack is one, so every placement in a plan built against a pack
-/// names segment 0 and a file offset. The `offset` is where the chunk's *record*
-/// starts rather than where its payload does, and `stored_len` is zero: a pack's
-/// index no longer carries the record's length — the record's own header does,
-/// and it is read there rather than looked up here — and nothing reads that field
-/// from a plan built over a pack. A plan reads `raw_len`, which is the one number
-/// that has to be right, and the caller goes back to [`Pack::get`] for the bytes.
+/// A small fiction, and the only place this command bends the store's types.
+/// A [`Placement`] names a segment and an offset because a *store* is several
+/// files and a pack is one.
+/// Every placement in a plan built against a pack therefore names segment 0
+/// and a file offset.
+/// The `offset` is where the chunk's *record* starts rather than where its
+/// payload does, and `stored_len` is zero.
+/// A pack's index no longer carries the record's length.
+/// The record's own header carries that length, and the record is read there
+/// rather than looked up here.
+/// Nothing reads that field from a plan built over a pack.
+/// A plan reads `raw_len`, which is the one number that has to be right, and
+/// the caller goes back to [`Pack::get`] for the bytes.
 ///
 /// The codec is `Raw`, and it is the one field here that is not a fact about the
-/// bytes: a plan never decodes a placement, and the bytes themselves arrive
-/// through [`Pack::get`], which reads the codec out of the record itself rather
-/// than from here. Naming a codec in an index that is not read to decode anything
-/// would be a second claim to keep in step with the record's own.
+/// bytes.
+/// A plan never decodes a placement, and the bytes themselves arrive through
+/// [`Pack::get`].
+/// `Pack::get` reads the codec out of the record itself rather than from here.
+/// Naming a codec in an index that is not read to decode anything would be a
+/// second claim.
+/// That claim would have to stay in step with the record's own.
 fn in_pack(pack: &Pack, id: &BlobId) -> Option<Placement> {
     let located = pack.locate(id)?;
 

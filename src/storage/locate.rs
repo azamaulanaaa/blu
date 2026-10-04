@@ -1,26 +1,26 @@
 //! Answering "where is version N's snapshot" without scanning the whole set.
 //!
 //! Every open scans, and the scan is proportional to the number of records in the
-//! set. The per-version index files exist to avoid that, and this is the path that
+//! set. The per-version index files exist to avoid that scan. This is the path that
 //! uses them.
 //!
 //! # The rule: an index file is checked, never believed
 //!
-//! Three things can be wrong with one, and each is caught differently:
+//! Three things can be wrong with one. Each is caught differently:
 //!
-//! * *stale* — the set has run since it was written, so a version has no index.
-//!   That is not a failure, only the slow path.
-//! * *from another set* — it names more versions than this set holds, or a
-//!   segment that is not here. Refused, because an over-reaching index would
+//! * *stale*: the set has run since the index was written, so a version has no
+//!   index. That is not a failure, only the slow path.
+//! * *from another set*: it names more versions than this set holds, or a segment
+//!   that is not here. The code refuses it, because an over-reaching index would
 //!   otherwise answer about a version that does not exist.
-//! * *edited* — it names a version, a segment and a hash that do not go together.
-//!   The hash is the check: the commit records of the segment it named are read,
-//!   and the version it claims must be among them with that hash.
+//! * *edited*: it names a version, a segment and a hash that do not go together.
+//!   The hash is the check. The code reads the commit records of the segment that
+//!   the index named. The version it claims must be among them with that hash.
 //!
-//! So a wrong index costs a scan and a forged one costs an error. Neither can
-//! make a set report a version it does not hold: **the store's commit records
-//! decide what versions exist, and this module only decides how much work it
-//! takes to find out.**
+//! A wrong index costs a scan. A forged one costs an error. Neither can make a
+//! set report a version that the set does not hold. **The store's commit records
+//! decide what versions exist. This module only decides how much work it takes
+//! to find out.**
 
 use std::{
     fs,
@@ -66,19 +66,20 @@ impl Resolved {
 
 /// Read the index for `version` and check it against the segments on disk.
 ///
-/// `versions` is the number of versions the set is known to hold: an index naming
-/// version 40 of a three-version set is describing something else, and refusing it
-/// is faster than scanning for a version that is not there.
+/// `versions` is the number of versions the set is known to hold. An index that
+/// names version 40 of a three-version set describes something else. The code
+/// refuses it, because refusing it is faster than scanning for a version that is
+/// not there.
 ///
 /// No I/O proportional to the size of the set: one small file, and the commit
 /// records of the one segment it named.
 ///
-/// **That last part is the expensive half, and a caller that already has the
-/// commit log should not pay for it again.** Reading a segment's commits walks
-/// every record header in it, so resolving N versions against one segment reads
-/// that segment N times — and `lepatch versions` resolves one version at a time
-/// through this function. [`BlobStore`](crate::storage::BlobStore) holds the whole
-/// log in memory already, because its own open scans for it, so it uses
+/// **That last part is the expensive half.** A caller that already has the commit
+/// log should not pay for it again. Reading a segment's commits walks every record
+/// header in it. Resolving N versions against one segment reads that segment N
+/// times. `lepatch versions` resolves one version at a time through this
+/// function. [`BlobStore`](crate::storage::BlobStore) holds the whole log in
+/// memory already, because its own open scans for it. That store uses
 /// [`resolve_with`] and skips the file entirely.
 #[must_use]
 pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
@@ -89,18 +90,17 @@ pub fn resolve(set: &IndexSet, version: u32, versions: u32) -> Resolved {
 
 /// [`resolve`], with the commit log supplied rather than read.
 ///
-/// `commits` is called with the segment number the index named, and answers with
-/// that segment's commit records in order, or `None` if they cannot be had — a
-/// missing segment, an unreadable one, or one whose header does not name the
-/// number it was asked for. The first two are what the caller would otherwise
-/// have to check separately; they are checked *here* so that a caller supplying
-/// its own log cannot accidentally skip the checks that make an index
-/// trustworthy.
+/// `commits` receives the segment number that the index named. It answers with
+/// that segment's commit records in order, or with `None` if they cannot be had.
+/// A missing segment, an unreadable one, or one whose header does not name the
+/// number it was asked for all answer `None`. A caller has to check the first two
+/// separately otherwise. The code checks them *here*, so a caller that supplies its
+/// own log cannot accidentally skip the checks that make an index trustworthy.
 ///
-/// A closure rather than a `&[BlobId]` because the log a caller already has is
-/// usually a slice of a longer one — a store's commits are one sequence across
-/// every segment — and a slice parameter would make every caller do the offset
-/// arithmetic that the ordinal is defined in terms of.
+/// The function takes a closure rather than a `&[BlobId]`. The log a caller
+/// already has is usually a slice of a longer one. A store's commits are one
+/// sequence across every segment. A slice parameter would make every caller do
+/// the offset arithmetic that the ordinal is defined in terms of.
 ///
 /// # Panics
 ///
@@ -124,9 +124,9 @@ pub fn resolve_with(
         return Resolved::Disagrees;
     }
 
-    // The segment has to be there. A caller supplying its own log has usually
-    // already established that, but "usually" is not a check, and the cost of
-    // this one is a `stat` against a file the caller is about to trust.
+    // The segment has to be there. A caller that supplies its own log has usually
+    // already established that. However, "usually" is not a check, and this check
+    // costs a `stat` against a file the caller is about to trust.
     if !set.segment_path(index.segment).is_file() {
         return Resolved::Disagrees;
     }
@@ -171,10 +171,10 @@ fn read_commits(path: &Path, segment: u32) -> std::io::Result<Vec<BlobId>> {
         ));
     }
 
-    // Already a `Vec<BlobId>`, and the collect was re-allocating and re-copying
-    // every hash to change nothing. Clippy's `useless_conversion` could not see
-    // it while `BlobId` was an alias for `[u8; HASH]`, because the two types
-    // were spelled differently and one of them was a synonym.
+    // The value is already a `Vec<BlobId>`. The collect was re-allocating and
+    // re-copying every hash to change nothing. Clippy's `useless_conversion` could
+    // not see that while `BlobId` was an alias for `[u8; HASH]`. The two types
+    // were spelled differently then, and one of them was a synonym.
     record::commits_in(&mut file, segment)
 }
 

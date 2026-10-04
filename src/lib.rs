@@ -1,28 +1,30 @@
-//! `lepatch` — content-defined-chunking backup with deduplicated versions.
+//! `lepatch`: content-defined-chunking backup with deduplicated versions.
 //!
-//! A backup is a *snapshot*: a description of a directory tree, the distinct
+//! A backup is a *snapshot*. A snapshot describes a directory tree, the distinct
 //! chunks its files are made of, and how those chunks map back onto the files.
-//! Chunks are stored by the hash of their contents, so an unchanged file costs
-//! nothing after the first time it is seen — and neither does one last seen in
-//! any earlier version, because deduplication is the store's business and it
-//! holds every version it has ever been given.
+//! The store holds chunks by the hash of their contents. An unchanged file
+//! costs nothing after the first time the store sees it. A file that the store
+//! saw in any earlier version costs nothing either. Deduplication is the
+//! store's business, and the store holds every version it has ever been given.
 //!
 //! # Layout
 //!
-//! A backup set is a sequence of numbered segment files, a per-version index file
-//! for each version, and a lock; see [`layout::IndexSet`]. A segment is *sealed*
-//! once it is full and is never written to again, which is what makes a torn write
-//! possible only in the last one and corruption in the rest permanent and
-//! detectable.
+//! A backup set is a sequence of numbered segment files. A backup set also holds
+//! a per-version index file for each version, and a lock. See
+//! [`layout::IndexSet`]. A segment is *sealed* once it is full. The store never
+//! writes to a sealed segment again. Sealing is what makes a torn write
+//! possible only in the last segment, and corruption in the other segments
+//! permanent and detectable.
 //!
-//! The index files are a cache: they say which segment a version's snapshot is in,
-//! so listing a set costs a file name per version rather than a scan of every
-//! record in it. They are derived from the store's commit records, and deleting
-//! every one of them loses nothing — `lepatch reindex` rebuilds them.
+//! The index files are a cache. They say which segment holds a version's
+//! snapshot. Listing a set then costs one file name per version. Listing a set
+//! does not scan every record in the set. The store derives the index files from
+//! its commit records. Deleting every one of them loses nothing. The
+//! `lepatch reindex` command rebuilds them.
 //!
-//! The store records its own versions, so publishing one is a single append to a
-//! single file and there is no second file whose contents have to be kept in step
-//! with it.
+//! The store records its own versions. Publishing one version is a single append
+//! to a single file. No second file has contents that must stay in step with
+//! that record.
 //!
 //! # Example
 //!
@@ -70,23 +72,24 @@ pub mod varint;
 /// The README's code blocks, compiled as doctests.
 ///
 /// A README is not attached to anything, so nothing was checking it. Its library
-/// examples had drifted a long way: one called `BlobStore::open_for_writing` with two
-/// arguments when it takes three, and the other called a `read_snapshot` that
-/// does not exist, passed a `BTreeSet` where the API now takes a `HashSet`, and
-/// referred to four names it never defined. A reader copying either got nothing
+/// examples had drifted a long way. One example called
+/// `BlobStore::open_for_writing` with two arguments. That function takes three
+/// arguments. The other example called a `read_snapshot` that does not exist.
+/// It passed a `BTreeSet` where the API now takes a `HashSet`. It referred to
+/// four names it never defined. A reader who copied either example got nothing
 /// that compiled.
 ///
-/// `include_str!` makes the Markdown documentation, so every ```rust block in it
-/// becomes a doctest. The blocks marked `console` or `text` are transcripts, not
-/// code, and are left alone. Lines beginning `# ` set up what a snippet needs
-/// without appearing in the rendered README, which is what lets a fragment read
-/// like a fragment and still compile.
+/// `include_str!` makes the Markdown documentation. Every ```rust block in the
+/// documentation becomes a doctest. The blocks marked `console` or `text` are
+/// transcripts, not code, and the build leaves them alone. Lines beginning `# `
+/// prepare what a snippet needs. These lines do not appear in the rendered
+/// README. This lets a fragment read like a fragment and still compile.
 ///
-/// `cfg(doctest)` so the item exists only while doctests are being collected —
-/// it documents nothing at runtime and costs one unused type otherwise.
+/// `cfg(doctest)` limits the item to the time when doctests are collected. The
+/// item documents nothing at runtime. It costs one unused type otherwise.
 ///
-/// This runs under `cargo test --doc`, which `--all-targets` does *not* imply,
-/// so the `doctests` task in `mise.toml` and the matching CI step are what make
+/// This runs under `cargo test --doc`. The `--all-targets` flag does *not*
+/// imply it. The `doctests` task in `mise.toml` and the matching CI step make
 /// it worth having.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]

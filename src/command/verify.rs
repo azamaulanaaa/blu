@@ -1,8 +1,9 @@
 //! Integrity checking of a snapshot's stored chunks.
 //!
-//! Run over the whole snapshot before a restore writes anything, and deliberately
-//! a separate pass from the writing: folding the hash into the copy would mean
-//! writing the first file before finding out the chunk for the last is corrupt.
+//! Run over the whole snapshot before a restore writes anything. The verifier is
+//! deliberately a separate pass from the writing. Folding the hash into the copy
+//! would mean writing the first file before finding out that the chunk for the
+//! last is corrupt.
 //!
 //! Chunks are checked several at a time, each hashed as it streams rather than
 //! buffered whole.
@@ -22,8 +23,8 @@ use crate::{
 /// overlap inside it, so this is all that keeps the store busy.
 const VERIFY_CONCURRENCY: usize = 8;
 
-/// Scratch size for hashing a chunk as it streams, so nothing here ever holds a
-/// whole chunk and an unexpectedly large blob costs reads rather than allocation.
+/// Scratch size for hashing a chunk as it streams. Nothing here ever holds a whole
+/// chunk. An unexpectedly large blob costs reads rather than allocation.
 const SCRATCH: usize = 32 * 1024;
 
 /// How many chunks to check at once.
@@ -44,17 +45,17 @@ pub struct Failure {
 /// Why a chunk failed to check out.
 ///
 /// Was a `String`, formatted at each of the four sites that could produce one.
-/// A caller could therefore match on *where* a failure was and nothing else —
-/// whether a chunk was missing, truncated mid-read, or intact-but-corrupt were
-/// three different diagnoses, and the only way to tell them apart was to
+/// A caller could therefore match on *where* a failure was and nothing else. A
+/// chunk may have been missing, truncated mid-read, or intact-but-corrupt. Those
+/// were three different diagnoses. The only way to tell them apart was to
 /// substring-match prose, which the tests did.
 ///
 /// The two read failures were the sharpest loss. `storage.get` failing and a
 /// read from the returned stream failing both rendered as "could not be read",
-/// but they are not the same problem: the first means the store does not hold
-/// the chunk, or cannot reach the segment that does; the second means it did
-/// hand one over and the read then failed, which points at the device, the
-/// connection, or damage within the chunk.
+/// but they are not the same problem. The first means the store does not hold
+/// the chunk, or cannot reach the segment that does. The second means it did
+/// hand one over and the read then failed. That failure points at the device,
+/// the connection, or damage within the chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reason {
     /// The store would not open the chunk at all.
@@ -70,8 +71,8 @@ pub enum Reason {
 
     /// The chunk opened, and a read from it failed partway through.
     ///
-    /// Bytes are what was read before the failure, which is less than the chunk
-    /// recorded — so this is a chunk that exists and does not survive being read.
+    /// Bytes are what was read before the failure. This is less than the chunk
+    /// recorded, so the chunk exists and does not survive being read.
     Truncated {
         /// How much was read before the failure.
         bytes: u64,
@@ -94,7 +95,7 @@ pub enum Reason {
     /// Not damage: every other variant is a statement about the store, and this
     /// one is a statement about the verifier. It is a separate variant rather
     /// than folded into "could not be read" so that it cannot be mistaken for a
-    /// bad backup, and it is why [`verify`] documents what it does with a task
+    /// bad backup. It is also why [`verify`] documents what it does with a task
     /// that vanishes.
     Unchecked,
 }
@@ -102,8 +103,8 @@ pub enum Reason {
 impl Reason {
     /// Whether this is the store's fault rather than the verifier's.
     ///
-    /// Everything but [`Reason::Unchecked`], and spelled out so a caller that
-    /// wants to distinguish "your backup is damaged" from "this program is
+    /// Everything but [`Reason::Unchecked`]. The spelling is deliberate. A caller
+    /// that wants to distinguish "your backup is damaged" from "this program is
     /// broken" does not have to remember which variant is which.
     #[must_use]
     pub fn is_damage(&self) -> bool {
@@ -115,13 +116,14 @@ impl std::fmt::Display for Failure {
     /// Exactly the text the `detail` string used to hold, so every line a user
     /// reads is unchanged.
     ///
-    /// The match lives here rather than on [`Reason`] because the four messages
-    /// put the location in two different places: three name the chunk first, and
-    /// the corruption message puts it in the middle of a sentence. Splitting the
-    /// rendering in two would have meant either fixing a wording a user has
-    /// already read, or threading the location through a second formatting
-    /// layer. `Reason` has no `Display` of its own, deliberately — it is meant
-    /// to be matched on, not printed.
+    /// The match lives here rather than on [`Reason`]. The four messages put the
+    /// location in two different places. Three name the chunk first. The
+    /// corruption message puts it in the middle of a sentence.
+    ///
+    /// Splitting the rendering in two would have meant fixing a wording a user
+    /// has already read. It would also have meant threading the location through
+    /// a second formatting layer. `Reason` has no `Display` of its own, deliberately. It
+    /// is meant to be matched on, not printed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let chunk = self.location;
         match &self.reason {
@@ -235,16 +237,17 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
 
     let concurrency = verify_concurrency().min(snapshot.chunks.len().max(1));
 
-    // Filled by index as the checks come back, so a failure is reported against
-    // the chunk it belongs to rather than against whichever check finished
-    // first. `None` until then, and still `None` if a check task died outright.
+    // Filled by index as the checks come back. A failure is then reported
+    // against the chunk it belongs to, rather than against whichever check
+    // finished first. `None` until then, and still `None` if a check task died
+    // outright.
     let mut checked: Vec<Option<Checked>> = (0..snapshot.chunks.len()).map(|_| None).collect();
 
     let mut running = JoinSet::new();
     let mut next = 0usize;
 
     // The one long silent wait, and the one place a user is told nothing is being
-    // written yet — so silence here is most likely to be read as a hang.
+    // written yet. Silence here is most likely to be read as a hang.
     let mut progress = Progress::new(Phase::Verify);
     progress.set(
         Counter::Chunks,
@@ -331,7 +334,7 @@ async fn check_chunk<S: StorageGet>(
         }
     };
 
-    // Hashed as it streams, so a chunk is never resident and a store that hands
+    // Hashed as it streams, so a chunk is never resident. A store that hands
     // back more than it stored costs reads rather than an allocation.
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0u64;
@@ -364,8 +367,8 @@ async fn check_chunk<S: StorageGet>(
     checked.bytes = bytes;
 
     // A chunk is stored under the hash of its contents, so the address *is* the
-    // expected value: a mismatch means the bytes under this name are not the bytes
-    // that were named.
+    // expected value. A mismatch means the bytes under this name are not the
+    // bytes that were named.
     let actual = hasher.finalize();
     if actual != chunk {
         checked.failure = Some(Failure {
@@ -389,15 +392,15 @@ mod tests {
     /// Every failure a check can produce, rendered exactly.
     ///
     /// These are the lines a user reads, verbatim, on stderr and in the summary
-    /// error. They were assembled by four `format!` calls that no test could
-    /// reach, because the only thing to assert on was the string the test itself
-    /// was checking. Pinning them here is what makes the rest of this change
+    /// error. Four `format!` calls assembled them, and no test could reach those
+    /// calls. The only thing to assert on was the string the test itself was
+    /// checking. Pinning them here is what makes the rest of this change
     /// safe to make: the reason is a type, and the text is a promise.
     #[test]
     fn a_failure_renders_as_it_did_as_a_string() {
-        // Full-width hex, not abbreviated. Worth being explicit about, because
-        // this is the one place where the switch from a hand-rolled `Hex` to
-        // `blake3::Hash`'s `Display` could have shortened a hash out of a
+        // Full-width hex, not abbreviated. An explicit note helps here. The switch
+        // replaced a hand-rolled `Hex` with `blake3::Hash`'s `Display`. This is
+        // the only place where the switch could have shortened a hash in a
         // message a user reads. It did not: `Hex` was full width too.
         let one = id(1).to_string();
         let two = id(2).to_string();
@@ -452,9 +455,9 @@ mod tests {
     /// The two read failures render alike but are not the same diagnosis, which
     /// is the whole reason they are separate variants.
     ///
-    /// They matched byte for byte as strings, so a caller could not tell "the
-    /// store would not hand me this chunk" from "it did, and the read then
-    /// failed" without matching on prose.
+    /// They matched byte for byte as strings. A caller could not tell "the store
+    /// would not hand me this chunk" from "it did, and the read then failed"
+    /// without matching on prose.
     #[test]
     fn the_two_read_failures_differ_only_in_what_they_carry() {
         let unavailable = Failure {

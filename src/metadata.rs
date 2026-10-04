@@ -1,19 +1,21 @@
 //! On-disk description of a backup.
 //!
-//! A snapshot is serialised into a single blob in the storage backend, named by
-//! the BLAKE3 hash of its bytes, and framed with a magic prefix and a format
-//! version so a layout change is reported as such rather than as a confusing
-//! deserialisation error. The wire format is in the `codec` submodule.
+//! A snapshot is serialised into a single blob in the storage backend. The store
+//! names the blob by the BLAKE3 hash of its bytes. The code frames the blob with
+//! a magic prefix and a format version. So a layout change is reported as a
+//! layout change, not as a confusing deserialisation error. The wire format is
+//! in the `codec` submodule.
 
 mod codec;
 
-// `Malformed` is the payload of `Error::Decode`, which is a public variant, so
-// it is already part of this module's public API whether or not it can be
-// named. A caller can write `Error::Decode(_)` and match on the outer error,
-// but cannot destructure the inner one, name it in a signature, or compare
-// against it — which is the only reason it was `pub` inside a private module in
-// the first place. Re-exported so the type and the variant that carries it
-// agree about being public.
+// `Malformed` is the payload of `Error::Decode`, and that variant is public. So
+// `Malformed` is already part of this module's public API. That is true whether
+// or not a caller can name the type. A caller can write `Error::Decode(_)` and
+// match on the outer error. The caller cannot destructure the inner one. The
+// caller cannot name it in a signature. The caller cannot compare against it.
+// That is the only reason it was `pub` inside a private module in the first
+// place. Re-exported so the type and the variant that carries it agree about
+// being public.
 pub use codec::Malformed;
 
 use std::{fmt, io, path::PathBuf};
@@ -28,28 +30,30 @@ pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
 /// Bump this whenever the shape of [`Snapshot`], or the encoding in `codec`,
 /// changes in a way that makes previously written blobs undecodable.
 ///
-/// This is 4. Version 3 recorded a permission mode and a modification time per
-/// entry; version 4 adds the owning user and group, so every entry is nine bytes
-/// larger on a platform that has them. Version 2 recorded, per chunk, both its
-/// content hash and a storage key naming a byte offset; the store's own index
-/// answers "where is this content" now, so a chunk is a bare hash.
+/// This is 4. Version 3 recorded a permission mode and a modification time for
+/// each entry. Version 4 adds the owning user and group. So every entry is nine
+/// bytes larger on a platform that has them. Version 2 recorded both the content
+/// hash and the storage key of each chunk. The storage key named a byte offset.
+/// The store's own index now answers "where is this content". So a chunk is a
+/// bare hash.
 pub const FORMAT_VERSION: u32 = 4;
 
 /// The first layout version that recorded an owner on every file and directory.
 ///
-/// A decoder branches on this rather than on a try, because the field's width is
-/// not self-describing: reading an entry laid out for version 3 with a version-4
-/// reader would take the next entry's length as a uid and every field after it from
-/// the wrong offset, producing a snapshot that decodes cleanly into nonsense. A
-/// version 3 snapshot simply has no owner to read, which is a fact about it rather
-/// than a gap in what this build knows.
+/// A decoder branches on this, not on a try. The field's width is not
+/// self-describing. A version 4 reader would read an entry laid out for version 3
+/// the wrong way. The reader would take the next entry's length as a uid. The
+/// reader would take every field after it from the wrong offset. The result is a
+/// snapshot that decodes cleanly into nonsense. A version 3 snapshot has
+/// no owner to read. That is a fact about the snapshot, not a gap in what this
+/// build knows.
 pub const OWNER_SINCE: u32 = 4;
 
 /// The oldest layout version this build can still read.
 ///
-/// Version 3 and later. Refusing the ones below is not leniency — they are layouts
-/// this code cannot decode, and a decoder that guessed at them would read a field
-/// from the wrong place rather than fail.
+/// Version 3 and later. Refusing the versions below is not leniency. Those
+/// versions are layouts that this code cannot decode. A decoder that guessed at
+/// them would read a field from the wrong place rather than fail.
 pub const MIN_READABLE_VERSION: u32 = 3;
 
 /// Reasons a snapshot blob could not be decoded. No encode variant, because
@@ -104,7 +108,7 @@ impl From<std::time::SystemTime> for Timestamp {
     fn from(time: std::time::SystemTime) -> Self {
         match time.duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => Self {
-                // Saturate rather than wrap: a wrapped negative would be a worse
+                // Saturate rather than wrap. A wrapped negative would be a worse
                 // answer than a clamp.
                 secs: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
                 nanos: d.subsec_nanos(),
@@ -153,46 +157,47 @@ impl Snapshot {
     ///
     /// Both directions of the round trip need this, and for different reasons.
     ///
-    /// A **backup** writes it, and a tree can change between being walked and
-    /// being read: the chunker stats each file when it registers it and reads it
-    /// again later, so a file that grew in between shifts every subsequent chunk
-    /// into the wrong one. The lengths recorded during the walk stop matching
-    /// what was chunked, and the snapshot would be internally consistent and
-    /// wrong.
+    /// A **backup** writes it. A tree can change between being walked and being
+    /// read. The chunker stats each file when it registers it. The chunker reads
+    /// that file again later. So a file that grew in between shifts every later
+    /// chunk into the wrong one. The lengths recorded during the walk stop
+    /// matching what the chunker read. The snapshot is then internally consistent
+    /// and wrong.
     ///
-    /// A **restore** reads a snapshot that is a blob in a store, and nothing
-    /// about it is trustworthy. `File::len` is one number, and if it is longer
-    /// than the slices then `set_len` at the end of each file — there to close a
-    /// gap *between* slices — zero-fills the tail instead. That does not fail.
-    /// The restore reports success and leaves a file of exactly the right size
-    /// with a plausible amount of content and a tail of nothing. A check that
-    /// exists only on the writing side, where a hostile snapshot is not the
-    /// threat, is a check in the wrong place.
+    /// A **restore** reads a snapshot that is a blob in a store. Nothing about
+    /// that blob is trustworthy. `File::len` is one number. If it is longer than
+    /// the slices, then `set_len` at the end of each file zero-fills the tail
+    /// instead. The `set_len` call exists to close a gap *between* slices. That
+    /// does not fail. The restore reports success. The restore leaves a file of
+    /// exactly the right size with a plausible amount of content and a tail of
+    /// nothing. A check that exists only on the writing side is a check in the
+    /// wrong place. A hostile snapshot is not the threat on the writing side.
     ///
     /// Both the total and the covered extent are required to match. The total
     /// catches slices that are too long, or too short, or that overlap so the
-    /// sum overcounts; the extent catches slices that leave a gap at the start,
+    /// sum overcounts. The extent catches slices that leave a gap at the start,
     /// where the sum can be right and a hole is not.
     ///
     /// The extent is also what catches a slice reaching *past* the end of its
-    /// file, so there is deliberately no separate check for that. It looks like
-    /// the more direct thing to say, and it has a clearer message — but it fires
-    /// first, on the path a growing file takes during a backup, and it replaces
-    /// the one that has been telling a user their tree moved under them. Same
+    /// file. So there is deliberately no separate check for that. A separate check
+    /// looks like the more direct thing to say. It also has a clearer message. But
+    /// it fires first, on the path a growing file takes during a backup. It
+    /// replaces the check that tells a user their tree moved under them. Same
     /// refusal, worse message.
     ///
-    /// `what` is the clause that goes between the file and the numbers, and it is
-    /// the caller's because the two situations read differently. "Changed while
-    /// it was being backed up" is a diagnosis; "does not match its own chunks" is
-    /// a description, and a restore has no basis for the first. A clause rather
-    /// than an enum because neither side branches on it — it is a sentence, and
-    /// putting it in the message is the whole of what it is for.
+    /// `what` is the clause that goes between the file and the numbers. The
+    /// caller's clause is the one to use, because the two situations read
+    /// differently. "Changed while it was being backed up" is a diagnosis.
+    /// "Does not match its own chunks" is a description. A restore has no basis
+    /// for the diagnosis. `what` is a clause rather than an enum, because neither
+    /// side branches on it. `what` is a sentence. Putting that sentence in the
+    /// message is the whole of what it is for.
     ///
     /// # Errors
     ///
     /// Returns an error naming the file, its recorded length, how many bytes the
-    /// slices total, and how much of the file they cover — all four, because a
-    /// mismatch between any two of them is a different mistake.
+    /// slices total, and how much of the file they cover. The error names all
+    /// four, because a mismatch between any two of them is a different mistake.
     pub fn verify_file_lengths(&self, what: &str) -> io::Result<()> {
         let mut totals = vec![0u64; self.files.len()];
         let mut extents: Vec<Option<(u64, u64)>> = vec![None; self.files.len()];
@@ -244,10 +249,10 @@ impl Snapshot {
 
     /// An empty snapshot.
     ///
-    /// There is no version field to stamp, and that is the point: the layout
-    /// version is a property of the encoder, not of any one snapshot. A field
-    /// could be set to a value this build then refused to read back, and
-    /// nothing would catch it until the blob was decoded.
+    /// There is no version field to stamp, and that is the point. The layout
+    /// version is a property of the encoder, not of any one snapshot. A caller
+    /// could set a field to a value that this build then refuses to read back.
+    /// Nothing would catch that until the blob was decoded.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -263,20 +268,22 @@ impl Snapshot {
     /// as a little-endian `u32`, then the body.
     ///
     /// The version written is [`FORMAT_VERSION`], always. There is nothing for a
-    /// caller to choose here: a snapshot is not "in" a version, it is written by
-    /// a build that emits one.
+    /// caller to choose here. A snapshot is not "in" a version. A build writes
+    /// the snapshot, and the build emits one version.
     ///
     /// # Errors
     ///
     /// Returns an error only where a path in this snapshot cannot be represented
-    /// on this platform. On unix that cannot happen — a path is a byte string, so
-    /// its bytes are written as they are and a name that is not valid UTF-8
-    /// round-trips exactly. Everywhere else a path is text, and a name the
-    /// platform's encoding cannot hold is **refused** rather than written with
-    /// replacement characters, which would record a path that does not exist and
-    /// collide two real ones. A tree the format cannot represent is refused here,
-    /// at the point where a person can be told, rather than being backed up into
-    /// a set that cannot be restored.
+    /// on this platform. On unix that cannot happen. A path is a byte string
+    /// there, so the code writes its bytes as they are. A name that is not valid
+    /// UTF-8 round-trips exactly on unix. Everywhere else a path is text. A name
+    /// that the platform's encoding cannot hold is **refused** there. The code
+    /// does not write such a name with replacement characters. Replacement
+    /// characters would record a path that does not exist. They would also
+    /// collide two real paths. A tree that the format cannot represent is
+    /// refused here. The refusal happens at the point where a person can be
+    /// told. The code does not back up such a tree into a set that cannot be
+    /// restored.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let body = codec::encode_body(self).map_err(Error::Decode)?;
 
@@ -304,11 +311,11 @@ impl Snapshot {
         version.copy_from_slice(&bytes[MAGIC.len()..header]);
         let version = u32::from_le_bytes(version);
 
-        // A range rather than an equality, because a version this build can read is
-        // not a version it would have written. Version 3 is readable and predates the
-        // owner field, which is exactly the case worth reading: a set taken before
-        // this build existed is still a set, and refusing it would cost a user every
-        // backup they had rather than costing them their ownership.
+        // A range rather than an equality. A version this build can read is not a
+        // version this build would have written. Version 3 is readable and it
+        // predates the owner field. That is exactly the case worth reading. A
+        // set taken before this build existed is still a set. Refusing it would
+        // cost a user every backup they had rather than their ownership.
         if !(MIN_READABLE_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(Error::UnsupportedVersion {
                 found: version,
@@ -326,17 +333,18 @@ impl TryFrom<&[u8]> for Snapshot {
     /// Parse the framed on-disk representation.
     ///
     /// `TryFrom` rather than an inherent `from_bytes`, so that "these bytes are a
-    /// snapshot" is a conversion like any other, and the same vocabulary as
-    /// `VersionIndex`, which parses a different wire format into a different type
-    /// and now says so the same way. One implementation, not an inherent method
-    /// beside a trait impl.
+    /// snapshot" is a conversion like any other. `VersionIndex` uses the same
+    /// vocabulary. It parses a different wire format into a different type. It
+    /// now says so the same way. There is one implementation, not an inherent
+    /// method beside a trait impl.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Truncated`] if the header is incomplete,
-    /// [`Error::BadMagic`] if the blob is not a snapshot,
-    /// [`Error::UnsupportedVersion`] if it was written by an incompatible layout,
-    /// and [`Error::Decode`] if the body does not match this version's shape.
+    /// Returns [`Error::Truncated`] if the header is incomplete. It returns
+    /// [`Error::BadMagic`] if the blob is not a snapshot. It returns
+    /// [`Error::UnsupportedVersion`] if an incompatible layout wrote it. It
+    /// returns [`Error::Decode`] if the body does not match this version's
+    /// shape.
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Self::parse(bytes)
     }
@@ -351,26 +359,27 @@ impl Default for Snapshot {
 
 /// A symbolic or hard link, recorded but never chunked.
 ///
-/// A sum type rather than a struct with a `kind`, because the two cases give the
-/// same field two different meanings and subject it to two different rules.
+/// A sum type rather than a struct with a `kind`. The two cases give the same
+/// field two different meanings. They also subject it to two different rules.
 ///
-/// `target` used to be "the raw link target" for a symbolic link and "the path of
-/// the file within the backup whose contents are shared" for a hard link. A
-/// restore does not treat them alike: a hard link's is resolved against the
-/// restore root and must land inside it, while a symbolic link's is used verbatim
-/// and is allowed to point anywhere including outside the backup. Two rules for
-/// one field, and nothing in the type said which applied — the only signal was
-/// the `kind` sitting next to it, and a field access reads as though it were just
-/// a field.
+/// `target` used to be "the raw link target" for a symbolic link. For a hard
+/// link, `target` used to be "the path of the file within the backup whose
+/// contents are shared". A restore does not treat them alike. A restore resolves
+/// the hard link path against the restore root. The hard link path must land
+/// inside that root. A restore uses the symbolic link target verbatim. The
+/// symbolic link may point anywhere, including outside the backup. Two rules for
+/// one field, and nothing in the type said which applied. The only signal was the
+/// `kind` sitting next to it. A field access reads as though it were just a
+/// field.
 ///
-/// So there are two variants and each names its own second path. `target` means
-/// a link target and exists only on [`Link::Symbolic`]; a hard link has `shares`,
-/// which is what it does rather than where it points.
+/// So there are two variants, and each names its own second path. `target` means
+/// a link target and exists only on [`Link::Symbolic`]. A hard link has
+/// `shares`, which is what it does rather than where it points.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Link {
     /// Points elsewhere. The target is stored verbatim and may name anything,
-    /// including a path outside the backup, because a symbolic link is only ever
-    /// a string until something follows it.
+    /// including a path outside the backup. A symbolic link is only ever a string
+    /// until something follows it.
     Symbolic {
         /// Path of the link relative to the backup root.
         path: PathBuf,
@@ -385,25 +394,27 @@ pub enum Link {
         path: PathBuf,
         /// Path, within the backup, of the file whose contents this shares.
         ///
-        /// Resolved against the restore root and required to land inside it, which
-        /// is the whole difference from [`Link::Symbolic::target`]: a hard link
-        /// is a claim about this tree, so a claim that names somewhere else is a
-        /// damaged snapshot rather than a link.
+        /// Resolved against the restore root and required to land inside it. That is
+        /// the whole difference from [`Link::Symbolic::target`]. A hard link is a
+        /// claim about this tree. So a claim that names somewhere else is a
+        /// damaged snapshot, not a link.
         shares: PathBuf,
     },
 }
 /// Everything this platform records about one entry, and a restore reapplies.
 ///
-/// All of it is the same kind of thing: something the platform may or may not have,
-/// recorded if it does and reapplied if it is there. Each is an `Option`, and "this
-/// platform has no permission bits" and "the permissions are the empty set" are
-/// different facts a sentinel like `0` could not tell apart — a restore acts on them
-/// differently, one is a no-op and the other is a set of permissions nobody has.
+/// All of it is the same kind of thing. It is something the platform may or may
+/// not have. The code records it if the platform has it. The code reapplies it
+/// if it is there. Each field is an `Option`. "This platform has no permission
+/// bits" and "the permissions are the empty set" are different facts. A sentinel
+/// like `0` could not tell them apart. A restore acts on them differently. One
+/// is a no-op and the other is a set of permissions nobody has.
 ///
-/// `owner` is the user and group as one value, because they are one identity and come
-/// out of one `stat`. It is absent on a platform with no users, and absent in every
-/// snapshot taken before this field existed — which is a fact rather than a guess, as
-/// a snapshot that recorded nothing about ownership had none to record.
+/// `owner` is the user and group as one value. They are one identity, and they
+/// come out of one `stat`. The field is absent on a platform with no users. The
+/// field is also absent in every snapshot taken before this field existed. That
+/// absence is a fact, not a guess. A snapshot that recorded nothing about
+/// ownership had none to record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Attributes {
     /// User and group that own the entry, or `None` where the platform has neither.
@@ -416,9 +427,9 @@ pub struct Attributes {
 
 /// A user and a group, which are one identity rather than two numbers.
 ///
-/// Ids and not names. A name means nothing on any machine but the one it was read
-/// from — uid 1000 is one person here and another there — so a name would be a
-/// portability bug stored alongside the answer.
+/// Ids and not names. A name means nothing on any machine but the one it was
+/// read from. A uid of 1000 is one person here and another person there. So a
+/// name would be a portability bug stored alongside the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Owner {
     /// The owning user id.
@@ -438,9 +449,10 @@ impl Owner {
 impl Attributes {
     /// Capture whatever this platform records about `meta`.
     ///
-    /// One call rather than three, because the interesting case is missing one: a
-    /// backup that captured the mode and the time and forgot the owner would produce
-    /// snapshots that look complete and restore a tree nobody can read.
+    /// One call rather than three. The interesting case is a missing one. A backup
+    /// that captured the mode and the time but forgot the owner would produce
+    /// snapshots that look complete. Such snapshots restore a tree that nobody
+    /// can read.
     #[must_use]
     pub fn of(meta: &std::fs::Metadata) -> Self {
         Self {
@@ -459,23 +471,23 @@ impl Attributes {
     /// Reapply all of them to `path`, in the order that survives.
     ///
     /// **Owner first, and that is not a style preference.** Linux clears a file's
-    /// set-user-ID and set-group-ID bits when its owner changes, so setting the mode
-    /// first and the owner second silently strips setuid from everything restored. It
-    /// is silent in the worst way: the file is written, its bytes match, and the only
-    /// difference is a bit nobody was looking for.
+    /// set-user-ID and set-group-ID bits when its owner changes. So setting the
+    /// mode first and the owner second silently strips setuid from everything
+    /// restored. The failure is silent in the worst way. The file is written and
+    /// its bytes match. The only difference is a bit nobody was looking for.
     ///
-    /// Modification time is last for a different reason: creating a link inside a
-    /// directory updates that directory's time, so a time set before the links would
-    /// be overwritten by them.
+    /// Modification time is last for a different reason. Creating a link inside a
+    /// directory updates that directory's time. So a time set before the links
+    /// would be overwritten by them.
     ///
-    /// An owner that cannot be set is an error here. [`Self::apply_restoring`] is the
-    /// other policy, for a caller that would rather report it than stop.
+    /// An owner that cannot be set is an error here. [`Self::apply_restoring`] is
+    /// the other policy, for a caller that would rather report it than stop.
     ///
     /// # Errors
     ///
-    /// Returns an error if the path cannot be found, or any attribute cannot be
-    /// applied — for instance because the caller does not own the file, or cannot
-    /// change its owner.
+    /// Returns an error if the path cannot be found, or if any attribute cannot
+    /// be applied. One cause is that the caller does not own the file. Another
+    /// cause is that the caller cannot change the owner.
     pub fn apply(&self, path: &std::path::Path) -> std::io::Result<()> {
         self.apply_inner(path, true).map(|_| ())
     }
@@ -485,16 +497,17 @@ impl Attributes {
     ///
     /// Returns whether the owner took, or `true` where there was none to set.
     ///
-    /// Changing an owner takes privilege, and for an unprivileged caller that is the
-    /// ordinary case rather than an exceptional one: restoring a tree containing a
-    /// file you do not own is a normal thing to want. Stopping there would be the
-    /// wrong answer twice over — the tree is left half-written, and the file that
-    /// failed already exists with the wrong owner, so there is nothing to retry and
-    /// no record that it is wrong.
+    /// Changing an owner takes privilege. For an unprivileged caller, that is the
+    /// ordinary case rather than an exceptional one. Restoring a tree that
+    /// contains a file you do not own is a normal thing to want. Stopping there
+    /// would be the wrong answer twice over. The tree is left half-written. The
+    /// file that failed already exists with the wrong owner. So there is nothing
+    /// to retry and no record that the owner is wrong.
     ///
-    /// Everything else is still applied. A file with the right contents and mode but
-    /// the wrong owner is a tree that is nearly right, which is a much better thing to
-    /// hand back than an aborted run and a partial directory.
+    /// Everything else is still applied. A file with the right contents and mode
+    /// but the wrong owner is a tree that is nearly right. A nearly right tree
+    /// is a much better thing to hand back than an aborted run and a partial
+    /// directory.
     ///
     /// # Errors
     ///
@@ -539,8 +552,9 @@ pub struct File {
     pub path: PathBuf,
     /// Length in bytes at the time the tree was walked.
     ///
-    /// Restore creates the file at this length and truncates back to it at the
-    /// end, so a gap in the recorded slices is zero-filled rather than detected.
+    /// A restore creates the file at this length. The restore truncates the file
+    /// back to this length at the end. So a gap in the recorded slices is
+    /// zero-filled rather than detected.
     pub len: u64,
     /// The permissions and modification time to restore.
     pub attrs: Attributes,

@@ -1,6 +1,6 @@
-//! The snapshot wire format. Hand-written rather than delegated: the encoding of
-//! a user's backup set is the one thing that has to keep working, and the
-//! reasoning behind that decision is in the README.
+//! The snapshot wire format. Hand-written rather than delegated. The encoding of
+//! a user's backup set is the one thing that has to keep working. The reasoning
+//! behind that decision is in the README.
 //!
 //! ```text
 //! magic     8 bytes,  b"LEPATCH\0"
@@ -19,25 +19,25 @@
 //!     per link:   path, path, u8 kind
 //! ```
 //!
-//! A `varint` is LEB128. Lengths and indices are variable width; byte counts,
-//! modes and file lengths are fixed width. An optional timestamp is a `u8` tag
-//! (`0` absent, `1` present) then `i64` secs and `u32` nanos, and a link's `u8`
-//! kind is `0` hard or `1` symbolic — any other value is refused.
+//! A `varint` is LEB128. Lengths and indices are variable width. Byte counts,
+//! modes, and file lengths are fixed width. An optional timestamp is a `u8` tag
+//! (`0` absent, `1` present). The tag is followed by `i64` secs and `u32` nanos.
+//! A link's `u8` kind is `0` hard or `1` symbolic. Any other value is refused.
 //!
 //! # Decoding is the security-relevant half
 //!
-//! A snapshot is untrusted input: it comes out of a file that gets synced,
-//! shared and backed up like anything else, and a tampered one should do nothing
-//! but fail. Every length is checked against the bytes remaining *before*
-//! anything is allocated for it, so a count can never request more than the blob
-//! holds, and trailing bytes after the body are refused.
+//! A snapshot is untrusted input. It comes out of a file that gets synced,
+//! shared, and backed up like anything else. A tampered snapshot should do
+//! nothing but fail. Every length is checked against the bytes remaining
+//! *before* the code allocates anything for it. So a count can never request
+//! more than the blob holds. Trailing bytes after the body are refused.
 
 use std::path::{Path, PathBuf};
 
 use super::{Attributes, Dir, File, FileChunk, Link, Snapshot, Timestamp};
 
-/// Refuse a count that cannot fit in the bytes left: every collection entry costs
-/// at least one byte on the wire, so a count above the remaining input is
+/// Refuse a count that cannot fit in the bytes left. Every collection entry
+/// costs at least one byte on the wire. So a count above the remaining input is
 /// malformed.
 fn plausible(count: u64, remaining: usize) -> bool {
     count <= remaining as u64
@@ -51,9 +51,8 @@ struct Reader<'a> {
 
 /// Why a body could not be decoded.
 ///
-/// Distinct from [`super::Error`] in that every case here means the input is
-/// malformed, and the message is written for whoever has to work out which blob
-/// is damaged.
+/// Distinct from [`super::Error`]. Every case here means the input is malformed.
+/// The message is written for whoever has to work out which blob is damaged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Malformed(pub &'static str);
 
@@ -119,14 +118,14 @@ impl<'a> Reader<'a> {
     /// An LEB128 unsigned integer: at most ten bytes, and the tenth may contribute
     /// only the last bit of a `u64`.
     ///
-    /// A snapshot decoder is the security-relevant half of this module — the
+    /// A snapshot decoder is the security-relevant half of this module. The
     /// blob it reads is named by the hash of its own bytes, so nothing upstream
-    /// vouched for its contents — which is why the tenth-byte rule lives in one
-    /// place now rather than in a copy per encoding.
+    /// vouched for its contents. So the tenth-byte rule lives in one place now,
+    /// rather than in a copy per encoding.
     ///
-    /// The bytes are gathered up to the terminator and then handed over, rather
-    /// than decoded in the loop: a number is self-delimiting, and reading a
-    /// fixed ten would consume whatever follows it.
+    /// The bytes are gathered up to the terminator and then handed over. They are
+    /// not decoded in the loop. A number is self-delimiting, and reading a fixed
+    /// ten would consume whatever follows it.
     fn varint(&mut self) -> Result<u64> {
         let mut window = [0u8; crate::varint::MAX];
         let mut taken = 0usize;
@@ -197,10 +196,10 @@ impl<'a> Reader<'a> {
     /// Read an owner written by [`Writer::owner`], or `None` for a layout that had
     /// no such field.
     ///
-    /// The `recorded` flag is the snapshot's version rather than the reader's
-    /// ability: before an owner was recorded there was nothing on the wire to read,
-    /// and reading a `u32` from the mode that follows would put every subsequent
-    /// field out by four bytes and produce a snapshot that decodes into nonsense.
+    /// The `recorded` flag is the snapshot's version, not the reader's ability.
+    /// Before an owner was recorded there was nothing on the wire to read. Reading
+    /// a `u32` from the mode that follows would put every later field out by four
+    /// bytes. The result would be a snapshot that decodes into nonsense.
     fn owner(&mut self, recorded: bool) -> Result<Option<super::Owner>> {
         if !recorded {
             return Ok(None);
@@ -218,8 +217,8 @@ impl<'a> Reader<'a> {
 
     fn hash(&mut self) -> Result<super::storage::BlobId> {
         let bytes = self.take(32)?;
-        // The length is checked by `take`, so this cannot fail; a hash of the
-        // wrong width is not a thing a snapshot can hold.
+        // The length is checked by `take`, so this cannot fail. A
+        // hash of the wrong width is not a thing that a snapshot can hold.
         Ok(super::storage::BlobId::from_bytes(
             bytes
                 .try_into()
@@ -268,31 +267,31 @@ impl Writer {
     /// Two arms, and they are not interchangeable.
     ///
     /// On unix a path is a byte string, so its bytes go in as they are. That is
-    /// the whole reason `tests/paths.rs` exists: a name that is not valid UTF-8 is
-    /// a legal file name, a tree can contain one, and a backup that refused the
-    /// tree over it would abandon the whole run. The decoder reads the same bytes
-    /// back, so the round trip is exact.
+    /// the whole reason `tests/paths.rs` exists. A name that is not valid UTF-8
+    /// is a legal file name, and a tree can contain one. A backup that refused
+    /// the tree over it would abandon the whole run. The decoder reads the same
+    /// bytes back, so the round trip is exact.
     ///
-    /// Everywhere else a path *is* text, and the only portable way to get at it is
-    /// `to_str` — or `to_string_lossy`, which replaces what it cannot represent
-    /// with `U+FFFD`. That was the arm in use, and it is worse than it looks: it
-    /// does not fail, it silently succeeds with a *different path*. Two names that
-    /// differ only in an unrepresentable byte encode to the same bytes, and a
-    /// restore writes both at the same place, having recorded something that never
-    /// existed on disk.
+    /// Everywhere else a path *is* text. The only portable way to get at it is
+    /// `to_str`, or `to_string_lossy`. The `to_string_lossy` call replaces what
+    /// it cannot represent with `U+FFFD`. That was the arm in use, and it is
+    /// worse than it looks. It does not fail. It silently succeeds with a
+    /// *different path*. Two names that differ only in an unrepresentable byte
+    /// encode to the same bytes. A restore then writes both at the same place.
+    /// The restore has recorded something that never existed on disk.
     ///
     /// So the answer is `None` and the caller refuses. A tree the format cannot
     /// represent is refused loudly at the point of encoding, which is where a
-    /// person is told, rather than being backed up into a state that cannot be
-    /// restored. `to_string_lossy` stays available on unix, where it is only a
-    /// *rendering* choice and nothing is written through it.
+    /// person is told. The code does not back up such a tree into a state that
+    /// cannot be restored. `to_string_lossy` stays available on unix. There it is
+    /// only a *rendering* choice, and nothing is written through it.
     /// One signature for two arms, so the return is an `Option` even where it
     /// cannot be `None`.
     ///
-    /// Clippy is right that on unix this never returns `None` and wrong to have
-    /// it here: the caller has to be one piece of code for both platforms, and
-    /// making the unix arm return a bare `&[u8]` would mean two callers. The
-    /// allow is on the function and says so, rather than being a crate-wide
+    /// Clippy is right that on unix this never returns `None`. Clippy is
+    /// wrong to have it here. The caller has to be one piece of code for both
+    /// platforms. Making the unix arm return a bare `&[u8]` would mean two
+    /// callers. The allow is on the function and says so, not a crate-wide
     /// concession.
     #[cfg_attr(unix, allow(clippy::unnecessary_wraps))]
     fn path_bytes(path: &Path) -> Option<&[u8]> {
@@ -332,13 +331,14 @@ impl Writer {
 
     /// Write an owner, tagged for presence.
     ///
-    /// A tag rather than `0` for absent, which is how a mode is written, because
-    /// `0` is the root user's id and also the root group's. A sentinel that is a
-    /// real value would make every root-owned file — which is most of `/etc` and
-    /// all of `/usr` — indistinguishable from a platform that has no users at all.
+    /// A tag rather than `0` for absent, which is how a mode is written. `0` is
+    /// the root user's id, and it is also the root group's id. A sentinel that is
+    /// a real value would make every root-owned file indistinguishable from a
+    /// platform that has no users at all. Most of `/etc` and all of `/usr` is
+    /// root-owned.
     ///
-    /// One tag for the pair, not one each: they come from one `stat` and are
-    /// recorded together, so a byte each would be one byte wasted per entry on every
+    /// One tag for the pair, not one each. They come from one `stat` and are
+    /// recorded together. A byte each would waste one byte per entry on every
     /// snapshot ever taken.
     fn owner(&mut self, owner: Option<super::Owner>) {
         match owner {
@@ -393,9 +393,9 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
 
     out.count(snapshot.links.len());
     for link in &snapshot.links {
-        // Two paths and a tag, in that order, for both variants — the two cases
-        // have always shared a field and the format has never distinguished them
-        // beyond the tag, so this writes exactly the bytes it always wrote.
+        // Two paths and a tag, in that order, for both variants. The two
+        // cases have always shared a field. The format has never distinguished
+        // them beyond the tag. So this writes exactly the bytes it always wrote.
         let (path, second, kind) = match link {
             Link::Symbolic { path, target } => (path, target, 1),
             Link::Hard { path, shares } => (path, shares, 0),
@@ -411,10 +411,10 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
 /// Decode a snapshot's body, which must be the whole of `bytes`.
 ///
 /// `version` is the layout the bytes were written in, not the one this build
-/// prefers. It is needed because the owner was added partway through the format's
-/// life and every entry is variable width, so a reader that guessed would be reading
-/// the mode of the next file as an owner's user id and every field after it from the
-/// wrong place.
+/// prefers. The decoder needs it because the owner was added partway through the
+/// format's life. Every entry is variable width. A reader that guessed would read
+/// the mode of the next file as an owner's user id. The same reader would read
+/// every field after it from the wrong place.
 pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
     let mut reader = Reader::new(bytes);
     let with_owner = version >= super::OWNER_SINCE;
@@ -423,9 +423,10 @@ pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
         .map(|_| {
             let path = reader.path()?;
             let len = reader.u64()?;
-            // `0` on the wire means "no mode recorded", which is what a snapshot
-            // taken on a platform without permission bits has always encoded and
-            // what a restore has always declined to apply. The bytes are unchanged.
+            // `0` on the wire means "no mode recorded". That is what a
+            // snapshot taken on a platform without permission bits has always
+            // encoded. It is also what a restore has always declined to apply.
+            // The bytes are unchanged.
             let mode = reader.u32()?;
             let mtime = reader.optional_timestamp()?;
             let owner = reader.owner(with_owner)?;
@@ -673,10 +674,10 @@ mod tests {
         }
     }
 
-    /// Root is uid 0, and root's files are most of a system backup, so an encoding
+    /// Root is uid 0, and root's files are most of a system backup. An encoding
     /// that used `0` for "no owner" would drop the identity of exactly the files
-    /// whose identity matters most — and would do it silently, decoding cleanly to a
-    /// platform with no users at all.
+    /// whose identity matters most. The encoding would also do it silently,
+    /// decoding cleanly to a platform with no users at all.
     #[test]
     fn root_is_an_owner_and_not_an_absence() {
         let mut snapshot = Snapshot::new();
@@ -717,14 +718,14 @@ mod tests {
 
     /// A version-3 snapshot has no owner field at all, and reads back with none.
     ///
-    /// Not a compat shim but an exact reading: a snapshot that recorded nothing
-    /// about ownership had none to record, so `None` is the truth rather than a gap.
+    /// Not a compat shim, but an exact reading. A snapshot that recorded nothing
+    /// about ownership had none to record. So `None` is the truth, not a gap.
     ///
-    /// What this pins is the *reading*, and that is the part that can go wrong
-    /// silently. The field is not self-describing, so a decoder that read one from a
-    /// version 3 body would take the next entry's length as a uid and everything
-    /// after it from the wrong offset — and would still decode, because a wrong uid
-    /// is a valid uid.
+    /// What this pins is the *reading*. That is the part that can go wrong
+    /// silently. The field is not self-describing. A decoder that read one from a
+    /// version 3 body would take the next entry's length as a uid. The same
+    /// decoder would read everything after it from the wrong offset. That decoder
+    /// would still decode, because a wrong uid is a valid uid.
     #[test]
     fn a_version_3_body_reads_with_no_owner() {
         let snapshot = sample();
@@ -762,12 +763,12 @@ mod tests {
         );
     }
 
-    /// A version-4 body is nine bytes longer per owned entry, so a decoder reading
-    /// one as version 3 must produce a different answer rather than the same one.
+    /// A version-4 body is nine bytes longer per owned entry. So a decoder that
+    /// reads one as version 3 must produce a different answer.
     ///
-    /// The negative of the test above, and it is what makes that test meaningful: if
-    /// reading the wrong version happened to agree, pinning the right answer would
-    /// prove nothing.
+    /// This test is the negative of the test above. It is what makes that test
+    /// meaningful. If reading the wrong version happened to agree, then pinning
+    /// the right answer would prove nothing.
     #[test]
     fn reading_a_version_4_body_as_version_3_does_not_agree() {
         let snapshot = sample();
@@ -787,11 +788,12 @@ mod tests {
         );
     }
 
-    /// Encode a snapshot the way version 3 did: every field except the owner.
+    /// Encode a snapshot the way version 3 did, with every field except the owner.
     ///
-    /// Built from the same [`Writer`] primitives the real encoder uses, so the field
-    /// widths are the encoder's rather than something restated here — a hand-rolled
-    /// copy is how a test ends up agreeing with a layout change it should have caught.
+    /// The code builds this from the same [`Writer`] primitives the real encoder
+    /// uses. So the field widths are the encoder's, not something restated here. A
+    /// hand-rolled copy is how a test ends up agreeing with a layout change that it
+    /// should have caught.
     fn encode_body_v3(snapshot: &Snapshot) -> Vec<u8> {
         let mut out = Writer::new();
 

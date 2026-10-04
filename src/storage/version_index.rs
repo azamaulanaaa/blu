@@ -10,18 +10,18 @@
 //! ## This is a cache
 //!
 //! The store's commit records are the record of which versions exist. An index
-//! file is derived from them, and a wrong or missing one costs a scan rather than
-//! a backup. The commit record is the commit, one append to one file; this is
-//! written afterwards, best-effort. Nothing here is trusted without being checked
-//! against the store, and nothing here can make a store report a version it does
-//! not hold — see [`resolve`](super::resolve).
+//! file is derived from them. A wrong or missing index file costs a scan, not a
+//! backup. The commit record is the commit, one append to one file. This index
+//! file is written afterwards, best-effort. Nothing here is trusted without a
+//! check against the store. Nothing here can make a store report a version that
+//! the store does not hold. See [`resolve`](super::resolve).
 //!
 //! ## Why the hash is in here at all
 //!
-//! Because it is the check. An index can be stale, or copied from another set, or
-//! edited; the hash is what says which segment holds *this* snapshot. A resolve
-//! that reads the wrong segment gets a snapshot whose bytes do not hash to what
-//! the index claimed, and says so rather than returning it.
+//! The hash is the check. An index can be stale, or copied from another set, or
+//! edited. The hash says which segment holds *this* snapshot. A resolve that reads
+//! the wrong segment gets a snapshot whose bytes do not hash to what the index
+//! claimed. The resolve says so instead of returning it.
 
 use std::{
     fs,
@@ -51,7 +51,7 @@ pub struct VersionIndex {
     /// Which commit record *within that segment* the version is.
     ///
     /// A global version number would need every earlier segment scanned to
-    /// resolve, which is the work this file exists to avoid. A position within
+    /// resolve. That scan is the work this file exists to avoid. A position within
     /// the segment is self-contained: read that one segment, take that commit.
     pub ordinal: u32,
     /// The snapshot's content hash, and the check on everything above.
@@ -135,22 +135,22 @@ impl VersionIndex {
 
     /// Read the index at `path`, or `None` if it is not there or not usable.
     ///
-    /// Never an error: absent, truncated, wrong checksum and unreadable are all
-    /// "no usable index" to a caller treating this as a cache, because an index
-    /// that cannot be read is one that must be rebuilt, and rebuilding is always
+    /// Never an error. Absent, truncated, wrong checksum and unreadable are all
+    /// "no usable index" to a caller treating this as a cache. An index that
+    /// cannot be read is an index that must be rebuilt. A rebuild is always
     /// available. See [`crate::storage::resolve`] for what a caller does next.
     ///
-    /// A directory at `path` is also `None`, not an error. It used to be called
-    /// out here as the one thing not swallowed — "a directory that cannot be read
-    /// at all is not swallowed, that is a problem with the set" — and the code
-    /// underneath cannot tell that case from any other: `fs::read(path).ok()?`
-    /// discards the `io::Error` whole, so a permission problem and a directory
-    /// both arrive as `None`. The sentence described an intention the
-    /// implementation never had.
+    /// A directory at `path` is also `None`, not an error. This doc comment used
+    /// to call out that case as the one thing not swallowed. The old sentence said
+    /// that "a directory that cannot be read at all is not swallowed, that is a
+    /// problem with the set". The code underneath cannot tell that case from any
+    /// other. `fs::read(path).ok()?` discards the `io::Error` whole, so a
+    /// permission problem and a directory both arrive as `None`. The sentence
+    /// described an intention the implementation never had.
     ///
-    /// The distinction is not lost so much as not made here. A set whose directory
-    /// cannot be read fails at `IndexSet::indexed_versions`, which lists the
-    /// directory it could not read and says so, and the store's own scan refuses
+    /// The distinction is not lost. It is not made here. A set whose directory
+    /// cannot be read fails at `IndexSet::indexed_versions`. That function lists
+    /// the directory it could not read and says so. The store's own scan refuses
     /// to open. This is the cache, and a cache that cannot be read is empty.
     #[must_use]
     pub fn read(path: &Path) -> Option<Self> {
@@ -164,23 +164,23 @@ impl TryFrom<&[u8]> for VersionIndex {
 
     /// Parse an index file's bytes.
     ///
-    /// `TryFrom` rather than an inherent `from_bytes`, so that "these bytes are a
-    /// version index" is a conversion like any other and this type shares a
-    /// vocabulary with everything else that parses a file. One implementation, not
-    /// an inherent method beside a trait impl — a `from_bytes` that only called
-    /// `try_from` would be a second spelling of one decision, and removing those
-    /// is most of what this branch has been about.
+    /// `TryFrom` rather than an inherent `from_bytes`. The choice makes "these
+    /// bytes are a version index" a conversion like any other. This type then
+    /// shares a vocabulary with everything else that parses a file. One
+    /// implementation, not an inherent method beside a trait impl. A `from_bytes`
+    /// that only called `try_from` would be a second spelling of one decision.
+    /// Removing second spellings is most of what this branch has been about.
     ///
-    /// The whole file rather than a prefix: an index is exactly `LEN` bytes, so
+    /// The whole file rather than a prefix. An index is exactly `LEN` bytes, so
     /// the length is a check and not a bound.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file is the wrong length, which is a file that is
-    /// not one of these, or if the checksum does not verify, which is a torn write
-    /// or something else entirely. Both are treated as "no index" by
-    /// [`resolve`](super::resolve): a cache that cannot be read is not a cache
-    /// that can be believed.
+    /// Returns an error if the file is the wrong length. A file of the wrong
+    /// length is not one of these. Returns an error if the checksum does not
+    /// verify. A checksum failure means a torn write or something else entirely.
+    /// [`resolve`](super::resolve) treats both errors as "no index". A cache that
+    /// cannot be read is not a cache that can be believed.
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Self::parse(bytes)
     }

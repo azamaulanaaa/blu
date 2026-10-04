@@ -7,39 +7,39 @@
 //!          | hash (32) | check (8) | payload
 //! ```
 //!
-//! The two lengths are different numbers, which is most of what the codec byte is
-//! for. A record's length lives in its own header, so a payload is compressed
-//! *before* the header is written. The stored length is what a scan skips, the
-//! raw length is what a reader is handed, and the hash is always of the raw
-//! content, so two stores which compressed the same bytes differently still agree
-//! on its name.
+//! The two lengths are different numbers. That difference is most of what the
+//! codec byte is for. A record's length lives in its own header, so a payload is
+//! compressed *before* the header is written. A scan skips the stored length. A
+//! reader receives the raw length. The hash is always of the raw content. Two
+//! stores which compressed the same bytes differently therefore agree on its name.
 //!
 //! **Every record is self-synchronising.** The scanner stops at the first header
-//! whose magic or check does not verify and never guesses past it, so a torn write
-//! at the tail cannot make it read a record boundary that is not one.
+//! whose magic or check does not verify. It never guesses past that header. A torn
+//! write at the tail therefore cannot make it read a record boundary that is not
+//! one.
 //!
 //! **The payload needs no checksum of its own.** The header's hash is the BLAKE3
-//! of the payload as it was read — for a chunk, the hash deduplication is keyed
-//! on, so verifying stored content costs nothing extra — which leaves `check` to
-//! cover only the few dozen bytes of header ahead of it. The check is a truncated
-//! BLAKE3 rather than a CRC: cheaper to compute is invisible next to the seek and
-//! read each record already needs, and a cryptographic digest rejects *garbage*
-//! — a run of zeroes left by an abandoned write, a length field from another
-//! format — with probability 2^-64 rather than 2^-32. It is not defending against
-//! an adversary who can write to the file, who can compute a valid check for
-//! anything they like.
+//! of the payload as it was read. For a chunk, this is the hash that deduplication
+//! is keyed on, so verifying stored content costs nothing extra. That leaves
+//! `check` to cover only the few dozen bytes of header ahead of it. The check is a
+//! truncated BLAKE3 rather than a CRC. Computing it more cheaply costs nothing
+//! next to the seek and read that each record already needs. A cryptographic digest
+//! rejects *garbage*, such as a run of zeroes left by an abandoned write. It also
+//! rejects a length field from another format. It does both with probability
+//! 2^-64 rather than 2^-32. The check does not defend against an adversary who
+//! can write to the file. That adversary can compute a valid check for anything
+//! they like.
 //!
 //! ## Who else frames a record
 //!
 //! [`crate::pack`]'s payload region is a run of these records rather than a run
-//! of bare payloads, so a chunk keeps its codec across a pack and a reader is
+//! of bare payloads. A chunk therefore keeps its codec across a pack. A reader is
 //! handed content rather than a frame. That makes the pack's writer a second
-//! producer of these bytes and its reader a second consumer, and both go through
+//! producer of these bytes and its reader a second consumer. Both go through
 //! [`encode_header`] and [`decode_header`] below rather than through a copy of
-//! them: two encoders would be two formats, and they would disagree the first
-//! time a field moved. So the encoder, the decoder, the decoded [`Header`], the
-//! record kind and the two header bounds are crate-visible, and nothing else
-//! here is.
+//! them. Two encoders would be two formats. They would disagree the first time a
+//! field moved. The encoder, the decoder, the decoded [`Header`], the record kind
+//! and the two header bounds are therefore crate-visible. Nothing else here is.
 
 use std::{
     collections::HashMap,
@@ -50,8 +50,9 @@ use super::BlobId;
 
 /// Magic at the start of a store file.
 ///
-/// A file that does not begin with this is not a store and is never written to,
-/// so a recovery scan cannot decide some other file is a store and truncate it.
+/// A file that does not begin with this is not a store, and the crate never
+/// writes to one. A recovery scan therefore cannot decide that some other file
+/// is a store and truncate it.
 pub(super) const STORE_MAGIC: [u8; 4] = *b"LPST";
 
 /// Magic at the start of every record.
@@ -61,8 +62,8 @@ pub(super) const RECORD_MAGIC: [u8; 4] = *b"LPB1";
 /// reported as such rather than misparsed.
 ///
 /// **2** added a codec byte and a second length to every record header. A store
-/// written by version 1 is *refused*, not converted: its headers are a different
-/// shape, and the only way to tell them apart is this number.
+/// written by version 1 is *refused*, not converted. Its headers have a different
+/// shape. Only this number tells the two shapes apart.
 pub(super) const FORMAT_VERSION: u32 = 2;
 
 /// Bytes of store header: magic, version, and this segment's own number.
@@ -79,27 +80,27 @@ const CHECK: usize = 8;
 
 /// Bytes in the smallest possible header: two one-byte lengths of zero.
 ///
-/// The `2` is those two lengths at their minimum. This is also the smallest
-/// record there is — a header with an empty payload — and `SegmentLimit::new`
-/// uses it as the floor, so it is not a header constant alone.
+/// The `2` counts those two lengths at their minimum. This is also the smallest
+/// record there is, which is a header with an empty payload. `SegmentLimit::new`
+/// uses it as the floor. It is therefore not a header constant alone.
 pub(crate) const MIN_HEADER: usize = PREFIX + 2 + HASH + CHECK;
 
 /// Bytes in the largest possible header: two varints at their widest.
 ///
 /// What a scan must have in hand before it tries to decode a header. Refilling
-/// against [`MIN_HEADER`] is not enough — a header carrying two three-byte
-/// varints is 52 bytes against a 48-byte floor, so a record boundary in the last
-/// few bytes of the buffer fails to decode and a good segment is reported as
+/// against [`MIN_HEADER`] is not enough. A header that carries two three-byte
+/// varints is 52 bytes against a 48-byte floor. A record boundary in the last few
+/// bytes of the buffer then fails to decode. A good segment is reported as
 /// damaged.
 pub(crate) const MAX_HEADER: usize = PREFIX + 2 * crate::varint::MAX + HASH + CHECK;
 
 /// Bytes read at a time while scanning.
 ///
-/// A record is skipped with a seek rather than read, so the scan is proportional
-/// to the number of records and not to the size of the store. This sets what it
-/// is proportional to in *reads*: the buffer is refilled only when the next
-/// header would not fit in what is left, and a refill therefore always leaves
-/// [`MAX_HEADER`] bytes available to decode one.
+/// A record is skipped with a seek rather than read. The scan is therefore
+/// proportional to the number of records and not to the size of the store. This
+/// constant sets what it is proportional to in *reads*. The buffer is refilled only
+/// when the next header would not fit in what is left. A refill therefore always
+/// leaves [`MAX_HEADER`] bytes available to decode one.
 const SCAN_BUFFER: usize = 1024 * 1024;
 
 /// What a record holds.
@@ -109,8 +110,9 @@ pub(crate) enum Kind {
     /// both this, and are told apart only by what refers to them.
     Blob,
     /// The commit record that publishes a snapshot. Its payload is the 32-byte
-    /// hash of that snapshot and nothing else: a version number is a commit
-    /// record's position in the log, so it cannot disagree with it.
+    /// hash of that snapshot and nothing else. A version number is a commit
+    /// record's position in the log. A version number therefore cannot disagree
+    /// with the log.
     Commit,
 }
 
@@ -134,8 +136,8 @@ impl Kind {
 /// How a record's payload is stored.
 ///
 /// One byte after the kind. It has to be in the header rather than implied by the
-/// length, because the two lengths are different things: a compressed record is
-/// *not* as long as its content, and a reader that mistook one for the other
+/// length, because the two lengths are different things. A compressed record is
+/// *not* as long as its content. A reader that mistook one length for the other
 /// would produce a blob of the wrong size under the right name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Codec {
@@ -175,9 +177,9 @@ pub(crate) struct Header {
     pub codec: Codec,
     /// BLAKE3 of the payload **as it was read**, before any compression.
     ///
-    /// Always of the content, never of the stored bytes: a chunk is addressed by
-    /// what it contains, so two stores that compressed the same content
-    /// differently must still agree on its name.
+    /// Always of the content, never of the stored bytes. A chunk is addressed by
+    /// what it contains. Two stores that compressed the same content differently
+    /// must therefore still agree on its name.
     pub hash: [u8; HASH],
     /// Bytes the payload occupies in the file, which is what a scan skips.
     ///
@@ -194,8 +196,8 @@ pub(crate) struct Header {
 
 /// Where a blob's payload sits in the store.
 ///
-/// A [`Placement`] names a *segment* and an offset within it, because a store is
-/// several files and an offset is only meaningful relative to the one it is in.
+/// A [`Placement`] names a *segment* and an offset within it. A store is
+/// several files, so an offset is only meaningful relative to the one it is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Placement {
     /// Which segment of the store the payload is in, counting from zero.
@@ -203,13 +205,14 @@ pub struct Placement {
     /// Byte offset of the payload within that segment.
     pub offset: u64,
     /// Bytes the payload occupies in the file, which is what a reader must skip
-    /// and what bounds the bytes it reads. Not the content length for a compressed
-    /// blob — that is [`Placement::raw_len`].
+    /// and what bounds the bytes it reads. This is the length on disk. For a
+    /// compressed record it is *not* the length of the content. That length is
+    /// [`Placement::raw_len`].
     ///
-    /// Named for the length rather than `len`, because a store has two of them
-    /// and the shorter name was the one that got read as the other. The two are
-    /// equal for an uncompressed blob and different for every compressed one, so
-    /// nothing about the type distinguishes them; only the name does.
+    /// Named for the length rather than `len`. A store has two of them, and the
+    /// shorter name was the one that got read as the other. The two are equal
+    /// for an uncompressed blob and different for every compressed one. Nothing
+    /// about the type distinguishes them. Only the name does.
     pub stored_len: u64,
     /// Bytes the payload is once decompressed.
     ///
@@ -226,8 +229,8 @@ pub struct Placement {
 pub(super) struct Scan {
     /// Every blob the store holds, by content hash.
     ///
-    /// From record headers only: the scan never reads a payload, so a blob with a
-    /// damaged payload is still listed here and fails when it is read.
+    /// From record headers only. The scan never reads a payload, so a blob with
+    /// a damaged payload is still listed here. That blob fails when it is read.
     pub blobs: HashMap<BlobId, Placement>,
     /// The snapshot hash of each committed version, oldest first.
     ///
@@ -269,9 +272,9 @@ pub(super) enum HeaderFault {
 /// Read a segment header, and say which segment it claims to be.
 ///
 /// The segment's number is in the header so a file that does not belong is
-/// detected rather than read as though it did: without it, two swapped segment
-/// files would produce a store that scans cleanly and holds the wrong records in
-/// the wrong order.
+/// detected rather than read as though it did. Without the number, two swapped
+/// segment files would produce a store that scans cleanly and holds the wrong
+/// records in the wrong order.
 pub(super) fn decode_store_header(bytes: &[u8]) -> Result<u32, HeaderFault> {
     if bytes.len() < STORE_HEADER || bytes[..4] != STORE_MAGIC {
         return Err(HeaderFault::NotAStore);
@@ -294,9 +297,9 @@ fn varint_len(value: u64) -> usize {
 
 /// Append the header for a record to `out`.
 ///
-/// `stored_len` is what the payload occupies in the file and `raw_len` what it is
-/// once decompressed; for a raw record they are equal. Both must be known first,
-/// because a header cannot be written twice.
+/// `stored_len` is what the payload occupies in the file and `raw_len` is what it
+/// is once decompressed. For a raw record they are equal. Both lengths must be
+/// known first, because a header cannot be written twice.
 pub(crate) fn encode_header(
     out: &mut Vec<u8>,
     kind: Kind,
@@ -331,13 +334,14 @@ fn check(header_without_check: &[u8]) -> [u8; CHECK] {
 
 /// Decode the header of the record starting at `at` in the store.
 ///
-/// `buffer` must begin at that record's first byte, so `at` is the record's
-/// absolute offset and is only used to work out where the payload lands.
+/// `buffer` must begin at that record's first byte. `at` is therefore the
+/// record's absolute offset. The scan uses it only to work out where the payload
+/// lands.
 ///
-/// `None` means the bytes here are not the start of a valid record: the buffer
-/// ran out, the magic is wrong, the kind or codec is unknown, or the check does
-/// not verify. All of them mean the same thing to a scanner — stop here — and
-/// none is distinguishable from a tail torn by a power cut.
+/// `None` means the bytes here are not the start of a valid record. The buffer ran
+/// out. The magic is wrong. The kind or codec is unknown. The check does not
+/// verify. All of these mean the same thing to a scanner, which is to stop here.
+/// None of them is distinguishable from a tail torn by a power cut.
 pub(crate) fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
     if buffer.len() < MIN_HEADER {
         return None;
@@ -353,14 +357,15 @@ pub(crate) fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
     let (stored_len, stored_bytes) = read_varint(&buffer[PREFIX..])?;
     let (raw_len, raw_bytes) = read_varint(&buffer[PREFIX + stored_bytes..])?;
 
-    // Both lengths in the fewest bytes that hold them, or not a header this build
-    // wrote. Everything below measures the header twice — once with the widths a
-    // length takes, once with the widths the bytes took — and a number written in
-    // more bytes than it needs is the one input that makes the two disagree. It
-    // is a small thing to refuse and not a small thing to read: `hash_at` then
-    // points past the header `total` describes, and the check below indexes with
-    // it. A downloaded pack or a copied segment is exactly where such a header
-    // comes from, so the disagreement is refused here rather than measured.
+    // Both lengths must use the fewest bytes that hold them. Otherwise this is
+    // not a header that this build wrote. Everything below measures the header
+    // twice. It measures once with the widths a length takes. It measures once
+    // with the widths the bytes took. A number written in more bytes than it needs
+    // is the one input that makes the two disagree. Refusing it is a small thing
+    // to do. Reading it is not a small thing to do. `hash_at` then points past
+    // the header `total` describes, and the check below indexes with it. A
+    // downloaded pack or a copied segment is exactly where such a header comes
+    // from. The disagreement is therefore refused here rather than measured.
     if stored_bytes != varint_len(stored_len) || raw_bytes != varint_len(raw_len) {
         return None;
     }
@@ -377,10 +382,10 @@ pub(crate) fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
     let hash_at = PREFIX + stored_bytes + raw_bytes;
     let check_at = hash_at + HASH;
 
-    // The check covers every byte of the header ahead of itself, so it is
-    // verified before the hash is believed. A record whose two lengths do not
-    // account for the header it stands in cannot be safely skipped, and is
-    // treated the same as one that was never written.
+    // The check covers every byte of the header ahead of itself. It is verified
+    // before the hash is believed. A record whose two lengths do not account for
+    // the header it stands in cannot be safely skipped. The code treats it the
+    // same as one that was never written.
     if buffer[check_at..total] != check(&buffer[..check_at]) {
         return None;
     }
@@ -396,7 +401,7 @@ pub(crate) fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
         raw_len,
         // The payload starts one header-length past the record. Deriving that any
         // other way borrows from a length with nothing to do with where the
-        // header ends, and underflows for any record bigger than what precedes it.
+        // header ends. It underflows for any record bigger than what precedes it.
         payload_offset: at.saturating_add(total as u64),
         total_len: total as u64,
     })
@@ -405,9 +410,9 @@ pub(crate) fn decode_header(buffer: &[u8], at: u64) -> Option<Header> {
 /// Read a LEB128 integer, returning it and how many bytes it took.
 ///
 /// A number that cannot be read is not an error here. A scan uses this to walk
-/// records it has not verified, and its whole contract is that a damaged tail
-/// and a tail that is simply the end of the file are the same thing: it stops
-/// and lets the caller decide. See the module doc.
+/// records it has not verified. Its whole contract is that a damaged tail
+/// and a plain end of file mean the same thing. The scan stops there and
+/// lets the caller decide. See the module doc.
 fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     crate::varint::read(bytes, 0).ok()
 }
@@ -429,11 +434,11 @@ pub(super) enum Blobs {
     /// Skip them, for a caller that wants only the commit records.
     ///
     /// This is not a micro-optimisation. A scan that indexes builds a
-    /// `HashMap` entry per blob record: at the default 4 GiB segment size and
-    /// 16 KiB average chunks that is 262,144 entries, about 42 MB allocated,
-    /// grown and freed. The one caller that wants only commits asks once per
-    /// version listed, so a set of a thousand versions sharing a segment paid
-    /// for the map a thousand times over to print a list.
+    /// `HashMap` entry per blob record. At the default 4 GiB segment size and
+    /// 16 KiB average chunks that is 262,144 entries, about 42 MB. The scan
+    /// allocates, grows and frees that map. The one caller that wants only commits
+    /// asks once per version listed. A set of a thousand versions that share a
+    /// segment therefore paid for the map a thousand times over to print a list.
     Discard,
 }
 
@@ -446,16 +451,17 @@ impl Blobs {
 
 /// Read one segment's records, stopping at the first one that is not valid.
 ///
-/// `file` may be positioned anywhere; the scan seeks for itself, and never reads a
+/// `file` may be positioned anywhere. The scan seeks for itself. It never reads a
 /// payload except a commit's 32 bytes. Every [`Placement`] is tagged with
-/// `segment`, so a set is scanned one segment at a time and never as a
+/// `segment`. A set is therefore scanned one segment at a time, never as a
 /// concatenation.
 ///
 /// # Errors
 ///
 /// Returns an error if the seek or read fails. A file whose contents are not a
-/// store is not an error here — that is [`crate::storage::blob`]'s business,
-/// because only it can tell a truncated tail from a file that was never a store.
+/// store is not an error here. That check belongs to [`crate::storage::blob`],
+/// because only that module can tell a truncated tail from a file that was never
+/// a store.
 pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::Result<Scan> {
     scan_with_buffer(file, segment, blobs, SCAN_BUFFER)
 }
@@ -463,20 +469,21 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::
 /// [`scan`], with the read size chosen rather than fixed.
 ///
 /// `scan_buffer` is a parameter so that `benches/throughput.rs` can measure it.
-/// It was a `const`, which is the right thing for a value nobody has ever varied:
-/// a constant that has never been measured is a constant nobody can say is right,
-/// and this is the one that decides how many `read` syscalls a whole-set scan
-/// makes and how large a buffer it holds while doing it.
+/// The value was a `const`. That is the right thing for a value nobody has ever
+/// varied. A constant that has never been measured is a constant nobody can say is
+/// right. This is the one constant that decides how many `read` syscalls a
+/// whole-set scan makes and how large a buffer it holds while doing it.
 ///
-/// A record is skipped with a seek rather than read, so the scan is proportional
-/// to the *record count* and not to the size of the store. This is what that count
-/// is proportional to as well: one read per refill rather than one per record.
+/// A record is skipped with a seek rather than read. The scan is therefore
+/// proportional to the *record count*, not to the size of the store. This is
+/// what that count is proportional to as well: one read per refill rather
+/// than one per record.
 ///
-/// Below one buffer's worth the scan still works — the refill guarantees
-/// [`MAX_HEADER`] bytes whatever the size — so a caller passing something tiny gets
-/// a slower scan and not a wrong answer. There is no floor to enforce, because a
-/// floor would be a claim about the size being *sensible*, and the caller is the
-/// only one who knows what it is measuring.
+/// Below one buffer's worth the scan still works. The refill guarantees
+/// [`MAX_HEADER`] bytes whatever the size. A caller that passes something tiny
+/// therefore gets a slower scan and not a wrong answer. There is no floor to
+/// enforce. A floor would be a claim about the size being *sensible*, and the
+/// caller is the only one who knows what it is measuring.
 pub(super) fn scan_with_buffer(
     file: &mut std::fs::File,
     segment: u32,
@@ -488,29 +495,30 @@ pub(super) fn scan_with_buffer(
 
     // The allocation and how much of it is valid are separate, deliberately.
     //
-    // `resize(n, 0)` zeroes n bytes, and every one of them is then overwritten by
-    // the read that follows — so the old shape spent a megabyte of memset on every
-    // refill, doubling the memory traffic of the scan's inner loop to produce
-    // bytes nobody reads. Keeping the `Vec` at its full size and tracking the
-    // valid length separately means the allocation is zeroed once, when it grows,
-    // and never again.
+    // `resize(n, 0)` zeroes n bytes. Every one of them is then overwritten by the
+    // read that follows. The old shape therefore spent a megabyte of memset on
+    // every refill. That doubled the memory traffic of the scan's inner loop and
+    // produced bytes that nobody read. Keeping the `Vec` at its full size and
+    // tracking the valid length separately means the allocation is zeroed once,
+    // when it grows, and never again.
     //
     // The cost of doing it this way is that `buffer` now holds stale bytes past
-    // the valid length, so *every* read from it has to be bounded by `filled`
-    // rather than by `buffer.len()`. That is the part to get right: a header read
-    // out of stale bytes could decode to something plausible, and the file's tail
-    // is the one place where fewer than `MAX_HEADER` bytes are available.
+    // the valid length. Therefore *every* read from it has to be bounded by
+    // `filled` rather than by `buffer.len()`. That is the part to get right. A
+    // header read out of stale bytes could decode to something plausible. The
+    // file's tail is the one place where fewer than `MAX_HEADER` bytes are
+    // available.
     let mut buffer: Vec<u8> = Vec::new();
     let mut filled = 0usize;
     let mut base = STORE_HEADER as u64;
     let mut position = base;
 
     while position < file_len {
-        // Refill only when the next header would not fit, so a run of small
-        // records costs one read per buffer rather than one read per record. What
-        // has to fit is `MAX_HEADER`, not `MIN_HEADER`: a header is variable
-        // width, and the shortfall here would be read as damage rather than as a
-        // boundary to move past.
+        // Refill only when the next header would not fit. A run of small records
+        // then costs one read per buffer rather than one read per record. What has
+        // to fit is `MAX_HEADER`, not `MIN_HEADER`. A header is variable width, and
+        // the shortfall here would be read as damage rather than as a boundary to
+        // move past.
         if position - base + MAX_HEADER as u64 > filled as u64 {
             file.seek(SeekFrom::Start(position))?;
             let want = usize::try_from((file_len - position).min(scan_buffer as u64))
@@ -533,16 +541,16 @@ pub(super) fn scan_with_buffer(
             }
         }
 
-        // `buffer` begins at `base`, which is this record's position only when the
-        // buffer was just refilled. Give the header the slice that actually
-        // starts at this record, and where that is in the file, so it can report
-        // an absolute payload offset.
+        // `buffer` begins at `base`. That is this record's position only when the
+        // buffer was just refilled. The header gets the slice that actually starts
+        // at this record, and where that is in the file, so it can report an
+        // absolute payload offset.
         //
         // Bounded by `filled`, not `buffer.len()`. A torn tail leaves fewer than
-        // `MAX_HEADER` bytes, and a slice reaching into the stale part of the
-        // buffer could hand the decoder a header that looks well formed — the one
-        // case where the buffer holds a plausible answer for a question the file
-        // cannot answer.
+        // `MAX_HEADER` bytes. A slice that reaches into the stale part of the
+        // buffer could hand the decoder a header that looks well formed. That is
+        // the one case where the buffer holds a plausible answer for a question
+        // the file cannot answer.
         let at = usize::try_from(position - base).ok();
         let Some(at) = at.filter(|a| *a < filled) else {
             break;
@@ -565,8 +573,8 @@ pub(super) fn scan_with_buffer(
             Kind::Blob => {
                 if !blobs.indexes() {
                     // The header has already been decoded and bounds-checked, so
-                    // the record is known good; the only thing being skipped is
-                    // the index entry nobody asked for.
+                    // the record is known good. The only thing being skipped is the
+                    // index entry that nobody asked for.
                     position = end;
                     continue;
                 }
@@ -584,9 +592,9 @@ pub(super) fn scan_with_buffer(
             }
             Kind::Commit => {
                 // A commit record whose payload is not exactly a hash is not one
-                // this build wrote, and treating it as one would publish a
-                // version pointing at nothing. The raw length decides: a commit
-                // is 32 bytes of content whatever it occupies on disk.
+                // that this build wrote. Treating it as one would publish a version
+                // that points at nothing. The raw length decides. A commit is 32
+                // bytes of content whatever it occupies on disk.
                 if header.raw_len == HASH as u64 && header.codec == Codec::Raw {
                     let start = usize::try_from(header.payload_offset - base).ok();
                     let start = start.filter(|s| *s + HASH <= filled);
@@ -598,9 +606,10 @@ pub(super) fn scan_with_buffer(
                     }) {
                         scan.commits.push(snapshot);
                     } else {
-                        // A commit straddling a buffer boundary has its payload in
-                        // the file but not in the buffer read for the header; read
-                        // it directly rather than call a real version damaged.
+                        // A commit that straddles a buffer boundary has its payload
+                        // in the file but not in the buffer read for the header. The
+                        // code reads it directly rather than call a real version
+                        // damaged.
                         let mut hash = [0u8; HASH];
                         file.seek(SeekFrom::Start(header.payload_offset))?;
                         if read_exact_or_eof(file, &mut hash)? {
@@ -639,19 +648,19 @@ mod tests {
     /// A segment whose records are sized so that a header lands in the last few
     /// bytes of the scan buffer.
     ///
-    /// The refill guarantees `MAX_HEADER` (66) bytes, which is the widest a
-    /// header can be: `PREFIX` (6) plus two varints at their ten-byte maximum
-    /// (20) plus `HASH` (32) and `CHECK` (8). Guaranteeing only `MIN_HEADER` (48)
-    /// was the bug — a header carrying two three-byte varints is 52 bytes, so a
-    /// record boundary in `[buffer.len() - 51, buffer.len() - 48]` could not be
-    /// decoded and the scan reported the rest of a perfectly good segment as
-    /// damaged. That was a false positive on a sealed segment, which means
-    /// refusing to open the set at all.
+    /// The refill guarantees `MAX_HEADER` (66) bytes, which is the widest a header
+    /// can be. That width is `PREFIX` (6), plus two varints at their ten-byte
+    /// maximum (20), plus `HASH` (32) and `CHECK` (8). Guaranteeing only
+    /// `MIN_HEADER` (48) was the bug. A header that carries two three-byte varints
+    /// is 52 bytes. A record boundary in `[buffer.len() - 51, buffer.len() - 48]`
+    /// therefore could not be decoded. The scan reported the rest of a perfectly
+    /// good segment as damaged. That was a false positive on a sealed segment,
+    /// which means refusing to open the set at all.
     ///
     /// Two records of 524 263 bytes put the third header at buffer offset
-    /// 1 048 526, which is in that window. (Buffer offset, not file offset: the
-    /// offset is 1 048 538 in the file and the scan's base is the store header,
-    /// so the two differ by `STORE_HEADER`.)
+    /// 1 048 526, which is in that window. Buffer offset, not file offset. The
+    /// file offset is 1 048 538. The scan's base is the store header, so the two
+    /// offsets differ by `STORE_HEADER`.
     #[test]
     fn a_header_in_the_last_bytes_of_the_scan_buffer_is_not_damage() {
         const RECORD: u64 = 524_263;
@@ -696,11 +705,11 @@ mod tests {
 
     /// A scan that is not asked for the blob index finds the same records.
     ///
-    /// `Blobs::Discard` skips the `HashMap` insert and nothing else: the header
-    /// is still decoded, still bounds-checked against the file length, and the
-    /// scan still advances by the record's own total length. If it did less than
-    /// that, a commit record past a discarded blob would be missed, and
-    /// `commits_in` would return a version list missing whatever came after it.
+    /// `Blobs::Discard` skips the `HashMap` insert and nothing else. The header is
+    /// still decoded, still bounds-checked against the file length, and the scan
+    /// still advances by the record's own total length. If it did less than that,
+    /// a commit record past a discarded blob would be missed. `commits_in` would
+    /// return a version list missing whatever came after it.
     #[test]
     fn a_scan_that_skips_the_index_finds_the_same_records() {
         let file = std::env::temp_dir().join(format!(
@@ -710,7 +719,7 @@ mod tests {
         ));
 
         // Four blobs and two commits, so the commits are not simply "everything
-        // at the start" — one of them follows a discarded blob record.
+        // at the start". One of them follows a discarded blob record.
         let mut bytes = encode_store_header(0).to_vec();
         let mut commits = Vec::new();
         for n in 0u8..6 {
@@ -718,10 +727,10 @@ mod tests {
                 let mut hash = [0u8; HASH];
                 hash[0] = 0xff;
                 hash[1] = n;
-                // A commit's payload is the snapshot hash — 32 bytes, and both of
-                // its lengths say so. Without the payload the record is
-                // malformed and the scan would be reading the next record's
-                // header as this one's content.
+                // A commit's payload is the snapshot hash, which is 32 bytes. Both
+                // of its lengths say so. Without the payload the record is
+                // malformed. The scan would then read the next record's header as
+                // this one's content.
                 let payload = HASH as u64;
                 let mut header = Vec::new();
                 encode_header(
@@ -776,19 +785,19 @@ mod tests {
 
 /// Every byte of a record header, pinned.
 ///
-/// This is the only test that would notice a change to the record format, and it
-/// is here because nothing else could. `tests/pack.rs` has the equivalent for
-/// the pack format; the record format had nothing at all, and the one test that
-/// touched `encode_header` built its fixture *with* `encode_header` — so an
-/// encoding change was invisible to it by construction.
+/// This is the only test that would notice a change to the record format. It is
+/// here because nothing else could. `tests/pack.rs` has the equivalent for the
+/// pack format. The record format had nothing at all. The one test that touched
+/// `encode_header` built its fixture *with* `encode_header`. An encoding change
+/// was therefore invisible to it by construction.
 ///
-/// The bytes below are written out by hand, not captured. A captured golden
-/// pins a bug just as faithfully as a correct one, and nobody reading a captured
-/// blob can tell which it is. Each is annotated with what the field is and why it
-/// is there, so a change to any of them reads as a decision.
+/// The bytes below are written out by hand, not captured. A captured golden pins
+/// a bug just as faithfully as a correct one. Nobody reading a captured blob can
+/// tell which it is. Each is annotated with what the field is and why it is there,
+/// so a change to any of them reads as a decision.
 ///
 /// A change to this test is a change to the on-disk format. [`FORMAT_VERSION`]
-/// goes up, every existing set is either refused or unreadable, and that is
+/// goes up. Every existing set is then either refused or unreadable. That is
 /// written down in [`FORMAT_VERSION`] itself.
 #[cfg(test)]
 mod golden {
@@ -821,9 +830,9 @@ mod golden {
     /// ```
     const COMMIT: &str = "4c50423101002020ababababababababababababababababababababababababababababababababce6848cd6223ade8";
 
-    /// A compressed blob, chosen so both varints are more than one byte — which
-    /// is the only way the two lengths and the `PREFIX`/`HASH`/`CHECK` offsets
-    /// are all exercised at once.
+    /// A compressed blob, chosen so both varints are more than one byte. That is
+    /// the only way the two lengths and the `PREFIX`/`HASH`/`CHECK` offsets are
+    /// all exercised at once.
     ///
     /// ```text
     /// 4c 50 42 31   "LPB1"
@@ -836,10 +845,10 @@ mod golden {
     /// d2 30 0c b8 99 05 7d c4       check
     /// ```
     ///
-    /// The two lengths differ by design, and a reader that mixed them up would
-    /// hand back a blob of the wrong size under the right name — which is why
-    /// `Codec` is in the header at all, and why this case is pinned rather than
-    /// just the easy uncompressed one.
+    /// The two lengths differ by design. A reader that mixed them up would hand
+    /// back a blob of the wrong size under the right name. That is why `Codec` is
+    /// in the header at all. That is also why this case is pinned rather than just
+    /// the easy uncompressed one.
     const BLOB_COMPRESSED: &str = "4c5042310001ac02a08d061111111111111111111111111111111111111111111111111111111111111111d2300cb899057dc4";
 
     fn hex(s: &str) -> Vec<u8> {
@@ -930,8 +939,8 @@ mod golden {
 
     /// The decoder reads back what the encoder wrote, field by field.
     ///
-    /// Separate from the bytes above on purpose: that one says the format has
-    /// not moved, and this one says the two halves still agree. A change that
+    /// Separate from the bytes above on purpose. The test above says the format
+    /// has not moved. This test says the two halves still agree. A change that
     /// moved both together would pass the first and fail this.
     #[test]
     fn a_header_survives_its_own_round_trip() {
@@ -1001,8 +1010,8 @@ mod golden {
             );
 
             // The widest header is `MAX_HEADER`, and the scan's refill guarantee
-            // rests on that number. Asserting it here means the two constants
-            // and the encoder cannot drift apart unnoticed.
+            // rests on that number. Asserting it here means the two constants and
+            // the encoder cannot drift apart unnoticed.
             if case.stored_len == u64::MAX {
                 assert_eq!(
                     encoded.len(),
@@ -1015,9 +1024,9 @@ mod golden {
 
     /// The two header bounds are the ones the format actually has.
     ///
-    /// `MIN_HEADER` is also the floor `SegmentLimit::new` enforces, so it is not
-    /// only a header constant — getting it wrong does not produce a rejected
-    /// write, it produces a store that refuses to open itself.
+    /// `MIN_HEADER` is also the floor `SegmentLimit::new` enforces. It is
+    /// therefore not only a header constant. Getting it wrong does not produce a
+    /// rejected write. It produces a store that refuses to open itself.
     #[test]
     fn the_header_bounds_are_the_formats_own() {
         // 6 (magic, kind, codec) + 2 (two one-byte lengths) + 32 + 8
@@ -1035,12 +1044,12 @@ mod golden {
 /// Measure the read size, which is the one constant here nobody had ever varied.
 ///
 /// `SCAN_BUFFER` decides how many `read` syscalls a whole-set scan makes and how
-/// large a buffer it holds while doing so, and it was a `const` — which is the
-/// right thing for a value nobody has questioned and a poor thing for a value
-/// nobody can check. Criterion cannot help: a bench target is an external crate
-/// and everything in this module is `pub(super)`, so exposing a knob to measure it
-/// would put an internal tuning parameter in the public API. Here, instead, where
-/// the function is.
+/// large a buffer it holds while doing so. It was a `const`. That is the right
+/// thing for a value nobody has questioned and a poor thing for a value nobody can
+/// check. Criterion cannot help. A bench target is an external crate, and
+/// everything in this module is `pub(super)`. Exposing a knob to measure it would
+/// put an internal tuning parameter in the public API. The measurement therefore
+/// lives here, where the function is.
 ///
 /// Ignored by default because it writes a temporary file and takes a second or
 /// two. Run it with:
@@ -1049,17 +1058,17 @@ mod golden {
 /// cargo test --release -- --ignored --nocapture scan_read_size
 /// ```
 ///
-/// It prints a table and asserts nothing about the numbers — the output is for a
-/// person, and the machine it runs on is not the machine the constant was chosen
-/// on. What it does assert is that every size produces the same answer, because a
-/// buffer below `MAX_HEADER` is the interesting boundary and a size that changed
-/// the result would be a bug rather than a tuning finding.
+/// It prints a table and asserts nothing about the numbers. The output is for a
+/// person. The machine it runs on is not the machine the constant was chosen on.
+/// What it does assert is that every size produces the same answer. A buffer
+/// below `MAX_HEADER` is the interesting boundary. A size that changed the result
+/// would be a bug rather than a tuning finding.
 #[test]
 #[ignore = "writes a temporary file and takes a second; run it by hand"]
 fn scan_read_size() {
     /// Records, and bytes per record, chosen so the file is a few tens of
-    /// megabytes — big enough that the read count is the thing being timed, and
-    /// small enough to build in a test.
+    /// megabytes. That is big enough that the read count is the thing being timed.
+    /// It is small enough to build in a test.
     const RECORDS: usize = 20_000;
     const PAYLOAD: usize = 1024;
 
@@ -1094,8 +1103,8 @@ fn scan_read_size() {
         SCAN_BUFFER,
         4 * SCAN_BUFFER,
     ] {
-        // The smallest buffer the refill guarantee makes legal, and one below it:
-        // both must give the same answer, which is the part worth asserting.
+        // The smallest buffer that the refill guarantee makes legal, and one below
+        // it. Both must give the same answer, which is the part worth asserting.
         let mut slowest = std::time::Duration::ZERO;
         let mut found = 0usize;
 
@@ -1125,16 +1134,16 @@ fn scan_read_size() {
 
 /// A length written in more bytes than it needs is not a header.
 ///
-/// The decoder measures the header twice: `total` from the widths the two lengths
-/// take, and `hash_at` from the widths the bytes in front of them actually took.
-/// `varint::read` accepts a number written wider than its own size — it refuses
-/// only what does not fit a `u64` — so the two counts can disagree, and where
-/// they do the hash begins past the end of the header the lengths describe. That
-/// is an index rather than a value, and the record it belongs to is a pack that
-/// was downloaded or a segment that was copied.
+/// The decoder measures the header twice. It takes `total` from the widths the two
+/// lengths take. It takes `hash_at` from the widths the bytes in front of them
+/// actually took. `varint::read` accepts a number written wider than its own
+/// size. It refuses only what does not fit a `u64`. The two counts can therefore
+/// disagree. Where they disagree, the hash begins past the end of the header the
+/// lengths describe. That is an index rather than a value. The record it belongs
+/// to is a pack that was downloaded or a segment that was copied.
 ///
-/// The check is recomputed over the widened header, so the only thing wrong with
-/// these bytes is the width: the refusal is the width's and not the check's.
+/// The check is recomputed over the widened header, so the width is the only
+/// thing wrong with these bytes. The refusal is the width's and not the check's.
 #[test]
 fn a_length_wider_than_its_own_size_is_refused() {
     let mut canonical = Vec::new();
@@ -1175,25 +1184,25 @@ fn a_length_wider_than_its_own_size_is_refused() {
 
 /// A torn tail is never mistaken for a record, at any length.
 ///
-/// The scan refills only when the next header would not fit in what it has read,
-/// and it sizes a refill by what is *left in the file*. At the end of a file that
-/// is less than a maximum header, so the read comes up short — and the iteration
+/// The scan refills only when the next header would not fit in what it has read.
+/// The scan sizes a refill by what is *left in the file*. At the end of a file
+/// that is less than a maximum header, so the read comes up short. The iteration
 /// after that refills again, reads zero bytes, finds fewer than a minimum header
 /// and stops. The tail is therefore discarded without ever reaching
-/// `decode_header`, which is why a file ending in a complete, well-formed record
-/// header and half a payload still reports exactly the records that are whole.
+/// `decode_header`. A file that ends in a complete, well-formed record header and
+/// half a payload therefore still reports exactly the records that are whole.
 ///
-/// Worth pinning because the other answer is silent. A header is small enough
-/// that a plausible-looking one at a buffer's edge could decode to a blob that
-/// nothing in the file contains, and the index would carry it as though the store
-/// held it. Probed across tail lengths from 0 to a full buffer to establish which
-/// branch this is, rather than assumed from reading the loop: every one of them
-/// reports the same count.
+/// Worth pinning because the other answer is silent. A header is small enough that
+/// a plausible-looking one at a buffer's edge could decode to a blob that nothing
+/// in the file contains. The index would carry it as though the store held it.
+/// The test probes across tail lengths from 0 to a full buffer to establish which
+/// branch this is, rather than assuming the branch from reading the loop. Every
+/// one of them reports the same count.
 #[test]
 fn a_torn_tail_is_never_taken_for_a_record() {
     const PAYLOAD: usize = 512;
-    /// Small enough that the file takes several refills, so the tail is read into
-    /// a buffer that holds stale bytes from an earlier one.
+    /// Small enough that the file takes several refills. The tail is therefore
+    /// read into a buffer that holds stale bytes from an earlier one.
     const SCAN_BUFFER: usize = 4096;
     const RECORDS: usize = 40;
 
@@ -1211,7 +1220,7 @@ fn a_torn_tail_is_never_taken_for_a_record() {
     let planted = BlobId::from_bytes(planted);
 
     // From nothing at all, to a header cut mid-length, to the whole header and
-    // half its payload. Each is a shape a killed run can leave behind.
+    // half its payload. Each is a shape that a killed run can leave behind.
     let tails: [(&str, &[u8]); 5] = [
         ("no tail", &[]),
         ("a bare magic", &header[..RECORD_MAGIC.len()]),

@@ -1,29 +1,31 @@
 //! Saying how a run is going while it is going.
 //!
-//! There is no percentage to report: content-defined chunking finds each boundary
-//! from the bytes before it, so a tree's chunk count is unknown until it is read.
-//! What is reported instead is bytes read or written, counts, elapsed time, and a
-//! rate derived from those, on a timer that [`Progress::report`] checks — so a
-//! fast run stays quiet and a slow one is not left silent for minutes.
+//! There is no percentage to report. Content-defined chunking finds each
+//! boundary from the bytes before it. The chunk count of a tree stays unknown
+//! until the run reads the tree. The run reports bytes read or written
+//! instead. It also reports counts, elapsed time, and a rate derived from
+//! those. A timer that [`Progress::report`] checks sets the pace. So a fast run
+//! stays quiet. So a slow run is not left silent for minutes.
 
 use std::{
     fmt,
     time::{Duration, Instant},
 };
 
-/// How often a run says something: short enough that a slow run is not left
-/// silent for long, long enough that a fast one does not fill the terminal.
+/// How often a run says something. The interval is short enough that a slow run
+/// is not left silent for long. It is long enough that a fast run does not fill
+/// the terminal.
 const INTERVAL: Duration = Duration::from_millis(300);
 
 /// What is being reported on.
 ///
-/// A value rather than a `&'static str` for the same reason the counters are:
-/// these are a closed set, and a closed set is what an `enum` is for. The
-/// counters were strings at ten call sites across three files, and
-/// `BYTE_COUNTERS` — a two-element array naming the two that are byte totals —
-/// was the only thing recording that. A typo in `"written"` compiled, passed
-/// every test, and silently rendered a byte count as a raw integer with no rate
-/// on it, which is a diagnostic that looks deliberate.
+/// A value rather than a `&'static str`, for the same reason the counters are.
+/// These are a closed set, and a closed set is what an `enum` is for. The
+/// counters were strings at ten call sites across three files. Only
+/// `BYTE_COUNTERS` recorded that, and it was a two-element array. The array
+/// names the two counters that are byte totals. A typo in `"written"` compiled.
+/// It passed every test. It silently rendered a byte count as a raw integer
+/// with no rate on it. That diagnostic looks deliberate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// Reading a tree and writing what is new.
@@ -50,9 +52,9 @@ impl Phase {
 
 /// One of the running totals a phase keeps.
 ///
-/// Closed, and each variant says whether its total is a byte count, so a counter
-/// cannot be misspelled and the renderer cannot disagree with its callers about
-/// which totals are worth showing as a size and a rate.
+/// Closed, and each variant says whether its total is a byte count. A caller
+/// cannot misspell a counter. The renderer cannot disagree with its callers
+/// about which totals need a size and a rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Counter {
     /// Files walked.
@@ -98,8 +100,8 @@ impl Counter {
 
     /// Whether its total is a byte count, and so worth a human size and a rate.
     ///
-    /// A property of the variant rather than a list kept in step with the
-    /// callers, which is the whole point: adding a counter forces the question.
+    /// A property of the variant, not a list that must stay in step with the
+    /// callers. This is the whole point. Adding a counter forces the question.
     const fn is_bytes(self) -> bool {
         matches!(self, Self::Read | Self::Written)
     }
@@ -128,14 +130,13 @@ pub struct Progress {
     last_reported: Option<Instant>,
     /// Running totals, in the order they are reported.
     ///
-    /// A fixed table rather than a `Vec` of pairs: `add` and `set` are called
-    /// once per chunk on the backup path, and each was a linear scan of a
-    /// `Vec` to find its own entry.
+    /// A fixed table, not a `Vec` of pairs. The backup path calls `add` and `set`
+    /// once per chunk. Each call was a linear scan of a `Vec` to find its entry.
     counters: [u64; Counter::ALL.len()],
     /// Which counters this run has touched, in report order.
     ///
-    /// A counter nothing has reported has no line, which is what the caller
-    /// wants: a `restore` does not have a chunk count to show.
+    /// A counter that nothing has reported has no line. That is what the caller
+    /// wants. A `restore` does not have a chunk count to show.
     seen: Vec<Counter>,
 }
 
@@ -179,10 +180,10 @@ impl Progress {
     ///
     /// Always true for the first call, and false immediately after a report.
     ///
-    /// Named for the mutation it performs rather than as a query: it latches
-    /// `last_reported`, so calling it twice in a row gives two different
-    /// answers. It is private, which is what stops a caller writing
-    /// `if p.due() { p.report() }` and reporting twice.
+    /// Named for the mutation it performs, not as a query. It latches
+    /// `last_reported`, so two calls in a row give two different answers. It is
+    /// private. That privacy stops a caller writing `if p.due() { p.report() }`
+    /// and reporting twice.
     fn due(&mut self) -> bool {
         let now = Instant::now();
         let due = self
@@ -198,12 +199,12 @@ impl Progress {
 
     /// Emit a line if one is due.
     ///
-    /// The return value says whether anything was emitted, which is what
-    /// distinguishes a quiet run from a stalled one.
+    /// The return value says whether anything was emitted. That answer distinguishes
+    /// a quiet run from a stalled one.
     ///
-    /// Emitted on the `lepatch::progress` target rather than the default one, so
-    /// a user who wants the summary lines without the running commentary can
-    /// turn it off with `RUST_LOG=lepatch=info,lepatch::progress=warn`.
+    /// The line goes to the `lepatch::progress` target, not the default one. So a
+    /// user who wants the summary lines without the running commentary can turn
+    /// it off with `RUST_LOG=lepatch=info,lepatch::progress=warn`.
     pub fn report(&mut self) -> bool {
         if !self.due() {
             return false;
@@ -223,24 +224,26 @@ impl Progress {
 
 /// Render the counters, with byte totals turned into a size and a rate.
 ///
-/// Takes the two arrays the counters live in rather than a `Vec` of pairs, so
-/// building the line allocates nothing but the line itself. The pairs were
-/// collected into a fresh `Vec` on every tick to be iterated once immediately
-/// afterwards, which is what the plan called "2 strings per counter per tick" —
-/// three allocations per tick, in fact, since `totals` was one of them.
+/// Takes the two arrays the counters live in, not a `Vec` of pairs. So building
+/// the line allocates nothing but the line itself. The old code collected the
+/// pairs into a fresh `Vec` on every tick. The code then iterated that `Vec`
+/// once immediately afterwards. The plan called that "2 strings per counter per
+/// tick". That count was three allocations per tick, because `totals` was one
+/// of them.
 ///
-/// The magnitude is worth stating once so it does not get picked up again: a tick
-/// is [`INTERVAL`] apart, so this is about ten allocations a second on a backup
-/// that is doing thousands of chunk operations a second. It is not a throughput
-/// change and nothing here should be described as one. What it is: a hot loop that
-/// allocates to build a diagnostic string, and no longer does.
+/// A tick is [`INTERVAL`] apart. So this change removes about ten allocations a
+/// second on a backup that does thousands of chunk operations a second. This
+/// magnitude is worth stating once so that a reader does not pick it up again.
+/// This is not a throughput change, and nothing here should be described as
+/// one. This is a hot loop that used to allocate a diagnostic string. The loop
+/// no longer allocates.
 ///
 /// The rendering is not deferred to the subscriber, and it does not need to be.
-/// `tracing` checks the callsite before it evaluates its arguments, so with
-/// progress off — `--quiet`, or any subscriber that filters this target — none of
-/// this runs at all. That is the gate that already exists, and it is the right
-/// one; the allocations below only ever happened when the line was going to be
-/// written.
+/// `tracing` checks the callsite before it evaluates its arguments. So with
+/// progress off, none of this runs at all. Progress is off for `--quiet`, and
+/// for any subscriber that filters this target. The gate already exists, and
+/// it is the right one. The allocations below only ever happened when the line
+/// was going to be written.
 fn describe(seen: &[Counter], counters: &[u64], elapsed: Duration) -> String {
     let mut out = String::new();
     for counter in seen {
@@ -266,11 +269,11 @@ fn describe(seen: &[Counter], counters: &[u64], elapsed: Duration) -> String {
 
 /// A byte count, rendered as a size.
 ///
-/// A [`fmt::Display`] newtype rather than a `String`, so the caller writes it into
-/// a formatter it already has instead of building a temporary to hand over. Three
-/// per second is not a throughput argument, and the real one is that a function
-/// returning `String` from a `u64` is a heap allocation dressed up as a
-/// conversion.
+/// A [`fmt::Display`] newtype, not a `String`. The caller writes it into a
+/// formatter it already has. The caller does not build a temporary to hand
+/// over. Three per second is not a throughput argument. The real argument is
+/// that a function returning `String` from a `u64` is a heap allocation dressed
+/// up as a conversion.
 struct Bytes(u64);
 
 impl fmt::Display for Bytes {
@@ -321,8 +324,8 @@ mod tests {
 
     /// The counters and their totals as pairs, for asserting on.
     ///
-    /// The rendering path takes the two arrays directly rather than a `Vec` of
-    /// pairs, so this is for tests only — nothing in the crate needs the pairs.
+    /// The rendering path takes the two arrays directly, not a `Vec` of pairs. So
+    /// this helper is for tests only. Nothing in the crate needs the pairs.
     fn totals(progress: &Progress) -> Vec<(Counter, u64)> {
         progress
             .seen
@@ -374,19 +377,20 @@ mod tests {
         assert_eq!(rendered, "chunks=1234");
     }
 
-    /// The unit a counter reports is a property of the counter, not a list
+    /// The unit a counter reports is a property of the counter. It is not a list
     /// somebody has to keep in step.
     ///
-    /// This is the property whose absence made a typo in `"written"` silently
-    /// downgrade a byte count to a raw integer — the only record of which
-    /// counters are byte totals was a two-element string array, and nothing
-    /// checked it against the strings used at the call sites.
+    /// This property was absent before. A typo in `"written"` silently downgraded a
+    /// byte count to a raw integer. The only record of which counters are byte
+    /// totals was a two-element string array. Nothing checked that array
+    /// against the strings used at the call sites.
     #[test]
     fn only_byte_counters_get_a_size_and_a_rate() {
-        // A second's worth of a mebibyte, so the rate is a number rather than a
+        // A second's worth of a mebibyte, so the rate is a number and not a
         // rounded zero. What is being checked is *which* counters get the
-        // treatment, not the arithmetic — which `a_byte_total_is_rendered_with_a_rate`
-        // covers — so the totals are chosen to keep that distinction legible.
+        // treatment, not the arithmetic. The test
+        // `a_byte_total_is_rendered_with_a_rate` covers the arithmetic. So the
+        // totals are chosen to keep that distinction legible.
         let (whole, tenth) = mib_per_second_tenths(1 << 20, Duration::from_secs(1));
         assert_eq!((whole, tenth), (1, 0), "one MiB in a second is one MiB/s");
 
@@ -447,9 +451,9 @@ mod tests {
 
     /// Every phase reports under its own command name.
     ///
-    /// The `match` in `name` already makes a forgotten variant a compile error,
-    /// so what this actually guards is the *string*: it appears in every line the
-    /// user sees, and a rename there is a user-visible change with no other
+    /// The `match` in `name` makes a forgotten variant a compile error. So what
+    /// this test actually guards is the *string*. The string appears in every
+    /// line the user sees. A rename there is a user-visible change with no other
     /// signal.
     #[test]
     fn every_phase_is_named() {

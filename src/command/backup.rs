@@ -1,7 +1,9 @@
 //! Recording what a directory tree contains, and handing the contents over to be
-//! stored: walking, telling a file from a link from a directory, and writing down
-//! what a restore needs to put the tree back. What happens to the file contents
-//! once read belongs to [`super::pipeline`].
+//! stored.
+//! The run walks the tree, tells a file from a link from a directory, and writes
+//! down what a restore needs.
+//! It writes down what is needed to put the tree back.
+//! What happens to the file contents once read belongs to [`super::pipeline`].
 
 use std::{
     collections::HashMap,
@@ -18,9 +20,10 @@ use walkdir::WalkDir;
 use crate::{command::pipeline, metadata, reader, storage};
 
 /// Uploads to run at once when the caller has not asked for a specific number.
-/// I/O bound, so a little oversubscription keeps them from stalling on round
-/// trips; the cap stops a many-core host opening an unbounded number of blobs at
-/// a remote store.
+/// These uploads are I/O bound, so a little oversubscription keeps them from
+/// stalling on round trips.
+/// The cap stops a many-core host opening an unbounded number of blobs at a
+/// remote store.
 const DEFAULT_CONCURRENCY: usize = 8;
 
 /// Hard ceiling on [`Options::concurrency`], whatever the caller asks for.
@@ -37,10 +40,11 @@ pub struct Options {
     pub chunker: reader::ChunkerConfig,
     /// How many chunks to upload at once.
     ///
-    /// `1` runs the pipeline strictly one chunk at a time. Higher values overlap
-    /// the round trips to the store, and do not change what comes out: chunk
-    /// order, and therefore the snapshot, is decided by the order chunks were
-    /// *read* in, not by the order they finished uploading.
+    /// `1` runs the pipeline strictly one chunk at a time.
+    /// Higher values overlap the round trips to the store, and do not change what
+    /// comes out.
+    /// Chunk order decides the snapshot, and it is the order chunks were *read* in,
+    /// not the order they finished uploading.
     ///
     /// Values above 32 are treated as 32, and `0` as `1`, rather than rejected.
     pub concurrency: usize,
@@ -48,13 +52,15 @@ pub struct Options {
 
 /// The command line's defaults.
 ///
-/// `Default` *is* the command line's configuration, not a stand-in for it: the
-/// binary's `--chunk-profile` resolves to one of the named
-/// [`reader::ChunkerProfile`]s, and `default` — what a run gets without the flag —
-/// is exactly [`reader::ChunkerConfig::default`], which is what every backup it
-/// has ever written used. A caller in a test that wants the same behaviour now
-/// says `Options::default()` and gets it by construction, rather than restating
-/// three numbers and hoping they still match.
+/// `Default` *is* the command line's configuration, not a stand-in for it.
+/// The binary's `--chunk-profile` resolves to one of the named
+/// [`reader::ChunkerProfile`]s.
+/// `default`, which is what a run gets without the flag, is exactly
+/// [`reader::ChunkerConfig::default`].
+/// Every backup this binary has ever written used that value.
+/// A caller in a test that wants the same behaviour now says
+/// `Options::default()` and gets it by construction.
+/// The caller no longer restates three numbers and hopes they still match.
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -74,24 +80,28 @@ pub struct Committed {
     pub snapshot: storage::BlobId,
 }
 
-/// What a backup of a tree would do, worked out by reading the tree and asking
-/// the set what it already holds, and by writing nothing.
+/// What a backup of a tree would do, worked out by reading the tree and by asking
+/// the set what it already holds.
+/// A plan writes nothing.
 ///
-/// **Every figure here comes from the run a real backup would have made.** It is
-/// not a second walk and an estimate beside it: [`backup_plan`] drives the same
-/// walk, the same chunker and the same deduplication map as [`backup`], with a
-/// store that answers what it is asked and keeps none of it. So a plan that says
-/// two chunks are new is describing a set that will grow by exactly those two
-/// chunks, and a plan that says none are new is describing a set that will not
-/// grow at all.
+/// **Every figure here comes from the run a real backup would have made.**
+/// It is not a second walk and an estimate beside it.
+/// [`backup_plan`] drives the same walk, the same chunker and the same
+/// deduplication map as [`backup`].
+/// It uses a store that answers what it is asked and keeps none of it.
+/// A plan that says two chunks are new describes a set that will grow by exactly
+/// those two chunks.
+/// A plan that says none are new describes a set that will not grow at all.
 ///
 /// The dry run is a separate entry point rather than a field on [`Options`], and
-/// the reason is the return type. `backup` answers with a [`Committed`], whose
-/// version number is chosen by the store at the moment it commits — and a run that
-/// writes nothing never reaches a commit, so there is no version for it to report.
+/// the reason is the return type.
+/// `backup` answers with a [`Committed`], whose version number is chosen by the
+/// store at the moment it commits.
+/// A run that writes nothing never reaches a commit, so there is no version for
+/// it to report.
 /// Asking one function for either answer means either making that field a lie or
-/// inventing a report type a caller has to unwrap, and the plan is worth having in
-/// full.
+/// inventing a report type a caller has to unwrap.
+/// The plan is worth having in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackupPlan {
     /// The version this run would commit, given the set as it stands.
@@ -112,9 +122,10 @@ pub struct BackupPlan {
     pub fresh: u64,
     /// Bytes of chunk content that would be written.
     ///
-    /// The content, before any compression: how large the records are on disk
-    /// depends on the set's compression policy, which is chosen when the store is
-    /// opened and so is not a property of the tree.
+    /// The content, before any compression.
+    /// How large the records are on disk depends on the set's compression policy.
+    /// The store chooses that policy when it is opened, so the size is not a
+    /// property of the tree.
     pub bytes: u64,
 }
 
@@ -135,16 +146,21 @@ struct Asked {
 
 /// A store that answers what it is asked and keeps none of it.
 ///
-/// The whole of a dry run: it stands where the real store would, so the walk,
-/// the chunker, the deduplication map and the snapshot are built by exactly the
-/// code a backup runs, and nothing reaches the disk.
+/// The whole of a dry run.
+/// It stands where the real store would.
+/// The walk, the chunker, the deduplication map and the snapshot are built by
+/// exactly the code a backup runs.
+/// Nothing reaches the disk.
 ///
 /// [`StoragePut::put`] asks the set whether it already holds the content instead
-/// of writing it. That is the one question a real store answers by consulting its
-/// own index and returning without a byte, so a plan costs the same lookup a
-/// deduplicating backup would have cost and nothing more. Which means it is not
-/// [`StoragePut`] itself that decides — see [`Planned`]'s implementation — and the
-/// answer is recorded per blob so the report can count them afterwards.
+/// of writing it.
+/// That is the one question a real store answers by consulting its own index and
+/// returning without a byte.
+/// A plan therefore costs the same lookup a deduplicating backup would have cost,
+/// and nothing more.
+/// It is not [`StoragePut`] itself that decides. See [`Planned`]'s
+/// implementation.
+/// The answer is recorded per blob so the report can count them afterwards.
 struct Planned {
     /// The set, if there is one. `None` is the first backup of a location: no
     /// store, nothing held, and the whole tree new.
@@ -153,9 +169,10 @@ struct Planned {
     asked: Arc<Mutex<Vec<Asked>>>,
 }
 
-// `async` on all three, and none of them awaits anything: that is what a store
-// which writes nothing looks like, and the trait is spelled in `async fn` because
-// the two implementations that do real I/O are.
+// `async` on all three, and none of them awaits anything.
+// That is what a store which writes nothing looks like.
+// The trait is spelled in `async fn` because the two implementations that do
+// real I/O are.
 #[allow(clippy::unused_async_trait_impl)]
 impl storage::StoragePut for Planned {
     /// Record what the run would have written, and drop the bytes.
@@ -171,9 +188,11 @@ impl storage::StoragePut for Planned {
     /// Record what the run would have written from a payload already encoded, and
     /// drop the bytes.
     ///
-    /// The verbatim write path, and a plan of it is the same plan: what it would
-    /// store is decided by the content hash, which both paths begin from, so a
-    /// record keyed by the content length is the same record either way.
+    /// The verbatim write path, and a plan of it is the same plan.
+    /// What it would store is decided by the content hash, which both paths begin
+    /// from.
+    /// A record keyed by the content length is therefore the same record either
+    /// way.
     async fn put_stored(
         &self,
         id: &storage::BlobId,
@@ -215,8 +234,9 @@ impl Planned {
     fn record(&self, id: &storage::BlobId, len: u64) -> io::Result<()> {
         let held = match self.store.as_ref() {
             // `locate` is the store's own index, so this is a lookup and not a
-            // read of the chunk — which is what keeps planning a large set the
-            // cost of a walk rather than the cost of a backup.
+            // read of the chunk.
+            // That is what keeps planning a large set the cost of a walk rather
+            // than the cost of a backup.
             Some(store) => match store.locate(id) {
                 Ok(_) => true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => false,
@@ -257,20 +277,24 @@ struct Walked {
 
 /// Snapshot a directory tree and commit it to the store as a new version.
 ///
-/// Deduplication is the store's business: a chunk whose content it already holds
-/// is not written again, so an unchanged file costs nothing after the first time
-/// it is seen, and so does one that was last seen in any version rather than
-/// only the most recent.
+/// Deduplication is the store's business.
+/// A chunk whose content the store already holds is not written again.
+/// An unchanged file therefore costs nothing after the first time it is seen.
+/// So does a file that was last seen in any version rather than only the most
+/// recent.
 ///
 /// # Errors
 ///
-/// Returns an error if `root` is not a directory, if the tree cannot be walked,
-/// if a file changes while it is being read, if the store rejects a write, or if
-/// the run cannot be committed. A run that returns an error has written no commit
-/// record, so the store is left exactly as it was — the space is reclaimed by the
-/// next run's recovery. The directory check is deliberately first: a root that is
-/// not a directory would otherwise be recorded as an entry with an empty path,
-/// which commits and is then unrestorable.
+/// Returns an error if `root` is not a directory.
+/// Returns an error if the tree cannot be walked.
+/// Returns an error if a file changes while it is being read.
+/// Returns an error if the store rejects a write, or if the run cannot be
+/// committed.
+/// A run that returns an error has written no commit record, so the store is
+/// left exactly as it was. The next run's recovery reclaims the space.
+/// The directory check is deliberately first.
+/// A root that is not a directory would otherwise be recorded as an entry with
+/// an empty path, which commits and is then unrestorable.
 #[instrument(level = "info", skip(storage, options), err)]
 pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     root: P,
@@ -282,27 +306,32 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 
 /// Work out what a backup of `root` would write, and write none of it.
 ///
-/// Everything a real backup does, in the same order and through the same code: the
-/// tree is walked, cut into chunks, hashed and deduplicated, and the snapshot that
-/// would be committed is built and hashed as well. The only difference is where the
-/// chunks go — into a store that asks the set whether it holds them and keeps the
-/// answers — so the figures are the ones a real run would have printed rather
-/// than an estimate made beside one.
+/// Everything a real backup does, in the same order and through the same code.
+/// The run walks the tree, cuts it into chunks, hashes and deduplicates them.
+/// The run builds and hashes the snapshot that would be committed.
+/// The only difference is where the chunks go.
+/// They go into a store that asks the set whether it holds them and keeps the
+/// answers.
+/// The figures are therefore the ones a real run would have printed rather than
+/// an estimate made beside one.
 ///
-/// `store` is `None` for a location with no set behind it, which is the first
-/// backup of somewhere and the case where a dry run has to answer "everything is
-/// new" instead of failing the way [`storage::BlobStore::open_for_reading`] would.
-/// Opening a set for writing to find out is not an option: that *creates* it.
+/// `store` is `None` for a location with no set behind it.
+/// That is the first backup of somewhere, and it is the case where a dry run has
+/// to answer "everything is new".
+/// A dry run must not fail the way [`storage::BlobStore::open_for_reading`] would.
+/// Opening a set for writing to find out is not an option, because that *creates*
+/// it.
 ///
 /// Nothing is created, not even the directory the set would have lived in, and no
-/// lock is taken — so a plan can be run against a set another backup is holding
-/// the lock on, at the cost of possibly planning against a set that moves under
-/// it.
+/// lock is taken.
+/// A plan can therefore run against a set another backup is holding the lock on.
+/// The cost is possibly planning against a set that moves under it.
 ///
 /// # Errors
 ///
-/// As [`backup`]: a tree that cannot be walked or read, a file that changes while
-/// it is being read, or a set that cannot answer what it already holds.
+/// As [`backup`]: a tree that cannot be walked or read, or a file that changes
+/// while it is being read.
+/// The run also fails if a set cannot answer what it holds.
 pub async fn backup_plan<P: AsRef<Path> + Debug>(
     root: P,
     options: Options,
@@ -317,9 +346,10 @@ pub async fn backup_plan<P: AsRef<Path> + Debug>(
     let (entries, committed) = run(root, options, planned).await?;
 
     // The snapshot is offered to the store like any other blob and is not a chunk
-    // of anything, so it is dropped here rather than counted. It is identified by
-    // the hash the run committed it under, which is the one thing that run knows it
-    // is not.
+    // of anything.
+    // It is dropped here rather than counted.
+    // It is identified by the hash the run committed it under.
+    // That hash is the one thing that run knows it is not.
     let asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
     let mut chunks = 0u64;
     let mut held = 0u64;
@@ -349,8 +379,10 @@ pub async fn backup_plan<P: AsRef<Path> + Debug>(
 /// The run both entries to this module make, with or without a store underneath.
 ///
 /// Split out rather than written twice because the thing that has to be shared is
-/// the *whole* run: a dry run that walked the tree by any other route could report
-/// a snapshot no backup would ever commit, which would be worse than no report.
+/// the *whole* run.
+/// A dry run that walked the tree by any other route could report a snapshot no
+/// backup would ever commit.
+/// That would be worse than no report.
 #[instrument(level = "info", skip(storage, options), err)]
 async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     root: P,
@@ -366,9 +398,10 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     let root = root.as_ref();
     let concurrency = effective_concurrency(concurrency);
 
-    // The walk goes first and on its own: the snapshot it records and the file
-    // index the pipeline needs have to exist before the first chunk comes back,
-    // and it touches metadata only.
+    // The walk goes first and on its own.
+    // The snapshot it records and the file index the pipeline needs have to exist
+    // before the first chunk comes back.
+    // The walk touches metadata only.
     let walk_root = root.to_path_buf();
     let excluded: Vec<PathBuf> = exclude.iter().map(|p| normalise(p)).collect();
 
@@ -395,15 +428,15 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
         .run(paths, config, concurrency, files, &mut snapshot)
         .await?;
 
-    // The chunker stats each file when it is registered and reads it again later,
-    // so a file that changed size in between would silently shift every
-    // subsequent chunk into the wrong file.
+    // The chunker stats each file when it is registered and reads it again later.
+    // A file that changed size in between would silently shift every subsequent
+    // chunk into the wrong file.
     snapshot.verify_file_lengths("changed while it was being backed up")?;
 
     // Only fails where a path in the snapshot cannot be represented on this
-    // platform, which on unix cannot happen. Reported as invalid input rather
-    // than as damaged data: nothing about the snapshot is wrong, this build
-    // cannot write it.
+    // platform, which on unix cannot happen.
+    // Reported as invalid input rather than as damaged data.
+    // Nothing about the snapshot is wrong. This build cannot write it.
     let buffer = snapshot.to_bytes().map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -412,7 +445,7 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     })?;
 
     // The snapshot is a blob like any other, addressed by the hash of its own
-    // bytes — which is what the commit record names.
+    // bytes. The commit record names that hash.
     let id = blake3::hash(&buffer);
 
     let len = u64::try_from(buffer.len())
@@ -441,17 +474,21 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 /// Walk the tree, recording everything that is not file content.
 fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
     // The walk records each entry relative to the root, so the root itself comes
-    // back with an empty relative path and is skipped below. That skip has to be
-    // unconditional, or anything that is not a directory falls through it and is
-    // recorded with an empty path — a version that commits and can then never be
-    // restored, since `restore` refuses an empty path before writing anything and
-    // no subcommand removes a version.
+    // back with an empty relative path and is skipped below.
+    // That skip has to be unconditional.
+    // Otherwise anything that is not a directory falls through it and is recorded
+    // with an empty path.
+    // Such a version commits and can then never be restored.
+    // `restore` refuses an empty path before writing anything, and no subcommand
+    // removes a version.
     //
-    // `metadata` follows links, so a symlink to a directory passes, which is what
-    // a user who typed `~/current-photos` means and what a shell would do. The
-    // per-entry walk below still uses `symlink_metadata` and still records links
-    // without following them; only the root is resolved, because a tree rooted at
-    // a link has to be entered.
+    // `metadata` follows links, so a symlink to a directory passes.
+    // That is what a user who typed `~/current-photos` means, and what a shell
+    // would do.
+    // The per-entry walk below still uses `symlink_metadata` and still records
+    // links without following them.
+    // Only the root is resolved, because a tree rooted at a link has to be
+    // entered.
     if !fs::metadata(root)?.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -487,9 +524,9 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 .to_path_buf();
 
             // The backup root is the destination on restore, so it is never
-            // recorded as an entry of its own. The root is known to be a
-            // directory by now, so the type test this used to carry is not
-            // needed to justify the skip.
+            // recorded as an entry of its own.
+            // The root is known to be a directory by now, so the type test this
+            // used to carry is not needed to justify the skip.
             if relative_path.as_os_str().is_empty() {
                 return Ok(None);
             }
@@ -513,11 +550,12 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 return Ok(None);
             }
 
-            // A named pipe, socket or device node. Reading one never returns —
-            // opening a FIFO for reading blocks until a writer appears — so they
-            // are skipped rather than hanging the run, and the skip is logged: a
-            // file in the tree the backup does not contain is what a user needs
-            // told.
+            // A named pipe, socket or device node.
+            // Reading one never returns.
+            // Opening a FIFO for reading blocks until a writer appears.
+            // These entries are therefore skipped rather than hanging the run.
+            // The skip is logged, because a file in the tree that the backup does
+            // not contain is what a user needs told.
             if !meta.is_file() {
                 tracing::info!(
                     path = %relative_path.display(),
@@ -526,8 +564,8 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
                 return Ok(None);
             }
 
-            // The first path to reference an inode carries the content; every
-            // later path sharing it becomes a hard link to that one.
+            // The first path to reference an inode carries the content.
+            // Every later path sharing it becomes a hard link to that one.
             if let Some(file_id) = FileId::from_metadata(&meta) {
                 if let Some(first) = inode_map.get(&file_id) {
                     snapshot.links.push(metadata::Link::Hard {
@@ -589,16 +627,20 @@ pub(super) fn index_to_u32(index: usize) -> io::Result<u32> {
 /// A failure from walking the tree, with the walkdir error kept intact.
 ///
 /// The flattening this replaces was `io::Error::other(format!("…: {e}"))`, which
-/// threw away everything about the failure except its text: the `ErrorKind` and
-/// the error itself. So an unreadable directory halfway down a tree came back as
-/// `ErrorKind::Other` when the real answer was `PermissionDenied`, and nothing
-/// could tell the two apart — including a caller of this library, which is not
-/// the CLI and does not have a person reading a message.
+/// threw away everything about the failure except its text.
+/// The `ErrorKind` and the error itself went with it.
+/// So an unreadable directory halfway down a tree came back as
+/// `ErrorKind::Other` when the real answer was `PermissionDenied`.
+/// Nothing could tell the two apart.
+/// That included a caller of this library, which is not the CLI and does not have
+/// a person reading a message.
 ///
-/// The kind is recovered from `walkdir::Error::io_error`, which is `Some` for an
-/// I/O failure and `None` for the one case that has no `io` error to speak of (a
-/// symlink loop). `walkdir` names the offending path in its own `Display`, so the
-/// message gains nothing by being longer.
+/// The kind is recovered from `walkdir::Error::io_error`.
+/// That value is `Some` for an I/O failure and `None` for the one case that has
+/// no `io` error to speak of.
+/// That case is a symlink loop.
+/// `walkdir` names the offending path in its own `Display`, so the message gains
+/// nothing by being longer.
 struct WalkFailure(walkdir::Error);
 
 impl std::fmt::Display for WalkFailure {
@@ -622,9 +664,9 @@ impl std::error::Error for WalkFailure {
 impl From<WalkFailure> for io::Error {
     fn from(failure: WalkFailure) -> Self {
         // The inner error, not the message, so `get_ref` hands back the walkdir
-        // error and `Display` still includes the path it names. The kind comes
-        // from the same place, and is `Other` only when walkdir had no `io` error
-        // to recover it from.
+        // error and `Display` still includes the path it names.
+        // The kind comes from the same place.
+        // It is `Other` only when walkdir had no `io` error to recover it from.
         let kind = failure
             .0
             .io_error()
@@ -646,8 +688,9 @@ impl FileId {
         None
     }
 
-    // Uniform across platforms, though the unix variant always succeeds: the
-    // others genuinely return `None` and callers should not have to care which.
+    // Uniform across platforms, though the unix variant always succeeds.
+    // The others genuinely return `None` and callers should not have to care
+    // which.
     #[cfg(unix)]
     #[allow(clippy::unnecessary_wraps)]
     fn from_metadata(meta: &fs::Metadata) -> Option<FileId> {
@@ -682,13 +725,15 @@ mod tests {
     ///
     /// Tested on the conversion rather than through a real unreadable directory,
     /// because provoking one needs a permission the test cannot take away from
-    /// itself — and this suite often runs as root, where `chmod 000` removes
-    /// nothing. A test that only works for a non-root user is a test that is
-    /// skipped in CI, silently.
+    /// itself.
+    /// This suite often runs as root, where `chmod 000` removes nothing.
+    /// A test that only works for a non-root user is a test that is skipped in
+    /// CI, silently.
     ///
     /// A path that is not there is a genuine walk failure and needs no special
-    /// anything: walkdir yields the `io::Error` underneath, and the question is
-    /// what comes out the other side.
+    /// anything.
+    /// walkdir yields the `io::Error` underneath, and the question is what comes
+    /// out the other side.
     #[test]
     fn a_walk_failure_is_not_flattened_to_other() {
         let missing = std::path::Path::new("/nonexistent-lepatch-walk-test");

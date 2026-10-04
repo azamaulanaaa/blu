@@ -1,53 +1,62 @@
 //! What an apply put into a directory, recorded so the next one need not read it.
 //!
 //! A manifest is a **cache, never a source of truth.** That distinction is the
-//! whole design, and it is the reason this is a separate file rather than a
-//! shortcut inside [`super::probe`].
+//! whole design. It is the reason this is a separate file rather than a shortcut
+//! inside [`super::probe`].
 //!
 //! ## The problem it solves
 //!
-//! An apply writes only the bytes a directory is missing, and finding them means
-//! comparing every slice the version records against what is on disk — a full read
-//! of the tree. For a directory nobody has touched since the last apply that is
-//! pure waste: the bytes are right, and they were right an hour ago.
+//! An apply writes only the bytes a directory is missing.
+//! Finding them means comparing every slice the version records against what is
+//! on disk.
+//! That comparison costs a full read of the tree.
+//! For a directory nobody has touched since the last apply, that read is waste.
+//! The bytes are right, and they were right an hour ago.
 //!
 //! ## Why a cache needs no format of its own
 //!
 //! The obvious design is a new on-disk structure recording which chunk sits where.
-//! It is not needed, because a version's snapshot *already* says that: `files` for
-//! paths and lengths, `file_chunks` for `(file_offset, chunk_offset, length)` and
-//! `chunks` for the hashes. A manifest is therefore the snapshot, plus one thing
-//! the snapshot cannot know — what the filesystem said about each file when this
-//! tool last wrote it.
+//! It is not needed, because a version's snapshot *already* says that.
+//! `files` gives paths and lengths.
+//! `file_chunks` gives `(file_offset, chunk_offset, length)`.
+//! `chunks` gives the hashes.
+//! A manifest is therefore the snapshot, plus one thing the snapshot cannot know.
+//! That thing is what the filesystem said about each file when this tool last
+//! wrote it.
 //!
-//! Reusing the snapshot encoding means the blob is verified by the same decoder
-//! that has been reading snapshots all along, and a manifest can never disagree
-//! with a version about chunk placement: it *is* one.
+//! Reusing the snapshot encoding means the same decoder that has been reading
+//! snapshots all along verifies the blob.
+//! A manifest can never disagree with a version about chunk placement, because it
+//! *is* one.
 //!
 //! ## Why it is not a source of truth
 //!
-//! A directory keeps changing after an apply writes it. A user edits a file, and a
-//! manifest that still claims the old chunk layout is worse than no manifest at
-//! all: it would let an apply skip a file that is now wrong and report success.
+//! A directory keeps changing after an apply writes it.
+//! A user edits a file, and a manifest that still claims the old chunk layout is
+//! worse than no manifest at all.
+//! Such a manifest would let an apply skip a file that is now wrong and report
+//! success.
 //!
 //! So nothing here is believed on sight. [`Manifest::untrusted`] re-stats every
-//! file and compares length and modification time against what the version imposed,
-//! and any file that moved is reported as untrusted so the caller reads it
-//! properly. A manifest that does not exist, does not decode, or names a version
-//! the caller is not applying is not an error — it is a cache miss, and the caller
-//! falls back to reading the whole tree.
+//! file and compares length and modification time against what the version imposed.
+//! It reports any file that moved as untrusted, so the caller reads it properly.
+//! A manifest that does not exist, does not decode, or names a version the caller
+//! is not applying is not an error.
+//! It is a cache miss, and the caller falls back to reading the whole tree.
 //!
 //! ## What is recorded is what the version imposes
 //!
-//! Not what `stat` returns when the manifest is written. A length and a
-//! modification time are known before the write and are exactly what the tree will
-//! look like after, because they are what `set_len` and the attribute stage put
-//! there. Recording the pre-write state instead would make a manifest stale the
-//! moment the apply that wrote it finished.
+//! Not what `stat` returns when the manifest is written.
+//! A length and a modification time are known before the write.
+//! Both are exactly what the tree will look like after, because they are what
+//! `set_len` and the attribute stage put there.
+//! Recording the pre-write state instead would make a manifest stale the moment
+//! the apply that wrote it finished.
 //!
 //! That is why this file is written with [`fs::write`] through a temporary and a
-//! rename rather than incrementally: a manifest torn by a crash mid-write would
-//! name half its files, and the stat check would pass for the half it did name.
+//! rename rather than incrementally.
+//! A manifest torn by a crash mid-write would name half its files.
+//! The stat check would then pass for the half it did name.
 
 use std::{
     collections::HashMap,
@@ -60,8 +69,9 @@ use crate::{fsattr, metadata::Snapshot, storage::BlobId};
 /// Suffix of the file recording what an apply put into a directory.
 ///
 /// Beside the destination rather than inside it, on the same terms as
-/// [`super::restore`]'s lock and scratch directories: it must not appear in the
-/// tree it describes, or it would be backed up as part of it.
+/// [`super::restore`]'s lock and scratch directories.
+/// It must not appear in the tree it describes.
+/// Otherwise it would be backed up as part of that tree.
 pub const MANIFEST_SUFFIX: &str = "lepatch-state";
 
 /// What a filesystem reported about one file when a manifest was written.
@@ -75,9 +85,10 @@ struct Recorded {
 /// What an apply put into a directory.
 ///
 /// Holds the version it applied and, for each file, the length and modification
-/// time the filesystem had at that moment. The chunk placement itself is not
-/// stored here — it is read back out of the snapshot, so there is only ever one
-/// copy of it in the system.
+/// time the filesystem had at that moment.
+/// The chunk placement itself is not stored here.
+/// It is read back out of the snapshot, so there is only ever one copy of it in
+/// the system.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     /// The hash of the snapshot this was written from.
@@ -122,23 +133,26 @@ impl Manifest {
     /// whole reason it works.
     ///
     /// What this records is what the version *imposes*: `file.len` and
-    /// `file.attrs.mtime`. Both are known before a byte is written and both are
-    /// exactly what the tree will look like once `apply` has finished, because
-    /// those are the values `set_len` and the attribute stage put there.
+    /// `file.attrs.mtime`.
+    /// Both are known before a byte is written.
+    /// Both are exactly what the tree will look like once `apply` has finished,
+    /// because those are the values `set_len` and the attribute stage put there.
     ///
-    /// Recording what `stat` returns instead — which was the first attempt, and is
-    /// the obvious reading of "record what is there" — records the *old* state for
-    /// every file the apply is about to change, and then reports itself stale
-    /// immediately afterwards. For a file being created it records nothing at all.
-    /// A manifest that is wrong about the apply that wrote it is worse than none,
-    /// because a caller that believes it skips files it should have read.
+    /// Recording what `stat` returns instead was the first attempt.
+    /// It is also the obvious reading of "record what is there".
+    /// That approach records the *old* state for every file the apply is about to
+    /// change, and then reports itself stale immediately afterwards.
+    /// For a file being created it records nothing at all.
+    /// A manifest that is wrong about the apply that wrote it is worse than none.
+    /// A caller that believes such a manifest skips files it should have read.
     ///
     /// # Errors
     ///
     /// Returns an error only if the destination has no directory name to record
-    /// anything beside. A version that records no modification time for a file
-    /// yields no record for it, so that file is read next time rather than trusted
-    /// on nothing.
+    /// anything beside.
+    /// A version that records no modification time for a file yields no record for
+    /// it.
+    /// That file is read next time rather than trusted on nothing.
     pub fn record(root: &Path, version: BlobId, snapshot: &Snapshot) -> io::Result<Self> {
         // Resolved once, so a destination with no usable name is refused before a
         // version is walked rather than after.
@@ -148,9 +162,9 @@ impl Manifest {
 
         for file in &snapshot.files {
             // No recorded time means there is nothing to compare against, so the
-            // file gets no entry and is read next time. Recording a zero time would
-            // be a claim, and it would be a false one on any filesystem with a real
-            // epoch.
+            // file gets no entry and is read next time.
+            // Recording a zero time would be a claim, and it would be a false one
+            // on any filesystem with a real epoch.
             let Some(mtime) = file.attrs.mtime else {
                 continue;
             };
@@ -171,14 +185,16 @@ impl Manifest {
     /// The paths in `snapshot` this manifest cannot vouch for.
     ///
     /// Empty means every file is where it was left, and a caller may skip reading
-    /// the ones it recognises. Anything named here must be read properly: a
-    /// manifest that claimed a file whose content has since changed is the one
-    /// way this cache could make an apply wrong, so the fallback is per file and
-    /// not all-or-nothing.
+    /// the ones it recognises.
+    /// Anything named here must be read properly.
+    /// A manifest that claimed a file whose content has since changed is the one
+    /// way this cache could make an apply wrong.
+    /// The fallback is therefore per file and not all-or-nothing.
     ///
     /// A path in `snapshot` that the manifest has no record for is untrusted, as
-    /// is one whose length or modification time has moved. A record for a path the
-    /// version does not have is ignored — it is a leftover, not a claim.
+    /// is one whose length or modification time has moved.
+    /// A record for a path the version does not have is ignored.
+    /// Such a record is a leftover, not a claim.
     #[must_use]
     pub fn untrusted(&self, root: &Path, snapshot: &Snapshot) -> Vec<PathBuf> {
         let mut out = Vec::new();
@@ -216,8 +232,9 @@ impl Manifest {
     /// Write this manifest beside its destination.
     ///
     /// Through a temporary and a rename, so a crash mid-write leaves either the
-    /// old manifest or none — never a half-written one that would name some files
-    /// and not others and pass the stat check for the ones it did name.
+    /// old manifest or none.
+    /// It never leaves a half-written one that would name some files and not
+    /// others and pass the stat check for the ones it did name.
     ///
     /// # Errors
     ///
@@ -237,17 +254,20 @@ impl Manifest {
     /// Read the manifest beside `destination`, if there is a usable one.
     ///
     /// Returns `Ok(None)` for every form of absence and every form of
-    /// unreadability, because a caller that cannot use the cache falls back to
-    /// reading the tree and there is nothing for it to report. A manifest is
-    /// always a candidate for deletion by anything that touches the machine, so
-    /// its absence is routine rather than exceptional — and a corrupt one is
-    /// indistinguishable from an absent one as far as the work left to do.
+    /// unreadability.
+    /// A caller that cannot use the cache falls back to reading the tree, and
+    /// there is nothing for it to report.
+    /// Anything that touches the machine can delete a manifest, so its absence is
+    /// routine rather than exceptional.
+    /// A corrupt one is indistinguishable from an absent one as far as the work
+    /// left to do.
     ///
     /// # Errors
     ///
-    /// Returns an error only if the manifest's path cannot be formed. Every I/O
-    /// failure while reading it is reported as a miss, since none of them leaves a
-    /// caller with anything it could not also do by finding no manifest at all.
+    /// Returns an error only if the manifest's path cannot be formed.
+    /// Every I/O failure while reading it is reported as a miss.
+    /// None of them leaves a caller with anything it could not also do by finding
+    /// no manifest at all.
     pub fn load(destination: &Path) -> io::Result<Option<Self>> {
         let Ok(path) = Self::path_for(destination) else {
             return Ok(None);
@@ -262,9 +282,10 @@ impl Manifest {
 
     /// Remove the manifest beside `destination`, if it is there.
     ///
-    /// Used when an apply decides the cache no longer describes the tree — a
-    /// destination that has been pruned or overwritten by something else — so
-    /// that the next run does not consult a record known to be wrong.
+    /// Used when an apply decides the cache no longer describes the tree.
+    /// That happens for a destination that has been pruned or overwritten by
+    /// something else.
+    /// The next run must then not consult a record known to be wrong.
     ///
     /// # Errors
     ///
@@ -315,9 +336,11 @@ fn encode(manifest: &Manifest) -> io::Result<Vec<u8>> {
 
 /// A signed time as one unsigned number, so a varint can carry it.
 ///
-/// Zigzag, rather than a sign flag beside the magnitude: one value per field
-/// instead of two, no special case in the decoder, and it round-trips the full
-/// `i64` range rather than the half a sign bit would leave addressable.
+/// Zigzag, rather than a sign flag beside the magnitude.
+/// Zigzag stores one value per field instead of two, and needs no special case
+/// in the decoder.
+/// It also round-trips the full `i64` range rather than the half a sign bit
+/// would leave addressable.
 fn zigzag(value: i64) -> u64 {
     let shifted = (value << 1) ^ (value >> 63);
     shifted.cast_unsigned()
@@ -330,9 +353,10 @@ fn unzigzag(value: u64) -> i64 {
 
 /// Decode a manifest, or `None` if the bytes are not one.
 ///
-/// Every failure is the same failure to a caller: unusable. The reasons are
-/// distinguished in the tests rather than in the type, because there is one
-/// correct response to all of them and it is to read the tree instead.
+/// Every failure is the same failure to a caller: unusable.
+/// The reasons are distinguished in the tests rather than in the type.
+/// There is one correct response to all of them, and it is to read the tree
+/// instead.
 fn decode(bytes: &[u8]) -> Option<Manifest> {
     let mut at = 0usize;
 

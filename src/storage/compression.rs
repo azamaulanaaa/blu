@@ -1,20 +1,20 @@
-//! How record payloads are compressed on the way in — and, more often, not.
+//! How record payloads are compressed on the way in, and, more often, not.
 //!
-//! The policy is handed to the writer and the reader never sees it: every record
-//! names the codec it was written with, so a set written at mixed levels, or
-//! with compression off, is still one store and still deduplicates. That is
-//! what makes the fallback in `compress` safe, and on a real tree the fallback
-//! is the common case — photos, archives and video are already entropy-coded,
-//! and a frame around one comes out *larger* than the bytes it replaced.
+//! The writer receives the policy and the reader never sees it. Every record
+//! names the codec it was written with. A set written at mixed levels, or with
+//! compression off, is therefore still one store and still deduplicates. That is
+//! what makes the fallback in `compress` safe. On a real tree the fallback is the
+//! common case. Photos, archives and video are already entropy-coded. A frame
+//! around one comes out *larger* than the bytes it replaced.
 //!
 //! [`Compressor`] and [`Decompressor`] are the two halves of that policy as a
-//! seam, so a caller outside this crate can bring its own without the store
-//! learning about it. [`Compression`] implements the first and [`Zstd`] the
-//! second, which is the whole of what this crate ships.
+//! seam, so a caller outside this crate can bring its own. The store does not
+//! learn about it. [`Compression`] implements the first half. [`Zstd`] implements
+//! the second half. Those are the whole of what this crate ships.
 //!
-//! The measurements behind the default level are in the README, and
-//! `tests/compression.rs` is what holds the store's other properties still true
-//! across a codec byte.
+//! The measurements behind the default level are in the README.
+//! `tests/compression.rs` holds the store's other properties true across a codec
+//! byte.
 
 use std::{borrow::Cow, io};
 
@@ -22,72 +22,74 @@ use super::record::Codec;
 
 /// How a payload becomes the bytes a record stores.
 ///
-/// The seam is *how a payload is written*, not *which codec*: an implementation is
-/// handed a payload and answers with the bytes to write and the codec to record
+/// The seam is *how a payload is written*, not *which codec*. An implementation
+/// receives a payload and answers with the bytes to write and the codec to record
 /// beside them. Nothing here is about zstd, about a level, or about whether
-/// compressing is a good idea for this payload — [`Compression`] is one
-/// implementation and the one this crate ships, but a caller with its own policy
-/// (a size threshold, a level of its own, a rule about which payloads are worth a
-/// frame) implements this trait and hands it to
-/// [`BlobStore::open_for_writing`](super::BlobStore::open_for_writing) instead,
-/// without touching a line of the store.
+/// compressing this payload is a good idea. [`Compression`] is one implementation
+/// and the one this crate ships. A caller with its own policy implements this trait
+/// instead. That policy may set a size threshold, a level of its own, or a rule
+/// about which payloads are worth a frame. The caller hands it to
+/// [`BlobStore::open_for_writing`](super::BlobStore::open_for_writing). The store
+/// stays unchanged.
 ///
 /// What a caller cannot do through this trait is add a codec. [`Codec`] has two
-/// arms and the store decodes one of them, so a policy is a choice about *which
-/// payloads* get a frame, at what level, and whether one is built at all — and
-/// the codec that comes back is advice, because the store records its own:
-/// `Zstd` only for bytes it will keep, and `Raw` for the payload it hashed.
-/// Naming a third codec would mean a new on-disk format, which is a larger
-/// change than the seam is for.
+/// arms and the store decodes one of them. A policy is therefore a choice about
+/// *which payloads* get a frame, at what level, and whether one is built at all.
+/// The codec that comes back is only advice, because the store records its own.
+/// The store records `Zstd` only for bytes it will keep. It records `Raw` for the
+/// payload it hashed. Naming a third codec would mean a new on-disk format. That
+/// is a larger change than the seam is for.
 ///
 /// # The fallback belongs to the writer, not to the trait
 ///
-/// The one rule a payload must never break is **a frame is stored only when it is
-/// strictly smaller than the payload it replaces**. It is documented on
-/// [`Compressor::compress`] as an obligation and *not* left to the obligation:
-/// [`super::BlobStore`] re-checks the answer and stores the payload untouched
-/// whenever the returned bytes came back no smaller, or named a codec the store
-/// cannot decode. So the guarantee is a property of the store rather than a
-/// promise every implementor has to remember, and a third-party compressor
-/// cannot grow a set by accident, or store bytes under a name that means
-/// something else.
+/// The one rule a payload must never break is this.
+/// **A frame is stored only when it is strictly smaller than the payload it
+/// replaces**. The rule is documented on
+/// [`Compressor::compress`] as an obligation. It is also not left to the
+/// obligation. [`super::BlobStore`] re-checks the answer and stores the payload
+/// untouched whenever the returned bytes came back no smaller. The store also
+/// stores the payload untouched when the codec is one the store cannot decode. The
+/// guarantee is therefore a property of the store rather than a promise that every
+/// implementor has to remember. A third-party compressor cannot grow a set by
+/// accident. It also cannot store bytes under a name that means something else.
 ///
-/// The alternative — leaving it to the implementor, and trusting it — was rejected
-/// for the obvious reason: the cost of getting it wrong is paid by the user's
-/// disk, not by the crate, and the mistake is invisible in review because a
-/// compressor that returns a frame is *doing what it was asked*. A compressor that
-/// is always allowed to answer is also a compressor that can always be wrong.
+/// The alternative was to leave the rule to the implementor and trust it. The
+/// crate rejected that alternative for an obvious reason. The cost of getting it
+/// wrong is paid by the user's disk, not by the crate. The mistake is also
+/// invisible in review, because a compressor that returns a frame is *doing what
+/// it was asked*. A compressor that is always allowed to answer is also a
+/// compressor that can always be wrong.
 ///
-/// [`Compression`] applies the rule itself as well, which is not redundant: it is
-/// what lets it hand back the input borrowed rather than an owned frame the store
-/// would drop, and the frame has to be built either way to be measured against the
-/// input. So the rule is stated once, where the size is compared, and enforced
-/// once, where the bytes are written.
+/// [`Compression`] applies the rule itself as well, which is not redundant. That
+/// is what lets it hand back the input borrowed rather than an owned frame that
+/// the store would drop. The frame has to be built either way, to be measured
+/// against the input. The rule is therefore stated once, where the size is
+/// compared, and enforced once, where the bytes are written.
 ///
-/// The lifetime is named rather than elided: with two input lifetimes, elision
-/// would tie the returned borrow to `&self` rather than to `raw`, which is the
-/// opposite of what every implementation wants — the answer usually borrows the
-/// payload and never touches the policy.
+/// The lifetime is named rather than elided. With two input lifetimes, elision
+/// would tie the returned borrow to `&self` rather than to `raw`. The opposite of
+/// what every implementation wants is what elision would produce. The answer
+/// usually borrows the payload and never touches the policy.
 pub trait Compressor: Send + Sync + 'static {
     /// The bytes to store for `raw`, and the codec to record beside them.
     ///
-    /// Returning [`Codec::Raw`] means "store these bytes as they are", which is a
-    /// legitimate answer for any payload and not a failure: the overwhelming
-    /// majority of a real tree is already entropy-coded, and a frame around one
-    /// comes out larger.
+    /// Returning [`Codec::Raw`] means "store these bytes as they are". That is a
+    /// legitimate answer for any payload, and it is not a failure. The
+    /// overwhelming majority of a real tree is already entropy-coded. A frame
+    /// around one comes out larger.
     ///
-    /// The answer is not trusted to be an improvement, and not trusted to name a
-    /// codec either — see the note on the trait — so the store stores `raw`
-    /// untouched unless the returned bytes are strictly smaller and the codec is
-    /// one it can decode. `Cow` rather than `Vec` for the reason [`Compression`]
-    /// gives: most answers are the input, unchanged.
+    /// The store does not trust the answer to be an improvement. The store does
+    /// not trust the codec either. See the note on the trait. The store stores
+    /// `raw` untouched unless the returned bytes are strictly smaller and the codec
+    /// is one it can decode. `Cow` rather than `Vec` for the reason [`Compression`]
+    /// gives. Most answers are the input, unchanged.
     fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>);
 }
 
 impl Compressor for Compression {
     fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>) {
         // Fully qualified, because the inherent method and this one are the same
-        // operation under two names: the inherent one is what the tests in this
+        // operation under two names. The inherent one is what the tests in this
         // module call, and it is not going away.
         Compression::compress(*self, raw)
     }
@@ -95,39 +97,40 @@ impl Compressor for Compression {
 
 /// How stored bytes become a payload again.
 ///
-/// The mirror of [`Compressor`], and separate from it for the reason the two are
-/// separate at all: a write policy is chosen by whoever opened the store, while a
-/// read is answered by the codec byte in the record being read. A caller reading a
-/// set written under a policy it has never heard of still has to decode it, so the
-/// reader is not given a policy — it is given the codec, and this is what the
-/// codec means.
+/// The mirror of [`Compressor`]. The two are separate for the reason the two are
+/// separate at all. A write policy is chosen by whoever opened the store. A read
+/// is answered by the codec byte in the record being read. A caller that reads a
+/// set written under a policy it has never heard of still has to decode it. The
+/// reader therefore is not given a policy. The reader is given the codec. This
+/// module says what the codec means.
 ///
 /// [`Zstd`] is the only implementation, because [`Codec`] has only one
-/// non-trivial arm. It is a trait rather than a call to `zstd::bulk::decompress`
-/// because that call has more to it than the decode — it validates a frame against
-/// the length its record claims, which is a trust decision about the file and not a
-/// detail of the codec — and because the two places that decode were each doing
-/// that validation for themselves.
+/// non-trivial arm. The value is a trait rather than a call to
+/// `zstd::bulk::decompress` for two reasons. That call has more to it than the
+/// decode. It validates a frame against the length its record claims. That is a
+/// trust decision about the file and not a detail of the codec. The two places
+/// that decode were each doing that validation for themselves.
 ///
 /// Return-position `impl Future` for the `+ Send`, and for the same reason as
-/// [`super::StorageGet::get`](super::StorageGet): a decode runs on the blocking
-/// pool and its future is awaited from a `get`, which is spawned.
+/// [`super::StorageGet::get`](super::StorageGet). A decode runs on the blocking
+/// pool. Its future is awaited from a `get`, which is spawned.
 pub trait Decompressor: Send + Sync + 'static {
     /// Decode `stored` into the payload, which must come back exactly `raw_len`
     /// bytes long.
     ///
-    /// `raw_len` is the record's claim, not a measurement: a record header carries a
-    /// truncated hash rather than a MAC, so it is checked against the frame and
-    /// never trusted. An implementation must refuse a frame that does not produce
-    /// exactly that many bytes rather than hand back a short read — a short read
-    /// looks like end of stream, and a restore that trusts one produces a file that
-    /// is quietly incomplete.
+    /// `raw_len` is the record's claim, not a measurement. A record header carries
+    /// a truncated hash rather than a MAC, so the frame is checked against
+    /// `raw_len` and `raw_len` is never trusted. An implementation must refuse a
+    /// frame that does not produce exactly that many bytes. It must refuse rather
+    /// than hand back a short read. A short read looks like the end of a stream. A
+    /// restore that trusts one produces a file that is quietly incomplete.
     ///
     /// # Errors
     ///
-    /// Returns an error if `stored` is not a frame this codec recognises, if the
-    /// frame does not say how many bytes it decodes to, if that number is not
-    /// `raw_len`, or if `raw_len` is not something this process can hold.
+    /// Returns an error if `stored` is not a frame this codec recognises. The
+    /// code also returns an error if the frame does not say how many bytes it
+    /// decodes to. It returns an error if that number is not `raw_len`. It
+    /// returns an error if `raw_len` is not something this process can hold.
     fn decompress(
         &self,
         stored: Vec<u8>,
@@ -137,18 +140,18 @@ pub trait Decompressor: Send + Sync + 'static {
 
 /// The only [`Decompressor`] this crate ships: zstd frames.
 ///
-/// A unit struct rather than an enum because there is one thing to be, and a type
-/// that says which is what an implementor of [`Decompressor`] needs to name. It
-/// carries no level: decoding does not take one, and a frame records the level it
-/// was written at in its own header.
+/// A unit struct rather than an enum, because there is one thing to be.
+/// A type that says which is what an implementor of [`Decompressor`] needs to
+/// name. It carries no level. Decoding does not take one. A frame records the
+/// level it was written at in its own header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Zstd;
 
 /// The body of [`Zstd::decompress`], split out so the trait method above can keep
-/// its return-position `impl Future` — the `manual_async_fn` lint points at a
-/// signature that names the future rather than an `async fn`, and here the naming
-/// is the point: it is what says the future can cross a thread, which an `async
-/// fn` in a trait does not.
+/// its return-position `impl Future`. The `manual_async_fn` lint points at a
+/// signature that names the future rather than an `async fn`. Here the naming is
+/// the point. The name says the future can cross a thread, which an `async fn` in
+/// a trait does not.
 impl Zstd {
     async fn decode(&self, stored: Vec<u8>, raw_len: u64) -> io::Result<Vec<u8>> {
         let expected = usize::try_from(raw_len).map_err(|_| {
@@ -159,8 +162,8 @@ impl Zstd {
         })?;
 
         // `None` means the frame does not declare a size, which is what a
-        // compressed *stream* looks like. Nothing here produces one, and
-        // accepting one would mean decoding blind.
+        // compressed *stream* looks like. Nothing here produces one, and accepting
+        // one would mean decoding blind.
         let declared = zstd::zstd_safe::get_frame_content_size(&stored)
             .map_err(|e| {
                 io::Error::new(
@@ -216,10 +219,10 @@ impl Decompressor for Zstd {
 
 /// How record payloads are compressed on the way in.
 ///
-/// A write policy, not a format property: every record names the codec it was
-/// written with and hashes the content rather than the stored bytes, so a set
-/// written at mixed levels — or with compression off — reads back and
-/// deduplicates correctly. The default is [`Compression::Zstd`] at level 1; the
+/// A write policy, not a format property. Every record names the codec it was
+/// written with. Every record hashes the content rather than the stored bytes. A
+/// set written at mixed levels, or with compression off, therefore reads back and
+/// deduplicates correctly. The default is [`Compression::Zstd`] at level 1. The
 /// measurements behind that are in the README.
 ///
 /// # Example
@@ -260,7 +263,7 @@ pub enum Compression {
     },
 }
 
-/// The highest level offered. zstd goes further; see [`Compression`].
+/// The highest level offered. zstd goes further. See [`Compression`].
 pub const MAX_COMPRESSION_LEVEL: u8 = 9;
 
 impl Default for Compression {
@@ -273,11 +276,11 @@ impl Compression {
     /// zstd at `level`, clamped to 1..=[`MAX_COMPRESSION_LEVEL`].
     ///
     /// The only way to name a zstd policy. A level of 0 clamps to 1, not to
-    /// [`Compression::Off`], because the caller asked for zstd and the two are
-    /// different requests: `Off` is a decision to store payloads as they are, and
-    /// silently taking it would be a store written at a policy nobody chose.
-    /// [`Compression::from_level`] is how a user's 0 becomes `Off`, and it is a
-    /// separate function because that is a separate question.
+    /// [`Compression::Off`]. The caller asked for zstd, and the two are different
+    /// requests. `Off` is a decision to store payloads as they are. Silently
+    /// taking it would be a store written at a policy that nobody chose.
+    /// [`Compression::from_level`] is how a user's 0 becomes `Off`. That is a
+    /// separate function because it answers a separate question.
     #[must_use]
     pub fn zstd(level: u8) -> Self {
         Self::Zstd {
@@ -288,12 +291,12 @@ impl Compression {
     /// The policy for a level the way a user counts them: 0 stores payloads as they
     /// are, and 1 to 9 are zstd levels.
     ///
-    /// The difference from [`Compression::zstd`] is the `0` arm and nothing else,
-    /// which is the whole reason they are two functions. One of them means "use
-    /// zstd at this level" and the other means "this is a level from a command
-    /// line, where 0 has always meant off". A single function would have to
-    /// answer both questions, and it would answer the first one wrongly for
-    /// anyone who passed 0 meaning zstd's floor.
+    /// The difference from [`Compression::zstd`] is the `0` arm and nothing else.
+    /// That is the whole reason they are two functions. One of them means "use
+    /// zstd at this level". The other means "this is a level from a command line,
+    /// where 0 has always meant off". A single function would have to answer both
+    /// questions. It would answer the first one wrongly for anyone who passed 0
+    /// meaning zstd's floor.
     ///
     /// Out-of-range values are clamped rather than rejected, so a bad number gives
     /// a working policy rather than a panic. A command line rejects them instead,
@@ -320,30 +323,30 @@ impl Compression {
     ///
     /// This is the inherent form of [`Compressor::compress`], and it is what the
     /// store calls through the trait. It stays as a method because the unit tests
-    /// below pin the fallback through it, and a test that went through a trait
-    /// object to assert a pointer was not the clearest way to say what it meant.
+    /// below pin the fallback through it. A test that went through a trait object to
+    /// assert a pointer was not the clearest way to say what it meant.
     ///
-    /// A payload becomes a zstd frame only when that frame is strictly smaller
-    /// than the input; otherwise [`Codec::Raw`] and the bytes unchanged, so
+    /// A payload becomes a zstd frame only when that frame is strictly smaller than
+    /// the input. Otherwise the answer is [`Codec::Raw`] and the bytes unchanged, so
     /// already-compressed content never grows by a frame header.
     ///
     /// The bytes are a [`Cow`] because three of the four answers are "the input,
-    /// unchanged", and returning a [`Vec`] made each of them a full copy of a
-    /// payload the caller was already holding. That is not a rare path either: it
-    /// is every payload with compression off, and every payload zstd cannot make
-    /// smaller — which is most of a tree of photos, archives or video, since a
-    /// zstd frame on content like that comes out *larger* and takes the fallback.
-    /// So the common case copied every byte of the tree an extra time to then hand
-    /// back exactly what it was given.
+    /// unchanged". Returning a [`Vec`] made each of them a full copy of a payload
+    /// that the caller was already holding. That is not a rare path. It is every
+    /// payload with compression off. It is also every payload that zstd cannot make
+    /// smaller. That is most of a tree of photos, archives or video. A zstd
+    /// frame on content like that comes out *larger* and takes the fallback. The
+    /// common case therefore copied every byte of the tree an extra time, then
+    /// handed back exactly what it was given.
     ///
-    /// The copy for the fourth answer is unavoidable and worth it: a frame is
-    /// built before it is known to be smaller than the input.
+    /// The copy for the fourth answer is unavoidable and worth it. A frame is built
+    /// before it is known to be smaller than the input.
     pub(super) fn compress(self, raw: &[u8]) -> (Codec, Cow<'_, [u8]>) {
         let Some(level) = self.level() else {
             return (Codec::Raw, Cow::Borrowed(raw));
         };
 
-        // A compressor failure is not an error: the fallback stores the bytes as
+        // A compressor failure is not an error. The fallback stores the bytes as
         // they are, which is a correct record and beats failing a backup.
         let Ok(encoded) = zstd::bulk::compress(raw, i32::from(level)) else {
             return (Codec::Raw, Cow::Borrowed(raw));
@@ -369,17 +372,17 @@ mod compression_tests {
 
     /// A payload the compressor cannot make smaller falls through untouched.
     ///
-    /// The three "the input, unchanged" answers are the ones worth pinning, and
-    /// pointer identity is how: the borrowed variant's data address is the input's
-    /// address, so a copy cannot have happened. A timing comparison cannot say
-    /// this — a backup here turns out to be bound by per-record filesystem work
-    /// rather than by memory bandwidth, so removing a full copy of every payload
-    /// measures as nothing. Whether the copy happens is a fact about the code, and
-    /// this asserts it directly.
+    /// The three "the input, unchanged" answers are the ones worth pinning. Pointer
+    /// identity is how. The borrowed variant's data address is the input's address,
+    /// so a copy cannot have happened. A timing comparison cannot say this. A
+    /// backup here turns out to be bound by per-record filesystem work rather than
+    /// by memory bandwidth. Removing a full copy of every payload therefore measures
+    /// as nothing. Whether the copy happens is a fact about the code, and this
+    /// asserts it directly.
     ///
-    /// Incompressible input is the realistic trigger, not a corner: photos, video
+    /// Incompressible input is the realistic trigger, not a corner. Photos, video
     /// and archives are most of a real tree, and a zstd frame around one is larger
-    /// than the payload, so every one of them takes the fallback.
+    /// than the payload. Every one of them therefore takes the fallback.
     #[test]
     fn a_payload_the_compressor_cannot_shrink_is_handed_back_untouched() {
         let raw = incompressible(64 * 1024);
@@ -416,7 +419,7 @@ mod compression_tests {
     /// Compression that works still owns its buffer.
     ///
     /// The complement, so the previous test cannot be satisfied by never
-    /// compressing anything: when a frame *is* smaller, it is a fresh allocation
+    /// compressing anything. When a frame *is* smaller, it is a fresh allocation
     /// and does not alias the input.
     #[test]
     fn a_payload_that_compresses_is_an_owned_copy() {
@@ -438,21 +441,22 @@ mod compression_tests {
 
     /// The message a caller sees when the stored bytes are not a frame.
     ///
-    /// The texts in [`Zstd`] are the store's report of a damaged record, and a
-    /// restore is the only thing standing between a backup and a silently wrong
-    /// file — so they are part of what this crate promises. Asserting them here
-    /// is what stops that being true only because nobody has reworded them yet.
+    /// The texts in [`Zstd`] are the store's report of a damaged record. A restore
+    /// is the only thing that stands between a backup and a silently wrong file.
+    /// The texts are therefore part of what this crate promises. Asserting them
+    /// here is what stops that being true only because nobody has reworded them
+    /// yet.
     ///
-    /// `InvalidData` and the "not a readable zstd frame" wording are both
-    /// asserted: the kind is what a caller can branch on, and zstd's own `{e}` is
-    /// part of the message because it is what says which frame complaint this was.
+    /// Both `InvalidData` and the "not a readable zstd frame" wording are asserted.
+    /// The kind is what a caller can branch on. zstd's own `{e}` is part of the
+    /// message because it says which frame complaint this was.
     ///
-    /// The panic path below it — a decode that panics inside `spawn_blocking` —
-    /// is deliberately not covered, because it cannot be reached from a test
-    /// without contrivance: it needs `zstd::bulk::decompress` itself to panic, and
-    /// this API gives a caller no way to arrange that. It is mapped to
-    /// `"decompression panicked: …"` so a panic cannot take the run down with it,
-    /// not because a test gets there.
+    /// The panic path below is deliberately not covered. The path is a decode that
+    /// panics inside `spawn_blocking`. A test cannot reach it without contrivance.
+    /// Reaching it needs `zstd::bulk::decompress` itself to panic, and this API
+    /// gives a caller no way to arrange that. The path is mapped to
+    /// `"decompression panicked: …"` so a panic cannot take the run down with it.
+    /// It is not mapped there because a test gets there.
     #[tokio::test]
     async fn bytes_that_are_not_a_frame_are_reported_as_such() {
         let err = Zstd
@@ -475,9 +479,9 @@ mod compression_tests {
 
     /// A frame that decodes to the wrong number of bytes is refused, by name.
     ///
-    /// The check this is, on a frame that is otherwise perfectly good: a header
-    /// that lies about the payload's length would otherwise decode to something,
-    /// and a restore would write it out as if it were the file.
+    /// The check this is, on a frame that is otherwise perfectly good. A header
+    /// that lies about the payload's length would otherwise decode to something. A
+    /// restore would then write it out as if it were the file.
     #[tokio::test]
     async fn a_frame_that_decodes_to_the_wrong_size_is_refused_by_name() {
         let raw = vec![b'a'; 64 * 1024];
@@ -498,10 +502,10 @@ mod compression_tests {
 
     /// A frame that declares no size at all is refused rather than decoded blind.
     ///
-    /// A *streaming* frame is what looks like this: the encoder did not know the
-    /// length up front, so the header does not carry it. Nothing this crate
-    /// writes produces one, which is exactly why accepting one would mean decoding
-    /// a record with nothing to check the answer against.
+    /// A *streaming* frame is what looks like this. The encoder did not know the
+    /// length up front, so the header does not carry it. Nothing this crate writes
+    /// produces one. That is exactly why accepting one would mean decoding a record
+    /// with nothing to check the answer against.
     #[tokio::test]
     async fn a_frame_that_declares_no_size_is_refused_by_name() {
         let mut frame = Vec::new();
@@ -525,11 +529,12 @@ mod compression_tests {
 
     /// Bytes zstd cannot compress, without needing a fixture on disk.
     ///
-    /// BLAKE3 of a counter, so the input has no structure to find but is not
-    /// obviously patterned either — the shape that defeats a general-purpose
-    /// compressor. Asserted here rather than assumed, because a test that
-    /// *assumes* its input is incompressible passes for the wrong reason when it
-    /// is not: it would be testing the compressed path and calling it the fallback.
+    /// BLAKE3 of a counter, so the input has no structure to find. The input is not
+    /// obviously patterned either. That is the shape that defeats a general-purpose
+    /// compressor. The property is asserted here rather than assumed. A test
+    /// that *assumes* its input is incompressible passes for the wrong reason when
+    /// it is not. Such a test would exercise the compressed path and call it the
+    /// fallback.
     fn incompressible(len: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(len);
         let mut counter = 0u64;

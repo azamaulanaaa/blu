@@ -6,8 +6,9 @@
 //!
 //! ## Why not hash the tree and compare
 //!
-//! The obvious approach — walk the target, hash it, compare against the version —
-//! cannot work here, for two separate reasons, and both matter.
+//! The obvious approach cannot work here, for two separate reasons, and both
+//! matter. That approach is to walk the target, hash it, and compare the result
+//! against the version.
 //!
 //! A version is not named by a hash of its contents. It is named by the hash of
 //! the *snapshot blob*, which is the encoded file table: paths, lengths,
@@ -19,7 +20,7 @@
 //! And re-chunking the target would not reproduce the version's chunks anyway.
 //! Boundaries are content-defined over all the files read as one concatenated
 //! stream, so they depend on the bytes that came before and on the order the walk
-//! produced — a tree with one extra file in it chunks differently, and so does the
+//! produced. A tree with one extra file in it chunks differently, and so does the
 //! same tree read in a different order.
 //!
 //! ## So: verify the slices the version records, against the chunk's bytes
@@ -30,31 +31,37 @@
 //!
 //! **Comparing against the bytes rather than against the hash** is not a
 //! preference, and getting it wrong is silent. A `FileChunk` records a
-//! `chunk_offset`, so a slice is usually *part* of a chunk: the last chunk of a
+//! `chunk_offset`. So a slice is usually *part* of a chunk. The last chunk of a
 //! file runs on into the next one. The bytes at `F[O..O+L]` are then not the whole
-//! of `H`, and hashing them produces something that is never equal to `H` — so a
-//! probe that hashes the file slice and compares to the chunk's hash condemns
-//! every boundary-crossing slice in the tree, forever, and reports a target that is
-//! byte-for-byte correct as holding nothing. The chunk's own bytes have to be read
-//! to compare the two, which is why a probe is given a source and not only a
+//! of `H`. Hashing them produces something that is never equal to `H`.
+//! A probe that hashes the file slice and compares to the chunk's hash condemns
+//! every boundary-crossing slice in the tree. It reports a target that is
+//! byte-for-byte correct as holding nothing, forever. The chunk's own bytes have
+//! to be read to compare the two. So a probe is given a source and not only a
 //! version.
 //!
 //! ## All-or-nothing, and that is load-bearing
 //!
-//! One chunk can be placed at several slices — repeated content, or one spanning a
-//! file boundary — and `held` is what [`Pack::needed`](crate::pack::Pack::needed)
-//! consults to decide a chunk needs no range request. A chunk recorded as held on
-//! the strength of three correct slices out of four would be skipped by the fetch
-//! and the fourth left wrong, and the client would believe it had applied the
-//! version. So the question is not "is this chunk right somewhere" but "is this
-//! chunk right everywhere it appears", and a probe that answered the first would
-//! be worse than one that does not answer at all: it looks like an optimisation
-//! and it is a silent corruption.
+//! One chunk can be placed at several slices.
+//! That happens with repeated content, or with one chunk spanning a file
+//! boundary.
+//! [`Pack::needed`](crate::pack::Pack::needed) consults `held`.
+//! It uses `held` to decide a chunk needs no range request.
 //!
-//! That also makes a probe idempotent, which is what lets an interrupted apply be
-//! resumed by running it again — and it is why no probe needs to name a base
-//! version. A client can be holding v4, v6, or half of each, and the same probe
-//! answers correctly for all three.
+//! A chunk recorded as held on the strength of three correct slices out of four
+//! would be skipped by the fetch. The fetch would leave the fourth slice wrong.
+//! The client would believe it had applied the version.
+//!
+//! So the question is not "is this chunk right somewhere".
+//! The question is "is this chunk right everywhere it appears".
+//! A probe that answered the first would be worse than one that does not answer
+//! at all. It looks like an optimisation, and it is a silent corruption.
+//!
+//! That also makes a probe idempotent.
+//! Running the probe again resumes an interrupted apply.
+//! It is also why no probe needs to name a base version.
+//! A client can be holding v4, v6, or half of each.
+//! The same probe answers correctly for all three.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -74,9 +81,9 @@ use crate::{
     storage::{BlobId, StorageGet},
 };
 
-/// Chunks to check at once. Reading one is a read and then a comparison per slice
-/// placing it, with nothing to overlap inside either, so this is all that keeps the
-/// disk busy.
+/// Chunks to check at once. Reading one chunk is a read and then a comparison per
+/// slice placing it. There is nothing to overlap inside either.
+/// So this is all that keeps the disk busy.
 const PROBE_CONCURRENCY: usize = 8;
 
 /// How many chunks to check at once.
@@ -87,8 +94,8 @@ fn probe_concurrency() -> usize {
 /// Why the target does not hold the bytes a version records.
 ///
 /// Not named `Reason`, which [`super::verify`] already uses for why a chunk could
-/// not be checked out. The two are the same shape and different questions, and a
-/// caller holding a failure from either should be able to tell which they have.
+/// not be checked out. The two have the same shape and answer different questions.
+/// A caller holding a failure from either should be able to tell which one it has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unheld {
     /// The file the version records is not there.
@@ -100,16 +107,16 @@ pub enum Unheld {
     /// The file continues past the last slice the version records.
     ///
     /// The one difference no slice can see. Every recorded slice of a file that
-    /// has grown can verify perfectly while a tail that is not the version's sits
-    /// past the end of them — and a probe that could not see that would answer
-    /// "holds this version" about a file with somebody else's data in it.
+    /// has grown can verify perfectly. An extra tail then sits past the end of
+    /// those slices. A probe that cannot see that tail would answer "holds this
+    /// version" about a file with somebody else's data in it.
     Long,
 
     /// The bytes there hash to something else.
     ///
-    /// Not necessarily corruption: this is also what a file the *user* edited
-    /// looks like, which is the ordinary case for a client applying an update to a
-    /// tree someone is using.
+    /// Not necessarily corruption. This is also what a file the *user* edited
+    /// looks like. That edit is the ordinary case for a client that applies an
+    /// update to a tree someone is using.
     Content,
 }
 
@@ -131,9 +138,10 @@ pub struct Mismatch {
 /// A file whose length is not the version's, for a reason no slice reported.
 ///
 /// Reported only where a slice could not have. A file *shorter* than the version is
-/// already reported slice by slice as [`Unheld::Short`], and saying it again once
-/// per file would be one finding three times over; a file *longer* is reported here
-/// and nowhere else, because there is no slice out past the end of one.
+/// already reported slice by slice as [`Unheld::Short`].
+/// Saying it again once per file would repeat one finding three times over.
+/// A file *longer* is reported here and nowhere else.
+/// There is no slice out past the end of one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mislength {
     /// The recorded path, relative to the root.
@@ -168,19 +176,19 @@ pub struct Probed {
     /// Entries the target has that the version does not record.
     ///
     /// Reported, never removed. A file here is as likely to be the user's own work
-    /// as a leftover from an older version, and a tool that deleted it to make a
-    /// directory match a file would be destroying data it cannot tell apart from
-    /// data it should keep — so removing them is a decision the caller has to make
-    /// out loud, and [`Probed`] only ever tells it what the decision would cost.
+    /// as a leftover from an older version. A tool that deletes it to make a
+    /// directory match a file destroys data it cannot tell apart from data it
+    /// should keep. So removing them is a decision the caller has to make out
+    /// loud. [`Probed`] only ever tells the caller what the decision would cost.
     pub extra: Vec<PathBuf>,
 }
 
 impl Probed {
     /// Whether the target *is* this version: every slice right, every length right.
     ///
-    /// Content alone, in other words — it says nothing about
-    /// [`Probed::extra`], because a directory with a stray file in it still holds
-    /// the version even though it is not equal to it.
+    /// Content alone, in other words. It says nothing about [`Probed::extra`].
+    /// A directory with a stray file in it still holds the version.
+    /// That directory is not equal to the version.
     #[must_use]
     pub fn is_current(&self) -> bool {
         self.mismatched.is_empty() && self.mislengths.is_empty()
@@ -190,24 +198,29 @@ impl Probed {
 /// Check what `root` holds of `snapshot`, without writing to it.
 ///
 /// Reads every slice the version records and hashes it. Nothing is created,
-/// truncated or removed, so this is safe to run against a tree in use — it may
-/// cost a full read of it, which is the price of knowing.
+/// truncated or removed, so this is safe to run against a tree in use.
+/// It may cost a full read of that tree.
+/// A full read is the price of knowing.
 ///
 /// # Errors
 ///
-/// Returns an error if the version records a path that would land outside `root`,
-/// if it names a file or chunk it does not itself contain, if a chunk it needs
-/// cannot be read from `source`, or if a recorded file cannot be opened or read
-/// for a reason that is not "it is not there". A missing file is a finding and
-/// lands in [`Probed::mismatched`] as [`Unheld::Absent`] rather than failing the
-/// probe: a client asking "what is missing" is asking precisely because some of it
-/// is.
+/// This function returns an error if the version records a path that would land
+/// outside `root`. It also returns an error if the version names a file or chunk
+/// that it does not itself contain. It returns an error if a chunk it needs
+/// cannot be read from `source`. It returns an error if a recorded file cannot
+/// be opened or read.
+/// It does not return that error when the reason is "it is not there".
 ///
-/// Generic over [`StorageGet`] because that is what a chunk's bytes come from — a
-/// pack for a client updating from one, a store for a tool comparing a directory
-/// against a set it can read. It needs somewhere to read chunks from, not a
-/// particular kind of somewhere. Taken by value and shared, as a restore takes its
-/// store, because each concurrent task holds one.
+/// A missing file is a finding, not a failure. It lands in [`Probed::mismatched`]
+/// as [`Unheld::Absent`] rather than failing the probe. A client asks "what is
+/// missing" precisely because some of it is missing.
+///
+/// This function is generic over [`StorageGet`] because a chunk's bytes come from
+/// a store. A client that updates from a pack uses a pack. A tool that compares a
+/// directory against a set it can read uses a store. The function needs somewhere
+/// to read chunks from, not a particular kind of somewhere. It takes the source
+/// by value and shares it, as a restore takes its store, because each concurrent
+/// task holds one.
 #[instrument(level = "info", skip_all, err)]
 pub async fn probe<P, S>(root: P, snapshot: &Snapshot, source: S) -> std::io::Result<Probed>
 where
@@ -236,8 +249,8 @@ pub struct Established<'a> {
     /// Chunks the directory holds correctly that `source` cannot supply.
     ///
     /// For a delta pack: the ones it deliberately left out. It is not read from the
-    /// pack *because* it is not in the pack, so nothing can be compared against it —
-    /// which is what makes the base version the only thing standing between a delta
+    /// pack *because* it is not in the pack. Nothing can be compared against it.
+    /// Therefore the base version is the only thing that stands between a delta
     /// and a wrong answer. A caller may only fill this in having established the
     /// directory holds the base, and `apply` establishes that from a manifest or
     /// refuses.
@@ -247,8 +260,9 @@ pub struct Established<'a> {
 /// [`probe`], reading only what `established` does not already account for.
 ///
 /// A file in [`Established::files`] is neither read nor reported. A chunk in
-/// [`Established::chunks`] is not read from `source` — it may not be there — and its
-/// placements are reported as held, because the caller has said the directory has it.
+/// [`Established::chunks`] is not read from `source`, because it may not be there.
+/// Its placements are reported as held, because the caller has said the directory
+/// has it.
 ///
 /// Naming every file and no chunks is [`probe`], and is what [`probe`] does.
 ///
@@ -269,14 +283,15 @@ where
     let root = root.as_ref();
     let source = Arc::new(source);
 
-    // Before a byte is read, and for the same reason a restore checks first: the
-    // whole point is to find out about a tree before touching it, and a path that
-    // escapes the root is a reason to stop rather than a reason to go and read it.
+    // This check runs before a byte is read, for the same reason a restore checks
+    // first. The whole point is to find out about a tree before touching it. A
+    // path that escapes the root is a reason to stop, not a reason to read it.
     super::restore::check_paths(snapshot)?;
 
-    // One task per *chunk*, not per slice: a chunk is read once and compared
-    // against every slice placing it, which is both the cheap way round and the
-    // only one that can decide "right everywhere" rather than "right somewhere".
+    // One task runs per *chunk*, not per slice. The task reads a chunk once and
+    // compares it against every slice that places it. That order is the cheap way
+    // round. It is also the only way to decide "right everywhere" rather than
+    // "right somewhere".
     let placed = placements(root, snapshot, established)?;
 
     let concurrency = probe_concurrency();
@@ -294,10 +309,11 @@ where
             let id = snapshot.chunks[index];
 
             // A chunk the caller has already accounted for is neither read nor
-            // reported, and is held — because the caller has said the directory has
-            // it. A delta pack omits exactly these, and cannot be asked for them:
-            // `get` would fail on a chunk that is not there by design, so the check
-            // has to come before the read rather than be handled after it.
+            // reported. It is held, because the caller has said the directory has
+            // it. A delta pack omits exactly these, and cannot be asked for them.
+            // A `get` call would fail on a chunk that is not there by design, so
+            // the check has to come before the read rather than be handled after
+            // it.
             if established.chunks.contains(&id) {
                 if !placed[index].is_empty() {
                     held.insert(id);
@@ -327,9 +343,9 @@ where
         }
     }
 
-    // Sorted, so the report is the same whichever order the reads finished in —
-    // and a report that reorders itself between two runs of the same tree is a
-    // report nobody can diff.
+    // Sorted, so the report is the same whichever order the reads finished in.
+    // A report that reorders itself between two runs of the same tree is a report
+    // nobody can diff.
     mismatched.sort_by(|a, b| (&a.path, a.offset).cmp(&(&b.path, b.offset)));
 
     let seen: HashSet<&Path> = mismatched.iter().map(|m| m.path.as_path()).collect();
@@ -350,17 +366,17 @@ where
 /// repeating a finding. The two directions are treated differently on purpose:
 ///
 /// * **Too long** is only ever reported here. Every recorded slice can verify
-///   perfectly while an extra tail sits past the end of them, so no slice can see
-///   it, and a probe that missed it would report a directory holding ten kilobytes
-///   of somebody's data as *this version*.
+///   perfectly while an extra tail sits past the end of them. No slice can see
+///   that tail. A probe that missed it would report a directory holding ten
+///   kilobytes of somebody's data as *this version*.
 ///
-/// * **Too short** is skipped when a slice already reported it, because the slice
-///   is the more specific finding — it says *which* bytes are missing, not just
-///   that the file is the wrong size. A file with no slices at all has nothing to
-///   report it, so it is reported here.
+/// * **Too short** is skipped when a slice already reported it. The slice is the
+///   more specific finding. It says *which* bytes are missing, not just that the
+///   file is the wrong size. A file with no slices at all has nothing to report
+///   it, so it is reported here.
 ///
-/// * **Missing** likewise, and only for a file with no slices: a file that exists
-///   in no slice but not on disk is a finding nothing else would make.
+/// * **Missing** likewise, and only for a file with no slices. A file that
+///   exists in no slice but not on disk is a finding that nothing else makes.
 fn mislengths(
     root: &Path,
     snapshot: &Snapshot,
@@ -424,10 +440,10 @@ struct Placement {
     path: PathBuf,
     /// Whether a caller said this file is where its last apply left it.
     ///
-    /// A trusted placement is not read. It is also not a finding: the caller has
-    /// already established the file is unchanged by stat, and re-reading it would
-    /// cost the very read the stat was meant to avoid. Nothing here trusts a file
-    /// on its own account — `trusted` is empty unless a caller with a manifest
+    /// A trusted placement is not read. It is also not a finding. The caller has
+    /// already established the file is unchanged by stat. Re-reading it would cost
+    /// the very read the stat was meant to avoid. Nothing here trusts a file on
+    /// its own account. `trusted` is empty unless a caller with a manifest
     /// supplied it, and a plain probe reads everything.
     trusted: bool,
     /// Where that lands, already checked to be inside the root.
@@ -444,9 +460,10 @@ struct Placement {
 
 /// Every slice of every chunk, grouped by the chunk it places.
 ///
-/// A chunk with no slice is not here at all: the version lists it but reads it
-/// nowhere, and a chunk nobody reads is not a thing a directory can be holding.
-/// Counting those as missing would make every version report itself as incomplete.
+/// A chunk with no slice is not here at all. The version lists it but reads it
+/// nowhere. A directory cannot hold a chunk that nobody reads.
+/// Counting those as missing would make every version report itself as
+/// incomplete.
 fn placements(
     root: &Path,
     snapshot: &Snapshot,
@@ -489,8 +506,8 @@ fn placements(
 
 /// The error for a slice naming a file or chunk the version does not contain.
 ///
-/// Names the index and which table it was checked against, because a caller who
-/// gets this is holding a damaged version and the whole of it is suspect.
+/// Names the index and which table it was checked against. A caller who gets
+/// this error holds a damaged version, and the whole of it is suspect.
 fn bad_index(
     snapshot: &Snapshot,
     slice: &crate::metadata::FileChunk,
@@ -518,19 +535,21 @@ fn bad_index(
 /// Whether every slice of `chunk` is right, and what is wrong with the ones that
 /// are not.
 ///
-/// The chunk is read once and buffered. It is bounded by the chunk profile's
-/// maximum — 256 KiB at the largest — and buffering it is what lets one read
-/// answer for every slice placing it, including the ones that hold only part of
-/// it. Streaming instead would mean re-reading the chunk per slice, or a second
-/// pass per slice to seek, and the win buys nothing: the caller is reading this
-/// chunk from a store or a pack anyway and a restore buffers the same bytes.
+/// The chunk is read once and buffered. The buffer is bounded by the chunk
+/// profile's maximum, which is 256 KiB at the largest. Buffering lets one read
+/// answer for every slice placing the chunk, including a slice that holds only
+/// part of it. Streaming instead would mean re-reading the chunk per slice, or a
+/// second pass per slice to seek. The win buys nothing, because the caller reads
+/// this chunk from a store or a pack anyway. A restore also buffers the same
+/// bytes.
 ///
 /// **A chunk whose every placement is trusted is not read at all.** That is the
-/// whole point of the trusted set — the chunk's bytes are needed only to compare
-/// against a file, and a file nobody has touched does not need comparing. It is
-/// checked before the read rather than the placements being filtered afterwards,
-/// because a `get` on a delta pack whose chunk was deliberately omitted would fail
-/// for a chunk that turns out not to need reading.
+/// whole point of the trusted set. The chunk's bytes are needed only to compare
+/// against a file, and a file nobody has touched does not need comparing. The
+/// function checks this before the read, rather than filtering the placements
+/// afterwards. A `get` call on a delta pack would fail for a chunk that the pack
+/// deliberately omitted. The failure happens even for a chunk that turns out
+/// not to need reading.
 async fn check_chunk<S: StorageGet + ?Sized>(
     id: BlobId,
     slices: Vec<Placement>,
@@ -608,10 +627,10 @@ enum Unreadable {
 
 /// Read exactly `length` bytes at `offset`, or say why they could not be.
 ///
-/// A short read is reported rather than returned, and the two are distinct
-/// because they are distinct problems: "this file is not here" and "this file ends
-/// early" send someone to two different places, and a caller that got only one of
-/// the two would have to guess which it was.
+/// A short read is reported rather than returned. The two are distinct because
+/// they are distinct problems. "This file is not here" and "this file ends early"
+/// send someone to two different places. A caller that got only one of the two
+/// would have to guess which one it was.
 async fn read_slice(path: &Path, offset: u64, length: u32) -> Result<Vec<u8>, Unreadable> {
     let wanted = u64::from(length);
 
@@ -625,9 +644,10 @@ async fn read_slice(path: &Path, offset: u64, length: u32) -> Result<Vec<u8>, Un
         return Err(Unreadable::Short);
     }
 
-    // Bounded, so a length from a downloaded version cannot read past its own
-    // slice, and read to exactly `wanted` so a file that ends early is visible as
-    // a short read rather than as bytes that happen to be different.
+    // This reader is bounded, so a length from a downloaded version cannot read
+    // past its own slice. It reads to exactly `wanted`, so a file that ends early
+    // shows a short read. A short read is not the same as bytes that happen to be
+    // different.
     let mut reader = crate::slice::SliceAsyncReader::new(file, wanted);
     let mut out = Vec::new();
     if reader.read_to_end(&mut out).await.is_err() {
@@ -643,19 +663,19 @@ async fn read_slice(path: &Path, offset: u64, length: u32) -> Result<Vec<u8>, Un
 
 /// Entries under `root` that `snapshot` does not record.
 ///
-/// Links are recorded but never followed, so a symlink pointing out of the tree
-/// is one entry to report rather than a path to walk — following it would make
-/// the answer depend on whatever is on the other end of it.
+/// Links are recorded but never followed. A symlink that points out of the tree
+/// is one entry to report. It is not a path to walk, because the answer would then
+/// depend on whatever is on the other end of it.
 ///
 /// The root itself is never reported: it is the destination, and it exists before
 /// any of this runs.
 ///
 /// A walk that cannot be read is *skipped* rather than fatal. The entries it did
-/// reach are still reported, and the alternative is a probe that refuses to answer
-/// because one directory in a tree is unreadable — which turns "here is what is
-/// wrong with your directory" into "here is nothing, and now go and find the
-/// permission problem yourself". A caller that needs certainty can compare the
-/// count against what the version records.
+/// reach are still reported. The alternative is a probe that refuses to answer
+/// because one directory in a tree is unreadable. That refusal turns "here is
+/// what is wrong with your directory" into "here is nothing". The caller then has
+/// to find the permission problem alone. A caller that needs certainty can compare
+/// the count against what the version records.
 fn extra_entries(root: &Path, snapshot: &Snapshot) -> Vec<PathBuf> {
     use crate::metadata::Link;
 

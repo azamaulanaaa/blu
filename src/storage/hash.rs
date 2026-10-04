@@ -1,40 +1,43 @@
-//! What a blob is named, and the short digest the formats check themselves with.
+//! What names a blob, and the short digest that the formats check themselves
+//! with.
 //!
-//! Two things, both one line long and both BLAKE3: the full hash a chunk is
-//! addressed by, and the first `N` bytes of one, which is what a record header
-//! and a version index file hash over the bytes ahead of themselves.
+//! Two things, both one line long and both BLAKE3. The first is the full hash
+//! that addresses a chunk. The second is the first `N` bytes of that hash. A
+//! record header and a version index file use those bytes to hash the bytes
+//! ahead of themselves.
 //!
-//! They live together because the record format needs both of them and nothing
-//! else in the module needs either: a header carries a chunk's address and its
-//! own checksum, and a checksum short enough to sit in a fixed-width field is
-//! the same computation as the address, cut off.
+//! They live together because the record format needs both of them, and nothing
+//! else in the module needs either one. A header carries a chunk address and its
+//! own checksum. A checksum short enough to sit in a fixed-width field is the
+//! same computation as the address, cut off.
 
 /// Address of a blob: the BLAKE3 hash of its contents.
 ///
 /// Both a chunk's identity in a snapshot and its key in the store's index.
 ///
-/// This is [`blake3::Hash`] rather than a `[u8; 32]` of our own, which is what
-/// the `traits-preview` feature on the `blake3` dependency has been providing
-/// this whole time. The alias it replaced was not a newtype — `BlobId` and
-/// `[u8; 32]` were the same type, interchangeable in both directions, so it
-/// distinguished nothing — and it was spelled three ways across the crate:
-/// `BlobId` in most places, `[u8; 32]` in `command::pipeline` and `metadata`,
-/// and `[u8; HASH]` in `storage::record`, with `HASH` being 32.
+/// This is [`blake3::Hash`] rather than a `[u8; 32]` of our own. The
+/// `traits-preview` feature on the `blake3` dependency has been providing this
+/// type for the whole life of the crate. The alias it replaced was not a newtype.
+/// `BlobId` and `[u8; 32]` were the same type, and they were interchangeable in
+/// both directions, so the alias distinguished nothing. The crate also spelled
+/// the type three ways. Most places use `BlobId`. `command::pipeline` and
+/// `metadata` use `[u8; 32]`. `storage::record` uses `[u8; HASH]`, where
+/// `HASH` is 32.
 ///
 /// `blake3::Hash` brings what this crate was writing by hand:
 ///
-/// * [`Display`](std::fmt::Display) as lowercase hex, which is what every
-///   message and log line in the crate wanted, and is why a `Hex` wrapper
-///   existed until this landed;
+/// * [`Display`](std::fmt::Display) as lowercase hex. Every message and log
+///   line in the crate wanted that form. A `Hex` wrapper existed until this
+///   change landed.
 /// * [`From<[u8; 32]>`](blake3::Hash::from_bytes) and
 ///   [`as_bytes`](blake3::Hash::as_bytes), so the record header and the
-///   snapshot's chunk table keep writing the same 32 bytes;
+///   snapshot's chunk table keep writing the same 32 bytes.
 /// * `PartialEq` against `[u8; 32]` and `[u8]`, both constant-time, so
-///   comparing a computed hash to a decoded one needs no conversion;
-/// * [`Copy`], [`Hash`] and [`Eq`], so it is usable as a map key as it was.
+///   comparing a computed hash to a decoded one needs no conversion.
+/// * [`Copy`], [`Hash`] and [`Eq`], so the type works as a map key.
 ///
-/// It deliberately has no `Ord`, no `AsRef<[u8]>` and no `Deref`: asking for the
-/// bytes is how you get them, and a `Deref` to a byte array would hand out the
+/// It deliberately has no `Ord`, no `AsRef<[u8]>` and no `Deref`. Asking for
+/// the bytes is how you get them. A `Deref` to a byte array would hand out the
 /// non-constant-time comparison that `Hash` exists to avoid.
 ///
 /// [`from_slice`](blake3::Hash::from_slice) is `TryFrom<&[u8]>`, so a length

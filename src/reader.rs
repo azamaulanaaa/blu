@@ -2,8 +2,8 @@
 //!
 //! Files are read as if they had been concatenated into one stream, so a chunk
 //! may span a file boundary. A [`FileRegistry`] records where each file sits in
-//! that stream, which lets a chunk's global range be mapped back onto the one or
-//! more file slices it covers.
+//! that stream. That record lets a chunk's global range be mapped back onto the
+//! one or more file slices it covers.
 
 use std::{
     collections::VecDeque,
@@ -23,12 +23,11 @@ pub struct ChunkSource {
     /// Path of the file, as it was passed to [`FileRegistry::new`].
     ///
     /// Shared, not owned. There is one of these per *file slice a chunk
-    /// covers*, and a chunk spanning a file boundary has more than one, so a
-    /// backup built a `PathBuf` per chunk - a fresh allocation of the whole
-    /// path, bytes and all, to name a file the registry had already recorded
-    /// once. An [`Arc`] makes that a refcount bump. The allocation is not the
-    /// point; the copy of the path is, and it happened once per chunk rather
-    /// than once per file.
+    /// covers*, and a chunk spanning a file boundary has more than one. A backup
+    /// therefore built a `PathBuf` per chunk, which allocated the whole path again,
+    /// bytes and all. That named a file the registry had already recorded once. An
+    /// [`Arc`] makes it a refcount bump. The allocation is not the point, the copy
+    /// of the path is. That copy happened once per chunk rather than once per file.
     pub path: Arc<Path>,
     /// Byte offset of this slice within the file.
     pub offset: u64,
@@ -38,24 +37,25 @@ pub struct ChunkSource {
 
 /// One chunk of the concatenated stream, and where it came from.
 ///
-/// `Debug` is hand-written and omits `data`: a debug log of a backup that
-/// printed every chunk would print the user's files. `PartialEq` is derived
-/// rather than hand-written because comparing the contents is exactly what a
-/// test of the chunker wants to do, and nothing in a log has to notice.
+/// `Debug` is hand-written and omits `data`, because a debug log of a backup
+/// that printed every chunk would print the user's files. `PartialEq` is derived
+/// rather than hand-written, because comparing the contents is exactly what a
+/// test of the chunker wants to do. Nothing in a log has to notice.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Chunk {
     /// The file slices this chunk covers, in stream order. More than one entry
     /// means the chunk spans a file boundary.
     pub sources: Vec<ChunkSource>,
-    /// The chunk's contents, owned rather than behind a reader: the chunker has
-    /// already materialised them to find the boundary.
+    /// The chunk's contents, owned rather than behind a reader. The chunker
+    /// has already materialised them to find the boundary.
     pub data: Vec<u8>,
 }
 
 impl Debug for Chunk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Contents omitted: a `Debug` that dumped a backup would be a way to
-        // print the user's data, and the length says everything useful anyway.
+        // Contents omitted, because a `Debug` that dumped a backup would be
+        // a way to print the user's data. The length says everything useful
+        // anyway.
         f.debug_struct("Chunk")
             .field("sources", &self.sources)
             .field("len", &self.data.len())
@@ -92,8 +92,8 @@ impl FileRegistry {
                 let length = std::fs::metadata(&path_buf)?.len();
 
                 let entry = EntryFileRegistry {
-                    // `into_boxed_path` then `Arc::from`, so the path bytes are moved
-                    // into the `Arc` rather than copied into it.
+                    // `into_boxed_path` then `Arc::from`, so the path bytes are
+                    // moved into the `Arc` rather than copied into it.
                     path: Arc::from(path_buf.into_boxed_path()),
                     length,
                     global_offset,
@@ -111,8 +111,8 @@ impl FileRegistry {
     /// Map a global range of the concatenated stream onto the file slices it
     /// covers.
     ///
-    /// An empty result means the range lies in a file that was not registered,
-    /// which for a well-formed chunker means a file changed size between being
+    /// An empty result means the range lies in a file that was not registered.
+    /// For a well-formed chunker that means a file changed size between being
     /// registered and being read.
     #[instrument(level = "trace", skip(self))]
     pub fn resolve_chunk(&self, global_start: u64, length: u32) -> Vec<ChunkSource> {
@@ -134,7 +134,7 @@ impl FileRegistry {
             let overlap_end_global = std::cmp::min(global_end, file_end_global);
 
             // Both endpoints lie in `[global_start, global_end]`, so the
-            // difference cannot exceed `length`; clamping keeps that true rather
+            // difference cannot exceed `length`. Clamping keeps that true rather
             // than wrapping to a plausible-looking wrong length.
             let overlap = overlap_end_global.saturating_sub(overlap_start_global);
 
@@ -207,7 +207,7 @@ impl Read for GlobalStream {
 /// the chunks around the change rather than every chunk after it.
 ///
 /// The three sizes are the whole public surface of the chunker's policy, and
-/// [`ChunkerProfile`] is how they are chosen: every backup the binary has written
+/// [`ChunkerProfile`] is how they are chosen. Every backup the binary has written
 /// used [`Default`], which is also what `--chunk-profile default` resolves to.
 /// Keeping the values here rather than at the call site means a second
 /// configuration cannot be a slightly different one by accident.
@@ -235,14 +235,14 @@ impl ChunkerConfig {
     /// Check these parameters are ones fastcdc will actually chunk with.
     ///
     /// fastcdc asserts its own bounds with `debug_assert!`, so they are **gone
-    /// from a release build**: a value it would refuse reaches the chunker and
-    /// produces chunks of a nonsense shape rather than an error. Validating here
+    /// from a release build**. A value it would refuse then reaches the chunker.
+    /// It produces chunks of a nonsense shape rather than an error. Validating here
     /// is what makes a bad configuration a message instead of a corrupt backup.
     ///
     /// # Errors
     ///
-    /// Returns an error naming the bound that was not met, whether it is one of
-    /// fastcdc's own limits or the ordering the three sizes must satisfy.
+    /// Returns an error naming the bound that was not met. It names a bound of
+    /// fastcdc's own limits, or the ordering the three sizes must satisfy.
     pub fn validate(&self) -> io::Result<()> {
         let (min, avg, max) = (
             usize::try_from(self.min_size).unwrap_or(usize::MAX),
@@ -268,9 +268,9 @@ impl ChunkerConfig {
             }
         }
 
-        // The ordering is not fastcdc's assertion but its algorithm's: a boundary
+        // The ordering is not fastcdc's assertion but its algorithm's. A boundary
         // is only looked for above `min`, and `avg` sets the masks the gear
-        // table is indexed with, so `avg <= min` chunks at `min` every time and
+        // table is indexed with. So `avg <= min` chunks at `min` every time, and
         // `max < avg` can never reach the forced boundary. Both are silent, so
         // both are refused.
         if self.avg_size <= self.min_size {
@@ -303,19 +303,19 @@ impl ChunkerConfig {
 /// calculated.
 ///
 /// How big a chunk should be is a trade, and the trade depends on the tree.
-/// Finer cuts deduplicate a *localised* edit better, because a boundary is more
-/// likely to land on the same content in both the old and the new copy; coarser
+/// Finer cuts deduplicate a *localised* edit better. A boundary is then more
+/// likely to land on the same content in both the old and the new copy. Coarser
 /// cuts mean fewer records, less framing and less to read back, which is what
 /// matters once the content stops compressing at all. Almost nobody can place
-/// themselves on that curve for a tree they have not measured, and being wrong is
-/// only visible as a worse ratio weeks later — so the sizes live here and the
+/// themselves on that curve for a tree they have not measured. Being wrong is
+/// only visible as a worse ratio weeks later. So the sizes live here and the
 /// command line asks for one by name.
 ///
-/// **A profile is not recorded in the store.** Chunks are named by their contents,
-/// so a set written at two different profiles is still one store and every version
-/// of it restores; what differs is how much a run deduplicates against the others.
-/// Moving a set to a different profile costs a full rewrite the first time, and
-/// nothing but a worse ratio afterwards.
+/// **A profile is not recorded in the store.** Chunks are named by their contents.
+/// A set written at two different profiles is still one store. Every version of
+/// it restores, and what differs is how much a run deduplicates against the
+/// others. Moving a set to a different profile costs a full rewrite the first
+/// time, and nothing but a worse ratio afterwards.
 ///
 /// [`ChunkerConfig`] remains the way to state sizes that no name covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,19 +323,19 @@ pub enum ChunkerProfile {
     /// Fine cuts: 2 KiB minimum, 4 KiB average, 16 KiB maximum.
     ///
     /// For trees of many small files. A file shorter than one default chunk is a
-    /// file stored whole, and an edit to it re-uploads all of it; at this size it
-    /// costs the chunks around the edit instead. The price is records — four times
+    /// file stored whole, and an edit to it re-uploads all of it. At this size the
+    /// edit costs the chunks around it instead. The price is records, four times
     /// as many of them, each with its own header and index entry.
     Small,
     /// The default: 8 KiB minimum, 16 KiB average, 64 KiB maximum.
     ///
     /// What every `lepatch backup` has used so far, and the safest thing to leave
-    /// a set on: a profile nobody chose beats a profile chosen once and forgotten.
+    /// a set on. A profile nobody chose beats a profile chosen once and forgotten.
     Default,
     /// Coarse cuts: 32 KiB minimum, 64 KiB average, 256 KiB maximum.
     ///
-    /// For content that does not deduplicate anyway — video, archives of already
-    /// compressed files — where a finer cut buys a marginally better match and
+    /// For content that does not deduplicate anyway, such as video or archives of
+    /// already compressed files. A finer cut buys a marginally better match and
     /// costs a record for every chunk of every version. It also gives a pack the
     /// coarse ranges a client downloading a whole file wants.
     Large,
@@ -357,9 +357,9 @@ impl ChunkerProfile {
 
     /// The chunker parameters this profile stands for.
     ///
-    /// Each one validates: a profile that did not would be a bad backup rather
-    /// than an error, since `fastcdc` asserts its bounds with `debug_assert!` and
-    /// a release build does not contain them.
+    /// Each one validates. A profile that did not would be a bad backup rather
+    /// than an error, because `fastcdc` asserts its bounds with `debug_assert!`. A
+    /// release build does not contain them.
     #[must_use]
     pub fn config(self) -> ChunkerConfig {
         match self {
@@ -380,8 +380,8 @@ impl ChunkerProfile {
         }
     }
 
-    /// Every profile's name, comma-separated: what there was to choose from, for
-    /// an error that has to be actionable on its own.
+    /// Every profile's name, comma-separated. This is what there was to choose
+    /// from, for an error that has to be actionable on its own.
     #[must_use]
     pub fn names() -> String {
         Self::ALL.map(Self::name).join(", ")
@@ -407,9 +407,9 @@ impl std::str::FromStr for ChunkerProfile {
     /// A profile name, in any case.
     ///
     /// The error is a [`String`] so that `clap`'s derived parser can turn it into
-    /// a usage error, quoting what was typed and what there was instead. Failing
-    /// the parse is the whole point: a backup cut at a size nobody asked for is
-    /// not a thing to discover from a storage ratio weeks later.
+    /// a usage error. That error quotes what was typed and what there was instead.
+    /// Failing the parse is the whole point. A backup cut at a size nobody
+    /// asked for is not a thing to discover from a storage ratio weeks later.
     ///
     /// [`String`]: std::string::String
     fn from_str(name: &str) -> Result<Self, Self::Err> {
@@ -449,7 +449,7 @@ impl Chunker {
     /// Returns an error if any file cannot be stat'ed while being registered, or
     /// if `config` is not one the chunker can chunk with. The second check is
     /// here rather than at the call site because it is the last point before the
-    /// parameters stop being checked at all: `fastcdc` asserts its bounds with
+    /// parameters stop being checked at all. `fastcdc` asserts its bounds with
     /// `debug_assert!`, which a release build does not contain.
     #[instrument(level = "trace", skip(paths, config), err)]
     pub fn new(paths: Vec<PathBuf>, config: ChunkerConfig) -> io::Result<Self> {
@@ -457,8 +457,8 @@ impl Chunker {
 
         let registry = Arc::new(FileRegistry::new(paths.iter())?);
 
-        // Bounds arrive as `u32` and are widened; a chunk longer than `u32::MAX` is
-        // caught in `next`, where it can be reported against the chunk that
+        // Bounds arrive as `u32` and are widened. A chunk longer than `u32::MAX`
+        // is caught in `next`, where it can be reported against the chunk that
         // caused it.
         let widen = |value: u32| usize::try_from(value).unwrap_or(usize::MAX);
 
@@ -488,7 +488,7 @@ impl Iterator for Chunker {
             Err(e) => return Some(Err(io::Error::other(e))),
         };
 
-        // A configuration error, reported rather than narrowed: truncating would
+        // A configuration error, reported rather than narrowed. Truncating would
         // map the chunk to the wrong files.
         let Ok(length) = u32::try_from(cdc_chunk.length) else {
             return Some(Err(io::Error::new(
@@ -559,8 +559,9 @@ mod tests {
         );
     }
 
-    /// `avg <= min` is silent in fastcdc — every chunk comes out at `min` — so
-    /// it is refused rather than left to produce a uniform-chunked backup.
+    /// `avg <= min` is silent in fastcdc, because every chunk comes out at `min`.
+    /// It is therefore refused rather than left to produce a uniform-chunked
+    /// backup.
     #[test]
     fn an_avg_at_or_below_min_is_refused() {
         let config = ChunkerConfig {
@@ -575,7 +576,7 @@ mod tests {
         );
     }
 
-    /// Likewise `max <= avg`: the forced boundary is never reached, so `max`
+    /// Likewise `max <= avg`. The forced boundary is never reached, so `max`
     /// does nothing and only the average is in play.
     #[test]
     fn a_max_at_or_below_avg_is_refused() {
@@ -593,11 +594,11 @@ mod tests {
 
     /// Every profile the command line offers is one the chunker can chunk with.
     ///
-    /// Checked here rather than trusted because a profile is a set of numbers
-    /// typed into a match arm, and fastcdc's bounds are `debug_assert!`s that a
-    /// release build does not contain: one out of range would be a bad backup
-    /// rather than a message. [`ChunkerProfile::ALL`] is what `--help` and the
-    /// parse error list, so anything not in it cannot be named at all.
+    /// Checked here rather than trusted, because a profile is a set of numbers
+    /// typed into a match arm. Fastcdc's bounds are `debug_assert!`s, and a
+    /// release build does not contain them. One out of range would be a bad
+    /// backup rather than a message. [`ChunkerProfile::ALL`] is what `--help` and
+    /// the parse error list, so anything not in it cannot be named at all.
     #[test]
     fn every_profile_is_a_configuration_the_chunker_accepts() {
         for profile in ChunkerProfile::ALL {
@@ -611,10 +612,10 @@ mod tests {
     /// The `default` profile is the default configuration, and cannot stop being
     /// it.
     ///
-    /// [`ChunkerConfig::default`] is what a library caller gets without asking, and
-    /// `--chunk-profile default` is what the binary gets without asking; they are
+    /// [`ChunkerConfig::default`] is what a library caller gets without asking.
+    /// `--chunk-profile default` is what the binary gets without asking. They are
     /// the same numbers, so a test that means "whatever the command line does"
-    /// means one thing. This is what pins them together — `config()` reads the
+    /// means one thing. This is what pins them together. `config()` reads the
     /// default rather than restating it, and this says why that is not a shortcut.
     #[test]
     fn the_default_profile_is_the_default_configuration() {
@@ -633,8 +634,8 @@ mod tests {
     /// The profiles are ordered by how finely they cut, and each says the same
     /// thing as its name.
     ///
-    /// The ordering is the point of `ALL`: it is what the flag's help and the
-    /// parse error present, and a list a reader cannot predict the order of is a
+    /// The ordering is the point of `ALL`, because it is what the flag's help and
+    /// the parse error present. A list a reader cannot predict the order of is a
     /// list they cannot choose from.
     #[test]
     fn the_profiles_run_from_finest_to_coarsest() {
@@ -659,8 +660,8 @@ mod tests {
 
     /// A name that is not a profile says so, and says what there is instead.
     ///
-    /// Both halves are the assertion: "unknown profile" alone leaves the user to
-    /// run `--help` to find out what profiles exist, and a message listing the
+    /// Both halves are the assertion. "unknown profile" alone leaves the user to
+    /// run `--help` to find out what profiles exist. A message that lists the
     /// names without quoting the one that was refused cannot be matched against
     /// what they typed.
     #[test]
@@ -678,8 +679,8 @@ mod tests {
             );
         }
 
-        // And the profiles themselves parse, in any case, because a name typed in
-        // caps is still the name.
+        // And the profiles themselves parse, in any case, because a name typed
+        // in caps is still the name.
         for profile in ChunkerProfile::ALL {
             let name = profile.name();
             assert_eq!(
@@ -698,23 +699,23 @@ mod tests {
 
 /// Measure `resolve_chunk`, whose per-chunk work is one path clone.
 ///
-/// The path in a [`ChunkSource`] is an [`Arc`] rather than a `PathBuf`, so building
-/// one is a refcount bump instead of an allocation plus a copy of the path. That
-/// is the only thing `resolve_chunk` does that touches memory beyond its output
-/// vector, which makes it measurable in a way an end-to-end backup is not: a
-/// backup spends its time on per-record filesystem calls, and a saved allocation
-/// per chunk does not show up there at all.
+/// The path in a [`ChunkSource`] is an [`Arc`] rather than a `PathBuf`. Building
+/// one is therefore a refcount bump instead of an allocation plus a copy of the
+/// path. That is the only thing `resolve_chunk` does that touches memory beyond
+/// its output vector. That makes it measurable in a way an end-to-end backup is
+/// not. A backup spends its time on per-record filesystem calls, and a saved
+/// allocation per chunk does not show up there at all.
 ///
 /// So this drives `resolve_chunk` directly, over a registry of enough files that a
 /// chunk lands inside one of them.
 ///
-/// **It asserts that every call resolved something, and that assertion is the
+/// **It asserts that every call resolved something. That assertion is the
 /// point.** The first version of this benchmark built a registry of *empty* files
-/// and reported 10ns per chunk for two milliseconds — the whole measurement was
-/// two hundred real resolutions and a hundred and ninety-nine thousand iterations
-/// that returned an empty vector because the global offset was past the end of the
-/// set. It looked like a working benchmark. Counting the sources is what makes the
-/// difference visible, so the count is checked on every run.
+/// and reported 10ns per chunk for two milliseconds. The whole measurement was two
+/// hundred real resolutions and a hundred and ninety-nine thousand iterations that
+/// returned an empty vector. Those iterations found the global offset past the end
+/// of the set. It looked like a working benchmark. Counting the sources is what
+/// makes the difference visible, so the count is checked on every run.
 ///
 /// Ignored by default. Run it with:
 ///

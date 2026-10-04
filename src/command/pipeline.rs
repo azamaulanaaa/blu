@@ -2,10 +2,12 @@
 //!
 //! Reading, chunking and hashing must be sequential: a content-defined boundary
 //! depends on the bytes before it, so the reader cannot be split across threads.
-//! Storing waits on the store and overlaps freely, so the reading half runs on a
-//! blocking thread, the storing half on the async pool, and a bounded channel
-//! joins them — which is what makes a slow store throttle the reader instead of
-//! buffering a whole tree in memory.
+//! Storing waits on the store and overlaps freely.
+//! The reading half runs on a blocking thread, and the storing half runs on the
+//! async pool.
+//! A bounded channel joins them.
+//! That makes a slow store throttle the reader instead of buffering a whole tree
+//! in memory.
 //!
 //! Each distinct hash gets a [`Slot`] filled once, so nothing is stored twice
 //! however many stores are in flight. Results are committed in the order chunks
@@ -52,8 +54,8 @@ struct Stored {
 ///
 /// Every chunk of the same content fills the same cell: the first to arrive stores
 /// it, the rest wait and reuse it. The store deduplicates too, but its index is
-/// only updated once a blob is written, so without this a run hands it the same
-/// content once per copy.
+/// only updated once a blob is written.
+/// Without this a run hands it the same content once per copy.
 type Slot = Arc<OnceCell<()>>;
 
 /// Deduplication state shared by every store in flight.
