@@ -257,8 +257,8 @@ impl Manifest {
     /// unreadability.
     /// A caller that cannot use the cache falls back to reading the tree, and
     /// there is nothing for it to report.
-    /// Anything that touches the machine can delete a manifest, so its absence is
-    /// routine rather than exceptional.
+    /// A manifest is always a candidate for deletion by anything that touches the
+    /// machine, so its absence is routine rather than exceptional.
     /// A corrupt one is indistinguishable from an absent one as far as the work
     /// left to do.
     ///
