@@ -1263,9 +1263,7 @@ where
 ///
 /// In the same directory, because `rename` is only atomic within one filesystem.
 ///
-/// A fixed suffix rather than a pid or a counter. Two runs cannot be writing the
-/// same pack to the same path at once, because the set they are packing holds its
-/// lock.
+/// A fixed suffix rather than a pid or a counter.
 fn temporary_for(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
