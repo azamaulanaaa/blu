@@ -1,10 +1,10 @@
 //! End-to-end tests that drive the `lepatch` binary as a subprocess.
 //!
-//! The library integration tests call `backup` and `restore` directly, which
-//! left the binary itself at zero coverage: version selection, the
-//! cross-process write lock, the exclude list, argument parsing, exit codes and
-//! every error message the user sees were all untested. These tests go through
-//! the real binary so those paths are exercised as a user would meet them.
+//! The library integration tests call `backup` and `restore` directly. That left
+//! the binary itself at zero coverage. Version selection, the cross-process write
+//! lock, the exclude list, argument parsing, exit codes and every error message
+//! the user sees were all untested. These tests go through the real binary so
+//! those paths are exercised as a user would meet them.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -55,8 +55,8 @@ fn ok(dir: &Path, args: &[&str]) -> String {
 
 /// Run the binary, require success, and return its **diagnostics**.
 ///
-/// Progress, warnings and summaries go to stderr; stdout carries only the data a
-/// command produces. Tests about what a run *said* want this, and tests about what
+/// Progress, warnings and summaries go to stderr. Stdout carries only the data a
+/// command produces. Tests about what a run *said* want this. Tests about what
 /// it *produced* want [`ok`].
 fn ok_logs(dir: &Path, args: &[&str]) -> String {
     let output = lepatch(dir, args);
@@ -129,9 +129,9 @@ fn each_backup_claims_the_next_version() {
         ok(dir.path(), &["backup", "src", "snap"]);
     }
 
-    // The versions are commit records inside the one store file, so three
-    // backups leave one file and not three index files. Each version is
-    // individually addressable, which is what proves they were all recorded.
+    // The versions are commit records inside the one store file. Three backups
+    // leave one file and not three index files. Each version is individually
+    // addressable, which is what proves they were all recorded.
     assert!(dir.path().join("snap.0000.bin").is_file());
     assert_eq!(
         count_entries(dir.path(), "snap"),
@@ -162,8 +162,8 @@ fn each_backup_claims_the_next_version() {
 
 /// How many commit records the store at `store` holds.
 ///
-/// Read through the store itself rather than by counting files, which is the
-/// point: a version is a record, so this is the only count that means anything.
+/// Read through the store itself rather than by counting files. That is the
+/// point. A version is a record, so this is the only count that means anything.
 fn count_entries(dir: &std::path::Path, set: &str) -> usize {
     let out = ok(dir, &["versions", set, "--numbers-only"]);
     out.lines().filter(|line| !line.trim().is_empty()).count()
@@ -171,9 +171,9 @@ fn count_entries(dir: &std::path::Path, set: &str) -> usize {
 
 /// The index files of the set named `set` in `dir`.
 ///
-/// Spelled out here rather than reached for through the library, because a test
-/// that deletes the cache should be deleting it the way a person would: by
-/// whatever matches the name.
+/// The code spells this out rather than reaching for the library. A test that
+/// deletes the cache should delete it the way a person would. A person deletes it
+/// by whatever matches the name.
 fn index_files(dir: &std::path::Path, set: &str) -> Vec<std::path::PathBuf> {
     let mut found: Vec<_> = fs::read_dir(dir)
         .unwrap()
@@ -257,8 +257,8 @@ fn the_backup_set_is_excluded_from_its_own_backup() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
-    // A set is several files, and the exclusion has to cover all of them — a
-    // segment left out of the list would be backed up while being written, which
+    // A set is several files, and the exclusion has to cover all of them. A
+    // segment left out of the list would be backed up while being written. That
     // is the failure this test exists for.
     assert!(
         listing.contains(&"self.0000.bin".to_string()),
@@ -294,10 +294,10 @@ fn verify_reports_a_clean_store() {
 
 /// A set with one byte flipped in the middle of its chunk data.
 ///
-/// The three tests below each need this, and setting it up is six lines — enough
-/// that repeating it three times is worse than a name for it. Which is why the
-/// original was one test: it was written once, and then three unrelated claims
-/// ended up sharing it.
+/// The three tests below each need this. Setting it up is six lines. That is
+/// enough that repeating it three times is worse than a name for it. The original
+/// was one test. It was written once, and then three unrelated claims ended up
+/// sharing it.
 fn damaged_store(dir: &std::path::Path) {
     build_tree(dir);
     ok(dir, &["backup", "src", "snap"]);
@@ -312,9 +312,9 @@ fn damaged_store(dir: &std::path::Path) {
 
 /// `verify` reports the damage on stdout and exits non-zero.
 ///
-/// The per-chunk detail goes to stderr and the summary line to stdout, so a test
-/// that reads only one stream reads half the answer — which is why these are
-/// separate tests and each says which stream it is looking at.
+/// The per-chunk detail goes to stderr and the summary line to stdout. A test
+/// that reads only one stream reads half the answer. These are therefore separate
+/// tests. Each one says which stream it is looking at.
 #[test]
 fn verify_exits_non_zero_and_says_so_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
@@ -336,11 +336,11 @@ fn verify_exits_non_zero_and_says_so_on_stdout() {
 
 /// The detail names the chunk and what its bytes really hashed to.
 ///
-/// A chunk is addressed by the hash of what it should contain, so a mismatch is a
-/// report of two different hashes and which is which. The pair is found by
-/// collecting the 64-character hex tokens rather than by splitting the message on
-/// its wording: a test that parses prose fails when the prose is reworded, and
-/// passes when the diagnosis is wrong.
+/// A chunk is addressed by the hash of what it should contain. A mismatch is
+/// therefore a report of two different hashes. The report says which is which.
+/// The test finds the pair by collecting the 64-character hex tokens. The test
+/// does not split the message on its wording. A test that parses prose fails when
+/// the prose is reworded, and passes when the diagnosis is wrong.
 #[test]
 fn verify_names_the_chunk_and_what_it_really_hashed_to() {
     let dir = tempfile::tempdir().unwrap();
@@ -367,8 +367,8 @@ fn verify_names_the_chunk_and_what_it_really_hashed_to() {
 
 /// A restore from a damaged store is refused, and writes nothing.
 ///
-/// The refusal matters as much as the absence: "nothing was written" is also what
-/// a run that did nothing looks like. The message has to say it refused, and the
+/// The refusal matters as much as the absence. "Nothing was written" is also what
+/// a run that did nothing looks like. The message has to say it refused. The
 /// destination has to be untouched.
 #[test]
 fn a_restore_from_a_damaged_store_is_refused_and_writes_nothing() {
@@ -388,9 +388,9 @@ fn a_restore_from_a_damaged_store_is_refused_and_writes_nothing() {
 
 /// A backup that fails must publish nothing.
 ///
-/// There is no index file to leave behind and no version number to skip, which is
-/// the easier half of the guarantee: the run's commit record is the only thing
-/// that makes a version exist, and a run that never got there wrote none.
+/// There is no index file to leave behind and no version number to skip. That is
+/// the easier half of the guarantee. The run's commit record is the only thing
+/// that makes a version exist. A run that never got there wrote none.
 #[test]
 fn a_failed_backup_publishes_no_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -417,11 +417,11 @@ fn a_failed_backup_publishes_no_version() {
 
 /// A run killed part-way leaves the store exactly as the last good version.
 ///
-/// This is the property the commit record buys, and it is what the old design
-/// could not promise: the previous version's data records are already on the
-/// device, and an unfinished run's records sit after them with no commit record
-/// of their own. The next run reclaims the space and the version that was there
-/// before is still restorable, and still the latest.
+/// The commit record buys this property, and the old design could not promise
+/// it. The previous version's data records are already on the device. An
+/// unfinished run's records sit after them with no commit record of their own.
+/// The next run reclaims the space. The version that was there before is still
+/// restorable. It is still the latest.
 #[test]
 fn an_unfinished_run_leaves_the_previous_version_intact() {
     let dir = tempfile::tempdir().unwrap();
@@ -430,19 +430,19 @@ fn an_unfinished_run_leaves_the_previous_version_intact() {
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(count_entries(dir.path(), "snap"), 1);
 
-    // Append a blob record that is then cut short, which is what a torn write at
-    // the tail of an interrupted run looks like: the header is there and the
-    // payload is not all of it. No commit record follows it, because the run
-    // never reached one.
+    // Append a blob record and then cut it short. That is what a torn write at
+    // the tail of an interrupted run looks like. The header is there. The payload
+    // is not all of it. No commit record follows it, because the run never
+    // reached one.
     let mut bytes = fs::read(dir.path().join("snap.0000.bin")).unwrap();
     bytes.extend_from_slice(b"LPB1\x00\x80\x01");
     bytes.extend_from_slice(&[0u8; 16]);
     bytes.extend_from_slice(b"half a record");
     fs::write(dir.path().join("snap.0000.bin"), &bytes).unwrap();
 
-    // A read refuses rather than repairing: the bytes are there and unreadable,
-    // and silently ignoring them would mean a restore that quietly omits whatever
-    // they held. The next *run* is what repairs it, below.
+    // A read refuses rather than repairing. The bytes are there and unreadable.
+    // Ignoring them silently would mean a restore that omits whatever they held.
+    // The next *run* is what repairs it, below.
     let refused = fails(dir.path(), &["restore", "out", "snap"]);
     assert!(
         refused.contains("damaged") && refused.contains("does not repair"),
@@ -468,7 +468,7 @@ fn an_unfinished_run_leaves_the_previous_version_intact() {
 ///
 /// The files exist so listing a set costs a file name per version rather than a
 /// scan of every record in it. What matters for a user is that deleting them costs
-/// nothing: the versions are still there, and one command brings the listing back.
+/// nothing. The versions are still there. One command brings the listing back.
 #[test]
 fn the_version_index_can_be_rebuilt_from_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -515,9 +515,9 @@ fn the_version_index_can_be_rebuilt_from_nothing() {
 /// A store with a tail that does not parse is reported, not repaired or ignored.
 ///
 /// The scan stops at the first record that does not verify, so bytes past that
-/// point are unreadable. Silently ignoring them would mean a restore that
-/// quietly omits whatever they held and reports success — so a read refuses, and
-/// a write truncates only the last segment. This is the test for the read half.
+/// point are unreadable. Ignoring them silently would mean a restore that omits
+/// whatever they held and reports success. So a read refuses. A write truncates
+/// only the last segment. This is the test for the read half.
 #[test]
 fn a_store_with_a_damaged_tail_is_reported_not_ignored() {
     let dir = tempfile::tempdir().unwrap();
@@ -706,10 +706,10 @@ fn an_unknown_subcommand_is_rejected() {
 /// `--compression-level` counts 0 to 9, and says so rather than guessing.
 ///
 /// The library clamps an out-of-range level so a caller with a bad number gets a
-/// working policy. A person typing a number should be told, not corrected: a
-/// store quietly written at a level other than the one they asked for is a thing
-/// they cannot see from the directory listing, and the whole point of the flag
-/// being a write policy is that it is legible.
+/// working policy. A person typing a number should be told, not corrected. A store
+/// quietly written at a level other than the one they asked for is a thing they
+/// cannot see from the directory listing. The whole point of the flag being a
+/// write policy is that it is legible.
 #[tokio::test]
 async fn a_compression_level_outside_zero_to_nine_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -726,13 +726,13 @@ async fn a_compression_level_outside_zero_to_nine_is_refused() {
         );
         // The range, and the number that was refused in it. Both, and only both.
         //
-        // This was `contains("0..=9") || contains('0')`, and the second arm is
-        // satisfied by almost any message with a zero in it — this one, a
-        // timestamp, a byte count, the level the user typed. So the `||` made the
-        // test pass whether or not the range was ever named, which is the one
-        // thing it is checking. `clap` writes `11 is not in 0..=9`, so both
-        // substrings are in one sentence and asserting both is no more brittle
-        // than asserting one.
+        // This was `contains("0..=9") || contains('0')`. The second arm is
+        // satisfied by almost any message with a zero in it. This message, a
+        // timestamp, a byte count, or the level the user typed all satisfy it. The
+        // `||` therefore made the test pass whether or not the range was ever
+        // named. The range is the one thing this check tests. `clap` writes
+        // `11 is not in 0..=9`, so both substrings are in one sentence. Asserting
+        // both is no more brittle than asserting one.
         let refused = stderr(&output);
         assert!(
             refused.contains("0..=9"),
@@ -769,19 +769,19 @@ async fn a_compression_level_outside_zero_to_nine_is_refused() {
 
 /// A profile that does not exist is a usage error, and it says what does.
 ///
-/// The same reasoning as `--compression-level`, one level up: the flag decides
-/// how finely the tree is cut, a set quietly cut at a size nobody asked for is
-/// invisible from the directory listing, and "unknown profile" on its own leaves
-/// the user to run `--help` to find out what the choices are. So the error names
-/// the profile that was refused *and* every profile that would have worked.
+/// The same reasoning as `--compression-level`, one level up. The flag decides
+/// how finely the tree is cut. A set quietly cut at a size nobody asked for is
+/// invisible from the directory listing. "Unknown profile" on its own leaves the
+/// user to run `--help` to find out what the choices are. The error therefore
+/// names the profile that was refused *and* every profile that would have worked.
 #[test]
 fn a_chunk_profile_that_does_not_exist_is_refused() {
     let dir = tempfile::tempdir().unwrap();
 
     for name in ["fine", "big", "16k", "defaul"] {
-        // Not `fails`, which insists on exit 1: a flag that does not parse is a
+        // Not `fails`, which insists on exit 1. A flag that does not parse is a
         // usage error, and clap exits 2 for those. The distinction is the one a
-        // script sees — exit 1 is a run that was asked for and could not be had.
+        // script sees. Exit 1 is a run that was asked for and could not be had.
         let output = lepatch(
             dir.path(),
             &["backup", ".", "store", "--chunk-profile", name],
@@ -822,12 +822,12 @@ fn a_chunk_profile_that_does_not_exist_is_refused() {
 /// The profile is what decides the chunking, and `default` decides exactly what
 /// no flag at all decides.
 ///
-/// The first half is the flag working: a tree cut at three profiles is three
-/// different sets of chunks, so the counts have to differ and in the direction
-/// the names promise. The second half is the property that makes the flag safe to
-/// leave alone — `default` resolves to the configuration every backup so far
-/// used, so a run that passes it has to produce the *same* run, down to the
-/// snapshot's hash, and a store cannot come to depend on which spelling was used.
+/// The first half is the flag working. A tree cut at three profiles is three
+/// different sets of chunks. The counts have to differ. They have to differ in the
+/// direction the names promise. The second half is the property that makes the flag
+/// safe to leave alone. `default` resolves to the configuration every backup so
+/// far used. A run that passes it has to produce the *same* run, down to the
+/// snapshot's hash. A store cannot come to depend on which spelling was used.
 #[tokio::test]
 async fn a_chunk_profile_is_the_chunking_and_default_is_the_flagless_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -873,9 +873,9 @@ async fn a_chunk_profile_is_the_chunking_and_default_is_the_flagless_run() {
 
 /// How many chunks the newest version of the set at `base` names.
 ///
-/// Through the snapshot rather than by counting records in the store: a chunk is
-/// what the snapshot refers to, and a record is also the snapshot itself and every
-/// commit, so the file holds more records than the version has chunks.
+/// Through the snapshot rather than by counting records in the store. A chunk is
+/// what the snapshot refers to. A record is also the snapshot itself and every
+/// commit. The file therefore holds more records than the version has chunks.
 async fn chunk_count(base: &Path) -> usize {
     let store = BlobStore::open_for_reading(base).await.unwrap();
     let snapshot = load_snapshot(&store, store.latest().unwrap().1)
@@ -886,10 +886,10 @@ async fn chunk_count(base: &Path) -> usize {
 
 /// A set whose runs were cut at different profiles is still one store.
 ///
-/// This is what the flag's own promise is: chunks are named by their contents and
-/// nothing about a profile is written into the format, so changing it mid-life
-/// costs deduplication and nothing else. Every version still restores, byte for
-/// byte, whichever profile cut it.
+/// Chunks are named by their contents. Nothing about a profile is written into the
+/// format. Changing the profile mid-life therefore costs deduplication and
+/// nothing else. Every version still restores, byte for byte, whichever profile
+/// cut it.
 #[test]
 fn a_set_survives_being_cut_at_more_than_one_profile() {
     let dir = tempfile::tempdir().unwrap();
@@ -927,9 +927,8 @@ fn a_set_survives_being_cut_at_more_than_one_profile() {
 #[test]
 fn a_run_says_that_it_is_making_progress() {
     // A backup of a real dataset takes minutes to hours. Until it reported
-    // anything at all, a user watching a silent terminal could not tell a
-    // working backup from a hung one, and the first thing they would do about
-    // that is kill it.
+    // anything at all, a user watching a silent terminal could not tell a working
+    // backup from a hung one. The first thing they would do about that is kill it.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(200_000)).unwrap();
@@ -940,8 +939,8 @@ fn a_run_says_that_it_is_making_progress() {
         backup.contains("in progress"),
         "a backup said nothing while it ran:\n{backup}"
     );
-    // The opening line is the file count, which the walk knows before any
-    // content has been read — the only thing worth saying at that point.
+    // The opening line is the file count. The walk knows that number before any
+    // content has been read. It is the only thing worth saying at that point.
     assert!(
         backup.contains("files=2"),
         "the opening progress line should report the file count:\n{backup}"
@@ -962,9 +961,9 @@ fn a_run_says_that_it_is_making_progress() {
 
 #[test]
 fn progress_reporting_can_be_turned_off() {
-    // Someone reading only the summary lines should be able to have them, and
-    // the running commentary is opt-out rather than something to filter out of
-    // the whole log.
+    // Someone reading only the summary lines should be able to have them. The
+    // running commentary is opt-out rather than something to filter out of the
+    // whole log.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(100_000)).unwrap();
@@ -989,10 +988,10 @@ fn progress_reporting_can_be_turned_off() {
 
 #[test]
 fn a_restore_merges_by_default_and_says_so() {
-    // Merging is the safer default — a restore into a directory that turns out to
-    // be the wrong one should not delete it first — but a user who expected the
-    // destination to be exactly the snapshot should not have to diff two trees to
-    // find out that it is not.
+    // Merging is the safer default. A restore into a directory that turns out to
+    // be the wrong one should not delete it first. But a user who expected the
+    // destination to be exactly the snapshot should not have to diff two trees.
+    // That user should not have to find out the destination is not the snapshot.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     fs::write(source.join("kept.bin"), noisy(50_000)).unwrap();
@@ -1044,7 +1043,7 @@ fn clean_gives_an_exact_copy() {
 #[test]
 fn clean_refuses_a_destination_holding_the_backup_set() {
     // The one operation here that destroys data, so the obvious mistake has to
-    // stop the run rather than empty the store it is about to read from.
+    // stop the run. It must not empty the store it is about to read from.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(50_000)).unwrap();
@@ -1095,7 +1094,7 @@ fn a_second_restore_into_one_destination_is_refused() {
 
     // Whichever order they actually ran in, the second one must not have been
     // allowed to write. If the first finished before the second started there is
-    // nothing to assert, so the check is on the lock file's existence instead.
+    // nothing to assert. The check is therefore on the lock file's existence.
     let lock_present = destination
         .with_file_name("out.lepatch-restore.lock")
         .exists();
@@ -1123,9 +1122,9 @@ fn a_second_restore_into_one_destination_is_refused() {
 fn a_restore_creates_a_destination_whose_parent_is_missing() {
     // `mnt/new/photos` is an ordinary thing to want, and the restore itself
     // creates the missing directories. The destination claim is a *sibling* of
-    // the destination, so it was the one part that could not cope with a path
-    // that is not there yet — and it failed the run with a bare ENOENT before
-    // any of that happened.
+    // the destination. It was therefore the one part that could not cope with a
+    // path that is not there yet. It failed the run with a bare ENOENT before any
+    // of that happened.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(50_000)).unwrap();
@@ -1179,13 +1178,12 @@ fn being_asked_to_stop_does_not_leave_a_claim_behind() {
     // Ctrl-C used to leave a claim that had to be removed by hand before the next
     // restore into the same directory would run.
     //
-    // The signal goes out through a shell rather than a new dependency: this
-    // crate's graph was just fought over to keep it small, and `kill` is a
-    // coreutils builtin on every platform this test is compiled for. Signalled by
-    // pid rather than by command-line pattern — matching the pattern races the
-    // process installing its handler, and a signal arriving first takes the
-    // default action and kills the run outright, which looks exactly like the
-    // bug being tested for.
+    // The signal goes out through a shell rather than a new dependency. This
+    // crate's graph was just fought over to keep it small. `kill` is a coreutils
+    // builtin on every platform this test is compiled for. The test signals by pid
+    // rather than by command-line pattern. Matching the pattern races the process
+    // that installs its handler. A signal arriving first takes the default action
+    // and kills the run outright, which looks exactly like the bug under test.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     for i in 0..12 {
@@ -1217,8 +1215,8 @@ fn being_asked_to_stop_does_not_leave_a_claim_behind() {
         let status = child.wait().expect("failed to wait for the restore");
         let path = claim_path(&destination);
 
-        // The claim must be gone whether the run was interrupted or finished:
-        // both paths release it, and that is the property worth asserting.
+        // The claim must be gone whether the run was interrupted or finished.
+        // Both paths release it, and that is the property worth asserting.
         assert!(
             !path.exists(),
             "SIG{signal} left a claim at {}",
@@ -1226,7 +1224,7 @@ fn being_asked_to_stop_does_not_leave_a_claim_behind() {
         );
 
         // When it was interrupted at all, it should report the way a shell
-        // expects: 128 + signal.
+        // expects, which is 128 plus the signal.
         if let Some(code) = status.code()
             && code != 0
         {
@@ -1296,25 +1294,25 @@ fn a_failing_clean_restore_leaves_the_destination_alone() {
 #[cfg(unix)]
 #[test]
 fn a_clean_restore_is_never_left_partly_written() {
-    // The invariant, stated so it holds whatever the timing: after a `--clean`
+    // The invariant, stated so it holds whatever the timing. After a `--clean`
     // restore is killed, the destination is either *entirely* the old contents or
-    // *entirely* the snapshot. Never some mixture of the two, which is what a
-    // restore that wrote in place would leave.
+    // *entirely* the snapshot. Never some mixture of the two. A restore that wrote
+    // in place would leave a mixture.
     //
-    // This test previously slept a fixed 120 ms and then killed, which is a race
-    // it cannot reliably win: on a machine where the restore of 20 MB finished
-    // inside that window, the kill arrived *after* the swap and the destination
-    // held the finished snapshot — a correct outcome the assertion rejected. The
-    // comment claimed "both outcomes are acceptable, so this cannot be flaky in
-    // the failing direction", and that was false: the assertion accepted one of
-    // them. A test whose stated invariant is wider than what it checks is worse
-    // than a tight assertion, because the comment is what a reader trusts.
+    // This test previously slept a fixed 120 ms and then killed. That is a race
+    // it cannot reliably win. On a machine where the restore of 20 MB finished
+    // inside that window, the kill arrived *after* the swap. The destination
+    // held the finished snapshot. That is a correct outcome the assertion
+    // rejected. The comment claimed "both outcomes are acceptable, so this cannot
+    // be flaky in the failing direction". That was false. The assertion accepted
+    // one of them. A test whose stated invariant is wider than what it checks is
+    // worse than a tight assertion, because the comment is what a reader trusts.
     //
     // So two things are fixed rather than one. The kill is aimed by *waiting* for
-    // the staging directory a `--clean` restore assembles into, which is the
-    // window the atomicity claim is actually about, instead of guessing a duration
-    // the machine decides. And the assertion states the invariant, so either side
-    // of the race passes and only a genuinely mixed destination fails.
+    // the staging directory a `--clean` restore assembles into. That is the window
+    // the atomicity claim is actually about, instead of guessing a duration the
+    // machine decides. The assertion then states the invariant, so either side of
+    // the race passes and only a genuinely mixed destination fails.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     for i in 0..10 {
@@ -1336,10 +1334,10 @@ fn a_clean_restore_is_never_left_partly_written() {
 
     // Wait for the restore to be *assembling*, rather than assuming how long that
     // takes. A `--clean` restore builds the whole tree in a sibling directory and
-    // swaps it in, so the presence of that directory is the signal that the
-    // destination has not been touched yet — the only state in which a kill says
-    // anything about atomicity, and a fact about the restore rather than a
-    // duration the machine gets to choose.
+    // swaps it in. The presence of that directory is therefore the signal that
+    // the destination has not been touched yet. That is the only state in which
+    // a kill says anything about atomicity. It is a fact about the restore rather
+    // than a duration the machine gets to choose.
     let staging = dir.path().join(format!("out.{PARTIAL_SUFFIX}"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !staging.exists() && std::time::Instant::now() < deadline {
@@ -1369,10 +1367,10 @@ fn a_clean_restore_is_never_left_partly_written() {
     let has_marker = names.iter().any(|n| n == "marker.txt");
     let restored_files = names.iter().filter(|n| n.starts_with('f')).count();
 
-    // The invariant, not one side of it. Either exactly what it was — the marker,
-    // and none of the restored files — or exactly the snapshot: every restored
-    // file, and no marker. Anything else means the destination was written into,
-    // which is the failure.
+    // The invariant, not one side of it. Either exactly what it was, which is the
+    // marker and none of the restored files. Or exactly the snapshot, which is
+    // every restored file and no marker. Anything else means the destination was
+    // written into, and that is the failure.
     let untouched = has_marker && restored_files == 0;
     let swapped = !has_marker && restored_files == 10;
 
@@ -1398,11 +1396,12 @@ fn a_clean_restore_is_never_left_partly_written() {
 
 /// `lepatch pack` writes a file a client can fetch in one range.
 ///
-/// The three properties that make a pack usable as a distributed artifact, checked
-/// through the command line rather than the library, because the command is what
-/// a user has:
-/// it can be produced at all; the same version packs to the same bytes whatever
-/// the set has done since; and a later version is a different artifact.
+/// The three properties that make a pack usable as a distributed artifact are
+/// checked here. The check runs through the command line rather than the library,
+/// because the command is what a user has. Those properties are:
+/// * the pack can be produced at all.
+/// * the same version packs to the same bytes whatever the set has done since.
+/// * a later version is a different artifact.
 #[test]
 fn a_pack_is_written_deterministically_and_per_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -1417,9 +1416,9 @@ fn a_pack_is_written_deterministically_and_per_version() {
     ok(dir.path(), &["backup", ".", "set"]);
     let first = ok(dir.path(), &["pack", "set", "v1.pack"]);
 
-    // The content hash is on stdout, and it is the pack's name: the same tree
-    // packs to the same bytes, so a cache can be keyed on it and a client can
-    // verify with one comparison.
+    // The content hash is on stdout, and it is the pack's name. The same tree
+    // packs to the same bytes. A cache can therefore be keyed on it. A client can
+    // verify a pack with one comparison.
     let hash_of = |text: &str| {
         text.lines()
             .next()
@@ -1440,9 +1439,9 @@ fn a_pack_is_written_deterministically_and_per_version() {
         "packing the same version twice produced different bytes"
     );
 
-    // Change a file and take a second version. That is a different artifact, and
-    // the first is still reproducible from the set afterwards — which is the
-    // property that makes a pack derived output rather than a second copy.
+    // Change a file and take a second version. That is a different artifact. The
+    // first is still reproducible from the set afterwards. That property makes a
+    // pack derived output rather than a second copy.
     fs::write(dir.path().join("f2.bin"), noisy(230_000)).unwrap();
     ok(dir.path(), &["backup", ".", "set"]);
     let second = ok(dir.path(), &["pack", "set", "v2.pack"]);
@@ -1467,8 +1466,8 @@ fn a_pack_is_written_deterministically_and_per_version() {
 /// A pack reports a version the set does not hold rather than packing the wrong
 /// one.
 ///
-/// `--version` is a number a user types, so it is exactly the input a stale script
-/// or a typo produces, and the failure has to be a refusal.
+/// `--version` is a number a user types. It is therefore exactly the input a stale
+/// script or a typo produces. The failure has to be a refusal.
 #[test]
 fn packing_a_version_that_does_not_exist_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -1488,9 +1487,9 @@ fn packing_a_version_that_does_not_exist_is_refused() {
 
 /// The whole round trip, through the command line and nothing else.
 ///
-/// `pack` then `apply`, with no set consulted at apply time — which is the point
-/// of a pack carrying its own file table. If a client needed the set as well as
-/// the file, this would fail the moment the set was moved or deleted, which is the
+/// `pack` then `apply`, with no set consulted at apply time. That is the point of
+/// a pack carrying its own file table. If a client needed the set as well as the
+/// file, this would fail the moment the set was moved or deleted. That move is the
 /// situation sharing a patch is for.
 #[test]
 fn a_pack_applied_to_an_empty_directory_produces_the_tree() {
@@ -1530,9 +1529,9 @@ fn a_pack_applied_to_an_empty_directory_produces_the_tree() {
 
 /// Applying an update writes what changed and says how little that was.
 ///
-/// This is the property the whole feature exists for, checked through the command
-/// line: the report has to name a figure small enough to be a delta, because a
-/// tool that quietly re-sent the tree would still produce a correct directory.
+/// The report has to name a figure small enough to be a delta. The whole feature
+/// exists for that. A tool that quietly re-sent the tree would still produce a
+/// correct directory.
 #[test]
 fn an_update_fetches_a_delta_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
@@ -1581,10 +1580,10 @@ fn an_update_fetches_a_delta_and_says_so() {
 
 /// An unprivileged restore finishes, and says which owners it could not set.
 ///
-/// The case that decides whether recording an owner is worth anything. Restoring a
-/// tree containing files you do not own is ordinary — a home directory holds a few
-/// and `/etc` is nothing but — and an unprivileged restore of one has to finish with
-/// correct contents rather than stop partway.
+/// The case that decides whether recording an owner is worth anything. Restoring
+/// a tree containing files you do not own is ordinary. A home directory holds a
+/// few. `/etc` is nothing but such files. An unprivileged restore of one has to
+/// finish with correct contents rather than stop partway.
 ///
 /// It stopped partway. The file that failed was already on disk under the wrong
 /// owner, so there was nothing to retry and nothing to say it was wrong.
@@ -1611,8 +1610,8 @@ fn an_unprivileged_restore_finishes_and_reports_its_owners() {
 
     ok(dir.path(), &["backup", "source", "set"]);
 
-    // The store and the destination are readable and writable by anyone; nothing is
-    // chownable by the caller, which is the whole situation.
+    // The store and the destination are readable and writable by anyone. Nothing
+    // is chownable by the caller. That is the whole situation.
     let dest = dir.path().join("out");
     fs::create_dir(&dest).unwrap();
     // The temp dir itself, because a restore's claim is a sibling of the
@@ -1652,7 +1651,7 @@ fn an_unprivileged_restore_finishes_and_reports_its_owners() {
         "naming what would fix it, got: {said}"
     );
 
-    // The tree is right; only the owner is not. That is the whole claim.
+    // The tree is right. Only the owner is not. That is the whole claim.
     assert_eq!(
         fs::read(dest.join("not-mine")).unwrap(),
         b"owned by someone else",
@@ -1677,9 +1676,9 @@ fn figure(report: &str, marker: &str) -> Option<u64> {
 
 /// `pack --from N` writes a delta, and it is smaller and it still works.
 ///
-/// The whole claim through the command line: a smaller artifact for a client known
-/// to be on version 1, applied from nothing but that artifact and the directory
-/// version 1 left behind.
+/// The whole claim through the command line. A smaller artifact for a client
+/// known to be on version 1. It is applied from nothing but that artifact and the
+/// directory version 1 left behind.
 #[test]
 fn a_delta_pack_is_written_and_applied_through_the_command_line() {
     let dir = tempfile::tempdir().unwrap();
@@ -1691,7 +1690,7 @@ fn a_delta_pack_is_written_and_applied_through_the_command_line() {
     ok(dir.path(), &["backup", "source", "set"]);
     ok(dir.path(), &["pack", "set", "v1.pack", "--version", "1"]);
 
-    // The client takes version 1, which is what leaves the record the delta will be
+    // The client takes version 1. That is what leaves the record the delta will be
     // checked against.
     let target = dir.path().join("target");
     ok(dir.path(), &["apply", "v1.pack", "target"]);
@@ -1727,8 +1726,8 @@ fn a_delta_pack_is_written_and_applied_through_the_command_line() {
 /// A delta pack is refused for a client that is not on the version it names.
 ///
 /// Through the command line, because the refusal is a thing a user has to read. A
-/// delta omits the chunks its assumed holder has, so applying one to the wrong
-/// client would leave a directory that is neither version and report success.
+/// delta omits the chunks its assumed holder has. Applying one to the wrong client
+/// would leave a directory that is neither version. It would report success.
 #[test]
 fn a_delta_pack_is_refused_for_a_client_on_another_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -1776,15 +1775,16 @@ fn a_delta_pack_is_refused_for_a_client_on_another_version() {
 /// A delta written with a compression level is still a delta, and still applies.
 ///
 /// `--compression` on `pack` re-encodes every chunk it writes rather than copying
-/// the frame the set holds, so a delta and a level meet on one code path: the plan
-/// is built from the chunks a delta omits, and the forms are measured against that
-/// smaller set. Every `--compression` test uses a full pack and every `--from` test
-/// uses the default, so the quadrant between them — where the plan is a subset and
-/// every form is recomputed — had nothing at all running through it.
+/// the frame the set holds. A delta and a level therefore meet on one code path.
+/// The plan is built from the chunks a delta omits, and the forms are measured
+/// against that smaller set. Every `--compression` test uses a full pack. Every
+/// `--from` test uses the default. The quadrant between them had nothing at all
+/// running through it. In that quadrant the plan is a subset and every form is
+/// recomputed.
 ///
-/// Both consumers of that pack are here as well, because they read it differently:
-/// `apply` resolves the delta against a directory, and `merge` against a set, which
-/// has to hold the delta's base before the delta can mean anything.
+/// Both consumers of that pack are here as well, because they read it differently.
+/// `apply` resolves the delta against a directory. `merge` resolves it against a
+/// set, which has to hold the delta's base before the delta can mean anything.
 #[test]
 fn a_delta_packed_with_a_compression_level_applies_and_merges() {
     let dir = tempfile::tempdir().unwrap();
@@ -1829,9 +1829,10 @@ fn a_delta_packed_with_a_compression_level_applies_and_merges() {
     common::assert_same_tree(&source, &target);
 
     // And into a set that holds the base on its own terms. A merge refuses a delta
-    // unless the receiving set holds the version it names, and what it matches is
-    // the base *snapshot* — so this set is built from the version 1 tree, restored
-    // rather than saved a second time, and the numbering works out on its own.
+    // unless the receiving set holds the version it names. What it matches is the
+    // base *snapshot*. This set is therefore built from the version 1 tree. The
+    // tree is restored rather than saved a second time. The numbering works out on
+    // its own.
     let base_tree = dir.path().join("v1-tree");
     ok(
         dir.path(),
@@ -1867,8 +1868,8 @@ fn a_delta_packed_with_a_compression_level_applies_and_merges() {
 /// `--full` wins over `--from`, and says so.
 ///
 /// Two flags that contradict, in a script that has both. `--full` is the promise
-/// that the artifact suits any client, so a stale `--from` narrowing it silently
-/// would break that promise with nothing in the output to show.
+/// that the artifact suits any client. A stale `--from` that narrows it silently
+/// would break that promise. Nothing in the output would show the break.
 #[test]
 fn a_full_flag_overrides_a_from_and_says_it_did() {
     let dir = tempfile::tempdir().unwrap();
@@ -1986,15 +1987,15 @@ fn applying_something_that_is_not_a_pack_is_refused() {
 
 /// `probe` is not a subcommand.
 ///
-/// It was one, reporting what a directory holds and which ranges a fetch would
-/// need. That answer is the one an `apply` has to work out before it can write
-/// anything, so it is not a separate thing a user does — it is a step of the apply,
-/// and an `apply` that has just run has already reported it as its summary line. A
-/// command worth only running when the user already knows what they want is not a
-/// command.
+/// It was one. It reported what a directory holds and which ranges a fetch would
+/// need. An `apply` has to work that answer out before it can write anything.
+/// `probe` was therefore not a separate thing a user does. It was a step of the
+/// apply. An `apply` that has just run has already reported it as its summary
+/// line. A command worth only running when the user already knows what they want
+/// is not a command.
 ///
-/// The library keeps both halves. `probe` is what an apply uses to find the missing
-/// slices and `Pack::needed` is how those become ranges; `tests/probe.rs` and
+/// The library keeps both halves. An apply uses `probe` to find the missing
+/// slices. `Pack::needed` turns those slices into ranges. `tests/probe.rs` and
 /// `tests/pack.rs` cover them.
 #[test]
 fn a_probe_is_not_a_subcommand() {
@@ -2027,9 +2028,9 @@ fn a_probe_is_not_a_subcommand() {
 
 /// Unrecorded entries are named and left alone unless pruning was asked for.
 ///
-/// The default is the decision this command makes on the user's behalf, so it is
-/// worth a test that says so from the outside: the note is on stderr and the file
-/// is still there.
+/// The default is the decision this command makes on the user's behalf. A test
+/// that says so from the outside is therefore worth having. The note is on
+/// stderr. The file is still there.
 #[test]
 fn an_unrecorded_entry_is_named_and_kept_until_prune_is_asked_for() {
     let dir = tempfile::tempdir().unwrap();
@@ -2067,8 +2068,8 @@ fn an_unrecorded_entry_is_named_and_kept_until_prune_is_asked_for() {
 /// A mistyped set name is an error, not an empty answer.
 ///
 /// The store's own rule is that reading a path which is not a store is an error
-/// rather than an empty set, "so a mistyped name cannot come back as no
-/// versions". Two commands were breaking it, in opposite ways.
+/// rather than an empty set. The rule exists so a mistyped name cannot come back
+/// as no versions. Two commands were breaking it, in opposite ways.
 #[test]
 fn a_mistyped_set_name_is_an_error_not_an_empty_listing() {
     let dir = tempfile::tempdir().unwrap();
@@ -2082,9 +2083,9 @@ fn a_mistyped_set_name_is_an_error_not_an_empty_listing() {
     );
     assert_eq!(stdout(&listed), "", "a failed listing should print nothing");
 
-    // The worse of the two: opening for writing *creates* a set, so a repair
-    // command given a mistyped name used to manufacture an empty one and report a
-    // successful repair of it.
+    // The worse of the two. Opening for writing *creates* a set. A repair command
+    // given a mistyped name therefore used to manufacture an empty one. It used to
+    // report a successful repair of it.
     let reindexed = lepatch(dir.path(), &["reindex", "nosuchset"]);
     assert_eq!(
         reindexed.status.code(),
@@ -2101,9 +2102,9 @@ fn a_mistyped_set_name_is_an_error_not_an_empty_listing() {
 /// A set that exists but commits no version lists as empty, which is a different
 /// thing from a name that names nothing.
 ///
-/// The distinction is the whole reason for the check above: an empty set is a
-/// real answer to a real question, and refusing it would make a freshly created
-/// set unusable.
+/// An empty set is a real answer to a real question. That distinction is the
+/// whole reason for the check above. Refusing it would make a freshly created set
+/// unusable.
 #[test]
 fn a_set_with_no_committed_version_lists_as_empty() {
     let dir = tempfile::tempdir().unwrap();
@@ -2120,8 +2121,8 @@ fn a_set_with_no_committed_version_lists_as_empty() {
     let _ = child.kill();
     let _ = child.wait();
 
-    // Whatever state the kill left, the store is either absent — in which case
-    // there is nothing to assert — or present and listing as empty.
+    // Whatever state the kill left, the store is either absent or present and
+    // listing as empty. A store that is absent leaves nothing to assert.
     if dir.path().join("store.0000.bin").exists() {
         let listed = lepatch(dir.path(), &["versions", "store"]);
         assert_eq!(
@@ -2135,10 +2136,10 @@ fn a_set_with_no_committed_version_lists_as_empty() {
 
 /// A tree containing a named pipe is backed up without hanging.
 ///
-/// Reading a FIFO blocks until a writer appears, so a tree containing one used to
-/// hang the run forever — and, because the binary installs a SIGTERM handler to
-/// release its claims, the signal could not kill it either. The test runs the
-/// backup with a timeout so a regression fails rather than hanging the suite.
+/// Reading a FIFO blocks until a writer appears. A tree containing one therefore
+/// used to hang the run forever. The binary installs a SIGTERM handler to release
+/// its claims, so the signal could not kill it either. The test runs the backup
+/// with a timeout so a regression fails rather than hanging the suite.
 #[cfg(unix)]
 #[test]
 fn a_named_pipe_is_skipped_rather_than_read() {
@@ -2203,10 +2204,10 @@ fn a_named_pipe_is_skipped_rather_than_read() {
 
 /// Piping a command into something that stops reading is not a failure.
 ///
-/// `lepatch versions set | head -1` used to print a line and then panic, because
-/// Rust ignores `SIGPIPE` and the print macros turn the resulting `EPIPE` into a
-/// panic. A reader that stops early is what `head` does on purpose, so it exits
-/// as the run otherwise would, with nothing on stderr.
+/// `lepatch versions set | head -1` used to print a line and then panic. Rust
+/// ignores `SIGPIPE`, and the print macros turn the resulting `EPIPE` into a
+/// panic. A reader that stops early is what `head` does on purpose. The command
+/// should therefore exit as the run otherwise would, with nothing on stderr.
 #[test]
 fn a_command_piped_into_something_that_stops_early_does_not_panic() {
     let dir = tempfile::tempdir().unwrap();
@@ -2255,19 +2256,19 @@ fn a_command_piped_into_something_that_stops_early_does_not_panic() {
 
 /// A failed `verify` reports the failure and exits 1.
 ///
-/// The summary `verify` prints to stdout is not the verdict — the verdict is
-/// `Report::into_result`, and it is computed *after* the summary is written.
-/// `say!` used to be able to terminate the process from inside the write, which
-/// meant the order of those two statements decided the exit code of a command
-/// whose whole job is to report one. This pins the outcome, and the ordering is
+/// The summary `verify` prints to stdout is not the verdict. The verdict is
+/// `Report::into_result`. It is computed *after* the summary is written.
+/// `say!` used to be able to terminate the process from inside the write. The
+/// order of those two statements therefore decided the exit code of a command
+/// whose whole job is to report one. This test pins the outcome. The ordering is
 /// now visible in the source rather than being an accident of it.
 ///
-/// Note what this does *not* cover: the `EPIPE` path itself. A shell pipeline
-/// cannot be made to close its read end deterministically — bash holds it open
-/// for the life of the pipeline, and `dash` exposes no way to read a member's
-/// status out of one — so a test that piped this would pass whether or not the
-/// `say!` fix were present. The companion test above covers the reader-closed
-/// case for a command that can only succeed.
+/// Note what this does *not* cover. It does not cover the `EPIPE` path itself. A
+/// shell pipeline cannot be made to close its read end deterministically. Bash
+/// holds it open for the life of the pipeline. `dash` exposes no way to read a
+/// member's status out of one. A test that piped this would therefore pass whether
+/// or not the `say!` fix were present. The companion test above covers the
+/// reader-closed case for a command that can only succeed.
 #[test]
 fn a_failed_verify_reports_and_exits_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -2281,8 +2282,8 @@ fn a_failed_verify_reports_and_exits_one() {
     ok(dir.path(), &["backup", ".", "store"]);
 
     // Damage a chunk's *payload*, so verification finds a hash mismatch rather
-    // than a record it cannot parse. A damaged record is a different path: it
-    // fails the run before the summary is ever reached and prints nothing to
+    // than a record it cannot parse. A damaged record is a different path. It
+    // fails the run before the summary is ever reached. It prints nothing to
     // stdout, which would make this test pass for the wrong reason.
     let segments = IndexSet::new(dir.path().join("store"));
     let paths = segments.segments().unwrap();
@@ -2321,10 +2322,10 @@ fn a_failed_verify_reports_and_exits_one() {
 
 /// Both listing modes name the same versions.
 ///
-/// `--numbers-only` used to read each index file on its own, which checksums one
+/// `--numbers-only` used to read each index file on its own. That checksums one
 /// file and never consults the store. A leftover index naming a version the set
-/// no longer holds was therefore printed by one mode and omitted by the other,
-/// from the same directory, in the same invocation pair. Both go through
+/// no longer holds was therefore printed by one mode and omitted by the other.
+/// Both read the same directory in the same invocation pair. Both go through
 /// `storage::resolve` now, which cross-checks the index against the store's own
 /// commit log.
 #[test]
@@ -2390,8 +2391,9 @@ fn both_listing_modes_name_the_same_versions() {
 /// `DestinationLock` resolves "beside the destination" by canonicalising, and its
 /// `Drop` removes the two scratch paths built from that resolution. Its own doc
 /// says "an interrupted restore leaves no half-written tree". The binary had a
-/// second copy of the same rule and did not canonicalise, so a run staging
-/// through a symlink put the tree somewhere the claim's cleanup never looked:
+/// second copy of the same rule. The binary did not canonicalise. A run staging
+/// through a symlink therefore put the tree somewhere the claim's cleanup never
+/// looked.
 ///
 /// ```text
 /// destination      /tmp/out/link  ->  /tmp/real
@@ -2400,10 +2402,10 @@ fn both_listing_modes_name_the_same_versions() {
 /// ```
 ///
 /// Testing the cleanup through the CLI means arranging a restore that fails
-/// *after* the staging directory exists, which is fiddly and mostly tests the
-/// test. So this asks the claim directly: take it, put something at the scratch
-/// paths it says it owns, drop it, and check they are gone. That is exactly the
-/// promise, with nothing else in the way.
+/// *after* the staging directory exists. That setup is fiddly and mostly tests
+/// the test. So this asks the claim directly. Take it, put something at the
+/// scratch paths it says it owns, drop it, and check they are gone. That is
+/// exactly the promise, with nothing else in the way.
 #[cfg(unix)]
 #[test]
 fn a_restore_claim_cleans_up_beside_the_resolved_destination() {
@@ -2465,8 +2467,9 @@ fn a_restore_claim_cleans_up_beside_the_resolved_destination() {
 /// A clean restore through a symlink reaches the directory the link points at.
 ///
 /// `restore_atomically` swaps by `rename`, and `rename` moves a symbolic link
-/// itself rather than what it points at. So a version that took the destination as
-/// written moved the *link* aside and put a plain directory in its place:
+/// itself rather than what it points at. A version that took the destination as
+/// written therefore moved the *link* aside. It put a plain directory in its
+/// place:
 ///
 /// ```text
 /// before: link -> /tmp/real,  real empty
@@ -2475,9 +2478,10 @@ fn a_restore_claim_cleans_up_beside_the_resolved_destination() {
 /// after:  link is a plain directory holding the snapshot,  real still empty
 /// ```
 ///
-/// Reported as success, into a path the user did not name, having replaced a
-/// symlink with a directory. The destination is now whatever the resolve step
-/// decided it is, so the swap is done against that and the link is left alone.
+/// The run reported success. It wrote into a path the user did not name. It
+/// replaced a symlink with a directory. The destination is now whatever the
+/// resolve step decided it is, so the swap is done against that and the link is
+/// left alone.
 #[cfg(unix)]
 #[test]
 fn a_clean_restore_through_a_symlink_lands_in_the_destination() {
@@ -2539,24 +2543,24 @@ fn a_clean_restore_through_a_symlink_lands_in_the_destination() {
 // ---------------------------------------------------------------------------
 // Dry runs.
 //
-// Each of the five writing subcommands takes `--dry-run`, and each of these says
-// two things: that a dry run reports the numbers the real run would print, and
-// that it wrote nothing — not one byte, not one file, and not one directory that
+// Each of the five writing subcommands takes `--dry-run`. Each of these says
+// two things. A dry run must report the numbers the real run would print. A dry
+// run must write nothing. Not one byte, not one file, and not one directory that
 // did not exist before it.
 //
-// The second is the one worth being paranoid about, because the failure is silent:
-// a plan that quietly created the store, the lock or the destination it was
-// describing would still print a correct-looking report, and the test that only
+// The second is the one worth being paranoid about, because the failure is silent.
+// A plan that quietly created the store, the lock or the destination it was
+// describing would still print a correct-looking report. The test that only
 // checked the report would pass. So every test here compares a listing taken
-// before with the same listing taken after, and the interesting cases are the ones
+// before with the same listing taken after. The interesting cases are the ones
 // where the artifact in question did not exist to begin with.
 // ---------------------------------------------------------------------------
 
 /// Every name in `dir`, sorted, as a listing a person would give.
 ///
 /// Recursive, because the thing a dry run must not leave behind is not always
-/// beside what it was asked about — a clean restore stages its tree next to the
-/// destination, and an apply records a manifest next to it.
+/// beside what it was asked about. A clean restore stages its tree next to the
+/// destination. An apply records a manifest next to it.
 fn listing(root: &Path) -> Vec<String> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -2572,7 +2576,7 @@ fn listing(root: &Path) -> Vec<String> {
             out.push(relative.display().to_string());
 
             // `symlink_metadata`, so a link is not followed into whatever it
-            // points at — a tree being backed up may well hold one.
+            // points at. A tree being backed up may well hold one.
             if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
                 walk(root, &path, out);
             }
@@ -2599,10 +2603,11 @@ fn after(report: &str, marker: &str) -> String {
 
 /// Every number in a line, in order.
 ///
-/// Both the pack and the apply say what they are doing in one sentence of figures,
-/// and what a plan has to agree with is the whole sentence apart from the part it
-/// cannot know — so comparing the numbers is simpler and stricter than matching on
-/// wording, and it survives the two wordings being different sentences.
+/// Both the pack and the apply say what they are doing in one sentence of
+/// figures. A plan has to agree with the whole sentence apart from the part it
+/// cannot know. So this compares the numbers. That is simpler and stricter than
+/// matching on wording. It also survives the two wordings being different
+/// sentences.
 fn numbers(line: &str) -> Vec<u64> {
     let mut out = Vec::new();
     let mut digits = String::new();
@@ -2634,8 +2639,8 @@ fn latest_snapshot(dir: &Path, set: &str) -> String {
 
 /// The bytes of every regular file in `root`.
 ///
-/// What a restore writes and — with nothing already held — what a backup stores,
-/// since both are the tree's own content. Checked against a plan's figure so the
+/// What a restore writes. Also what a backup stores when it holds nothing already,
+/// because both are the tree's own content. Checked against a plan's figure so the
 /// report is pinned to the tree rather than to itself.
 fn content_bytes(root: &Path) -> u64 {
     common::describe(root)
@@ -2678,10 +2683,10 @@ fn a_dry_backup_of_a_new_location_creates_nothing_and_plans_every_chunk() {
 
     let report = ok(dir.path(), &["backup", "src", "snap", "--dry-run"]);
 
-    // Nothing at all. The set's directory does not exist and must not be made:
-    // `open_for_writing` creates segment 0 for a set with none, so a dry run that
-    // opened the store the way a backup does would leave an empty store behind and
-    // report a first version in it.
+    // Nothing at all. The set's directory does not exist and must not be made.
+    // `open_for_writing` creates segment 0 for a set with none. So a dry run that
+    // opened the store the way a backup does would leave an empty store behind. It
+    // would also report a first version in it.
     assert_eq!(
         listing(dir.path()),
         before,
@@ -2696,8 +2701,8 @@ fn a_dry_backup_of_a_new_location_creates_nothing_and_plans_every_chunk() {
         "a dry backup took the write lock"
     );
 
-    // The plan is a plan: it says what it would commit, and it knows there is no set
-    // behind the name yet rather than failing the way reading one would.
+    // The plan is a plan. It says what it would commit. It knows there is no set
+    // behind the name yet, rather than failing the way reading one would.
     assert!(
         report.contains("would create it"),
         "the first backup of a location should plan as an all-new version: {report}"
@@ -2718,7 +2723,7 @@ fn a_dry_backup_of_a_new_location_creates_nothing_and_plans_every_chunk() {
         "the planned snapshot is not the one the next backup committed"
     );
 
-    // Nothing was held before, so every chunk is new — and the byte total is the
+    // Nothing was held before, so every chunk is new. The byte total is the
     // tree's content, which is a figure a test can check against the tree itself.
     let figures = backup_figures(&report);
     let (files, _dirs, _links, chunks, fresh, held, stored) = (
@@ -2775,7 +2780,7 @@ fn a_dry_backup_of_an_unchanged_set_reports_nothing_to_store_and_grows_nothing()
     assert!(figures[3] > 0, "a tree this size has chunks: {report}");
 
     // The version it would commit is the next one, and the tree is unchanged, so
-    // the snapshot hash is the one the *first* backup committed — a second version
+    // the snapshot hash is the one the *first* backup committed. A second version
     // of the same tree is the same version.
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(
@@ -2813,7 +2818,7 @@ fn a_dry_restore_writes_no_file_no_directory_and_no_claim() {
     );
 
     // The counts are the ones the restore will go on to report, and the bytes are
-    // the tree's — a restore writes each recorded file whole.
+    // the tree's. A restore writes each recorded file whole.
     let source_bytes = content_bytes(&dir.path().join("src"));
     let figures = numbers(report.lines().nth(1).expect("a plan reports its counts"));
     assert_eq!(
@@ -2827,9 +2832,9 @@ fn a_dry_restore_writes_no_file_no_directory_and_no_claim() {
     );
     assert_ne!(figures[3], 0, "the version names chunks: {report}");
 
-    // And the one figure a real restore can only turn into a count afterwards: the
-    // bound a plan gives, in the apply dry run's words, because whether this
-    // process could set an owner is only knowable by setting it.
+    // And the one figure a real restore can only turn into a count afterwards. A
+    // plan gives the bound, in the apply dry run's words. Whether this process
+    // could set an owner is only knowable by setting it.
     let logs = ok_logs(dir.path(), &["restore", "out", "snap", "--dry-run"]);
     assert!(
         logs.contains(
@@ -2855,8 +2860,8 @@ fn a_dry_clean_restore_does_not_empty_the_destination() {
     fs::write(destination.join("mine"), b"work in progress\n").unwrap();
     let before = common::describe(&destination);
 
-    // `--clean` is the one operation here that destroys data, so a dry run that
-    // did not empty the destination would be the single most surprising thing this
+    // `--clean` is the one operation here that destroys data. A dry run that
+    // did not empty the destination would be the most surprising thing this
     // flag could do.
     let report = ok(
         dir.path(),
@@ -2907,7 +2912,7 @@ fn a_dry_pack_writes_no_file_and_reports_what_it_would_hold() {
         "a dry pack should say the file was not written: {plan}"
     );
 
-    // The plan and the pack agree, chunk for chunk and byte for byte: the plan's
+    // The plan and the pack agree, chunk for chunk and byte for byte. The plan's
     // sentence is the pack's with the one figure a plan cannot know left off.
     let written = ok(dir.path(), &["pack", "snap", "v1.pack"]);
     let planned = numbers(
@@ -3118,8 +3123,8 @@ fn a_dry_reindex_writes_no_index_file_and_takes_no_lock() {
         "and the set holds one version: {plan}"
     );
 
-    // The figure a plan leads with is how many index files the real run writes,
-    // which is a count of what it can resolve rather than of what it holds.
+    // The figure a plan leads with is how many index files the real run writes.
+    // That is a count of what it can resolve, rather than of what it holds.
     let planned = numbers(plan.lines().nth(1).expect("a plan reports its counts"))[0];
 
     ok(dir.path(), &["reindex", "snap"]);
@@ -3137,17 +3142,17 @@ fn a_dry_reindex_writes_no_index_file_and_takes_no_lock() {
 
 /// A dry run is taken against a set or a destination something else holds.
 ///
-/// Every write a real run makes around the work — the write lock on a set, the
-/// claim beside a destination — is a file, and a plan that created one would be
-/// making the very claim it must not. A listing taken after the run cannot see
-/// this, because the file is removed on the way out again; the claim that *was*
-/// taken is what another process would have collided with while the run was in
-/// progress, so the way to see it is to be holding it.
+/// Every write a real run makes around the work is a file. The write lock on a
+/// set is a file. The claim beside a destination is a file. A plan that created
+/// one would be making the very claim it must not. A listing taken after the run
+/// cannot see this. The file is removed on the way out again. The claim that
+/// *was* taken is what another process would have collided with while the run
+/// was in progress. The only way to see it is to be holding it.
 ///
-/// Which is also the property worth having: the reason a dry run takes no claim
-/// is that it reads nothing that a claim protects, so a plan can be taken against
-/// a set a backup is holding or a destination a restore is writing into. The
-/// refusals at the end are what make the successes meaningful — without them, a
+/// Which is also the property worth having. A dry run takes no claim because it
+/// reads nothing that a claim protects. A plan can therefore be taken against a
+/// set a backup is holding or a destination a restore is writing into. The
+/// refusals at the end are what make the successes meaningful. Without them, a
 /// lock nobody honours would prove nothing.
 #[test]
 fn a_dry_run_needs_no_claim_and_takes_none() {
@@ -3169,8 +3174,9 @@ fn a_dry_run_needs_no_claim_and_takes_none() {
     ok(dir.path(), &["restore", "out", "snap", "--dry-run"]);
     ok(dir.path(), &["apply", "v1.pack", "out", "--dry-run"]);
 
-    // And the same commands are refused while the claims are held, so the four
-    // successes above are about the dry run rather than about a lock nobody takes.
+    // And the same commands are refused while the claims are held. The four
+    // successes above are therefore about the dry run, not about a lock nobody
+    // takes.
     fails(dir.path(), &["backup", "src", "snap"]);
     fails(dir.path(), &["reindex", "snap"]);
     fails(dir.path(), &["restore", "out", "snap"]);
@@ -3215,7 +3221,7 @@ fn versions_and_verify_refuse_a_dry_run_rather_than_pretending_to_have_one() {
 #[test]
 fn every_writing_subcommand_documents_its_dry_run() {
     // The help is where somebody looks before trusting the flag, and the neighbours
-    // say both what it affects and what it does not — so this checks both are there
+    // say both what it affects and what it does not. So this checks both are there
     // rather than just the word.
     let dir = tempfile::tempdir().unwrap();
 
@@ -3252,7 +3258,7 @@ fn every_writing_subcommand_documents_its_dry_run() {
 }
 
 // ---------------------------------------------------------------------------
-// `lepatch merge` — the receiving half of a pack.
+// `lepatch merge`, the receiving half of a pack.
 // ---------------------------------------------------------------------------
 
 /// A source tree with several files, big enough that a delta is a real fraction
@@ -3295,15 +3301,16 @@ fn set_contents(
 /// `lepatch merge` is the other half of `pack`, and the two must compose.
 ///
 /// The property that decides whether merge is a real operation rather than a
-/// write that happens to succeed: a set built by merging a pack restores to the
-/// same tree as one built by `backup`, byte for byte. Compared as trees rather
-/// than by exit code, because a merge that dropped a file, truncated one or
-/// stored the wrong chunk at the wrong offset would still exit 0.
+/// write that happens to succeed. A set built by merging a pack restores to the
+/// same tree as one built by `backup`, byte for byte. This compares trees rather
+/// than exit codes. A merge that dropped a file, truncated one or stored the
+/// wrong chunk at the wrong offset would still exit 0.
 ///
 /// What would falsify it: the merge storing chunks under the wrong hashes, or
-/// committing a snapshot that does not match the chunks beside it, or the pack
-/// being read at the wrong offsets. Any of those leaves a set that restores to
-/// something else, which `assert_same_tree` catches and an exit code does not.
+/// committing a snapshot that does not match the chunks beside it. It would also
+/// be falsified by the pack being read at the wrong offsets. Any of those leaves
+/// a set that restores to something else. `assert_same_tree` catches that. An
+/// exit code does not.
 #[test]
 fn a_merged_set_restores_exactly_as_a_backed_up_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -3332,11 +3339,12 @@ fn a_merged_set_restores_exactly_as_a_backed_up_one() {
     common::assert_same_tree(&source, &dir.path().join("out-merged-1"));
 }
 
-/// A full pack into a set that is not there creates it, which is the case a
-/// remote push is for: a new machine receiving its first version.
+/// A full pack into a set that is not there creates it. That is the case a
+/// remote push is for. A remote push gives a new machine its first version.
 ///
-/// Falsified by a merge that refused a name with nothing behind it, or that
-/// created the set and then failed to leave a version in it.
+/// Falsified by a merge that refused a name with nothing behind it. It would also
+/// be falsified by a merge that created the set and then failed to leave a
+/// version in it.
 #[test]
 fn a_full_pack_creates_a_set_that_is_not_there() {
     let dir = tempfile::tempdir().unwrap();
@@ -3372,8 +3380,8 @@ fn a_full_pack_creates_a_set_that_is_not_there() {
 /// The same pack into a set that already holds versions.
 ///
 /// The falsifiable part is that the chunks already held are *not* written again
-/// and the set still grows a version: a merge that deduplicated without
-/// committing would lose the version, and one that committed without
+/// and the set still grows a version. A merge that deduplicated without
+/// committing would lose the version. A merge that committed without
 /// deduplicating would double the store.
 #[test]
 fn a_full_pack_merges_into_a_set_that_already_has_versions() {
@@ -3420,15 +3428,16 @@ fn a_full_pack_merges_into_a_set_that_already_has_versions() {
 /// Merging the same pack twice does nothing, and says which version holds it.
 ///
 /// The decision this pins: a no-op reported as success. A store is a log, and a
-/// transfer may be retried, so a second arrival has to be answerable — and the
-/// answer has to name the version, because the client that has to decide what to
-/// do next is asking *which* version the pack became, not whether the command was
+/// transfer may be retried, so a second arrival has to be answerable. The answer
+/// has to name the version. The client that must decide what to do next asks
+/// *which* version the pack became. It does not ask whether the command was
 /// pleased.
 ///
-/// What would falsify it: a second version appearing (the old behaviour, which
-/// manufactured a number nobody asked for), a non-zero exit (a retried transfer
-/// would be stuck), or a report that says "already merged" without saying what it
-/// is already merged as.
+/// What would falsify it: a second version appearing. The old behaviour did
+/// that. The old behaviour manufactured a number nobody asked for. A non-zero
+/// exit would falsify it too, because a retried transfer would be stuck. It would
+/// also be falsified by a report that says "already merged" without saying what
+/// it is already merged as.
 #[test]
 fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -3453,8 +3462,8 @@ fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
     );
 
     // Not one byte written. A repeat that re-sent the version would grow the
-    // segment by the whole pack, and one that committed an empty version would
-    // grow it by a commit record — both are what "does nothing" rules out.
+    // segment by the whole pack. One that committed an empty version would grow
+    // it by a commit record. Both are what "does nothing" rules out.
     let grown = fs::metadata(dir.path().join("received.0000.bin"))
         .unwrap()
         .len();
@@ -3470,7 +3479,7 @@ fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
         "a repeated merge published a version"
     );
 
-    // And the version it did not touch still restores the tree, which is the
+    // And the version it did not touch still restores the tree. That is the
     // half a no-op could get wrong by being wrong about which version it holds.
     set_contents(dir.path(), "received", 1);
     common::assert_same_tree(
@@ -3482,24 +3491,24 @@ fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
 /// A pack from behind the set's tip is warned about on stderr, and merged anyway.
 ///
 /// The property is the comparison and where it is said. The pack's recorded
-/// version is the *origin* set's numbering and the tip is this set's, and the
-/// only fact two independently-assigned numbers can support is whether the
-/// sender's view of its own set was stale.
+/// version is the *origin* set's numbering. The tip is this set's. The only fact
+/// two independently-assigned numbers can support is whether the sender's view of
+/// its own set was stale.
 ///
-/// What would falsify it, one per assertion: a warning at equal or above (a
+/// What would falsify it, one per assertion. A warning at equal or above. A
 /// sender exactly up to date would learn to ignore the warning, and there would
-/// be nothing left for it to mean); no warning below (the feature would do
-/// nothing at all); the warning on stdout (a script reading the report would
-/// have to skip a line to find the line it wanted); or a refusal — the pack is
-/// not wrong, its chunks are exactly the ones its snapshot names, and only the
-/// sender's view is behind.
+/// be nothing left for it to mean. No warning below. The feature would do nothing
+/// at all. The warning on stdout. A script reading the report would have to skip
+/// a line to find the line it wanted. A refusal. The pack is not wrong, its
+/// chunks are exactly the ones its snapshot names, and only the sender's view is
+/// behind.
 #[test]
 fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
     let dir = tempfile::tempdir().unwrap();
     let source = merge_tree(dir.path());
 
-    // Three versions at the origin, so there are three recorded numbers to merge
-    // in an order that walks the receiving set's tip up past two of them.
+    // Three versions at the origin, so there are three recorded numbers to merge.
+    // The order walks the receiving set's tip up past two of them.
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     ok(
         dir.path(),
@@ -3558,7 +3567,7 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
     );
 
     // The version really was published, and it really restores the tree the
-    // pack carries — the whole point of warning rather than refusing.
+    // pack carries. That is the whole point of warning rather than refusing.
     assert_eq!(
         ok(dir.path(), &["versions", "behind", "--numbers-only"])
             .lines()
@@ -3571,7 +3580,7 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
         &dir.path().join("out-behind-3"),
     );
 
-    // And a pack exactly on the tip: equal is not lower, and the ordinary case
+    // And a pack exactly on the tip. Equal is not lower. The ordinary case
     // of a sender who is up to date must be silent.
     ok(dir.path(), &["merge", "three.pack", "level"]);
     let level = ok_logs(dir.path(), &["merge", "one.pack", "level"]);
@@ -3590,27 +3599,27 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
 
 /// A pack's recorded version is never the destination's numbering.
 ///
-/// The one field in a pack that could plausibly be wired into a receiving set:
-/// `version` is a `u32` in the header, it is read on merge, and it means
-/// something — the origin set's number, for the tip warning. The destination's
-/// numbering is the store's own, allocated at commit time from its own commit
-/// count, and a destination that adopted the sender's numbers would number its
-/// first version 3 here while holding exactly one version, so `versions` would
+/// The one field in a pack that could plausibly be wired into a receiving set is
+/// `version`. It is a `u32` in the header. A merge reads it. It means something:
+/// the origin set's number, for the tip warning. The destination's numbering is
+/// the store's own. The store allocates a number at commit time from its own
+/// commit count. A destination that adopted the sender's numbers would number its
+/// first version 3 here while holding exactly one version. `versions` would then
 /// print 3 and the set would claim versions it has never had.
 ///
 /// Falsified by the destination publishing anything but 1 into an empty set, or
 /// its listing naming a number other than 1.
 ///
 /// Three versions at the origin is the smallest count that makes the mistake
-/// visible: the pack records 3, so an adopted number would show up as a gap
+/// visible. The pack records 3. An adopted number would then show up as a gap
 /// before the set's only version rather than as an off-by-one.
 #[test]
 fn a_packs_version_is_not_the_numbering_of_the_set_it_is_merged_into() {
     let dir = tempfile::tempdir().unwrap();
     let source = merge_tree(dir.path());
 
-    // Three versions at the origin, each distinct from the last, so the pack's
-    // recorded number is 3 and not something the destination could reach by
+    // Three versions at the origin, each distinct from the last. The pack's
+    // recorded number is then 3, not something the destination could reach by
     // accident.
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     fs::write(source.join("f0.bin"), noisy(210_000)).unwrap();
@@ -3647,22 +3656,22 @@ fn a_packs_version_is_not_the_numbering_of_the_set_it_is_merged_into() {
 /// Merging a mixed run of packs leaves the destination's numbering gapless.
 ///
 /// Every version in a store is a commit record, and the store is the only thing
-/// that allocates the number. So the sequence below is a run of paths that could
-/// each consume a number without publishing one: a merge of a pack the set
-/// already holds, and a merge refused for a base it lacks. Either would leave
-/// the destination reading as `1, 3` over two versions rather than `1, 2` —
-/// which is the shape a set is easy to be in and hard to notice, because
-/// nothing but a person reads a version by number, and the versions either side
-/// of a gap still restore perfectly.
+/// that allocates the number. The sequence below is a run of paths that could
+/// each consume a number without publishing one. A merge of a pack the set
+/// already holds is one such path. A merge refused for a base it lacks is
+/// another. Either would leave the destination reading as `1, 3` over two
+/// versions rather than `1, 2`. That is the shape a set is easy to be in and
+/// hard to notice. Nothing but a person reads a version by number. The versions
+/// either side of a gap still restore perfectly.
 ///
 /// The packs' own numbers are 4, 5, 6 and 2, and none of them is what the
-/// destination publishes, so a destination that adopted the sender's numbering
+/// destination publishes. A destination that adopted the sender's numbering
 /// would publish 4, 5 and 6 here and read as a set of six holding three. Gapless
 /// is not enough if the numbers in the gap came from somewhere else.
 ///
-/// What would falsify it: a gap or a repeat in the listing, a count that
-/// disagrees with the three merges that published, or a report naming a number
-/// the set never reached.
+/// What would falsify it: a gap or a repeat in the listing, or a count that
+/// disagrees with the three merges that published. It would also be falsified by
+/// a report naming a number the set never reached.
 #[test]
 fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
     let dir = tempfile::tempdir().unwrap();
@@ -3688,8 +3697,8 @@ fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
         ],
     );
 
-    // Then versions 3, 4 and 5, so the packs the destination does accept carry
-    // numbers of 4, 5 and 6 — well above the three it will hold.
+    // Then versions 3, 4 and 5. The packs the destination does accept carry
+    // numbers of 4, 5 and 6, well above the three it will hold.
     fs::write(source.join("f0.bin"), noisy(210_000)).unwrap();
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     fs::write(source.join("f1.bin"), noisy(220_000)).unwrap();
@@ -3748,7 +3757,7 @@ fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
     );
 
     // A delta whose base the set does not hold, refused. The set holds versions
-    // 4 and 5 of the origin's content and has never seen version 1, so the base
+    // 4 and 5 of the origin's content. It has never seen version 1. So the base
     // is absent however many versions there are.
     let refused = fails(dir.path(), &["merge", "stale.delta", "received"]);
     assert!(
@@ -3782,9 +3791,9 @@ fn merging_a_mixed_run_of_packs_leaves_the_numbering_gapless() {
 /// A delta merges into a set that holds its base, and does not re-send what the
 /// base already has.
 ///
-/// The falsifiable part is the count: if the delta's chunks were all written, or
-/// if the base's chunks were fetched from nowhere, the "already held" figure
-/// would not be a delta-sized one.
+/// The falsifiable part is the count. If the delta's chunks were all written, the
+/// "already held" figure would not be a delta-sized one. The same is true if the
+/// base's chunks were fetched from nowhere.
 #[test]
 fn a_delta_merges_into_a_set_holding_its_base() {
     let dir = tempfile::tempdir().unwrap();
@@ -3832,8 +3841,8 @@ fn a_delta_merges_into_a_set_holding_its_base() {
 
     set_contents(dir.path(), "received", 2);
     common::assert_same_tree(&source, &dir.path().join("out-received-2"));
-    // And version 1 of the receiving set is untouched by the merge, which is the
-    // half a delta merge could quietly break: the base's own chunks had to be
+    // And version 1 of the receiving set is untouched by the merge. That is the
+    // half a delta merge could quietly break. The base's own chunks had to be
     // found in the set rather than fetched from the pack.
     set_contents(dir.path(), "received", 1);
     common::assert_same_tree(
@@ -3844,15 +3853,15 @@ fn a_delta_merges_into_a_set_holding_its_base() {
 
 /// A delta merges into a set left with a torn tail, and the merge repairs it.
 ///
-/// A merge killed mid-`put` leaves bytes past the last valid record, and nothing
-/// ever claims them, so the set is not damaged — it is unfinished. The run that
-/// comes next is what reclaims that space, and this pins that the run is a
-/// *merge* that does it: refusing the tail instead would leave a delta
-/// permanently unmergeable into its own set, with no command left that could fix
-/// it.
+/// A merge killed mid-`put` leaves bytes past the last valid record. Nothing ever
+/// claims them. The set is therefore not damaged, it is unfinished. The run that
+/// comes next is what reclaims that space. This pins that the run is a *merge*
+/// that does it. Refusing the tail instead would leave a delta permanently
+/// unmergeable into its own set, with no command left that could fix it.
 ///
-/// What would falsify it: a merge that refuses the torn set the way a read does,
-/// or one that succeeds and leaves the torn bytes where they were.
+/// What would falsify it: a merge that refuses the torn set the way a read does.
+/// A merge that succeeds and leaves the torn bytes where they were would falsify
+/// it too.
 #[test]
 fn a_delta_merges_into_a_set_left_with_a_torn_tail() {
     let dir = tempfile::tempdir().unwrap();
@@ -3861,8 +3870,8 @@ fn a_delta_merges_into_a_set_left_with_a_torn_tail() {
     ok(dir.path(), &["pack", "origin", "v1.pack"]);
 
     // The receiving set takes version 1, and a run then dies part-way through
-    // the next one: a record header with its payload cut short, and no commit
-    // record behind it.
+    // the next one. A record header has its payload cut short, and no commit
+    // record follows it.
     ok(dir.path(), &["merge", "v1.pack", "received"]);
     let segment = dir.path().join("received.0000.bin");
     let mut bytes = fs::read(&segment).unwrap();
@@ -3884,7 +3893,7 @@ fn a_delta_merges_into_a_set_left_with_a_torn_tail() {
     );
 
     // The delta of version 2, which can only be merged by a set holding its
-    // base — and version 1 is there, commit record and all.
+    // base. Version 1 is there, commit record and all.
     fs::write(source.join("f3.bin"), noisy(260_000)).unwrap();
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     ok(
@@ -3906,7 +3915,7 @@ fn a_delta_merges_into_a_set_left_with_a_torn_tail() {
         report.contains("version 2"),
         "the delta should have merged into the torn set: {report}"
     );
-    // The merge is the run that repaired the set: the same read that refused it
+    // The merge is the run that repaired the set. The same read that refused it
     // a moment ago now works, and restores the tree the delta merged.
     set_contents(dir.path(), "received", 2);
     common::assert_same_tree(&source, &dir.path().join("out-received-2"));
@@ -3926,9 +3935,9 @@ fn a_delta_merges_into_a_set_left_with_a_torn_tail() {
 
 /// The tree as it was at version 1 of `origin`, restored.
 ///
-/// Version 1 is gone from `source` by the time the delta test looks at it, and
-/// this is how the earlier version is compared without assuming anything about
-/// what a later version changed.
+/// Version 1 is gone from `source` by the time the delta test looks at it. This
+/// is how the earlier version is compared. It assumes nothing about what a later
+/// version changed.
 fn merge_tree_at_v1(dir: &Path) -> std::path::PathBuf {
     let copy = dir.join("at-v1");
     let _ = fs::remove_dir_all(&copy);
@@ -3949,10 +3958,10 @@ fn merge_tree_at_v1(dir: &Path) -> std::path::PathBuf {
 /// A delta is refused for a set that does not hold its base, and refuses to
 /// create one.
 ///
-/// The whole reason the base check exists, and the half that is easy to get
-/// wrong: a refused merge must leave the name exactly as it was, or the refusal
-/// has created the set it just declined to use. Falsified by an exit code of 0,
-/// by a segment appearing, or by a version in the set afterwards.
+/// The whole reason the base check exists is that a refused merge must leave the
+/// name exactly as it was. Otherwise the refusal has created the set it just
+/// declined to use. Falsified by an exit code of 0, by a segment appearing, or
+/// by a version in the set afterwards.
 #[test]
 fn a_delta_is_refused_for_a_set_that_does_not_hold_its_base() {
     let dir = tempfile::tempdir().unwrap();
@@ -3999,9 +4008,9 @@ fn a_delta_is_refused_for_a_set_that_does_not_hold_its_base() {
 /// A delta is refused for a set that holds *other* versions but not this one.
 ///
 /// The case a "is the set on the base version?" check gets backwards. A set at a
-/// later version still holds every chunk of an earlier one, so the only thing
-/// that matters is whether the base is among its committed versions — and here it
-/// is not, however many versions there are.
+/// later version still holds every chunk of an earlier one. So the only thing
+/// that matters is whether the base is among its committed versions. Here it is
+/// not, however many versions there are.
 #[test]
 fn a_delta_is_refused_for_a_set_holding_only_other_versions() {
     let dir = tempfile::tempdir().unwrap();
@@ -4042,8 +4051,8 @@ fn a_delta_is_refused_for_a_set_holding_only_other_versions() {
         refused.contains("is a delta against"),
         "the refusal should name the pack as a delta: {refused}"
     );
-    // The numbering, not just the size of it: a refusal that consumed a number
-    // would leave a set of the same length that no longer starts at 1, and the
+    // The numbering, not just the size of it. A refusal that consumed a number
+    // would leave a set of the same length that no longer starts at 1. The
     // next merge into it would publish 3 over a set holding two versions.
     assert_eq!(
         ok(dir.path(), &["versions", "received", "--numbers-only"])
@@ -4063,11 +4072,11 @@ fn a_delta_is_refused_for_a_set_holding_only_other_versions() {
 
 /// A delta is merged into a set that is *ahead* of its base.
 ///
-/// The other half of the case above, and the one that justifies the containment
-/// check: the set holds version 3 while the delta assumes version 1, and the
-/// merge must succeed because every chunk of version 1 is still there. A check
-/// ported from `apply` — which establishes a base against a *directory* that may
-/// hold extra files — would refuse this, and refusing it would be wrong.
+/// The other half of the case above justifies the containment check. The set
+/// holds version 3 while the delta assumes version 1. The merge must succeed
+/// because every chunk of version 1 is still there. A check ported from `apply`
+/// would refuse this. That check establishes a base against a *directory* that
+/// may hold extra files. Refusing this would be wrong.
 #[test]
 fn a_delta_is_merged_into_a_set_that_is_ahead_of_its_base() {
     let dir = tempfile::tempdir().unwrap();
@@ -4121,13 +4130,13 @@ fn a_delta_is_merged_into_a_set_that_is_ahead_of_its_base() {
 
 /// A pack whose payload has been damaged is refused, and publishes nothing.
 ///
-/// Falsified by a merge that succeeds: the chunk is addressed by a hash of its
-/// contents, and `put` checks what it is given against it, so damaged bytes
+/// Falsified by a merge that succeeds. A chunk is addressed by a hash of its
+/// contents. `put` checks what it is given against that hash. So damaged bytes
 /// cannot be stored under a chunk's name. What is *not* asserted is that nothing
-/// was written to the segment — records no version references are wasted space,
-/// not corruption, and nothing names them. The space is not reclaimed either,
-/// only a record the run tore on the way out is: a record written whole is a
-/// valid record, and recovery truncates only what is past the last valid one.
+/// was written to the segment. Records no version references are wasted space,
+/// not corruption, and nothing names them. The space is not reclaimed either.
+/// Only a record the run tore on the way out is. A record written whole is a
+/// valid record. Recovery truncates only what is past the last valid one.
 #[test]
 fn a_damaged_pack_is_refused_and_publishes_no_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -4136,7 +4145,7 @@ fn a_damaged_pack_is_refused_and_publishes_no_version() {
     ok(dir.path(), &["pack", "origin", "v1.pack"]);
 
     // One byte of payload flipped. The header and index still agree with each
-    // other, so `Pack::open` accepts this file; only the bytes are wrong.
+    // other, so `Pack::open` accepts this file. Only the bytes are wrong.
     let bytes = fs::read(dir.path().join("v1.pack")).unwrap();
     let mut damaged = bytes.clone();
     let at = 200;
@@ -4149,8 +4158,8 @@ fn a_damaged_pack_is_refused_and_publishes_no_version() {
         "the refusal should name what is wrong with the pack: {refused}"
     );
 
-    // Nothing was published. The segment may exist — the open created it, and the
-    // records it holds are unreferenced — but there is no version.
+    // Nothing was published. The segment may exist, because the open created it.
+    // The records it holds are unreferenced. There is no version.
     let output = lepatch(dir.path(), &["versions", "received"]);
     assert!(
         output.status.success(),
@@ -4174,10 +4183,11 @@ fn a_damaged_pack_is_refused_and_publishes_no_version() {
 
 /// `--dry-run` writes nothing and says what it would have merged.
 ///
-/// The falsifiable part is the *nothing*: not just no new version, but no
-/// segment, no index file, no lock, and not the set's directory for a name that
-/// had none. A dry run that created a set in order to report on it would be the
-/// one thing the flag promises it never does.
+/// The falsifiable part is the *nothing*. There must be no new version. There must
+/// be no segment. There must be no index file. There must be no lock. The set's
+/// directory must not appear for a name that had none. A dry run that created a
+/// set in order to report on it would be the one thing the flag promises it never
+/// does.
 #[test]
 fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
     let dir = tempfile::tempdir().unwrap();
@@ -4208,9 +4218,9 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
         "a dry merge took the lock"
     );
 
-    // Against a set that does exist, and holds the version already: a dry run of
-    // a repeat has to say so, because a plan that reported a merge of something
-    // already merged would be promising the user a version their set is not
+    // Against a set that does exist, and holds the version already. A dry run of
+    // a repeat has to say so. A plan that reported a merge of something already
+    // merged would be promising the user a version their set is not
     // about to grow. Nothing moves.
     ok(dir.path(), &["merge", "v1.pack", "received"]);
     let before = fs::read(dir.path().join("received.0000.bin")).unwrap();
@@ -4263,8 +4273,7 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
 /// real one.
 ///
 /// A plan that waved a delta through would send somebody to run a command that
-/// cannot work, and the report would have been the last place the problem
-/// surfaced.
+/// cannot work. The report would then be the last place the problem surfaced.
 #[test]
 fn a_dry_merge_refuses_a_delta_whose_base_the_set_lacks() {
     let dir = tempfile::tempdir().unwrap();
@@ -4298,7 +4307,7 @@ fn a_dry_merge_refuses_a_delta_whose_base_the_set_lacks() {
     );
 
     // With the base merged first, the plan is happy and reports a delta-sized
-    // figure — which is the difference the refusal is about.
+    // figure. That is the difference the refusal is about.
     ok(dir.path(), &["merge", "v1.pack", "received"]);
     let plan = ok(dir.path(), &["merge", "v2.delta", "received", "--dry-run"]);
     assert!(plan.contains("since 1"), "{plan}");
@@ -4317,7 +4326,7 @@ fn a_dry_merge_refuses_a_delta_whose_base_the_set_lacks() {
 
 /// A dry merge refuses a damaged pack, like a real one.
 ///
-/// The plan resolves the pack and hashes every chunk the merge would store, so a
+/// The plan resolves the pack and hashes every chunk the merge would store. So a
 /// pack it waves through is a pack a real merge accepts. A plan that only counted
 /// records would report success for a file that cannot be merged.
 #[test]
@@ -4351,11 +4360,10 @@ fn a_dry_merge_refuses_a_damaged_pack() {
 /// `a_dry_merge_refuses_a_damaged_pack` above only asks about a set that does not
 /// exist, where the refusal cannot be confused with the already-merged answer.
 /// Once the set holds the pack's snapshot, the two paths have something to
-/// disagree about: the real run's pre-check consults the set, and a pre-check
-/// that answers "already merged" from an unverified pack reports success and
-/// exits zero for a file neither library path would accept, while the dry run
-/// still refuses it. A dry run that does not say what the real run does is not a
-/// dry run.
+/// disagree about. The real run's pre-check consults the set. A pre-check that
+/// answers "already merged" from an unverified pack reports success and exits
+/// zero for a file neither library path would accept. The dry run still refuses
+/// it. A dry run that does not say what the real run does is not a dry run.
 #[test]
 fn a_merge_of_a_damaged_pack_is_refused_even_when_the_set_already_holds_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -4370,7 +4378,7 @@ fn a_merge_of_a_damaged_pack_is_refused_even_when_the_set_already_holds_it() {
 
     // Damaged inside the file table, which is the section the header names a
     // hash for. The header is left alone, so the pack still opens and still
-    // claims the snapshot the set already holds — the pre-check has everything
+    // claims the snapshot the set already holds. The pre-check has everything
     // it would need to answer, and answers for a pack that cannot be merged.
     let bytes = fs::read(dir.path().join("v1.pack")).unwrap();
     let mut damaged = bytes;
@@ -4391,10 +4399,10 @@ fn a_merge_of_a_damaged_pack_is_refused_even_when_the_set_already_holds_it() {
         "and must not report a damaged pack as already merged: {refused}"
     );
 
-    // Same file, same set, same refusal: the two paths cannot disagree about one
+    // Same file, same set, same refusal. The two paths cannot disagree about one
     // pack, or a dry run is promising something the real run will not do. The
-    // wording around it differs — one refuses the pack, one refuses the merge —
-    // so this asks for the clause they share rather than for identical text.
+    // wording around it differs. One refuses the pack, one refuses the merge.
+    // So this asks for the clause they share rather than for identical text.
     let planned = fails(
         dir.path(),
         &["merge", "damaged.pack", "received", "--dry-run"],
@@ -4438,9 +4446,9 @@ fn a_second_merge_is_refused_while_the_lock_is_held() {
 
 /// A merged version verifies, so it is as sound as a backed-up one.
 ///
-/// The property is about the store rather than the tree: the chunks a merge
-/// wrote must hash to what they are addressed by, which is the same check a
-/// backup's own store passes.
+/// The property is about the store rather than the tree. The chunks a merge
+/// wrote must hash to what they are addressed by. A backup's own store passes
+/// the same check.
 #[test]
 fn a_merged_version_verifies() {
     let dir = tempfile::tempdir().unwrap();
@@ -4460,19 +4468,19 @@ fn a_merged_version_verifies() {
 ///
 /// The option chooses an *encoding*, and the only thing it is allowed to change is
 /// how the records come out on disk. So each one has to restore to exactly what a
-/// restore from the source set gives — and this is the test that would catch an
-/// option honoured in one direction and ignored in the other, which is the failure
-/// a flag like this invites: `keep` writing content while claiming to keep frames
-/// would still restore, and so would a level that quietly re-read the pack's stored
+/// restore from the source set gives. This is the test that would catch an option
+/// honoured in one direction and ignored in the other. That is the failure a
+/// flag like this invites. `keep` writing content while claiming to keep frames
+/// would still restore. So would a level that quietly re-read the pack's stored
 /// bytes as if they were content.
 ///
-/// Every setting is checked against the *same* answer, the source set's own
-/// restore, rather than against each other: two sets that were wrong in the same
-/// way would otherwise agree.
+/// Every setting is checked against the *same* answer, which is the source set's
+/// own restore, rather than against each other. Two sets that were wrong in the
+/// same way would otherwise agree.
 ///
-/// What would falsify it: any setting whose restore differs by a byte, a setting
-/// silently ignored (which passes here, and is why the sizes are checked too — see
-/// below), or a default that changed.
+/// What would falsify it: any setting whose restore differs by a byte, or a
+/// setting silently ignored. A setting silently ignored passes here. That is why
+/// the sizes are checked too, see below. A changed default would falsify it.
 #[test]
 fn a_merge_restores_the_same_tree_under_every_compression() {
     let dir = tempfile::tempdir().unwrap();
@@ -4508,10 +4516,10 @@ fn a_merge_restores_the_same_tree_under_every_compression() {
         );
     }
 
-    // And the flag is not a no-op wearing a name: the encodings it chooses are
+    // And the flag is not a no-op wearing a name. The encodings it chooses are
     // genuinely different, so a run that ignored it could not have restored
     // correctly by accident three times over. Measured on the segments, which is
-    // where the encoding shows up at all — `restore` cannot tell them apart, and
+    // where the encoding shows up at all. `restore` cannot tell them apart, and
     // that is the point of the first half.
     let kept = common::set_size(&dir.path().join("kept"));
     let raw = common::set_size(&dir.path().join("uncompressed"));
@@ -4522,8 +4530,8 @@ fn a_merge_restores_the_same_tree_under_every_compression() {
     );
 
     // Each also verifies, which is the store's own statement that every record it
-    // holds hashes to the name it is addressed by — the property the verbatim path
-    // has to keep while skipping the encode.
+    // holds hashes to the name it is addressed by. That is the property the
+    // verbatim path has to keep while skipping the encode.
     for name in ["kept", "uncompressed", "level-one", "level-nine"] {
         let report = ok(dir.path(), &["verify", name]);
         assert!(
@@ -4536,17 +4544,18 @@ fn a_merge_restores_the_same_tree_under_every_compression() {
 /// A dry merge reports the same figures whatever `--compression` says, and writes
 /// nothing under any of them.
 ///
-/// The figures count chunk *content*, which is the same under every setting, so a
-/// plan is the same plan — a dry run that changed its numbers with the flag would be
-/// telling the user the encoding changes what is merged, which it does not. And it
-/// writes nothing at all, which is the half that is easy to lose by adding a
-/// parameter to a path that used to take none.
+/// The figures count chunk *content*, which is the same under every setting. So a
+/// plan is the same plan. A dry run that changed its numbers with the flag would
+/// be telling the user the encoding changes what is merged, which it does not.
+/// It also writes nothing at all. That is the half that is easy to lose by
+/// adding a parameter to a path that used to take none.
 ///
 /// Each setting is planned into a *fresh* name, so "already merged" cannot be what
 /// made the second and third runs agree with the first.
 ///
-/// What would falsify it: a plan whose figures moved with the flag, a set created
-/// or a version published by a dry run, or a lock taken.
+/// What would falsify it: a plan whose figures moved with the flag, or a set
+/// created or a version published by a dry run. A lock taken would falsify it
+/// too.
 #[test]
 fn a_dry_merge_reports_the_same_figures_under_every_compression() {
     let dir = tempfile::tempdir().unwrap();
@@ -4571,8 +4580,8 @@ fn a_dry_merge_reports_the_same_figures_under_every_compression() {
         );
 
         // The figures, off the front of the plan's own wording and off the
-        // "nothing written to <name>" tail, so what is compared is the numbers
-        // rather than which set was named or how the two reports are phrased.
+        // "nothing written to <name>" tail. What is compared is the numbers,
+        // not which set was named or how the two reports are phrased.
         let figures = figures_of(&report);
         reports.push(figures.clone());
 
@@ -4587,7 +4596,7 @@ fn a_dry_merge_reports_the_same_figures_under_every_compression() {
             flag.join(" ")
         );
 
-        // And the real run, into the same name, reports the same figures — which
+        // And the real run, into the same name, reports the same figures. That
         // is what makes the plan worth having read. Its wording differs on purpose
         // (the real line is what a script parses), so only the numbers are held to
         // the plan's.
@@ -4616,9 +4625,9 @@ fn a_dry_merge_reports_the_same_figures_under_every_compression() {
 
 /// The figures a merge report leads with: chunks, new, already held, bytes.
 ///
-/// Pulled out of both reports' wording rather than reformatted, because the two
-/// lines differ deliberately — `report_merge_plan` says why — and a test that
-/// normalised them into one shape would be asserting on its own formatting.
+/// Pulled out of both reports' wording rather than reformatted. The two lines
+/// differ deliberately, and `report_merge_plan` says why. A test that normalised
+/// them into one shape would be asserting on its own formatting.
 fn figures_of(report: &str) -> String {
     let line = report
         .lines()
@@ -4629,8 +4638,8 @@ fn figures_of(report: &str) -> String {
     let figures: Vec<&str> = line
         .split(", ")
         .skip(1)
-        // The plan's byte figure is followed by what it did instead of writing,
-        // which is not a figure and is dropped with the rest of that clause.
+        // The plan's byte figure is followed by what it did instead of writing.
+        // That is not a figure, and it is dropped with the rest of that clause.
         .take_while(|part| !part.starts_with("nothing"))
         .map(|part| part.split(' ').next().unwrap_or_default())
         .collect();
@@ -4641,7 +4650,7 @@ fn figures_of(report: &str) -> String {
 /// `--compression` names `keep` or a level, and refuses anything else by name.
 ///
 /// The vocabulary is the flag's own, and a value outside it has to be a usage error
-/// rather than a policy nobody chose — the same treatment `backup
+/// rather than a policy nobody chose. That is the same treatment `backup
 /// --compression-level` gives. Asserted for the two ways a user gets this wrong: a
 /// word that is not `keep`, and a number past the top level.
 ///
@@ -4654,8 +4663,8 @@ fn a_merge_compression_outside_its_vocabulary_is_refused() {
     ok(dir.path(), &["backup", "source", "origin"]);
     ok(dir.path(), &["pack", "origin", "v1.pack"]);
 
-    // `-1` is not here: clap reads it as a flag rather than as this flag's value,
-    // so it never reaches the parser, and that refusal says so on its own.
+    // `-1` is not here. Clap reads it as a flag rather than as this flag's value,
+    // so it never reaches the parser. That refusal says so on its own.
     for bad in ["banana", "10", "1.5", ""] {
         let output = lepatch(
             dir.path(),
@@ -4682,13 +4691,14 @@ fn a_merge_compression_outside_its_vocabulary_is_refused() {
 /// refuses the same things by name.
 ///
 /// Asserted for `pack` as well as `merge` because sharing the parser is a claim
-/// about the two flags, and a claim is only worth what a test holds it to: a second
+/// about the two flags. A claim is only worth what a test holds it to. A second
 /// parser that accepted a bare number, or spelled `keep` differently, would leave
-/// every existing test green and make the two commands disagree in front of a user.
+/// every existing test green. It would make the two commands disagree in front of
+/// a user.
 ///
-/// So this runs the same refusals against `pack`, and — the half that a refusal
-/// cannot show — asserts the two commands *accept* the same values, which the
-/// matrix below does cell by cell.
+/// So this runs the same refusals against `pack`. It also asserts the two
+/// commands *accept* the same values, which is the half a refusal cannot show.
+/// The matrix below does that cell by cell.
 ///
 /// What would falsify it: a `pack` that accepted `--compression banana`, or one
 /// whose refusal did not say what it does accept.
@@ -4723,13 +4733,13 @@ fn a_pack_compression_outside_its_vocabulary_is_refused() {
 
 /// Every pack form, through the binary, through every merge form.
 ///
-/// The matrix as a user meets it: three pack options by three merge options, and
-/// every one of the nine has to restore to what the source set restores. The
-/// library-level matrix in `tests/pack.rs` proves the routing; this proves the
-/// *flags* reach it, which is the half a routing test cannot see — a `--compression`
-/// parsed and then dropped on the floor restores perfectly and reports perfectly,
-/// and nothing but running the nine combinations through the real binary would say
-/// so.
+/// The matrix as a user meets it: three pack options by three merge options. Every
+/// one of the nine has to restore to what the source set restores. The
+/// library-level matrix in `tests/pack.rs` proves the routing. This proves the
+/// *flags* reach it. That is the half a routing test cannot see. A
+/// `--compression` parsed and then dropped on the floor restores perfectly and
+/// reports perfectly. Nothing but running the nine combinations through the real
+/// binary would say so.
 ///
 /// Each cell is checked against the source set's own restore, taken once, rather
 /// than against the others. What would falsify it: any cell restoring differently
@@ -4775,14 +4785,15 @@ fn every_pack_compression_restores_through_every_merge_compression() {
 /// writes nothing.
 ///
 /// The figures are the point and the absence is the easy half to lose. A plan is
-/// resolved through the same encoder the writer uses, so `payload` is the size of
-/// the records that *would* be written — which is the only way a plan of a
-/// re-encoding run can be worth reading — and the plan and the run are compared
-/// number for number to say so. Under `keep` the same comparison holds for free,
+/// resolved through the same encoder the writer uses. So `payload` is the size of
+/// the records that *would* be written. That is the only way a plan of a
+/// re-encoding run can be worth reading. The plan and the run are compared number
+/// for number to say so. Under `keep` the same comparison holds for free,
 /// which is why every form is run here rather than only the new ones.
 ///
-/// What would falsify it: figures that differ between the plan and the run, a file
-/// at `--out` afterwards, or a `payload` that did not move with the flag.
+/// What would falsify it: figures that differ between the plan and the run, or a
+/// file at `--out` afterwards. A `payload` that did not move with the flag would
+/// falsify it too.
 #[test]
 fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
     let dir = tempfile::tempdir().unwrap();
@@ -4791,7 +4802,7 @@ fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
 
     // Half compressible and half not. `merge_tree`'s fixture is entirely
     // `noisy`, which zstd cannot shrink, so every chunk in it takes the store's
-    // fallback and `keep` and `0` write the same records — the figures would agree
+    // fallback. `keep` and `0` write the same records. The figures would agree
     // for the wrong reason and the assertion below would prove nothing.
     for i in 0..3 {
         fs::write(
@@ -4848,8 +4859,8 @@ fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
             "a dry pack as {form} should report the figures that run has:\n{plan}\n{written}"
         );
 
-        // The third figure is `payload` — version number, chunk count, then payload —
-        // and it is the one the option moves: a
+        // The third figure is `payload`, which is version number, chunk count,
+        // then payload. It is the one the option moves. A
         // plan holding the source set's numbers would be reporting about a file it
         // does not write.
         payloads.push((form, planned[2]));

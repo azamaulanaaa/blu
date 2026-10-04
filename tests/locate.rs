@@ -1,21 +1,24 @@
 //! Resolving a version through its index file, and the three ways that can fail.
 //!
 //! [`resolve`] is the fast path, and everything about it is a question of what it
-//! returns rather than what it does: the store's commit records are the record of
-//! what versions exist, and this module only decides how much work it takes to
-//! find out. So a wrong answer here is never corruption — it is a wasted scan, or
-//! a refusal to use a file that would have misled.
+//! returns rather than what it does.
+//! The store's commit records are the record of what versions exist.
+//! This module only decides how much work it takes to locate the answer.
+//! So a wrong answer here is never corruption.
+//! It is a wasted scan, or a refusal to use a file that would have misled.
 //!
 //! The refusal cases are covered in `version_index.rs`, which is where the danger
-//! of a believed file is argued. What is here is what that file leaves untested:
+//! of a believed file is argued.
+//! What is here is what that file leaves untested:
 //!
-//! * [`Resolved::confirmed`], which is what a caller actually *acts* on — it is
-//!   the difference between reading the answer and rescanning for it, so a wrong
-//!   `Some` hands back a snapshot the fast path never checked;
-//! * an index naming a segment that is present but unreadable as a segment, which
-//!   is a different failure from one naming a segment that is absent;
-//! * the ordinal, which is a claim about *position* and is checked separately from
-//!   the snapshot hash, so it needs testing separately too;
+//! * [`Resolved::confirmed`], which is what a caller actually *acts* on.
+//!   It is the difference between reading the answer and rescanning for it.
+//!   A wrong `Some` hands back a snapshot the fast path never checked.
+//! * an index naming a segment that is present but unreadable as a segment.
+//!   That is a different failure from one naming a segment that is absent.
+//! * the ordinal, which is a claim about *position*.
+//!   The ordinal is checked separately from the snapshot hash, so it needs
+//!   testing separately too.
 //! * [`Resolved::reason`], which is the only part of this a person reads.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
@@ -53,8 +56,10 @@ fn index_of(blob: &std::path::Path, version: u32) -> VersionIndex {
 /// `resolve` about which case it is in.
 ///
 /// A `Some` where there should be a `None` is the dangerous direction and the
-/// whole reason this is a test: the caller would read the snapshot this returned
-/// without the store ever being asked. The other direction only costs a scan.
+/// whole reason this is a test.
+/// The caller would read the snapshot this returned without the store ever being
+/// asked.
+/// The other direction only costs a scan.
 #[tokio::test]
 async fn confirmed_agrees_with_what_resolve_found() {
     let dir = tempfile::tempdir().unwrap();
@@ -106,17 +111,18 @@ async fn confirmed_agrees_with_what_resolve_found() {
 /// The ordinal is a claim about position, and it is checked apart from the hash.
 ///
 /// An index can name the right segment and the right snapshot and still point at
-/// the wrong *place*, because the position within the segment is recorded rather
-/// than derived. If only the hash were checked, that index would confirm and hand
-/// back a version number that addresses a different commit record.
+/// the wrong *place*.
+/// The position within the segment is recorded rather than derived.
+/// If only the hash were checked, that index would confirm and hand back a
+/// version number that addresses a different commit record.
 #[tokio::test]
 async fn an_index_naming_the_wrong_ordinal_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let blob = set_with_versions(dir.path(), 3).await;
     let set = IndexSet::new(&blob);
 
-    // Same segment, same snapshot, wrong position: the one combination a
-    // hash-only check would wave through.
+    // Same segment, same snapshot, wrong position.
+    // That is the one combination a hash-only check would wave through.
     let real = index_of(&blob, 2);
     let mut moved = real;
     moved.ordinal = 0;
@@ -132,12 +138,15 @@ async fn an_index_naming_the_wrong_ordinal_is_refused() {
 /// A segment that is a valid store for a *different* segment is refused.
 ///
 /// This is the case the store header carries, and it is the one the rest of
-/// `resolve` cannot catch. A scan of a file returns whatever records it holds,
-/// tagged with the segment number it was *asked* about, so asking about segment 1
-/// and getting segment 0's records back produces a plausible answer: the snapshot
-/// really is at that ordinal, in the file really is named for that segment, and
-/// the two facts are simply about different stores. Only the header in the file
-/// says which.
+/// `resolve` cannot catch.
+/// A scan of a file returns whatever records it holds, tagged with the segment
+/// number it was *asked* about.
+/// So asking about segment 1 and getting segment 0's records back produces a
+/// plausible answer.
+/// The snapshot really is at that ordinal, and the file really is named for that
+/// segment.
+/// The two facts are simply about different stores.
+/// Only the header in the file says which.
 #[tokio::test]
 async fn a_segment_filed_under_the_wrong_number_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -161,11 +170,13 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
     let last = u32::try_from(set.segments().unwrap().len()).unwrap() - 1;
     assert!(last > 0, "the fixture needs a segment 0 to be wrong about");
 
-    // Version 1's snapshot, at ordinal 0 of segment 0. An index naming exactly
-    // that — but pointing at segment `last` — is the only shape that separates the
-    // header check from the rest: the file it names will hold that snapshot at that
-    // ordinal, so the hash and the position both agree, and only the segment
-    // number in the file's own header says the file is not the one meant.
+    // Version 1's snapshot, at ordinal 0 of segment 0.
+    // An index naming exactly that, but pointing at segment `last`, is the only
+    // shape that separates the header check from the rest.
+    // The file it names will hold that snapshot at that ordinal.
+    // So the hash and the position both agree.
+    // Only the segment number in the file's own header says the file is not the
+    // one meant.
     let first = index_of(&blob, 1);
     assert_eq!(first.segment, 0, "version 1 should be in the first segment");
     assert_eq!(
@@ -173,8 +184,9 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
         "version 1 should be its segment's first commit"
     );
 
-    // Put segment 0's file where segment `last` should be: a real store, with real
-    // commit records, that is not the one the index claims.
+    // Put segment 0's file where segment `last` should be.
+    // That is a real store, with real commit records, that is not the one the
+    // index claims.
     fs::copy(set.segment_path(0), set.segment_path(last)).unwrap();
 
     let misfiled = VersionIndex {
@@ -192,9 +204,10 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
          even when the snapshot and ordinal it holds do match"
     );
 
-    // The store enforces the same rule on the way in, and names both numbers. Two
-    // layers refusing the same file is the point: the index check is not the only
-    // thing standing between a misfiled segment and a wrong snapshot.
+    // The store enforces the same rule on the way in, and names both numbers.
+    // Two layers refusing the same file is the point.
+    // The index check is not the only thing standing between a misfiled segment
+    // and a wrong snapshot.
     let err = BlobStore::open_for_reading(&blob)
         .await
         .expect_err("a set with a misfiled segment must not open");
@@ -207,10 +220,11 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
 
 /// A file that is present but is not a store at all is refused.
 ///
-/// The other way the read can fail, and a different one from a missing segment:
-/// `is_file` says yes and the parse says no. The scan stops at the first record
-/// that is not valid, so a file of nonsense yields no commits, and the ordinal
-/// lookup finds nothing.
+/// The other way the read can fail, and a different one from a missing segment.
+/// `is_file` says yes and the parse says no.
+/// The scan stops at the first record that is not valid.
+/// So a file of nonsense yields no commits, and the ordinal lookup finds
+/// nothing.
 #[tokio::test]
 async fn a_segment_that_is_present_but_unreadable_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -238,9 +252,11 @@ async fn a_segment_that_is_present_but_unreadable_is_refused() {
 /// the two failures it was.
 ///
 /// "No index file" and "the index does not describe this set" call for opposite
-/// responses — the first is a set that has been running, the second is a file worth
-/// deleting — so collapsing them into one message would send someone to look in
-/// the wrong place.
+/// responses.
+/// The first is a set that has been running, and the second is a file worth
+/// deleting.
+/// So collapsing them into one message would send someone to look in the wrong
+/// place.
 #[tokio::test]
 async fn the_reason_distinguishes_the_two_failures() {
     let dir = tempfile::tempdir().unwrap();
@@ -291,10 +307,12 @@ async fn the_reason_distinguishes_the_two_failures() {
 
 /// A store still answers correctly when every index file has been destroyed.
 ///
-/// `resolve` refusing is only half the claim. The other half is that refusing
-/// costs a scan and nothing more: the commit records are the record, so a caller
-/// that falls back gets the same answer a caller with no index files at all would
-/// have got, and the two must not be different code paths with different answers.
+/// `resolve` refusing is only half the claim.
+/// The other half is that refusing costs a scan and nothing more.
+/// The commit records are the record.
+/// So a caller that falls back gets the same answer a caller with no index files
+/// at all would have got.
+/// The two must not be different code paths with different answers.
 #[tokio::test]
 async fn a_destroyed_index_costs_a_scan_and_no_answer() {
     let dir = tempfile::tempdir().unwrap();

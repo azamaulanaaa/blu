@@ -1,15 +1,18 @@
 //! The decompressing reader that a compressed blob is handed out through.
 //!
 //! It exists because [`lepatch::storage::StorageGet`] returns something seekable,
-//! and a streaming zstd frame cannot seek backwards without an index. Buffering
-//! the decompressed payload makes a seek a slice, which is both what callers
-//! expect and what a restore needs when it assembles a file from several chunks.
+//! and a streaming zstd frame cannot seek backwards without an index.
+//! Buffering the decompressed payload makes a seek a slice.
+//! That is what callers expect, and a restore needs it when it assembles a file
+//! from several chunks.
 //!
-//! So the tests are about the parts a plain reader would get for free: that the
-//! bytes come back exactly, that a seek lands where it says, and that a frame
-//! which does not decode to the length its record claims is refused rather than
-//! handed on short — a short read that looked like end-of-file would leave a
-//! restored file quietly incomplete.
+//! So the tests are about the parts a plain reader would get for free.
+//! The tests check that the bytes come back exactly, and that a seek lands where
+//! it says.
+//! They also check that a frame which does not decode to the length its record
+//! claims is refused rather than handed on short.
+//! A short read that looked like end-of-file would leave a restored file quietly
+//! incomplete.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
@@ -43,10 +46,11 @@ async fn it_yields_the_decompressed_bytes() {
 
 /// A frame that decodes to a different length than its record claims is refused.
 ///
-/// This is the check that makes a damaged store report itself rather than
-/// producing a file that is quietly short. A reader that trusted the frame and
-/// ignored the header would hand back fewer bytes than the snapshot asked for and
-/// the restore would succeed.
+/// This is the check that makes a damaged store report itself.
+/// Without it, a damaged store produces a file that is quietly short.
+/// A reader that trusted the frame and ignored the header would hand back fewer
+/// bytes than the snapshot asked for.
+/// The restore would then succeed.
 #[tokio::test]
 async fn a_frame_that_decodes_to_the_wrong_length_is_refused() {
     let raw = payload(50_000);
@@ -82,10 +86,11 @@ async fn something_that_is_not_a_frame_is_refused() {
 
 /// A seek lands where it says, from the start, from the end and from here.
 ///
-/// A restore assembles a file by seeking within each chunk, so a reader whose
-/// seek reported a position it had not actually reached would produce a file
-/// whose bytes came from the wrong offsets — the kind of corruption that passes a
-/// length check and is only caught by comparing the whole tree.
+/// A restore assembles a file by seeking within each chunk.
+/// So a reader whose seek reported a position it had not actually reached would
+/// produce a file whose bytes came from the wrong offsets.
+/// That is the kind of corruption that passes a length check.
+/// Only comparing the whole tree catches it.
 #[tokio::test]
 async fn it_seeks_where_it_says_from_every_origin() {
     let raw = payload(60_000);
@@ -139,15 +144,19 @@ async fn seeking_before_the_start_is_refused() {
 /// Seeking past the end is refused rather than underflowing or wrapping.
 ///
 /// The sibling type in the same module bounds its seek by its limit, and this one
-/// has to match: both are handed out by [`lepatch::storage::StorageGet`] as the
-/// reader for a blob, and `StorageGet::get` promises the stream is "bounded to
-/// the blob, so a blob cannot be used to read past itself". Only the sign of the
-/// target was checked, so a snapshot naming a `chunk_offset` past the end of the
-/// chunk it addresses made the subtraction below wrap.
+/// has to match.
+/// Both are handed out by [`lepatch::storage::StorageGet`] as the reader for a
+/// blob.
+/// `StorageGet::get` promises the stream is "bounded to the blob, so a blob cannot
+/// be used to read past itself".
+/// Only the sign of the target was checked.
+/// So a snapshot naming a `chunk_offset` past the end of the chunk it addresses
+/// made the subtraction below wrap.
 ///
-/// A seek to a position beyond `usize::MAX` is the other half of the same gap,
-/// and it fails differently: `position` would not convert, and the fallback of 0
-/// silently rewound to the start of the payload and replayed it in full.
+/// A seek to a position beyond `usize::MAX` is the other half of the same gap.
+/// It also fails differently.
+/// `position` would not convert, and the fallback of 0 silently rewound to the
+/// start of the payload and replayed it in full.
 #[tokio::test]
 async fn seeking_past_the_end_is_refused() {
     let raw = payload(1_000);
@@ -186,8 +195,8 @@ async fn seeking_past_the_end_is_refused() {
 
 /// A refused seek leaves the reader where it was, still serving the right bytes.
 ///
-/// The position is only assigned once the target is known to be in bounds, so a
-/// refusal cannot leave a reader mid-payload with a position that does not
+/// The position is only assigned once the target is known to be in bounds.
+/// So a refusal cannot leave a reader mid-payload with a position that does not
 /// describe it.
 #[tokio::test]
 async fn a_refused_seek_does_not_move_the_reader() {
@@ -209,9 +218,10 @@ async fn a_refused_seek_does_not_move_the_reader() {
 
 /// Seeking to exactly the end is allowed, and reads as empty.
 ///
-/// `len` is the first position with no byte behind it, so it is in bounds; only a
-/// position *past* it is not. Confining the bound to `>` rather than `>=` is what
-/// makes `write_file` able to seek to the end of a zero-length final slice.
+/// `len` is the first position with no byte behind it, so it is in bounds.
+/// Only a position *past* it is not.
+/// Confining the bound to `>` rather than `>=` is what makes `write_file` able to
+/// seek to the end of a zero-length final slice.
 #[tokio::test]
 async fn seeking_to_the_end_is_allowed() {
     let raw = payload(1_000);
@@ -225,9 +235,9 @@ async fn seeking_to_the_end_is_allowed() {
 
 /// An empty payload is empty, not an error.
 ///
-/// A zero-length chunk is a real thing a chunker can produce, and a reader that
-/// refused to open one would fail a restore over a file that happened to chunk
-/// to nothing.
+/// A zero-length chunk is a real thing a chunker can produce.
+/// A reader that refused to open one would fail a restore over a file that
+/// happened to chunk to nothing.
 #[tokio::test]
 async fn an_empty_payload_reads_as_empty() {
     let mut reader = DecompressReader::new(frame_of(&[]), 0).await.unwrap();
@@ -239,11 +249,13 @@ async fn an_empty_payload_reads_as_empty() {
 /// A record claiming an absurd length is refused, and does not allocate.
 ///
 /// The length comes out of a record header, and a header is covered by a truncated
-/// hash rather than a MAC. A file that has been tampered with could therefore
-/// carry a valid check and a length of `u64::MAX`, and the reader has to refuse
-/// that *before* sizing a buffer from it — the alternative is a multi-gigabyte
-/// allocation, or a panic from inside the decompressor when the frame turns out to
-/// be longer than the buffer it was handed.
+/// hash rather than a MAC.
+/// So a file that has been tampered with could carry a valid check and a length of
+/// `u64::MAX`.
+/// The reader has to refuse that *before* sizing a buffer from it.
+/// The alternative is a multi-gigabyte allocation.
+/// The alternative is also a panic from inside the decompressor when the frame
+/// turns out to be longer than the buffer it was handed.
 #[tokio::test]
 async fn a_record_claiming_an_absurd_length_is_refused() {
     let raw = payload(1_000);
@@ -258,9 +270,9 @@ async fn a_record_claiming_an_absurd_length_is_refused() {
 
 /// Its debug form does not dump the payload.
 ///
-/// A `{:?}` in a log line is a normal thing to have, and one that printed a whole
-/// decompressed chunk would put a hundred kilobytes of text into somebody's
-/// terminal.
+/// A `{:?}` in a log line is a normal thing to have.
+/// One that printed a whole decompressed chunk would put a hundred kilobytes of
+/// text into somebody's terminal.
 #[tokio::test]
 async fn its_debug_form_does_not_include_the_payload() {
     let raw = payload(2_000);

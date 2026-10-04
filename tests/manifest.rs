@@ -1,15 +1,18 @@
 //! The manifest: a cache an apply writes so the next one need not read the tree.
 //!
-//! These tests are about one property above all — **a manifest can never make an
-//! apply wrong**. A cache that could would be worse than no cache, because it would
-//! turn a missing read into a silently incorrect directory. So the cases here are
-//! mostly about the ways a manifest goes stale, and every one of them must come
-//! back as "untrusted" rather than as "trusted".
+//! These tests are about one property above all: **a manifest can never make an
+//! apply wrong**.
+//! A cache that could would be worse than no cache.
+//! It would turn a missing read into a silently incorrect directory.
+//! So the cases here are mostly about the ways a manifest goes stale.
+//! Every one of them must come back as "untrusted" rather than as "trusted".
 //!
-//! The trees are real backups wherever a test is about a real apply's output, and
-//! hand-built snapshots only where the manifest's own arithmetic is what is under
-//! test. A manifest records the length and time a version *imposes*, so a test that
-//! recorded something else would be testing a manifest nothing produces.
+//! The trees are real backups wherever a test is about a real apply's output.
+//! Hand-built snapshots appear only where the manifest's own arithmetic is what
+//! is under test.
+//! A manifest records the length and time a version *imposes*.
+//! A test that recorded something else would be testing a manifest that nothing
+//! produces.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -27,15 +30,16 @@ const IMPOSED: i64 = 1_600_000_000;
 
 /// A snapshot recording `files`, each with the given length and no slices.
 ///
-/// Built directly rather than by backing a tree up, because what these tests are
-/// about is the manifest's own arithmetic — a manifest written from a snapshot with
-/// slices behaves identically, and `tests/apply.rs` covers that path end to end
-/// through a real backup.
+/// Built directly rather than by backing a tree up.
+/// What these tests are about is the manifest's own arithmetic.
+/// A manifest written from a snapshot with slices behaves identically.
+/// `tests/apply.rs` covers that path end to end through a real backup.
 ///
-/// Every file gets the same imposed modification time, because a manifest records
-/// what the version imposes rather than what the filesystem happened to report, and
-/// a snapshot with no modification time yields no record at all. That is the case
-/// `a_version_that_records_no_time_produces_no_record` pins.
+/// Every file gets the same imposed modification time.
+/// A manifest records what the version imposes rather than what the filesystem
+/// happened to report.
+/// A snapshot with no modification time yields no record at all.
+/// That is the case `a_version_that_records_no_time_produces_no_record` pins.
 fn snapshot(files: &[(&str, u64)]) -> Snapshot {
     let mut snapshot = Snapshot::new();
     for (path, len) in files {
@@ -77,8 +81,9 @@ fn tree(dir: &Path, files: &[(&str, &[u8])]) {
     }
 }
 
-/// Give a file the modification time a version imposes — what an apply leaves
-/// behind, and therefore what a manifest built from that version records.
+/// Give a file the modification time a version imposes.
+/// That is what an apply leaves behind.
+/// It is therefore what a manifest built from that version records.
 fn impose(path: &Path) {
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(IMPOSED, 0)).unwrap();
 }
@@ -108,8 +113,8 @@ fn a_manifest_lives_beside_the_destination_and_never_inside_it() {
     );
 }
 
-/// A manifest round-trips, and the round trip is what makes the cache usable at
-/// all — a manifest that decoded into something else would be silently trusted.
+/// A manifest round-trips, and the round trip is what makes the cache usable.
+/// A manifest that decoded into something else would be silently trusted.
 #[test]
 fn a_manifest_survives_a_round_trip_through_its_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -257,9 +262,10 @@ fn a_file_the_manifest_never_saw_is_not_trusted() {
     let recorded = Manifest::record(&destination, version, &snapshot(&[("a.bin", 4)])).unwrap();
     recorded.save(&destination).unwrap();
 
-    // A file the version has since added. The manifest cannot vouch for it, and
-    // `a.bin` is still trusted — so the answer is exactly the new file, which is
-    // what makes the per-file fallback worth having.
+    // A file the version has since added.
+    // The manifest cannot vouch for it, and `a.bin` is still trusted.
+    // So the answer is exactly the new file.
+    // That is what makes the per-file fallback worth having.
     let snap = snapshot(&[("a.bin", 4), ("fresh.bin", 4)]);
 
     let loaded = Manifest::load(&destination).unwrap().unwrap();
@@ -272,9 +278,10 @@ fn a_file_the_manifest_never_saw_is_not_trusted() {
 
 /// A version that records no modification time yields no manifest record at all.
 ///
-/// There is nothing to compare a file against, and recording a zero time would be a
-/// claim — a false one on any filesystem with a real epoch. So the file is read
-/// next time, which is slower and correct.
+/// There is nothing to compare a file against, and recording a zero time would be
+/// a claim.
+/// That claim is false on any filesystem with a real epoch.
+/// So the file is read next time, which is slower and correct.
 #[test]
 fn a_version_that_records_no_time_produces_no_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -294,8 +301,9 @@ fn a_version_that_records_no_time_produces_no_record() {
 /// No manifest is a cache miss, not an error.
 ///
 /// A caller that cannot use the cache reads the tree instead, and there is nothing
-/// for it to report — so `load` returns `None` rather than failing, or a first
-/// apply could never run.
+/// for it to report.
+/// So `load` returns `None` rather than failing.
+/// Otherwise a first apply could never run.
 #[test]
 fn a_destination_with_no_manifest_is_a_miss_and_not_a_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -429,8 +437,8 @@ fn a_manifest_handles_a_path_with_a_newline_in_it() {
 /// The same tree always produces the same manifest bytes.
 ///
 /// Entries are sorted on the way out, so two manifests of one tree can be
-/// compared rather than merely diffed by eye — and a caller caching by content
-/// gets a hit.
+/// compared rather than merely diffed by eye.
+/// A caller caching by content then gets a hit.
 #[test]
 fn a_manifest_is_a_function_of_the_tree_it_records() {
     let dir = tempfile::tempdir().unwrap();

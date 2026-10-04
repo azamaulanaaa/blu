@@ -1,21 +1,22 @@
 //! Compression: what it does to a store, and what it must never do to one.
 //!
-//! The record format carries a codec byte and two lengths — the bytes on disk and
-//! the bytes of content — and every property of the store that does not involve
-//! those has to survive their introduction unchanged. So the tests here are mostly
-//! about *other* things staying true:
+//! The record format carries a codec byte and two lengths. The lengths are the
+//! bytes on disk and the bytes of content. Every property of the store that does
+//! not involve those has to survive their introduction unchanged. The tests here
+//! are therefore mostly about *other* things staying true:
 //!
-//! * a chunk is addressed by the content, so deduplication must work across
-//!   records written with different codecs, and even with compression off;
-//! * a payload zstd cannot improve on is stored raw rather than as a frame a few
-//!   bytes larger than what it replaced;
+//! * a chunk is addressed by the content. Deduplication must work across records
+//!   written with different codecs. It must work with compression off.
+//! * a payload that zstd cannot improve on is stored raw. The store does not
+//!   store it as a frame a few bytes larger than the payload it would replace.
 //! * every version of a set restores exactly, whatever settings its records were
-//!   written under;
-//! * a store written at one level reads back at any other, because the codec is in
-//!   the record rather than in the store.
+//!   written under.
+//! * a store written at one level reads back at any other. The codec is in the
+//!   record rather than in the store.
 //!
-//! The one thing compression is *for* — a smaller store — is measured rather than
-//! asserted, because whether a given payload compresses is a fact about the data.
+//! The one thing compression is *for* is a smaller store. The test measures that
+//! store instead of asserting it. Whether a given payload compresses is a fact
+//! about the data.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
@@ -34,17 +35,17 @@ use lepatch::{
 /// A write policy that is not [`Compression`], written the way a caller outside
 /// this crate has to write one.
 ///
-/// Nothing here reaches into the store: it is a type, an impl of the public
-/// [`Compressor`] trait, and an argument to `open_for_writing`. It compresses
-/// with zstd at a level of its own choosing — a *policy* about which payloads are
-/// worth compressing, not a different codec, because [`Codec`] has only two arms
-/// and a third one would be a different on-disk format.
+/// Nothing here reaches into the store. The code is a type, an impl of the public
+/// [`Compressor`] trait, and an argument to `open_for_writing`. It compresses with
+/// zstd at a level of its own choosing. That level is a *policy* about which
+/// payloads are worth compressing. It is not a different codec. [`Codec`] has only
+/// two arms. A third arm would be a different on-disk format.
 ///
-/// The policy is a threshold: payloads below `min_bytes` are stored as they are
-/// without being handed to the compressor at all. That is a real choice a real
-/// caller makes — a small chunk cannot pay for a frame, and the frame header is a
-/// larger share of it — and it is invisible to the store, which records whatever
-/// codec each record names.
+/// The policy is a threshold. Payloads below `min_bytes` are stored as they are.
+/// The store does not hand them to the compressor at all. A real caller makes
+/// this choice. A small chunk cannot pay for a frame. The frame header is a larger
+/// share of that chunk. The store does not see the choice. The store records
+/// whatever codec each record names.
 struct BigPayloadsOnly {
     min_bytes: usize,
 }
@@ -67,19 +68,20 @@ impl Compressor for BigPayloadsOnly {
 /// with a policy it cannot vouch for.
 ///
 /// It returns a zstd frame of the payload padded past its own end. The store must
-/// notice and store the payload untouched, which is the whole of the "the fallback
-/// belongs to the writer" argument in [`Compressor`]: a third-party compressor that
-/// gets this wrong costs a wasted frame, never a grown set.
+/// notice and store the payload untouched. That rule is the whole of the "the
+/// fallback belongs to the writer" argument in [`Compressor`]. A third-party
+/// compressor that gets this wrong costs a wasted frame. It never costs a grown
+/// set.
 ///
-/// The reason is not that the padded buffer could not be decoded back, which is
-/// what this comment used to say and is not what happens. zstd reads the *first*
-/// frame's declared size and ignores whatever follows it, so the padded buffer
-/// still declares the payload's own length and the decode's size check would pass;
-/// it is `zstd::bulk::decompress` that then refuses a source which is not exactly
-/// one frame, with "Src size is incorrect". So a store that trusted the policy
-/// would fail a restore loudly rather than hand back the wrong bytes — a milder
-/// failure than the two size assertions below, which catch it at the point where
-/// it was still a decision rather than a restore.
+/// The reason is not that the padded buffer could not be decoded back. An earlier
+/// version of this comment said so. That is not what happens. zstd reads the
+/// *first* frame's declared size and ignores whatever follows it. The padded
+/// buffer still declares the payload's own length. The decode's size check would
+/// pass. `zstd::bulk::decompress` then refuses a source which is not exactly one
+/// frame. The refusal says "Src size is incorrect". So a store that trusted the
+/// policy would fail a restore loudly. It would not hand back the wrong bytes.
+/// That failure is milder than the two size assertions below. Those assertions
+/// catch the failure while it is still a decision rather than a restore.
 struct AlwaysGrows;
 
 impl Compressor for AlwaysGrows {
@@ -91,14 +93,15 @@ impl Compressor for AlwaysGrows {
     }
 }
 
-/// A policy that hands back bytes that are not the payload, under a codec the
-/// reader will never decode, to pin that the codec the store records is its own.
+/// A policy that hands back bytes that are not the payload. The policy uses a
+/// codec that the reader will never decode. This pins that the codec the store
+/// records is its own.
 struct Truncates;
 
-/// `Raw` in a record means "the bytes the store hashed", so a policy that claims
-/// it while returning half the payload is not believed: what the reader is handed
-/// for chunk `id` would otherwise be those half bytes followed by whatever record
-/// follows them in the segment.
+/// `Raw` in a record means "the bytes the store hashed". The store does not
+/// believe a policy that claims `Raw` while returning half the payload. The reader
+/// would otherwise receive those half bytes for chunk `id`. Those bytes would be
+/// followed by whatever record comes next in the segment.
 impl Compressor for Truncates {
     fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>) {
         (Codec::Raw, Cow::Owned(vec![0u8; raw.len() / 2]))
@@ -107,8 +110,8 @@ impl Compressor for Truncates {
 
 /// Bytes that zstd cannot compress, so a frame is never smaller than the input.
 ///
-/// The store falls back to raw for these, which is what makes a size assertion
-/// about the file mean "the records are this big" rather than "the compressor
+/// The store falls back to raw for these bytes. A size assertion about the file
+/// therefore means "the records are this big". It does not mean "the compressor
 /// happened to do well".
 fn incompressible(seed: u8, len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
@@ -153,8 +156,8 @@ async fn read(store: &BlobStore<Read>, id: &lepatch::storage::BlobId) -> Vec<u8>
 
 /// A payload that compresses is stored compressed, and comes back byte for byte.
 ///
-/// The round trip is the property; the codec byte is the mechanism. Asserting the
-/// codec separately is what makes a failure say *which* half broke.
+/// The round trip is the property. The codec byte is the mechanism. Asserting the
+/// codec separately makes a failure say *which* half broke.
 #[tokio::test]
 async fn a_payload_that_compresses_is_stored_compressed() {
     let dir = tempfile::tempdir().unwrap();
@@ -180,10 +183,11 @@ async fn a_payload_that_compresses_is_stored_compressed() {
 
 /// A payload that does not compress is stored raw.
 ///
-/// Not a nicety: a zstd frame carries a few bytes of header of its own, so on
-/// already-compressed content a frame is *larger* than the input. Storing it would
-/// make the store bigger for content zstd had no opinion about, which is most of
-/// what a game ships as textures, audio and video.
+/// This is not a nicety. A zstd frame carries a few bytes of header of its own.
+/// On already-compressed content a frame is *larger* than the input. Storing it
+/// would make the store bigger. The store would grow for content that zstd had no
+/// opinion about. A game ships most of its textures, audio and video as such
+/// content.
 #[tokio::test]
 async fn a_payload_that_does_not_compress_is_stored_raw() {
     let dir = tempfile::tempdir().unwrap();
@@ -207,14 +211,14 @@ async fn a_payload_that_does_not_compress_is_stored_raw() {
 
 /// A caller outside this crate brings its own write policy, and the store takes it.
 ///
-/// The point of the seam, end to end. Nothing in `lepatch` knows `BigPayloadsOnly`
-/// exists, and nothing in the store changed to accommodate it: the type parameter
-/// default is what lets every other call site keep naming `Compression`.
+/// This test covers the point of the seam, end to end. Nothing in `lepatch` knows
+/// `BigPayloadsOnly` exists. Nothing in the store changed to accommodate it. The
+/// default type parameter lets every other call site keep naming `Compression`.
 ///
-/// What is asserted is that the policy reached the writer at all — the threshold
-/// really did keep the small payload out of the compressor — and that the records
-/// still read back through an ordinary reader, because each record names its own
-/// codec and a reader is told nothing.
+/// The test asserts that the policy reached the writer at all. The threshold really
+/// did keep the small payload out of the compressor. The test also asserts that the
+/// records still read back through an ordinary reader. Each record names its own
+/// codec. A reader is told nothing.
 #[tokio::test]
 async fn a_write_policy_from_outside_the_crate_is_taken_and_respected() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,16 +264,16 @@ async fn a_write_policy_from_outside_the_crate_is_taken_and_respected() {
 /// A compressor that makes its payload bigger does not grow the store.
 ///
 /// The invariant is the writer's, so this is where it is pinned. The policy here
-/// returns a frame that is larger than the payload it was given, every time, and
-/// claims a codec that would need it to be stored — so a store that trusted its
-/// compressor would write bytes that nothing can decode back to the payload, and
-/// would write more of them than it was given.
+/// returns a frame that is larger than the payload it was given. It does so every
+/// time. It claims a codec that would need the frame to be stored. A store that
+/// trusted its compressor would then write bytes that nothing can decode back to
+/// the payload. It would write more of them than it was given.
 ///
-/// Both halves matter and they are separate properties: the record says `Raw`, so
-/// a reader is handed the content rather than a frame; and its stored length is
-/// the payload's, so the set did not grow. A fix that got only the first right
-/// would produce a store that reads back correctly and is still larger than the
-/// tree.
+/// Both halves matter. They are separate properties. The record says `Raw`, so a
+/// reader receives the content rather than a frame. The stored length is the
+/// payload's length, so the set did not grow. A fix that got only the first half
+/// right would produce a store that reads back correctly. That store would still
+/// be larger than the tree.
 #[tokio::test]
 async fn a_compressor_that_grows_its_payload_cannot_grow_the_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -279,10 +283,10 @@ async fn a_compressor_that_grows_its_payload_cannot_grow_the_store() {
         .await
         .unwrap();
 
-    // Incompressible, because the padding has to be what tips the frame over: on
-    // compressible content a frame is far smaller than the payload and sixty-odd
-    // bytes do not make it the bigger of the two, so this policy would pass
-    // unnoticed for the wrong reason.
+    // The payload is incompressible on purpose. The padding has to be what tips
+    // the frame over. On compressible content a frame is far smaller than the
+    // payload. Sixty-odd bytes do not make the frame the bigger of the two. Such
+    // content would let this policy pass unnoticed for the wrong reason.
     let payload = incompressible(7, 200_000);
     let id = put(&store, &payload).await;
 
@@ -306,13 +310,14 @@ async fn a_compressor_that_grows_its_payload_cannot_grow_the_store() {
 /// A policy that returns fewer bytes than it was given cannot make a chunk read
 /// back as something else.
 ///
-/// The size check and the codec check are separate obligations, and this pins the
-/// second one. `Truncates` returns strictly fewer bytes than the payload, so it
-/// passes a writer that only compares sizes — and pairs them with a codec the
-/// reader does not decode, so the payload is written under a name that means
-/// "these are the bytes that hashed to `id`" without them being so. Nothing on the
-/// read path hashes what it hands back, so the damage is silent: a restore
-/// produces a file of zeros and the bytes of whichever record came next.
+/// The size check and the codec check are separate obligations. This test pins the
+/// second one. `Truncates` returns strictly fewer bytes than the payload. It
+/// therefore passes a writer that only compares sizes. It pairs those bytes with a
+/// codec that the reader does not decode. The payload is written under a name that
+/// means "these are the bytes that hashed to `id`". Those bytes are not those
+/// bytes. Nothing on the read path hashes what it hands back. The damage is
+/// therefore silent. A restore produces a file of zeros and the bytes of whichever
+/// record came next.
 #[tokio::test]
 async fn bytes_that_are_not_the_payload_are_not_stored_under_its_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -349,17 +354,17 @@ async fn bytes_that_are_not_the_payload_are_not_stored_under_its_name() {
 /// A `Raw` payload is stored under the length it has, not the one it was claimed
 /// to be.
 ///
-/// `put_stored` is the path a merge takes when it keeps the frames it was sent,
-/// and it takes two lengths from the caller: the bytes on disk and the bytes of
-/// content. For a frame the second is checked against the first by the decode. For
-/// `Raw` there is nothing to check against — the payload *is* the content — so the
-/// only honest record of it is the length of what arrived.
+/// `put_stored` is the path a merge takes when it keeps the frames it was sent.
+/// The function takes two lengths from the caller. The lengths are the bytes on
+/// disk and the bytes of content. For a frame, the decode checks the second length
+/// against the first. For `Raw` there is nothing to check against. The payload
+/// *is* the content. The only honest record of it is the length of what arrived.
 ///
-/// This is the one arm of that function with no direct test. It was reached only
-/// through a merge, where the record's own header and the index agree by
-/// construction, so a store that believed the claim instead would have gone
-/// unnoticed: the record would say a chunk is longer than it is, and a restore
-/// comparing a slice's end against a snapshot would be off by exactly the
+/// This is the one arm of that function with no direct test. A merge was the only
+/// path that reached it. In a merge, the record's own header and the index agree
+/// by construction. A store that believed the claim instead would have gone
+/// unnoticed. The record would say a chunk is longer than it is. A restore that
+/// compares a slice's end against a snapshot would be off by exactly the
 /// difference between the two lengths.
 #[tokio::test]
 async fn a_raw_payload_is_stored_under_its_own_length() {
@@ -405,12 +410,12 @@ async fn a_raw_payload_is_stored_under_its_own_length() {
 /// A policy that returns exactly as many bytes as it was given is not believed
 /// either.
 ///
-/// The boundary is *strictly* smaller, and this is what pins it. A writer that
-/// compared with `<=` would store this policy's frame and pass every other test
-/// in this file, because a policy that grows its payload and one that merely
-/// matches it differ only at a boundary nobody asserted. A frame that saved
-/// nothing still costs its header, and it is still bytes the store did not hash
-/// under the codec the record would claim.
+/// The boundary is *strictly* smaller. This type pins that boundary. A writer that
+/// compared with `<=` would store this policy's frame. Such a writer would pass
+/// every other test in this file. A policy that grows its payload and one that
+/// merely matches it differ only at a boundary. Nobody asserted that boundary. A
+/// frame that saved nothing still costs its header. It is still bytes that the store
+/// did not hash under the codec the record would claim.
 struct MatchesSize;
 
 impl Compressor for MatchesSize {
@@ -431,9 +436,10 @@ async fn a_frame_that_saved_nothing_is_not_stored() {
         .await
         .unwrap();
 
-    // Compressible, because the frame has to be long enough to be padded up to the
-    // payload's own length at all; on content zstd cannot shrink there is no
-    // shorter frame to grow and the fixture would pass for the wrong reason.
+    // The payload is compressible on purpose. The frame has to be long enough to
+    // be padded up to the payload's own length. Content that zstd cannot shrink
+    // leaves no shorter frame to grow. Such content would let the fixture pass for
+    // the wrong reason.
     let payload = compressible(200_000);
     let id = put(&store, &payload).await;
 
@@ -472,9 +478,9 @@ async fn compression_off_stores_everything_raw() {
 /// A chunk is addressed by its content, so the codec it was stored under is not
 /// part of its identity.
 ///
-/// This is the property that makes the codec safe to be a write policy at all. If
-/// the address depended on how the bytes were compressed, then changing the level
-/// between runs would re-upload the entire tree — and a level is a flag.
+/// This is the property that makes the codec safe to be a write policy. If the
+/// address depended on how the bytes were compressed, then changing the level
+/// between runs would upload the entire tree again. A level is only a flag.
 #[tokio::test]
 async fn deduplication_holds_across_different_codecs() {
     let dir = tempfile::tempdir().unwrap();
@@ -496,8 +502,8 @@ async fn deduplication_holds_across_different_codecs() {
     assert_eq!(store.locate(&id).unwrap().codec, Codec::Raw);
     let after_first = fs::metadata(blob.with_extension("0000.bin")).unwrap().len();
 
-    // Same hash, different policy. Nothing should be written: the store already
-    // holds this content, and *how* it holds it is not the store's business.
+    // Same hash, different policy. Nothing should be written. The store already
+    // holds this content. *How* it holds that content is not the store's business.
     drop(store);
     let store = writable(&blob, Compression::zstd(9)).await;
     store
@@ -524,9 +530,9 @@ async fn deduplication_holds_across_different_codecs() {
 
 /// A store written at one level reads back correctly at any other.
 ///
-/// The codec is in the record, not the store, so there is nothing to configure on
-/// the reading side at all. That is what makes a level safe to change between
-/// runs: the reader never has to know what the writer chose.
+/// The codec is in the record and not in the store. Nothing on the reading side
+/// needs configuration. That is what makes a level safe to change between runs.
+/// The reader never has to know what the writer chose.
 #[tokio::test]
 async fn a_store_written_at_one_level_reads_at_another() {
     let dir = tempfile::tempdir().unwrap();
@@ -563,10 +569,10 @@ async fn a_store_written_at_one_level_reads_at_another() {
 /// A store holding records written under several policies is one store, and every
 /// version of it restores exactly.
 ///
-/// The case that catches a codec stored per-set rather than per-record: three
-/// backups of a growing tree at three different settings, then each version
-/// restored on its own. A per-set codec would fail to read the versions written
-/// under the others.
+/// This case catches a codec stored per-set rather than per-record. The test takes
+/// three backups of a growing tree at three different settings. The test then
+/// restores each version on its own. A per-set codec would fail to read the
+/// versions written under the others.
 #[tokio::test]
 async fn a_store_may_hold_records_written_under_several_policies() {
     let dir = tempfile::tempdir().unwrap();
@@ -600,8 +606,8 @@ async fn a_store_may_hold_records_written_under_several_policies() {
         "each backup should have published a version"
     );
 
-    // Every version restores, and each carries the files that existed when it was
-    // taken — so version N has exactly N of the pairs above.
+    // Every version restores. Each version carries the files that existed when it
+    // was taken. Version N therefore has exactly N of the pairs above.
     for version in 1..=u32::try_from(policies.len()).unwrap() {
         let destination = dir.path().join(format!("out{version}"));
         common::run_restore_version(&blob, &destination, version).await;
@@ -636,11 +642,11 @@ async fn a_store_may_hold_records_written_under_several_policies() {
 
 #[tokio::test]
 async fn a_compressed_blob_reports_its_raw_length_to_a_plan() {
-    // A plan compares a snapshot's slice length against what the store holds, and
-    // the two are in different units if the store is compressed: a snapshot
-    // records content bytes, a placement reports bytes on disk. Getting this wrong
-    // would either reject every chunk of a compressed store or accept one that is
-    // genuinely too short.
+    // A plan compares a snapshot's slice length against what the store holds. A
+    // compressed store measures the two in different units. A snapshot records
+    // content bytes. A placement reports bytes on disk. Getting this wrong would
+    // reject every chunk of a compressed store. It would also accept a chunk that
+    // is genuinely too short.
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("tree");
     fs::create_dir_all(&source).unwrap();
@@ -675,8 +681,8 @@ async fn a_compressed_blob_reports_its_raw_length_to_a_plan() {
         );
     }
 
-    // The chunks really are compressed, or this test has proved nothing about
-    // comparing content against storage.
+    // The chunks must really be compressed. Otherwise this test has proved nothing
+    // about comparing content against storage.
     let compressed = plan
         .chunks()
         .iter()
@@ -691,8 +697,9 @@ async fn a_compressed_blob_reports_its_raw_length_to_a_plan() {
 /// A pack built from a compressed store holds the store's compressed bytes, so a
 /// client downloads less without the store being decompressed first.
 ///
-/// The other half of the decision to put compression in the store: a pack is
-/// assembled by copying record payloads, so it inherits whatever the store holds.
+/// This is the other half of the decision to put compression in the store. The
+/// code assembles a pack by copying record payloads. A pack therefore inherits
+/// whatever the store holds.
 #[tokio::test]
 async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
     let dir = tempfile::tempdir().unwrap();
@@ -715,10 +722,10 @@ async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
         .unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 
-    // The pack writer reads through the store, so it is fed decompressed content.
-    // What it writes is that content, end to end — and the *store* is where the
-    // saving is. This asserts the two facts the design rests on, separately: the
-    // plan is in content bytes, and the records behind it are smaller.
+    // The pack writer reads through the store. It is therefore fed decompressed
+    // content. It writes that content, end to end. The *store* is where the saving
+    // is. This test asserts the two facts that the design rests on. The plan is in
+    // content bytes. The records behind it are smaller.
     let content: u64 = plan.iter().map(|c| c.length).sum();
     let on_disk: u64 = plan.iter().map(|c| c.placement.stored_len).sum();
 
@@ -731,18 +738,19 @@ async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
 
 /// The level the user types is the policy that gets applied.
 ///
-/// `--compression-level` counts 0 to 9 and there is no separate switch, so the
-/// mapping from what a user writes to what the store does is the whole interface.
-/// Two mistakes are possible and both are worth pinning: `0` has to mean "as-is"
-/// rather than falling into zstd's own idea of level 0, and a number outside the
-/// range has to be clamped by the library while the command line rejects it
-/// before the library is ever reached.
+/// `--compression-level` counts 0 to 9. There is no separate switch. The mapping
+/// from what a user writes to what the store does is therefore the whole
+/// interface. Two mistakes are possible. Both are worth pinning. `0` has to mean
+/// "as-is" instead of falling into zstd's own idea of level 0. A number outside
+/// the range has to be clamped by the library. The command line rejects it before
+/// the library is ever reached.
 #[test]
 fn the_level_a_user_types_is_the_policy_applied() {
     use lepatch::storage::MAX_COMPRESSION_LEVEL;
 
-    // 0 is not zstd level 0, which zstd itself treats as "use the default". It is
-    // "do not compress", which is the only reading that makes it worth having.
+    // 0 is not zstd level 0. zstd itself treats that level as "use the default".
+    // Here 0 means "do not compress". That is the only reading which makes the
+    // level worth having.
     assert_eq!(Compression::from_level(0), Compression::Off);
     assert_eq!(Compression::from_level(0).level(), None);
 
@@ -757,8 +765,8 @@ fn the_level_a_user_types_is_the_policy_applied() {
         Compression::zstd(9)
     );
 
-    // Past the top, the library clamps rather than panicking: a library caller
-    // with a bad number gets a working policy, where a user gets an error.
+    // Past the top, the library clamps the number instead of panicking. A library
+    // caller with a bad number gets a working policy. A user gets an error.
     assert_eq!(Compression::from_level(200).level(), Some(9));
     assert_eq!(Compression::zstd(0).level(), Some(1));
 

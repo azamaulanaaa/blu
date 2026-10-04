@@ -1,30 +1,36 @@
 //! Properties of the benchmark fixtures.
 //!
 //! These live in `tests/` rather than in either bench because a bench is its own
-//! crate: nothing runs a bench target's `#[test]` functions as part of
-//! `cargo test`, so a property asserted in one would only be checked by
-//! whoever happened to run that bench. Here it is checked by every `cargo test`,
-//! against the same generator both benches use — the file is included by path
-//! rather than copied, so the test and the benchmarks cannot drift apart.
+//! crate.
+//! `cargo test` does not run a bench target's `#[test]` functions.
+//! So a property asserted in a bench would only be checked by whoever happened
+//! to run that bench.
+//! Here every `cargo test` checks the property.
+//! Both benches use the same generator.
+//! The test includes the file by path rather than copying it, so the test and
+//! the benchmarks cannot drift apart.
 //!
-//! The property exists because the failure it guards is silent. A generator
-//! whose output is a function of `seed + position` produces a tree that is one
-//! stream sampled at different offsets; it round-trips perfectly, the benchmark
-//! numbers look reasonable, and the only thing wrong with them is that they
-//! measure a tree with almost nothing left to store. `examples/ab.rs` documents
-//! the discovery in full; this is the part of it that keeps it from coming
-//! back.
+//! The property exists because the failure it guards is silent.
+//! A generator whose output is a function of `seed + position` produces a tree
+//! that is one stream sampled at different offsets.
+//! The tree round-trips perfectly, and the benchmark numbers look reasonable.
+//! The only thing wrong with them is that they measure a tree with almost
+//! nothing left to store.
+//! `examples/ab.rs` documents the discovery in full.
+//! This is the part of it that keeps it from coming back.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
 #[path = "../benches/fixture.rs"]
 mod fixture;
 
-// `ab.rs`'s generator, for the same reason. It is a *different* generator and
-// that is deliberate: the bench fixture builds files that share a prefix, because
-// deduplication moving work out of the store is what it measures, while this one
-// builds files that share nothing, because a shared prefix would hide the store
-// behind the reader. Neither is reusable for the other's job, and both have to
-// satisfy the properties below.
+// `ab.rs`'s generator, for the same reason.
+// It is a *different* generator and that is deliberate.
+// The bench fixture builds files that share a prefix, because deduplication
+// moving work out of the store is what it measures.
+// This one builds files that share nothing, because a shared prefix would hide
+// the store behind the reader.
+// Neither is reusable for the other's job, and both have to satisfy the
+// properties below.
 #[path = "fixtures/ab.rs"]
 mod ab_fixture;
 
@@ -32,48 +38,57 @@ use std::collections::HashSet;
 
 use fixture::noisy;
 
-/// Bytes each generated file holds here. Smaller than either bench uses, so the
-/// test is quick, but far larger than [`RUN`] — the property only bites when a
-/// file has many offsets at which a run can start, because it is a collision
-/// between a *seed* and an *offset* that has to be looked for.
+/// Bytes each generated file holds here.
+/// This is smaller than either bench uses, so the test is quick.
+/// It is far larger than [`RUN`].
+/// The property only bites when a file has many offsets at which a run can
+/// start.
+/// It bites because it is a collision between a *seed* and an *offset* that has
+/// to be looked for.
 const FILE_BYTES: usize = 16 * 1024;
 
 /// Files in the tree under test.
 ///
-/// Fewer than either bench uses, and deliberately overlapping [`OFFSETS`]: the
-/// seeds under test run from 0, and the offsets within a file run from 0, so the
-/// two ranges have to meet for the bug to be visible at all. A generator that is
-/// a function of `seed + position` collides wherever `seed_i + at` equals
-/// `seed_j + at'`, and it takes only a difference of up to `FILES` for that.
+/// Fewer than either bench uses, and deliberately overlapping [`OFFSETS`].
+/// The seeds under test run from 0, and the offsets within a file run from 0.
+/// So the two ranges have to meet for the bug to be visible at all.
+/// A generator that is a function of `seed + position` collides wherever
+/// `seed_i + at` equals `seed_j + at'`.
+/// It takes only a difference of up to `FILES` for that.
 const FILES: usize = 24;
 
 /// A run as long as a chunk is likely to be, which is the thing that must not
 /// repeat.
 ///
-/// Four KiB is under the default chunker's 8 KiB minimum, so a repeat of this
-/// length cannot come from two different chunks being cut at the same place by
-/// chance — if it is in the tree, it is in it twice. It is also short enough to
-/// turn up by accident, which is what makes this a real test rather than a
-/// formality.
+/// Four KiB is under the default chunker's 8 KiB minimum.
+/// So a repeat of this length cannot come from two different chunks being cut
+/// at the same place by chance.
+/// If a run of this length is in the tree, it is in it twice.
+/// It is also short enough to turn up by accident.
+/// That is what makes this a real test rather than a formality.
 const RUN: usize = 4 * 1024;
 
 /// Offsets within each file that are checked.
 ///
 /// `slice::windows` is *overlapping*: every byte offset in a 16 KiB file is a
-/// start, so collecting them all is 12,289 four-kilobyte keys per file, about
-/// a gigabyte of hashing for a test, and it gets worse in proportion to the
-/// file rather than staying constant. Taking the first `OFFSETS` is enough and
-/// is not a compromise: a collision between two seeds needs their difference to
-/// equal a difference between two offsets, and consecutive offsets from zero
-/// cover every seed difference up to `FILES - 1` without missing any.
+/// start.
+/// Collecting them all is 12,289 four-kilobyte keys per file, about a gigabyte
+/// of hashing for a test.
+/// The cost grows in proportion to the file rather than staying constant.
+/// Taking the first `OFFSETS` is enough, and it is not a compromise.
+/// A collision between two seeds needs their difference to equal a difference
+/// between two offsets.
+/// Consecutive offsets from zero cover every seed difference up to `FILES - 1`
+/// without missing any.
 const OFFSETS: usize = 64;
 
 /// Every run of `RUN` bytes in the tree is unique.
 ///
-/// This is the property that matters, and it is a property of the whole tree
-/// rather than of a pair of seeds — which is how the original bug survived a
-/// test that compared two specific seeds, since the pairs that happen to
-/// misalign are the ones a two-seed test looks at.
+/// This is the property that matters.
+/// It is a property of the whole tree rather than of a pair of seeds.
+/// That is how the original bug survived a test that compared two specific
+/// seeds.
+/// The pairs that happen to misalign are the ones a two-seed test looks at.
 #[test]
 fn no_two_files_overlap_at_any_offset() {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
@@ -114,9 +129,11 @@ fn different_seeds_share_no_long_run() {
 /// The shared prefix a fixture builds on purpose is genuinely shared.
 ///
 /// Both benches deliberately give every file the same first half, so that
-/// deduplication has something to do. That is a deliberate property, and this
-/// asserts it survived the move to a shared generator — a generator that
-/// accidentally made the unique halves identical would collapse this.
+/// deduplication has something to do.
+/// That is a deliberate property, and this asserts it survived the move to a
+/// shared generator.
+/// A generator that accidentally made the unique halves identical would
+/// collapse this.
 #[test]
 fn the_shared_prefix_is_shared_and_the_unique_half_is_not() {
     let shared = noisy(FILE_BYTES, 7);
@@ -140,34 +157,39 @@ fn the_shared_prefix_is_shared_and_the_unique_half_is_not() {
 /// The properties, run against both generators.
 ///
 /// These were three `#[test]` functions inside `examples/ab.rs`, guarding that
-/// example's own generator. An example is its own crate and `cargo test` does not
-/// run its `#[cfg(test)]` items, so they were only checked by whoever happened to
-/// run the example — and an example is the first thing anyone deletes as "just a
-/// benchmark". They are here now, and they check *both* generators rather than
-/// one, which is the other half of the win: the bench fixture had the same two
-/// properties written out again, and a fourth copy was never going to happen.
+/// example's own generator.
+/// An example is its own crate, and `cargo test` does not run its `#[cfg(test)]`
+/// items.
+/// So only whoever happened to run the example checked them.
+/// An example is also the first thing anyone deletes as "just a benchmark".
+/// The three tests are here now, and they check *both* generators rather than
+/// one.
+/// The bench fixture had the same two properties written out again, and a
+/// fourth copy was never going to happen.
 ///
-/// Each takes the generator as a function, so the property is written once and the
-/// two fixtures are checked against it. A generator that drifts back to a
-/// counter fails whichever one it is, with the property's own message saying
-/// what a chunk-sized repeated run would mean for the measurement.
+/// Each test takes the generator as a function, so the property is written once
+/// and the two fixtures are checked against it.
+/// A generator that drifts back to a counter fails whichever one it is.
+/// The property's own message says what a chunk-sized repeated run would mean
+/// for the measurement.
 mod both {
     use super::ab_fixture::noisy as ab;
     use super::fixture::noisy as bench;
 
     use std::collections::{HashMap, HashSet};
 
-    /// Files per tree. Fewer than either benchmark uses, because the property is
-    /// a pairwise search and the failure it looks for is total rather than
-    /// marginal.
+    /// Files per tree.
+    /// Fewer than either benchmark uses, because the property is a pairwise
+    /// search.
+    /// The failure it looks for is total rather than marginal.
     const FILES: usize = 24;
 
     /// Comfortably above the chunker's minimum, so a real chunk would collapse
     /// and this catches it.
     const WINDOW: usize = 8 * 1024;
 
-    /// A chunker can only deduplicate a run of at least a minimum chunk, so a run
-    /// this long would be thrown away by the real pipeline.
+    /// A chunker can only deduplicate a run of at least a minimum chunk.
+    /// A run this long would be thrown away by the real pipeline.
     const MIN_CHUNK: usize = 256;
 
     const FILE_BYTES: usize = 16 * 1024;
@@ -175,14 +197,17 @@ mod both {
     /// Longest run of bytes appearing in both slices, at any alignment.
     ///
     /// Indexed by a 16-byte gram and extended from each hit, so this is linear
-    /// rather than quadratic. The quadratic version took 43 seconds, which is too
-    /// slow to be a test anybody keeps.
+    /// rather than quadratic.
+    /// The quadratic version took 43 seconds, which is too slow to be a test
+    /// anybody keeps.
     ///
     /// Checking one alignment is not enough, and that is the whole point of the
-    /// gram: if one file is another shifted by a single byte, every aligned
-    /// window of one lands in the middle of a window of the other and they all
-    /// differ. A test that compares aligned windows passes on exactly the case
-    /// that went wrong, which is the case a counter-seeded generator produces.
+    /// gram.
+    /// If one file is another shifted by a single byte, every aligned window of
+    /// one lands in the middle of a window of the other.
+    /// Then they all differ.
+    /// A test that compares aligned windows passes on exactly the case that went
+    /// wrong, and that is the case a counter-seeded generator produces.
     fn longest_common_run(a: &[u8], b: &[u8]) -> usize {
         const GRAM: usize = 16;
         /// Stop early: the assertion is about runs far below this.
@@ -254,9 +279,10 @@ mod both {
 
     /// Two different seeds must not produce the same bytes at a different offset.
     ///
-    /// Kept because it fails with a far more specific message, and because it is
-    /// the cheap one to run while iterating on a generator. It also checks that
-    /// they differ nearly everywhere, which a weak mixer would not.
+    /// Kept because it fails with a far more specific message.
+    /// It is also the cheap one to run while iterating on a generator.
+    /// It checks that two seeds differ nearly everywhere, which a weak mixer
+    /// would not.
     fn seeds_are_unrelated<F>(noisy: F)
     where
         F: Fn(usize, u64) -> Vec<u8>,
@@ -283,9 +309,9 @@ mod both {
 
     /// No chunk-sized run may be repeated anywhere in the tree.
     ///
-    /// The whole-tree form of the same property, and the one that survives: a
-    /// two-seed check looks at one pair out of hundreds, and the pairs that
-    /// happen to misalign are not the ones it picks.
+    /// The whole-tree form of the same property, and the one that survives.
+    /// A two-seed check looks at one pair out of hundreds.
+    /// The pairs that happen to misalign are not the ones it picks.
     fn no_repeated_window<F>(noisy: F)
     where
         F: Fn(usize, u64) -> Vec<u8>,

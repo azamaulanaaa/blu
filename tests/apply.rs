@@ -1,26 +1,27 @@
 //! An apply: bringing a directory up to the version a pack carries.
 //!
-//! A restore writes every byte a version needs. An apply writes only the bytes the
-//! destination lacks, and the tests are about that difference being real rather
-//! than cosmetic:
+//! A restore writes every byte a version needs.
+//! An apply writes only the bytes the destination lacks.
+//! The tests are about that difference being real rather than cosmetic:
 //!
-//! * the tree ends up equal to the version — the same assertion a round trip
-//!   makes, reached a different way;
+//! * the tree ends up equal to the version. A round trip makes the same assertion,
+//!   and reaches it a different way.
 //! * a file with nothing to write is *not opened*, so it keeps its inode and its
-//!   timestamps;
+//!   timestamps.
 //! * a **missing file whose chunks are shared with an intact one** is still
-//!   created in full. This is the bug the two answers are separated to prevent: a
-//!   chunk the destination holds elsewhere must not make the destination's own copy
-//!   of it look present;
+//!   created in full.
+//!   The two answers are separated to prevent one bug.
+//!   A chunk the destination holds elsewhere must not make the destination's own
+//!   copy of it look present.
 //! * a pack that does not hash to its own contents is refused before a byte is
-//!   written, rather than being written over a correct directory;
+//!   written. The pack does not overwrite a correct directory.
 //! * an interrupted apply is finished by running it again, because a probe is
-//!   idempotent;
+//!   idempotent.
 //! * entries the version does not record are left alone unless pruning was asked
-//!   for, and pruning takes them deepest-first.
+//!   for. Pruning takes them deepest-first.
 //!
-//! And the one that is the point of all of it: version 6 → 7 over a real change is
-//! a handful of ranges, not a whole tree.
+//! And the one that is the point of all of it.
+//! Version 6 to 7 over a real change is a handful of ranges, not a whole tree.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
@@ -142,9 +143,11 @@ async fn an_empty_directory_becomes_the_version() {
 
 /// A directory already holding the version is left exactly as it is.
 ///
-/// Not "ends up the same" — *untouched*. No file is opened, so no inode changes
-/// and no timestamp moves. That is more than a smaller download: it is the
-/// difference between updating a tree someone is working in and rewriting it.
+/// Not "ends up the same", but *untouched*.
+/// No file is opened, so no inode changes and no timestamp moves.
+/// That is more than a smaller download.
+/// It is the difference between updating a tree someone is working in and
+/// rewriting it.
 #[tokio::test]
 async fn a_directory_already_holding_the_version_is_not_touched() {
     let versions = Versions::new(4, 120_000).await;
@@ -175,8 +178,9 @@ async fn a_directory_already_holding_the_version_is_not_touched() {
 
 /// One edited file is repaired, and the others keep their inodes.
 ///
-/// The property that makes an apply worth having over a restore: the cost is
-/// proportional to what changed, and the blast radius is too.
+/// The property that makes an apply worth having over a restore.
+/// The cost is proportional to what changed.
+/// The blast radius is too.
 #[tokio::test]
 async fn one_edited_file_is_repaired_and_the_rest_are_left_alone() {
     let versions = Versions::new(5, 150_000).await;
@@ -229,11 +233,13 @@ async fn one_edited_file_is_repaired_and_the_rest_are_left_alone() {
 /// A file that is missing is created in full, even where its chunks are held
 /// elsewhere.
 ///
-/// This is the trap the two probe answers are separated to avoid. `held` is per
-/// chunk and exists to decide what a *fetch* needs — and a chunk the destination
-/// holds correctly in `a.bin` is in it, because the destination does hold it. But
-/// `b.bin` is a *different file* and has none of those bytes. Judge `b.bin` by
-/// `held` and every one of its slices is skipped, and the file is created empty.
+/// This is the trap the two probe answers are separated to avoid.
+/// `held` is per chunk and exists to decide what a *fetch* needs.
+/// A chunk the destination holds correctly in `a.bin` is in `held`, because the
+/// destination does hold it.
+/// But `b.bin` is a *different file* and has none of those bytes.
+/// Judge `b.bin` by `held` and every one of its slices is skipped.
+/// The file is then created empty.
 #[tokio::test]
 async fn a_missing_file_is_created_even_where_its_chunks_are_held_elsewhere() {
     let versions = Versions::new(3, 150_000).await;
@@ -283,9 +289,10 @@ async fn a_missing_file_is_created_even_where_its_chunks_are_held_elsewhere() {
 
 /// A file longer than the version is truncated to it.
 ///
-/// A file whose slices all verify but whose length does not match is one whose tail
-/// is not the version's. Leaving it would mean the directory still is not the
-/// version while every probe reports it as held.
+/// A file whose slices all verify but whose length does not match is one whose
+/// tail is not the version's.
+/// Leaving it would mean the directory still is not the version while every probe
+/// reports it as held.
 #[tokio::test]
 async fn a_file_longer_than_the_version_is_truncated() {
     let versions = Versions::new(2, 100_000).await;
@@ -311,17 +318,18 @@ async fn a_file_longer_than_the_version_is_truncated() {
 /// A pack whose bytes do not hash to its own contents is refused, before any write.
 ///
 /// The probe compares the destination against the chunk's bytes *as the pack gives
-/// them*. So a damaged pack makes every slice look absent — and without this
-/// check, applying one would write its damage straight over a correct directory,
-/// and report success.
+/// them*.
+/// So a damaged pack makes every slice look absent.
+/// Without this check, applying one would write its damage straight over a correct
+/// directory, and report success.
 #[tokio::test]
 async fn a_corrupt_pack_is_refused_and_nothing_is_written() {
     let versions = Versions::new(3, 150_000).await;
     let pack = versions.pack().await;
     let target = versions.client().await;
 
-    // The target already holds the version, so there is nothing to write and the
-    // run should be a no-op... which means the corruption has to be found anyway.
+    // The target already holds the version, so there is nothing to write.
+    // The run should be a no-op, and the corruption has to be found anyway.
     // Delete a file so there *is* work, then damage a chunk that filling it needs.
     let path = target.join("f1.bin");
     let bytes = fs::read(&path).unwrap();
@@ -353,9 +361,9 @@ async fn a_corrupt_pack_is_refused_and_nothing_is_written() {
 
 /// An interrupted apply is finished by running it again.
 ///
-/// Not atomic, and not pretending to be: the recovery is that a probe answers the
-/// same way twice, so the second run finds the first run's work and only does what
-/// is left.
+/// Not atomic, and not pretending to be.
+/// The recovery is that a probe answers the same way twice.
+/// So the second run finds the first run's work and only does what is left.
 #[tokio::test]
 async fn running_an_apply_twice_converges() {
     let versions = Versions::new(4, 150_000).await;
@@ -430,8 +438,9 @@ async fn unrecorded_entries_survive_unless_pruning_was_asked_for() {
 /// Links and directories are laid down the same way a restore lays them.
 ///
 /// Reusing the restore's own stages rather than writing an apply-specific copy is
-/// the point: an apply that created links its own way would be a second
-/// implementation to keep in step with the first.
+/// the point.
+/// An apply that created links its own way would be a second implementation to
+/// keep in step with the first.
 #[tokio::test]
 async fn directories_and_links_come_out_the_same_as_a_restores() {
     let versions = Versions::new(2, 80_000).await;
@@ -512,8 +521,8 @@ async fn updating_a_version_costs_a_delta_and_not_a_tree() {
     assert_eq!(applied.removed, 1);
 }
 
-/// A file the version dropped stays, without pruning — and that is the right
-/// default, stated as a test.
+/// A file the version dropped stays when pruning was not asked for.
+/// That is the right default, stated as a test.
 #[tokio::test]
 async fn a_file_the_version_dropped_stays_without_pruning() {
     let versions = Versions::new(3, 100_000).await;
@@ -535,10 +544,11 @@ async fn a_file_the_version_dropped_stays_without_pruning() {
 
 /// A second apply trusts the first one's record and reads nothing.
 ///
-/// The saving, measured. `trusted` is how many files were taken on the record's
-/// word. On a second run of an untouched tree it is every file and `written` is
-/// zero — so the pack was not read at all, because every chunk of it was covered by
-/// a file nobody opened.
+/// The saving, measured.
+/// `trusted` is how many files were taken on the record's word.
+/// On a second run of an untouched tree it is every file, and `written` is zero.
+/// So the pack was not read at all.
+/// Every chunk of it was covered by a file nobody opened.
 #[tokio::test]
 async fn a_second_apply_trusts_the_first_and_reads_nothing() {
     let versions = Versions::new(4, 150_000).await;
@@ -578,9 +588,10 @@ async fn a_second_apply_trusts_the_first_and_reads_nothing() {
 
 /// A file edited after an apply is read, even though its neighbours are not.
 ///
-/// The per-file fallback, and the reason it is per file. If the fast path were
-/// all-or-nothing, one edited file would send the whole tree back to being read; if
-/// it were trusted anyway, the edit would survive an apply reporting success.
+/// The per-file fallback, and the reason it is per file.
+/// If the fast path were all-or-nothing, one edited file would send the whole tree
+/// back to being read.
+/// If it were trusted anyway, the edit would survive an apply reporting success.
 #[tokio::test]
 async fn an_edited_file_is_read_while_its_neighbours_are_trusted() {
     let versions = Versions::new(5, 150_000).await;
@@ -616,8 +627,8 @@ async fn an_edited_file_is_read_while_its_neighbours_are_trusted() {
 
 /// `--recheck` trusts nothing, and agrees with the fast path about the tree.
 ///
-/// The paranoid mode has to reach the same answer as the ordinary one, or it is not
-/// a mode — it is a different tool.
+/// The paranoid mode has to reach the same answer as the ordinary one.
+/// Without that, it is not a mode. It is a different tool.
 #[tokio::test]
 async fn a_recheck_trusts_nothing_and_agrees() {
     let versions = Versions::new(4, 150_000).await;
@@ -629,9 +640,11 @@ async fn a_recheck_trusts_nothing_and_agrees() {
         .unwrap();
 
     // One byte changed, and the modification time put back to what the record
-    // holds. Length matches, time matches, and the content is wrong — the case the
-    // fast path provably cannot see, and the reason `--recheck` exists rather than
-    // being redundant. Only something that puts timestamps back produces it.
+    // holds.
+    // Length matches, and time matches, and the content is wrong.
+    // That is the case the fast path provably cannot see.
+    // That is the reason `--recheck` exists rather than being redundant.
+    // Only something that puts timestamps back produces it.
     let victim = target.join("f1.bin");
     let before = fs::metadata(&victim).unwrap();
     let mut bytes = fs::read(&victim).unwrap();
@@ -676,8 +689,8 @@ async fn a_recheck_trusts_nothing_and_agrees() {
 
 /// A file that has grown is still corrected with a record present.
 ///
-/// Length is not the record's job — a stat is — so the fast path must not lose the
-/// check that catches this.
+/// A stat gives the length. The record does not.
+/// So the fast path must not lose the check that catches this.
 #[tokio::test]
 async fn a_file_that_has_grown_is_truncated_with_a_record_present() {
     let versions = Versions::new(3, 120_000).await;
@@ -713,8 +726,9 @@ async fn a_file_that_has_grown_is_truncated_with_a_record_present() {
 /// A record naming another version is ignored rather than believed.
 ///
 /// This is the case where the record does not describe a stale tree but a different
-/// chunk layout entirely. Reading is slower and correct; believing it would be
-/// faster and could not be.
+/// chunk layout entirely.
+/// Reading is slower and correct.
+/// Believing the record would be faster and could not be correct.
 #[tokio::test]
 async fn a_record_naming_another_version_is_not_believed() {
     let versions = Versions::new(3, 120_000).await;
@@ -751,8 +765,8 @@ async fn a_record_naming_another_version_is_not_believed() {
 
 /// A destination with no record is read in full, and still works.
 ///
-/// The first apply, and the case where something deleted it. It must be an ordinary
-/// run rather than a failure.
+/// The first apply, and the case where something deleted the record.
+/// It must be an ordinary run rather than a failure.
 #[tokio::test]
 async fn a_destination_with_no_record_is_read_in_full() {
     let versions = Versions::new(3, 120_000).await;
@@ -810,9 +824,9 @@ async fn a_corrupt_record_is_a_cache_miss() {
 
 /// The record lives beside the destination, so it is never backed up with it.
 ///
-/// A record inside the tree would be part of the next version's snapshot, so every
-/// version would differ from the one before by a file neither the user nor the
-/// version has anything to say about.
+/// A record inside the tree would be part of the next version's snapshot.
+/// So every version would differ from the one before by a file.
+/// Neither the user nor the version has anything to say about that file.
 #[tokio::test]
 async fn the_record_is_beside_the_destination_and_not_inside_it() {
     let versions = Versions::new(3, 120_000).await;

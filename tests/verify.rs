@@ -49,19 +49,21 @@ async fn a_flipped_byte_in_the_store_is_detected() {
 
     assert!(!report.is_ok(), "corruption went undetected");
 
-    // Matched, not substring-matched. This used to assert the message contains
-    // "actually hash to", which is a claim about prose: reword the sentence and
-    // the test fails, reword the *diagnosis* and it passes. The variant is the
-    // diagnosis.
+    // Matched, not substring-matched.
+    // This used to assert the message contains "actually hash to".
+    // That is a claim about prose.
+    // Reword the sentence and the test fails.
+    // Reword the *diagnosis* and it passes.
+    // The variant is the diagnosis.
     assert!(
         matches!(report.failures[0].reason, Reason::Corrupt { .. }),
         "a flipped byte is corruption, not a failure to read: {:?}",
         report.failures[0].reason
     );
 
-    // And the variant still carries the two facts a reader needs, which the
-    // string used to carry: what the bytes really hashed to, and how many there
-    // were.
+    // And the variant still carries the two facts a reader needs.
+    // The string used to carry the same two facts.
+    // The facts are what the bytes really hashed to, and how many there were.
     let Reason::Corrupt { actual, bytes } = report.failures[0].reason else {
         unreachable!("just asserted the variant");
     };
@@ -77,11 +79,14 @@ async fn a_flipped_byte_in_the_store_is_detected() {
 
 /// A store cut short is reported as damaged, not read as a shorter store.
 ///
-/// The single-file design had a version here: lopping off the tail destroyed the
-/// commit record, so the set held no version and a restore said so. Segments make
-/// that quieter rather than clearer -- the scan stops at the first record that does
-/// not verify and the bytes after it are simply not there -- so the refusal moved
-/// earlier, to the open. A set that cannot be read whole is refused whole.
+/// The single-file design had a version here.
+/// Lopping off the tail destroyed the commit record.
+/// The set held no version, and a restore said so.
+/// Segments make that quieter rather than clearer.
+/// The scan stops at the first record that does not verify.
+/// The bytes after it are simply not there.
+/// So the refusal moved earlier, to the open.
+/// A set that cannot be read whole is refused whole.
 #[tokio::test]
 async fn a_store_truncated_before_its_snapshot_is_refused() {
     let dir = tempfile::tempdir().unwrap();

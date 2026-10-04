@@ -8,9 +8,9 @@ use std::fs;
 
 use common::{assert_round_trip, noisy};
 
-/// Build a tree that exercises the shapes a backup tool has to survive:
-/// nested directories, and files both smaller and much larger than the
-/// chunker configuration.
+/// Build a tree that exercises the shapes a backup tool has to survive.
+/// The tree has nested directories.
+/// The files are smaller and much larger than the chunker configuration.
 ///
 /// Empty files, empty directories and links are covered separately in
 /// `tests/fidelity.rs`.

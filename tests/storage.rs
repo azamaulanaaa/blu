@@ -197,14 +197,15 @@ async fn content_that_does_not_hash_to_its_address_is_rejected() {
     );
 
     // And nothing was stored at all. `put` checks the content against the address
-    // it was given *before* it reserves a place in the file or writes a byte, so
-    // there is no record to abandon and no hole to punch: the set is exactly as
-    // it was before the call.
+    // it was given. It does this *before* it reserves a place in the file or
+    // writes a byte. The store therefore has no record to abandon and no hole to
+    // punch. The set is exactly as it was before the call.
     //
     // An earlier design wrote the record first and took its magic away on a
-    // mismatch, which left the store reporting itself as damaged until something
-    // repaired it. That worked, but it needed a window in which a record whose
-    // bytes were not the ones its name promised existed on disk at all.
+    // mismatch. That design left the store reporting itself as damaged until
+    // something repaired it. The design worked. It needed a window in which a
+    // record existed on disk. In that window, the bytes on disk were not the ones
+    // its name promised.
     let store = BlobStore::open_for_reading(&blob).await.unwrap();
     assert_eq!(
         store.segment_count(),
@@ -245,10 +246,10 @@ async fn a_blob_the_store_does_not_hold_is_rejected() {
 
 /// A payload the store does not hold in full is not listed at all.
 ///
-/// The recovery scan checks that each record's payload is entirely present before
-/// it believes the header, so a chopped store reports the blob as missing rather
-/// than handing back a reader that stops short — which, in a restore, would be a
-/// quietly wrong file.
+/// The recovery scan checks that a record's payload is entirely present. The scan
+/// does this before it believes the header. A chopped store therefore reports the
+/// blob as missing. It does not hand back a reader that stops short. In a restore,
+/// such a reader would produce a quietly wrong file.
 #[tokio::test]
 async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
     let dir = tempfile::tempdir().unwrap();
@@ -268,9 +269,9 @@ async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
     let bytes = std::fs::read(&segment).unwrap();
     std::fs::write(&segment, &bytes[..40]).unwrap();
 
-    // A read refuses rather than repairing, so this surfaces as damage on the way
-    // in rather than as a missing blob. Either is honest; what would not be is a
-    // short read handed back as though it were the blob.
+    // A read refuses rather than repairing. The damage therefore surfaces on the
+    // way in rather than as a missing blob. Either result is honest. A short read
+    // handed back as though it were the blob would not be honest.
     let error = BlobStore::open_for_reading(&blob).await.unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -282,18 +283,18 @@ async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
 
 /// A segment that is shorter than its own index is refused, not read short.
 ///
-/// `stored` is the path a merge takes when it keeps the frames it was sent, and
-/// it answers with bytes the pack handed over rather than bytes the store already
-/// held. It bounds the read by the record's own stored length so a wrong index
-/// cannot pull in a neighbour, and it refuses outright when the segment is
-/// shorter than that length — because a blob handed out now has to be the blob
-/// that was indexed.
+/// `stored` is the path a merge takes when it keeps the frames it was sent. It
+/// answers with bytes the pack handed over. It does not answer with bytes the
+/// store already held. It bounds the read by the record's own stored length. The
+/// bound stops a wrong index from pulling in a neighbour. The path refuses
+/// outright when the segment is shorter than that length. A blob handed out now
+/// has to be the blob that was indexed.
 ///
-/// The bound had no test, and it is the only thing standing between a hand-edited
-/// store and a `put_stored` that writes a frame nobody hashed. The index is built
-/// when the store opens, so cutting the segment afterwards is what it takes to
-/// have one: a store opened *after* the cut is refused much earlier, as damage,
-/// which is what the test above pins.
+/// The bound had no test. It is the only thing between a hand-edited store and a
+/// `put_stored` that writes a frame nobody hashed. The store builds the index
+/// when it opens. The test therefore cuts the segment after the store opens. A
+/// store opened *after* the cut is refused much earlier, as damage. The test above
+/// pins that case.
 #[tokio::test]
 async fn a_segment_shorter_than_its_index_is_refused_when_stored() {
     let dir = tempfile::tempdir().unwrap();
@@ -336,8 +337,8 @@ async fn a_segment_shorter_than_its_index_is_refused_when_stored() {
     );
 }
 
-/// A file that is not a store is refused, and — the part that matters — is not
-/// truncated on the way to being refused.
+/// A file that is not a store is refused. It is not truncated on the way to being
+/// refused. That second part matters.
 #[tokio::test]
 async fn a_file_that_is_not_a_store_is_refused_without_being_truncated() {
     let dir = tempfile::tempdir().unwrap();
@@ -429,9 +430,9 @@ async fn a_store_in_a_missing_directory_is_created() {
 
 /// Content already in the store is not written again.
 ///
-/// This is what makes deduplication a property of the store rather than of the
-/// caller: a run that has never seen the previous version can still hand over
-/// every chunk it read and pay for only the ones that are new.
+/// This is what makes deduplication a property of the store and not of the caller.
+/// A run that has never seen the previous version can still hand over every chunk
+/// it read. That run pays only for the chunks that are new.
 #[tokio::test]
 async fn content_the_store_already_holds_is_not_written_again() {
     let dir = tempfile::tempdir().unwrap();
@@ -539,15 +540,14 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
 
 /// Concurrent uploads must not overlap.
 ///
-/// The store claims a range for each blob and then copies into it without
-/// holding anything, which is what lets uploads run in parallel. That is only
-/// sound if every claim is distinct, and the way it goes wrong is quiet: two
-/// writers agree on an offset, one clobbers the other, and both records look
-/// perfectly valid.
+/// The store claims a range for each blob. It then copies into that range without
+/// holding anything. This is what lets uploads run in parallel. The method is
+/// sound only if every claim is distinct. It goes wrong quietly. Two writers agree
+/// on an offset. One writer clobbers the other. Both records look perfectly valid.
 ///
-/// Every payload is filled with its own index, so an overlap shows up as a blob
-/// that reads back with somebody else's number in it. Payloads are large and
-/// uneven, so a writer cannot finish before its neighbours have started.
+/// Every payload is filled with its own index. An overlap then shows up as a blob
+/// that reads back with somebody else's number in it. The payloads are large and
+/// uneven. A writer cannot finish before its neighbours have started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_uploads_do_not_overlap() {
     const BLOBS: usize = 64;
@@ -562,12 +562,13 @@ async fn concurrent_uploads_do_not_overlap() {
 
     // Uneven, and big enough that the copies genuinely overlap in time.
     //
-    // Filled from a hash rather than a repeated byte, for two reasons. An overlap
-    // would otherwise be masked: a run of one byte compresses to almost nothing,
-    // so two writers whose ranges overlapped could still produce a store that
-    // *looked* the right size. And the size assertion below only means "the
-    // claimed ranges are disjoint" while the stored bytes are the bytes handed in,
-    // which is a property of the payloads rather than of the store.
+    // The code fills each payload from a hash rather than a repeated byte. Two
+    // reasons explain that choice. Otherwise an overlap would be masked. A run of
+    // one byte compresses to almost nothing. Two writers whose ranges overlapped
+    // could then produce a store that *looked* the right size. The size assertion
+    // below also only means "the claimed ranges are disjoint" while the stored
+    // bytes are the bytes handed in. That property belongs to the payloads rather
+    // than to the store.
     let payloads: Vec<Vec<u8>> = (0..BLOBS)
         .map(|i| {
             let len = 40_000 + (i * 977) % 90_000;
@@ -601,7 +602,7 @@ async fn concurrent_uploads_do_not_overlap() {
         stored.push(task.await.unwrap().unwrap());
     }
 
-    // Reopened, not the same handle: this is what a restore or a verify does.
+    // Reopened, not the same handle. A restore or a verify does this.
     let reader_store = BlobStore::open_for_reading(&blob).await.unwrap();
     for (i, id) in &stored {
         let read = read_all(&reader_store, id).await.unwrap();
@@ -616,9 +617,9 @@ async fn concurrent_uploads_do_not_overlap() {
         );
     }
 
-    // The store is at least as large as the payloads it holds — the record
-    // headers are the difference, and finding no gaps below is what makes the
-    // claims disjoint rather than merely non-overlapping.
+    // The store is at least as large as the payloads it holds. The record headers
+    // are the difference. Finding no gaps below is what makes the claims disjoint
+    // rather than merely non-overlapping.
     let total: usize = payloads.iter().map(Vec::len).sum();
     assert!(
         common::set_size(&blob) >= total as u64,
@@ -631,10 +632,10 @@ async fn concurrent_uploads_do_not_overlap() {
 
 /// A failed upload must not disturb the ones that follow it.
 ///
-/// A failed record keeps the range it claimed: the bytes are never referenced by
-/// any commit, and giving them back would mean truncating past a writer that has
-/// already claimed the space after them. The next run's recovery reclaims the lot
-/// of them, which is the other half of the guarantee.
+/// A failed record keeps the range it claimed. No commit ever references those
+/// bytes. Giving the range back would mean truncating past a writer. That writer
+/// has already claimed the space after the range. The next run's recovery reclaims
+/// the lot of them. That reclaim is the other half of the guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
     let dir = tempfile::tempdir().unwrap();
@@ -677,9 +678,9 @@ async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
     );
     assert_eq!(stored.len(), 63);
 
-    // The blobs that were written before the failure are still readable through
-    // an index rebuilt from the file, so a half-finished record does not take
-    // its neighbours down with it.
+    // The blobs that were written before the failure are still readable. The
+    // reader uses an index that is rebuilt from the file. A half-finished record
+    // therefore does not take its neighbours down with it.
     let reader_store = BlobStore::open_for_reading(&blob).await.unwrap();
     for (i, id) in &stored {
         let read = read_all(&reader_store, id).await.unwrap();
@@ -693,15 +694,16 @@ async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
 
 /// A store's `Debug` says how much it holds, not what.
 ///
-/// The derived version walked the whole in-memory index, so a `{:?}` of a store
-/// with a few hundred blobs was a few hundred hashes on one line. That is a log
-/// line nobody can read, and it is produced at the moment something goes wrong —
-/// which is the only time anyone asks for it. The counts are what a diagnostic
-/// actually wants.
+/// The derived version walked the whole in-memory index. A `{:?}` of a store with
+/// a few hundred blobs was a few hundred hashes on one line. Nobody can read that
+/// log line. The line appears at the moment something goes wrong. That moment is
+/// the only time anyone asks for it. The counts are what a diagnostic actually
+/// wants.
 ///
-/// Two stores of very different sizes are formatted and the *length* compared, so
-/// the assertion is about the output not scaling with the store. A test that
-/// checked for one absence would pass on a store too small to trip it.
+/// The test formats two stores of very different sizes and compares the *length*.
+/// The assertion therefore covers an output that does not scale with the store. A
+/// test that checked for one absence would pass on a store that is too small to
+/// trip it.
 #[tokio::test]
 async fn a_store_does_not_print_its_index() {
     let dir = tempfile::tempdir().unwrap();
@@ -740,9 +742,9 @@ async fn a_store_does_not_print_its_index() {
         "a store should report what it holds: {many}"
     );
 
-    // The point of the test: the output does not grow with the store. A derived
-    // `Debug` prints one entry per blob and a hash is 64 characters, so even this
-    // small a store would blow straight past a few hundred bytes.
+    // The point of the test is that the output does not grow with the store. A
+    // derived `Debug` prints one entry per blob. A hash is 64 characters. Even
+    // this small a store would therefore grow past a few hundred bytes.
     let held = many
         .split("blobs: ")
         .nth(1)
@@ -755,8 +757,8 @@ async fn a_store_does_not_print_its_index() {
         "the fixture should hold a good many blobs for this to mean anything: {many}"
     );
 
-    // Two stores, compared. Asserting only an upper bound would pass for a `Debug`
-    // that printed nothing at all; the second store is what makes "does not grow"
+    // Two stores are compared. Asserting only an upper bound would pass for a
+    // `Debug` that printed nothing at all. The second store makes "does not grow"
     // a claim about growth rather than about brevity.
     assert!(
         many.len() < few.len() + 40,
@@ -769,15 +771,15 @@ async fn a_store_does_not_print_its_index() {
 
 /// A filesystem failure names the path and keeps its kind.
 ///
-/// A bare `?` on `File::open` gives `No such file or directory (os error 2)`,
-/// which is true and useless: a person reading it has a machine with many files
-/// and no idea which one. The kind is the other half — a crate that hands
-/// `io::Error` to callers has already made the kinds the contract, so a wrapper
-/// that flattened them to `Other` would be a quiet regression of the same kind
-/// the `NotFound` swallow was.
+/// A bare `?` on `File::open` gives `No such file or directory (os error 2)`.
+/// That message is true and useless. A person reading it has a machine with many
+/// files. That person has no idea which one failed. The kind is the other half. A
+/// crate that hands `io::Error` to callers has already made the kinds the
+/// contract. A wrapper that flattened them to `Other` would be a quiet regression.
+/// It would be the same kind of regression that the `NotFound` swallow was.
 ///
-/// Runs as root, so it cannot provoke a real permission error; a missing file is
-/// a real one that needs no special anything.
+/// The test runs as root, so it cannot provoke a real permission error. A missing
+/// file is a real one. A missing file needs no special anything.
 #[test]
 fn a_filesystem_failure_names_the_path_and_keeps_its_kind() {
     let missing = std::path::Path::new("/nonexistent-lepatch/store.0000.bin");
@@ -830,20 +832,19 @@ async fn the_async_wrapper_behaves_the_same() {
 /// A `StorageGet` future crosses a thread, and the traits are not object safe.
 ///
 /// Two things about the return-position `impl Future` in [`StorageGet`] and
-/// [`StoragePut`], and both are worth a test because both are invisible
-/// otherwise.
+/// [`StoragePut`] deserve a test. Both are otherwise invisible.
 ///
-/// The `+ Send` is not decoration. These futures are awaited inside
-/// `tokio::spawn`, so without it the compiler cannot prove a spawned task is
-/// `Send` and a backup would not build. Asserting that a store can be moved into
-/// a task and used there proves the bound is real and not merely declared.
+/// The `+ Send` is not decoration. The code awaits these futures inside
+/// `tokio::spawn`. Without the bound, the compiler cannot prove that a spawned
+/// task is `Send`. A backup would then fail to build. Asserting that a store can
+/// move into a task and work there proves the bound is real and not merely
+/// declared.
 ///
-/// The other half is that these traits are *not* object safe, and that is the
-/// deliberate trade: there is no `dyn StorageGet` anywhere, and every caller is
-/// generic and monomorphises. `is_object_safe` is a nightly-only method, so the
-/// check is that naming a trait object is a compile error — asserted here by
-/// noting the absence rather than by a `trybuild` case, which would be a
-/// dependency for one line.
+/// These traits are also *not* object safe. That is a deliberate trade. No
+/// `dyn StorageGet` appears anywhere. Every caller is generic and monomorphises.
+/// `is_object_safe` is a nightly-only method. The check is therefore that naming
+/// a trait object is a compile error. This test notes the absence. The test does
+/// not use a `trybuild` case. Such a case would be a dependency for one line.
 #[tokio::test]
 async fn a_store_crosses_a_thread_boundary_and_back() {
     let dir = tempfile::tempdir().unwrap();
@@ -866,9 +867,10 @@ async fn a_store_crosses_a_thread_boundary_and_back() {
         .expect("the fixture has at least one chunk");
 
     // The store moves into a spawned task and is used there. `StorageGet::get`
-    // returns a future, so this is also the assertion that it is `Send` — the
-    // compiled form of the `+ Send` in the trait. A backup does exactly this,
-    // through `pipeline.rs`, and would not build without it.
+    // returns a future. The code is therefore also the assertion that the future
+    // is `Send`. That is the compiled form of the `+ Send` in the trait. A backup
+    // does exactly this through `pipeline.rs`. A backup would not build without
+    // it.
     let payload = tokio::spawn(async move {
         let mut reader = store.get(&id).await.expect("the store holds this chunk");
 

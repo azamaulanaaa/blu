@@ -51,8 +51,9 @@ async fn round_trip_recreates_hard_links() {
     let source = common::source(dir.path());
     fs::write(source.join("original"), b"shared contents").unwrap();
 
-    // Three names for one inode: the first carries the content, the rest must
-    // come back as links rather than as independent copies.
+    // Three names for one inode.
+    // The first carries the content.
+    // The rest must come back as links rather than as independent copies.
     std::fs::hard_link(source.join("original"), source.join("second")).unwrap();
     std::fs::hard_link(source.join("original"), source.join("third")).unwrap();
 
@@ -62,16 +63,19 @@ async fn round_trip_recreates_hard_links() {
 /// A backup root that is not a directory is refused, not backed up as an empty path.
 ///
 /// The walk skips the root entry so that the destination directory itself is
-/// never recorded as an entry inside itself — but the skip was conditioned on
-/// the root being a *directory*, which it need not be. A regular file root
-/// reaches `strip_prefix(root)` and comes back empty, and the entry is recorded
-/// with an empty path. So does a symbolic link to a directory, because the walk
-/// stats with `symlink_metadata` and never follows it.
+/// never recorded as an entry inside itself.
+/// The skip was conditioned on the root being a *directory*, which it need not
+/// be.
+/// A regular file root reaches `strip_prefix(root)` and comes back empty.
+/// The entry is then recorded with an empty path.
+/// A symbolic link to a directory does the same, because the walk stats with
+/// `symlink_metadata` and never follows it.
 ///
 /// Both cases produce a version that commits successfully and can then never be
-/// restored: `command::restore` refuses an empty path before writing anything,
-/// and there is no subcommand that removes a version. Refusing up front is the
-/// only point at which this is cheap to report.
+/// restored.
+/// `command::restore` refuses an empty path before writing anything.
+/// There is no subcommand that removes a version.
+/// Refusing up front is the only point at which this is cheap to report.
 #[tokio::test]
 async fn a_backup_root_that_is_a_file_is_refused() {
     use lepatch::{
@@ -100,9 +104,10 @@ async fn a_backup_root_that_is_a_file_is_refused() {
 
 /// A symbolic link to a directory is a directory, and is backed up as one.
 ///
-/// The companion to the test above, and the more likely of the two in practice:
+/// The companion to the test above, and the more likely of the two in practice.
 /// `~/current-photos` pointing at a versioned directory is an ordinary thing to
-/// type. Following it is what a user means, and it is what a shell would do.
+/// type.
+/// Following it is what a user means, and it is what a shell would do.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_backup_root_that_is_a_symlink_to_a_directory_is_followed() {
@@ -192,28 +197,35 @@ async fn restore_over_an_existing_tree_succeeds() {
 
 /// A directory's recorded time survives the links created inside it.
 ///
-/// The restore sets attributes *after* recreating links, and that order is load
-/// bearing in a way almost nothing else about a restore is. Creating an entry
-/// inside a directory updates that directory's modification time, so a restore that
-/// set the time first and made the links afterwards would leave every directory
-/// holding a link stamped with the *restore's* time instead of the recorded one.
+/// The restore sets attributes *after* recreating links.
+/// That order matters in a way almost nothing else about a restore matters.
+/// Creating an entry inside a directory updates that directory's modification
+/// time.
+/// So a restore that set the time first and made the links afterwards would leave
+/// every directory holding a link stamped with the *restore's* time instead of
+/// the recorded one.
 ///
-/// Nothing reports that. The file contents are right, the link is right, `verify`
-/// passes — `verify` checks chunk hashes, and a directory's timestamp is not in any
-/// of them. The only evidence is `stat`, which is exactly the kind of fidelity
-/// claim that gets checked once and then assumed forever.
+/// Nothing reports that.
+/// The file contents are right, the link is right, `verify` passes.
+/// `verify` checks chunk hashes, and a directory's timestamp is not in any of
+/// them.
+/// The only evidence is `stat`.
+/// That is exactly a fidelity claim of the kind that gets checked once and then
+/// assumed forever.
 ///
-/// **Verified by reversing the order**, not by reading the code: with attributes
-/// applied before links, the restored directory's time comes back as the restore
-/// time (2026-…) rather than the recorded one (2021-…).
+/// **Verified by reversing the order**, not by reading the code.
+/// With attributes applied before links, the restored directory's time comes back
+/// as the restore time (2026-…), and not as the recorded one (2021-…).
 ///
-/// The recorded time is made old by *waiting* rather than by setting it. The crate
-/// forbids `unsafe` everywhere including tests, so `utimensat` is out;
-/// `File::set_times` is safe but `OpenOptions` will not open a directory on Linux;
-/// and a `touch` subprocess would make the test depend on a locale and on `PATH`.
+/// The test makes the recorded time old by *waiting* rather than by setting it.
+/// The crate forbids `unsafe` everywhere including tests, so `utimensat` is out.
+/// `File::set_times` is safe but `OpenOptions` will not open a directory on
+/// Linux.
+/// A `touch` subprocess would make the test depend on a locale and on `PATH`.
 ///
 /// Unix only, because a platform without permission bits has no directory time to
-/// compare — and the test's own premise is the platform that has one.
+/// compare.
+/// The test's own premise is a platform that has one.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_directory_holding_a_link_keeps_its_recorded_time() {
@@ -225,16 +237,18 @@ async fn a_directory_holding_a_link_keeps_its_recorded_time() {
     fs::write(holding.join("file.bin"), common::noisy(20_000)).unwrap();
     std::os::unix::fs::symlink("file.bin", holding.join("link")).unwrap();
 
-    // Creating the link above is the last thing to touch the directory, so its time
-    // is the moment the tree was built — which is what gets recorded.
+    // Creating the link above is the last thing to touch the directory.
+    // So its time is the moment the tree was built, and that is what gets
+    // recorded.
     let recorded = whole_seconds_since_epoch(fs::metadata(&holding).unwrap().modified().unwrap());
     let taken_at = std::time::SystemTime::now();
 
-    // Wait until the wall clock is in a later second than the directory's, so the
-    // two answers cannot be equal by accident. A filesystem with one-second
-    // resolution would otherwise make a reversed restore look correct whenever the
-    // whole round trip finished inside the same second — which a small fixture
-    // does, reliably.
+    // Wait until the wall clock is in a later second than the directory's.
+    // That way the two answers cannot be equal by accident.
+    // A filesystem with one-second resolution would otherwise make a reversed
+    // restore look correct whenever the whole round trip finished inside the same
+    // second.
+    // A small fixture does finish inside the same second, reliably.
     let elapsed = taken_at
         .duration_since(std::time::UNIX_EPOCH)
         .expect("after the epoch")
@@ -274,13 +288,15 @@ async fn a_directory_holding_a_link_keeps_its_recorded_time() {
     );
 }
 
-/// Whole seconds since the epoch, which is the resolution a directory's
-/// modification time is compared at even where it is recorded more finely.
+/// Whole seconds since the epoch.
+/// That is the resolution at which a directory's modification time is compared,
+/// even where the filesystem records it more finely.
 ///
-/// The `allow` is the one `tests/common/` uses, and for the same reason: this is
-/// not inside a `#[test]`, so it is not covered by the test exemption in
-/// `.clippy.toml`. A timestamp before 1970 is the only way this fails, and the
-/// filesystem did not report one.
+/// The `allow` is the one `tests/common/` uses, and for the same reason.
+/// This is not inside a `#[test]`, so the test exemption in `.clippy.toml` does
+/// not cover it.
+/// A timestamp before 1970 is the only way this fails.
+/// The filesystem did not report one.
 #[cfg(unix)]
 #[allow(clippy::expect_used)]
 fn whole_seconds_since_epoch(when: std::time::SystemTime) -> u64 {
@@ -292,18 +308,22 @@ fn whole_seconds_since_epoch(when: std::time::SystemTime) -> u64 {
 /// The set-user-ID bit survives a restore that changes a file's owner.
 ///
 /// The ordering constraint, pinned as an outcome rather than as a code reading.
-/// Linux clears setuid and setgid when a file's owner changes, so an `apply` that
-/// set the mode and *then* the owner would strip the bit from everything it
-/// restored — and it would look like a success: the bytes match, the lengths match,
-/// and the only thing wrong is a bit nobody was looking for.
+/// Linux clears setuid and setgid when a file's owner changes.
+/// So an `apply` that set the mode and *then* the owner would strip the bit from
+/// everything it restored.
+/// It would also look like a success.
+/// The bytes match, and the lengths match.
+/// The only thing wrong is a bit nobody was looking for.
 ///
 /// The whole value of recording ownership is that a system restore brings back a
-/// working `su` and `passwd`; getting this order wrong quietly removes exactly that.
+/// working `su` and `passwd`.
+/// Getting this order wrong quietly removes exactly that.
 ///
-/// Root only, because it is the only caller that can change an owner and so the only
-/// one where the two orders differ. For anyone else both orders produce the same
-/// file, which is why the bug can sit unnoticed until someone restores `/usr` as
-/// root and finds `su` no longer works.
+/// Root only, because it is the only caller that can change an owner.
+/// It is also the only one where the two orders differ.
+/// For anyone else both orders produce the same file.
+/// That is why the bug can sit unnoticed until someone restores `/usr` as root and
+/// finds `su` no longer works.
 #[cfg(unix)]
 #[tokio::test]
 async fn the_setuid_bit_survives_a_restore_that_changes_the_owner() {
@@ -323,8 +343,9 @@ async fn the_setuid_bit_survives_a_restore_that_changes_the_owner() {
 
     if fs::metadata(&file).unwrap().uid() != 0 {
         // Not root: the owner cannot be changed, so both orders produce the same
-        // file and there is nothing here to distinguish. Skipped rather than passed,
-        // so a green run is not mistaken for the ordering having been checked.
+        // file and there is nothing here to distinguish.
+        // The test skips rather than passes, so a green run is not mistaken for
+        // the ordering having been checked.
         eprintln!("skipped: changing an owner needs root");
         return;
     }
@@ -344,10 +365,12 @@ async fn the_setuid_bit_survives_a_restore_that_changes_the_owner() {
 
 /// The owner of a file survives a restore, on a platform that records one.
 ///
-/// Unix only, and root-gated for the same reason as the setuid case: an unprivileged
-/// restore cannot change an owner, so there is nothing for the assertion to be about.
-/// It skips rather than passing quietly, because "the tree matched" is true either
-/// way and would read as though ownership had been verified.
+/// Unix only, and root-gated for the same reason as the setuid case.
+/// An unprivileged restore cannot change an owner.
+/// So there is nothing for the assertion to be about.
+/// The test skips rather than passing quietly.
+/// "The tree matched" is true either way, and would read as though ownership had
+/// been verified.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_owner_survives_a_restore() {
@@ -363,8 +386,9 @@ async fn an_owner_survives_a_restore() {
         return;
     }
 
-    // An owner nothing else in the tree has, so "the same owner" is not satisfied
-    // by the file simply having been created by the test process.
+    // An owner nothing else in the tree has.
+    // So "the same owner" is not satisfied by the file having been created by the
+    // test process.
     let wanted = 20_001;
     std::os::unix::fs::chown(&owned, Some(wanted), None).unwrap();
 
@@ -382,13 +406,16 @@ async fn an_owner_survives_a_restore() {
 
 /// The owner and group a file has, as the filesystem reports them.
 ///
-/// Unix only. A file's owner is the identity that created it, so there is nothing
-/// to compare against but what it already was — the point of these tests is that
-/// `owner_of` and `set_owner` agree about the same file, not that either agrees
-/// about some other one.
+/// Unix only.
+/// A file's owner is the identity that created it, so there is nothing to compare
+/// against but what it already was.
+/// The point of these tests is that `owner_of` and `set_owner` agree about the
+/// same file.
+/// The point is not that either agrees about some other one.
 ///
-/// The `allow` is `tests/common/`'s, for the same reason: this is not inside a
-/// `#[test]`, so the exemption in `.clippy.toml` does not reach it.
+/// The `allow` is `tests/common/`'s, for the same reason.
+/// This is not inside a `#[test]`, so the exemption in `.clippy.toml` does not
+/// reach it.
 #[cfg(unix)]
 #[allow(clippy::unwrap_used)]
 fn owner_and_group(path: &std::path::Path) -> (u32, u32) {
@@ -439,8 +466,10 @@ fn an_owner_is_applied_to_a_file() {
     }
 
     // Unprivileged, setting the owner a file already has is the most a test can
-    // assert: it is a call the filesystem accepts without privilege, which is what
-    // makes an unprivileged restore of an unchanged tree work at all.
+    // assert.
+    // It is a call the filesystem accepts without privilege.
+    // That call is what makes an unprivileged restore of an unchanged tree work
+    // at all.
     let before = owner_and_group(&file);
     lepatch::fsattr::set_owner(&file, Some(before)).unwrap();
 
@@ -474,8 +503,9 @@ fn an_absent_owner_is_a_no_op() {
 /// A symbolic link is skipped rather than followed.
 ///
 /// Following one to set its destination's owner would be a claim about a file the
-/// snapshot does not describe — the link records a target, not a version of it, and
-/// the target is restored from its own recorded entry.
+/// snapshot does not describe.
+/// The link records a target, not a version of it.
+/// The target is restored from its own recorded entry.
 #[test]
 #[cfg(unix)]
 fn an_owners_target_is_not_followed_for_a_symbolic_link() {

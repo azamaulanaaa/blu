@@ -5,9 +5,10 @@
 //! guarantee that a tampered or hostile store cannot choose what a restore
 //! writes, or where.
 //!
-//! The escape was confirmed working before it was fixed: a snapshot recording
-//! `../../escaped-dir/owned.txt` restored into a destination two levels below
-//! it, landed outside, and the restore reported success.
+//! The escape was confirmed working before it was fixed.
+//! A snapshot recording `../../escaped-dir/owned.txt` was restored into a
+//! destination two levels below it.
+//! The restore landed outside, and the restore reported success.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -46,8 +47,9 @@ impl Forged {
         let mut snapshot = Snapshot::new();
         mutate(&mut snapshot);
 
-        // Give every referenced chunk real content, so a restore that passes the
-        // path checks goes on to succeed and the test can tell the two apart.
+        // Give every referenced chunk real content.
+        // A restore that passes the path checks then goes on to succeed.
+        // The test can tell the two apart.
         let payload = b"OWNED\n";
         let hash = blake3::hash(payload);
         storage
@@ -135,8 +137,8 @@ async fn a_file_path_escaping_the_root_is_refused() {
 
 #[tokio::test]
 async fn a_dot_dot_buried_mid_path_is_refused() {
-    // The obvious case is a leading `..`; a `..` in the middle is just as
-    // effective and much easier to miss.
+    // The obvious case is a leading `..`.
+    // A `..` in the middle is just as effective and much easier to miss.
     let forged = Forged::new(snapshot_with_file("a/b/../../../escaped.txt")).await;
     let dest = forged.dir.path().join("restore-here");
     fs::create_dir_all(&dest).unwrap();
@@ -195,11 +197,13 @@ async fn an_escaping_directory_path_is_refused() {
 
 #[tokio::test]
 async fn an_escaping_hard_link_target_is_refused() {
-    // A hard link's second path names another entry in the tree, so it is
-    // resolved against the root and has to stay inside it. This is the only thing
-    // that distinguishes the two link kinds, and the reason `Link` is a sum type
-    // rather than a struct with a `kind`: the field is called `shares`, not
-    // `target`, because it is a claim about this tree rather than a pointer.
+    // A hard link's second path names another entry in the tree.
+    // The restore resolves it against the root, and it has to stay inside the
+    // root.
+    // This rule is the only thing that distinguishes the two link kinds.
+    // This rule is why `Link` is a sum type rather than a struct with a `kind`.
+    // The field is called `shares`, not `target`, because it is a claim about
+    // this tree rather than a pointer.
     let forged = Forged::new(|snapshot: &mut Snapshot| {
         snapshot.files.push(File {
             path: PathBuf::from("innocent.txt"),
@@ -229,10 +233,12 @@ async fn an_escaping_hard_link_target_is_refused() {
 #[tokio::test]
 async fn an_ordinary_symbolic_link_out_of_the_tree_is_restored() {
     // The counterpart to the case above, and the reason the rule differs by link
-    // kind. A symbolic link's target is written into the link verbatim and
-    // resolved by whoever follows it, so a tree containing a link to
-    // `/etc/passwd` is an ordinary tree. Refusing it would break restoring real
-    // backups to accommodate a threat that does not apply.
+    // kind.
+    // A restore writes a symbolic link's target into the link verbatim.
+    // Whoever follows the link resolves that target.
+    // So a tree containing a link to `/etc/passwd` is an ordinary tree.
+    // Refusing it would break restoring real backups to accommodate a threat
+    // that does not apply.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -259,8 +265,9 @@ async fn an_ordinary_symbolic_link_out_of_the_tree_is_restored() {
 #[tokio::test]
 async fn a_file_is_not_written_through_a_symlink_left_by_an_earlier_restore() {
     // Restores merge into their destination, so the second run finds what the
-    // first left. If that is a symbolic link, opening the file for writing
-    // follows it, and the content lands wherever it points.
+    // first left.
+    // If that is a symbolic link, opening the file for writing follows it.
+    // The content lands wherever the link points.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -288,8 +295,9 @@ async fn a_file_is_not_written_through_a_symlink_left_by_an_earlier_restore() {
 
 #[tokio::test]
 async fn an_ordinary_tree_still_restores() {
-    // The fix must not cost anything: relative paths, nested directories and
-    // `.` components are all normal and all still work.
+    // The fix must not cost anything.
+    // Relative paths, nested directories and `.` components are all normal.
+    // They all still work.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(src.join("a/b/c")).unwrap();
@@ -306,28 +314,33 @@ async fn an_ordinary_tree_still_restores() {
 
 /// A snapshot whose recorded length is longer than its chunks is refused.
 ///
-/// `File::len` is a number in a blob. Nothing about a snapshot is trusted until
-/// it has been checked, and a length that the chunk slices do not account for is
-/// the easiest thing in the format to get wrong — it is one field, and nothing
-/// downstream of it can notice.
+/// `File::len` is a number in a blob.
+/// Nothing about a snapshot is trusted until it has been checked.
+/// A length that the chunk slices do not account for is the easiest thing in
+/// the format to get wrong.
+/// It is one field, and nothing downstream of it can notice.
 ///
-/// Restore is the dangerous direction. It writes the recorded slices and then
-/// `set_len`s the file to the recorded length, which is what closes a gap
-/// between slices. A length longer than the slices therefore does not fail: it
-/// *zero-fills*, and the result is a file the right size, with a plausible
-/// amount of content, silently missing a tail. A restore that claims success has
-/// lost data.
+/// Restore is the dangerous direction.
+/// A restore writes the recorded slices and then `set_len`s the file to the
+/// recorded length, which is what closes a gap between slices.
+/// A length longer than the slices therefore does not fail.
+/// The restore *zero-fills*, and the result is a file the right size, with a
+/// plausible amount of content, silently missing a tail.
+/// A restore that claims success has lost data.
 ///
-/// `backup` has always checked this — `verify_file_lengths` is why a tree that
-/// changes mid-run is caught — but the check lived only on the writing side,
-/// where a hostile snapshot is not the threat. The same arithmetic, in the same
-/// terms, belongs wherever a snapshot is consumed.
+/// `backup` has always checked this.
+/// `verify_file_lengths` is why a tree that changes mid-run is caught.
+/// The check lived only on the writing side, where a hostile snapshot is not
+/// the threat.
+/// The same arithmetic, in the same terms, belongs wherever a snapshot is
+/// consumed.
 #[tokio::test]
 async fn a_file_longer_than_its_chunks_is_refused() {
     let forged = Forged::new(|snapshot| {
         snapshot.files.push(File {
             path: PathBuf::from("a.bin"),
-            // Six bytes are covered by the one slice below; this claims twenty.
+            // Six bytes are covered by the one slice below.
+            // This claims twenty.
             len: 20,
             attrs: Attributes {
                 owner: None,

@@ -3,9 +3,10 @@
 //!
 //! Version numbering used to live here too, as a scan for `NNN.idx` files. It
 //! does not any more: the store records its own versions in its commit records,
-//! and a version number is a position in that log. What is left of this module is
-//! the part that is still the set's own business — where its files go, how they
-//! are numbered, and how two writers are kept apart.
+//! and a version number is a position in that log.
+//! What is left of this module is the set's own business.
+//! The module covers where the files go, how they are numbered, and how two
+//! writers are kept apart.
 
 use lepatch::layout::{IndexSet, SEGMENT_DIGITS, SEGMENT_EXTENSION};
 
@@ -24,10 +25,12 @@ fn derived_paths_do_not_clobber_an_extension_in_the_base_name() {
 #[test]
 fn a_backup_set_is_a_sequence_of_segments_and_a_lock() {
     // The whole point of the commit record: publishing a version is a single
-    // append to a single file, so there is no second file whose contents have to
-    // be kept in step with the first. Segments are the *same* file's log split for
-    // size, not a second source of truth — which is why there is no index file and
-    // never will be one again.
+    // append to a single file.
+    // So there is no second file whose contents have to be kept in step with the
+    // first.
+    // Segments are the *same* file's log split for size, not a second source of
+    // truth.
+    // That is why there is no index file, and why there never will be one again.
     let set = IndexSet::new("photos");
 
     assert_eq!(set.segment_path(0), std::path::Path::new("photos.0000.bin"));
@@ -37,11 +40,13 @@ fn a_backup_set_is_a_sequence_of_segments_and_a_lock() {
 
 /// The property the whole segment scheme rests on.
 ///
-/// Segment numbers are zero-padded to a fixed width so that a directory listing —
-/// which sorts lexically — comes back in numeric order. Without it, segment 10
-/// would sort before segment 2, and every scan that trusted the listing would
-/// read the set's records in the wrong order and report a store that holds the
-/// right bytes in the wrong sequence.
+/// Segment numbers are zero-padded to a fixed width.
+/// A directory listing sorts lexically, and the padding brings it back in
+/// numeric order.
+/// Without the padding, segment 10 would sort before segment 2.
+/// Every scan that trusted the listing would read the records in the wrong order.
+/// The scan would then report a store that holds the right bytes in the wrong
+/// sequence.
 #[test]
 fn segment_numbers_sort_into_numerical_order() {
     let set = IndexSet::new("photos");
@@ -56,8 +61,8 @@ fn segment_numbers_sort_into_numerical_order() {
          in order, so 0002 sorts before 0010"
     );
 
-    // 12 segments is past the point where 3 digits would still sort right, which
-    // is the case a narrower field would get wrong.
+    // 12 segments is past the point where 3 digits would still sort right.
+    // A narrower field gets that case wrong.
     assert!(
         set.segment_path(2) < set.segment_path(10),
         "segment 10 must sort after segment 2"
@@ -84,10 +89,12 @@ fn derived_paths_honour_a_directory_component() {
 
 /// An index file is named with a `v`, so a glob cannot confuse the two.
 ///
-/// Segments are `base.NNNN.bin`, and index files would otherwise be
-/// `base.NNNN.idx` — different things, same digits, same directory. A script
-/// globbing one pattern, or a person clearing out old index files, would hit
-/// both, and deleting a segment is not something `reindex` can undo.
+/// Segments are `base.NNNN.bin`.
+/// Index files would otherwise be `base.NNNN.idx`.
+/// Those are different things with the same digits in the same directory.
+/// A script globbing one pattern, or a person clearing out old index files,
+/// would hit both.
+/// Deleting a segment is not something `reindex` can undo.
 #[test]
 fn an_index_file_is_never_confusable_with_a_segment() {
     let set = IndexSet::new("photos");
@@ -106,8 +113,9 @@ fn an_index_file_is_never_confusable_with_a_segment() {
 
 /// Segments and index files are told apart by name, in both directions.
 ///
-/// Including the unprefixed spelling, which is exactly the trap the `v` avoids:
-/// a file that looks like an index and is not one is ignored rather than adopted.
+/// Including the unprefixed spelling, which is exactly the trap the `v` avoids.
+/// A file that looks like an index and is not one is ignored rather than
+/// adopted.
 #[test]
 fn segments_and_index_files_are_told_apart_by_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -168,9 +176,11 @@ fn segments_are_listed_in_order() {
 
 /// A gap in the numbering is refused, not tolerated.
 ///
-/// The segments are the only place the data is. A set missing one in the middle
-/// read as though the chunks it held had never been stored, which is a backup
-/// that quietly lost data rather than one that reported a problem.
+/// The segments are the only place the data is.
+/// A set missing one in the middle read as though its chunks had never been
+/// stored.
+/// That is a backup that quietly lost data rather than one that reported a
+/// problem.
 #[test]
 fn a_missing_segment_in_the_middle_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -243,15 +253,16 @@ fn taking_the_lock_creates_the_containing_directory() {
 
 /// A set whose base path is not valid UTF-8 is a set.
 ///
-/// The base path is the user's, and nothing about it is required to be UTF-8 — a
-/// name restored from an archive, or typed on a system whose encoding is not
-/// UTF-8, is a perfectly ordinary thing to back up to. Every file of the set is
-/// named after it, and those names are legal files.
+/// The base path is the user's, and nothing about it has to be UTF-8.
+/// A name restored from an archive is a perfectly ordinary thing to back up to.
+/// A name typed on a system whose encoding is not UTF-8 is one too.
+/// Every file of the set is named after it, and those names are legal files.
 ///
-/// This used to work exactly once. `suffixed` builds the file name from the
-/// `OsStr` and so kept the bytes; the directory scan that finds them decoded the
-/// name and gave up on anything that was not UTF-8. Both ends had just agreed on
-/// a name, and then one of them forgot it:
+/// This used to work exactly once.
+/// `suffixed` builds the file name from the `OsStr` and so kept the bytes.
+/// The directory scan that finds them decoded the name and gave up on anything
+/// that was not UTF-8.
+/// Both ends had just agreed on a name, and then one of them forgot it:
 ///
 /// ```text
 /// $ lepatch backup src $'sto\xffre'
@@ -262,11 +273,12 @@ fn taking_the_lock_creates_the_containing_directory() {
 ///   error: File exists (os error 17)
 /// ```
 ///
-/// So the first backup reported success, the store could not be read, listed,
-/// verified or restored, and a second backup failed against the segment that
-/// first one had written. `create_new` in `create_segment` is the only reason
-/// that last one is an error and not a truncated store — the set was wedged
-/// rather than destroyed, and the data was intact throughout.
+/// So the first backup reported success.
+/// The store could not be read, listed, verified or restored.
+/// A second backup failed against the segment that the first one had written.
+/// `create_new` in `create_segment` is the only reason that last failure is an
+/// error and not a truncated store.
+/// The set was wedged rather than destroyed, and the data was intact throughout.
 ///
 /// A person recovers by renaming the files, which works because nothing about
 /// the bytes was ever wrong.
@@ -283,8 +295,8 @@ fn a_set_at_a_non_utf8_base_path_is_readable() {
     let store = dir.path().join(base);
     let set = IndexSet::new(&store);
 
-    // The names are built from the real bytes, which is half the bug: they were
-    // always right on disk, and only unreadable in memory.
+    // The names are built from the real bytes, which is half the bug.
+    // The names were always right on disk, and only unreadable in memory.
     let segment = set.segment_path(0);
     assert_eq!(
         segment.file_name().unwrap().as_encoded_bytes(),

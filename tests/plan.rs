@@ -1,10 +1,12 @@
 //! A plan resolves a snapshot against a store and yields an ordered chunk list.
 //!
-//! The property that matters is determinism: a plan is ordered by the snapshot's
-//! own chunk table, not by the order chunks happened to be written, so two
-//! backups of one tree produce the same plan. Without that, anything built from a
-//! plan — a pack, a diff, a delta download — differs between runs, and the
-//! snapshot's determinism buys nothing.
+//! The property that matters is determinism.
+//! A plan is ordered by the snapshot's own chunk table, not by the order chunks
+//! happened to be written.
+//! So two backups of one tree produce the same plan.
+//! Without that, anything built from a plan differs between runs.
+//! That includes a pack, a diff and a delta download.
+//! The snapshot's determinism then buys nothing.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -54,8 +56,8 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
     assert_eq!(plan.len(), snapshot.chunks.len());
 
     // The plan counts each chunk once, so it is a pack's size, not the tree's.
-    // It is smaller than the sum of the files whenever a chunk is shared, and
-    // the slice lengths add up to the files exactly.
+    // It is smaller than the sum of the files whenever a chunk is shared.
+    // The slice lengths add up to the files exactly.
     let slices: u64 = snapshot
         .file_chunks
         .iter()
@@ -71,12 +73,12 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
     // Every planned chunk is readable at the place the plan says it is, and has
     // the length the plan claims.
     //
-    // `raw_len`, not `stored_len`: a plan's `length` is in content bytes,
-    // because it describes a file rather than a payload, and for a compressed
-    // blob the content is *longer* than what is on disk. This asserted
-    // `length <= stored_len`, which is true for uncompressed content and false
-    // for compressed — so it only passed because this fixture happens to be
-    // incompressible.
+    // `raw_len`, not `stored_len`: a plan's `length` is in content bytes.
+    // A plan describes a file rather than a payload.
+    // For a compressed blob the content is *longer* than what is on disk.
+    // The old test asserted `length <= stored_len`.
+    // That is true for uncompressed content and false for compressed.
+    // So the test only passed because this fixture happens to be incompressible.
     for chunk in plan.chunks() {
         assert!(chunk.length <= chunk.placement.raw_len);
         let mut reader = store.get(&chunk.id).await.unwrap();
@@ -89,12 +91,13 @@ async fn a_plan_covers_every_chunk_the_snapshot_reads() {
 /// A store's framing keeps two chunks a restore reads back to back apart.
 ///
 /// This used to be asserted through `Plan::ranges`, which merged adjacent ranges
-/// and was asked to produce one range per chunk. It is worth keeping, because it
-/// is the reason a delta download cannot be served straight out of a store and
-/// the reason a pack is a separate artifact — but the property belongs to the
-/// *store*, not to a method that has been deleted, so it is now stated directly:
-/// there is a gap between consecutive chunks in a segment, and that gap is a
-/// record header.
+/// and was asked to produce one range per chunk.
+/// It is worth keeping, because it is the reason a delta download cannot be served
+/// straight out of a store.
+/// It is also the reason a pack is a separate artifact.
+/// But the property belongs to the *store*, not to a method that has been deleted.
+/// So the property is now stated directly: there is a gap between consecutive chunks
+/// in a segment, and that gap is a record header.
 #[tokio::test]
 async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -120,8 +123,8 @@ async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
         "the fixture needs several chunks or there is nothing to be separated from"
     );
 
-    // The whole payload, and the store is bigger than that: the difference is the
-    // framing plus the snapshot record.
+    // The whole payload, and the store is bigger than that.
+    // The difference is the framing plus the snapshot record.
     assert_eq!(
         plan.total_bytes(),
         chunks.iter().map(|c| c.length).sum::<u64>()
@@ -132,9 +135,9 @@ async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
          or the framing is not where it was expected"
     );
 
-    // No two chunks the plan needs are adjacent in a segment. If any pair were,
-    // a restore could have fetched them in one read, and the argument for packing
-    // would be weaker than this crate says it is.
+    // No two chunks the plan needs are adjacent in a segment.
+    // If any pair were, a restore could have fetched them in one read.
+    // Then the argument for packing would be weaker than this crate says it is.
     let mut touching = 0;
     for pair in chunks.windows(2) {
         let (before, after) = (&pair[0], &pair[1]);
@@ -153,10 +156,11 @@ async fn a_stores_framing_separates_the_chunks_a_restore_reads_in_order() {
 
 /// The determinism the plan exists for.
 ///
-/// Two backups of one tree are separate runs, so chunks are stored in whatever
-/// order concurrent uploads finished and land at different offsets. The plan
-/// must not care: same snapshot, same chunk list, same total, whatever the
-/// store's layout is.
+/// Two backups of one tree are separate runs.
+/// Chunks are stored in whatever order concurrent uploads finished and land at
+/// different offsets.
+/// The plan must not care: same snapshot, same chunk list, same total, whatever
+/// the store's layout is.
 #[tokio::test]
 async fn two_backups_of_one_tree_produce_the_same_plan() {
     let dir = tempfile::tempdir().unwrap();
@@ -190,8 +194,9 @@ async fn two_backups_of_one_tree_produce_the_same_plan() {
 }
 
 /// A plan is what a pack writer needs, so the obvious end of it is the smallest
-/// possible pack: the payloads, in plan order. Checking that here rather than in
-/// a pack's own test is deliberate — it says the plan is already sufficient.
+/// possible pack: the payloads, in plan order.
+/// Checking that here rather than in a pack's own test is deliberate.
+/// It says the plan is already sufficient.
 #[tokio::test]
 async fn a_plans_payloads_concatenate_into_the_files_it_describes() {
     let dir = tempfile::tempdir().unwrap();

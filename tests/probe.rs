@@ -1,19 +1,19 @@
 //! A probe: what a directory already holds of a version.
 //!
-//! The probe is the only thing standing between a client and a delta download, so
-//! the tests are about the answers a delta would be built on being *right*:
+//! The probe is the only thing standing between a client and a delta download,
+//! so the tests are about the answers a delta would be built on being *right*:
 //!
-//! * a directory that is the version holds every chunk, and one that is not holds
-//!   what it should and nothing more;
+//! * a directory that is the version holds every chunk.
+//! * a directory that is not the version holds only what it should.
 //! * a chunk placed at several places is held only if it is right at **all** of
-//!   them — the failure this is the whole module about, because the alternative
-//!   produces a delta that skips a chunk it needed and a tree that is silently
-//!   wrong;
-//! * "short" and "different" are told apart, because they send someone looking at
-//!   two different things;
-//! * entries the version does not record are reported and left alone;
-//! * and the answer is worth having: one edited file in a large tree is one range
-//!   request, not one per chunk.
+//!   them. The whole module is about that failure. The alternative produces a
+//!   delta that skips a needed chunk. The alternative also produces a silently
+//!   wrong tree.
+//! * "short" and "different" are told apart. They send someone looking at two
+//!   different things.
+//! * entries the version does not record are reported and left alone.
+//! * the answer saves work. One edited file in a large tree is one range request.
+//!   It is not one request per chunk.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
@@ -35,10 +35,10 @@ use tokio::io::AsyncReadExt;
 
 /// A tree, backed up once, with the version and plan that describe it.
 ///
-/// The tempdir is *taken* rather than created here, because it is the thing that
-/// owns the source tree: a `Built` that dropped the directory holding the tree it
-/// describes would be probing a path that no longer exists, and every test using
-/// it would fail on that rather than on what it is about.
+/// The tempdir is *taken* here rather than created here. The tempdir owns the
+/// source tree. A `Built` that dropped the directory holding the tree it
+/// describes would probe a path that no longer exists. Every test that uses it
+/// would fail on the path. It would not fail on what the test is about.
 struct Built {
     dir: tempfile::TempDir,
     source: std::path::PathBuf,
@@ -92,7 +92,7 @@ impl Built {
 
     /// A directory holding this version, restored from the store.
     ///
-    /// The situation a client is actually in: the tree on disk *is* the version
+    /// This is the situation a client is in. The tree on disk *is* the version
     /// before someone edits it.
     async fn client(&self) -> std::path::PathBuf {
         let client = self.dir.path().join("client");
@@ -109,8 +109,8 @@ impl Built {
     /// Probe `root` with `established`, and count the chunks that were read.
     ///
     /// The count is the point. An accounted-for file is not merely left out of the
-    /// report — the chunk backing it must not be opened from the source at all, or
-    /// the fast path saves nothing but arithmetic.
+    /// report. The chunk that backs it must not be opened from the source at all.
+    /// Otherwise the fast path saves nothing but arithmetic.
     async fn probe_skipping_counting(
         &self,
         root: &Path,
@@ -169,10 +169,10 @@ impl Built {
 
 /// A chunk every one of whose files is accounted for is never read from the source.
 ///
-/// The saving, asserted rather than described. Accounting for a file has to mean the
-/// chunk backing it is not fetched, or the fast path costs the same read and saves
-/// only the comparison — and a test that counted findings instead of reads would
-/// pass either way.
+/// The test asserts the saving. It does not describe the saving. Accounting for a
+/// file must mean that the chunk which backs it is not fetched. Otherwise the fast
+/// path costs the same read and saves only the comparison. A test that counted
+/// findings instead of reads would pass either way.
 #[tokio::test]
 async fn a_chunk_whose_every_file_is_trusted_is_never_read() {
     let built = tree(4, 150_000).await;
@@ -200,9 +200,9 @@ async fn a_chunk_whose_every_file_is_trusted_is_never_read() {
 
 /// Skipping most files reads only the chunks the remaining ones need.
 ///
-/// The partial case, which is the one that has to be right: a chunk spanning a
-/// skipped and an unskipped file must still be read, because one of its placements
-/// is unchecked. Skipping it would report a chunk as held when half of it is not.
+/// The partial case is the one that has to be right. A chunk that spans a skipped
+/// and an unskipped file must still be read. One of its placements is unchecked.
+/// Skipping it would report a chunk as held when half of it is not.
 #[tokio::test]
 async fn a_chunk_spanning_a_skipped_and_an_unskipped_file_is_still_read() {
     let built = tree(6, 200_000).await;
@@ -265,9 +265,9 @@ async fn an_unskipped_file_is_checked_as_thoroughly_as_any_other() {
     )
     .unwrap();
 
-    // Account for everything *except* the victim. This is what a caller whose stat had
-    // been fooled would pass — and the point is that being fooled here costs
-    // nothing, because the file is still read properly.
+    // Account for everything *except* the victim. A caller with a fooled stat
+    // passes this. Being fooled here costs nothing. The file is still read
+    // properly.
     let (probed, _) = built
         .probe_skipping_counting(&client, &built.all_skipped_but(victim))
         .await;
@@ -285,10 +285,11 @@ async fn an_unskipped_file_is_checked_as_thoroughly_as_any_other() {
 
 /// A chunk the source cannot supply is held when the caller has accounted for it.
 ///
-/// The delta pack's case, and the only reason a delta can be applied at all. A probe
-/// verifies a slice by reading the chunk, so a chunk the source does not hold cannot
-/// be verified — and a delta omits exactly those. So it is never asked for, and is
-/// reported as held on the strength of the caller's claim.
+/// This is the delta pack's case. It is the only reason a delta can be applied at
+/// all. A probe verifies a slice by reading the chunk. A chunk that the source does
+/// not hold cannot be verified. A delta omits exactly those chunks. The probe never
+/// asks for them. The probe reports them as held on the strength of the caller's
+/// claim.
 #[tokio::test]
 async fn a_chunk_the_source_lacks_is_held_when_accounted_for() {
     let built = tree(4, 150_000).await;
@@ -298,9 +299,9 @@ async fn a_chunk_the_source_lacks_is_held_when_accounted_for() {
     // Every chunk the version needs.
     let all = built.paths();
 
-    // Two chunks the source will not be able to supply, as a delta pack's would not
-    // be. Taken by reference out of the snapshot so the set borrows rather than
-    // copies, which is what `Established::chunks` holds.
+    // Two chunks the source cannot supply, as a delta pack's chunks cannot be.
+    // The code takes them by reference out of the snapshot. The set borrows and
+    // does not copy. `Established::chunks` holds a borrowing set.
     let missing: HashSet<&BlobId> = built.snapshot.chunks[..2].iter().collect();
 
     let established = lepatch::command::Established {
@@ -330,9 +331,10 @@ async fn a_chunk_the_source_lacks_is_held_when_accounted_for() {
 
 /// A [`StorageGet`] that counts how many blobs it was asked to open.
 ///
-/// The only way to tell that the trusted path saved a *read* rather than merely a
-/// comparison: a probe that counted the mismatches correctly while still fetching
-/// every chunk would pass every other test here and save nothing.
+/// This is the only way to tell that the trusted path saved a *read*. A comparison
+/// alone does not show a saving. A probe that counted the mismatches correctly but
+/// still fetched every chunk would pass every other test here. That probe would
+/// save nothing.
 struct Counting<S> {
     inner: S,
     reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -399,17 +401,17 @@ async fn an_empty_directory_holds_nothing() {
 
 /// One edited file costs one chunk, not the tree.
 ///
-/// This is the property the probe exists for: the answer has to be *fine-grained*,
-/// because a probe that reported a tree as matching or not would be useless for
-/// the one thing it is for.
+/// This is the property the probe exists for. The answer has to be
+/// *fine-grained*. A probe that reports a whole tree as matching or not is useless
+/// for the one thing it is for.
 #[tokio::test]
 async fn one_edited_file_leaves_the_rest_held() {
     let built = tree(6, 150_000).await;
     let all = built.all_chunks();
 
-    // A one-byte edit in the middle of the second file. Boundaries are
-    // content-defined, so this condemns the chunks spanning that point and leaves
-    // the rest of the file — and every other file — intact.
+    // A one-byte edit in the middle of the second file. The boundaries come from
+    // the content. The edit condemns the chunks that span that point. The rest of
+    // the file stays intact. Every other file stays intact.
     let path = built.source.join("f2.bin");
     let mut bytes = fs::read(&path).unwrap();
     let at = bytes.len() / 2;
@@ -441,14 +443,14 @@ async fn one_edited_file_leaves_the_rest_held() {
 
 /// A chunk placed in two places is held only if it is right in both.
 ///
-/// This is the failure the whole design turns on. `held` is what
-/// [`Pack::needed`] consults to decide a chunk needs no range request, so a
-/// chunk recorded as held on the strength of one correct slice out of two is
-/// skipped by the fetch — and the other slice is left wrong. The client would
-/// believe it had applied the version.
+/// This is the failure the whole design turns on. [`Pack::needed`] consults
+/// `held` to decide that a chunk needs no range request. A chunk that the report
+/// records as held on the strength of one correct slice out of two is skipped by
+/// the fetch. The other slice is left wrong. The client would believe it had
+/// applied the version.
 ///
-/// So the rule is *every* slice or nothing, and a probe that answered "is this
-/// chunk right somewhere" would look like an optimisation while being a silent
+/// So the rule is *every* slice or nothing. A probe that answered "is this chunk
+/// right somewhere" would only look like an optimisation. It would be a silent
 /// corruption.
 #[tokio::test]
 async fn a_chunk_in_two_places_is_held_only_if_it_is_right_in_both() {
@@ -482,8 +484,8 @@ async fn a_chunk_in_two_places_is_held_only_if_it_is_right_in_both() {
     // The tree as taken holds them.
     assert!(built.probe(&built.source).await.held.contains(&shared));
 
-    // Now corrupt one byte of *one* of the two files — at the first offset that
-    // shared chunk is placed at, so that slice is the one that breaks.
+    // Now corrupt one byte of *one* of the two files. Use the first offset where
+    // the shared chunk is placed. That slice is the one that breaks.
     let victim = built.source.join("a.bin");
     let mut bytes = fs::read(&victim).unwrap();
     let offset = built
@@ -514,23 +516,23 @@ async fn a_chunk_in_two_places_is_held_only_if_it_is_right_in_both() {
 
 /// A slice that runs off the end of one file into the next still verifies.
 ///
-/// A `FileChunk` records a `chunk_offset`, so a slice is usually only *part* of a
-/// chunk — the last chunk of a file runs on into the next one. The bytes in the
-/// file are then not the whole of the chunk, so hashing them produces something
-/// that is never equal to the chunk's hash. A probe that compared a file slice's
-/// hash to the chunk's hash would condemn every boundary-crossing slice in every
-/// tree, forever, and report a target that is byte-for-byte correct as holding
-/// nothing.
+/// A `FileChunk` records a `chunk_offset`. A slice is therefore usually only
+/// *part* of a chunk. The last chunk of a file runs on into the next file. The
+/// bytes in the file are then not the whole of the chunk, so hashing them
+/// produces something that is never equal to the chunk's hash. A probe that
+/// compared a file slice's hash to the chunk's hash would condemn every
+/// boundary-crossing slice in every tree, forever, and would report a target that
+/// is byte-for-byte correct as holding nothing.
 ///
-/// So the two sides are compared as *bytes*, and this is the fixture that says so:
-/// two files, with a chunk spanning the join, reported as held.
+/// The two sides are compared as *bytes*. This fixture says so. It uses two files.
+/// One chunk spans the join. The probe reports that chunk as held.
 #[tokio::test]
 async fn a_chunk_spanning_two_files_verifies_in_both() {
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
 
-    // Two small files, so the join between them lands inside a chunk rather than
-    // on a boundary of its own.
+    // Two small files. The join between them lands inside a chunk rather than on
+    // a boundary of its own.
     fs::write(source.join("a.bin"), common::untagged_stream(1, 40_000)).unwrap();
     fs::write(source.join("b.bin"), common::untagged_stream(2, 40_000)).unwrap();
 
@@ -593,10 +595,10 @@ async fn a_truncated_file_is_short_rather_than_different() {
         "every slice past a truncated file's end is short, not merely different"
     );
 
-    // Every chunk the cut-off slices were holding is condemned — including the one
-    // running off the end of the file into the next, which is why the assertion is
-    // about the cut rather than about the tree: the chunks wholly inside `f1.bin`
-    // are untouched and still held.
+    // Every chunk that the cut-off slices were holding is condemned. That includes
+    // the chunk that runs off the end of the file into the next. The assertion is
+    // therefore about the cut rather than about the tree. The chunks wholly inside
+    // `f1.bin` are untouched and still held.
     let condemned: HashSet<BlobId> = built
         .snapshot
         .file_chunks
@@ -620,12 +622,11 @@ async fn a_truncated_file_is_short_rather_than_different() {
     }
 }
 
-/// Entries the version does not record are reported, and left exactly where they
-/// are.
+/// Entries that the version does not record are reported and left where they are.
 ///
 /// A file here is as likely to be the user's own work as a leftover from an older
-/// version. A probe that removed them would be destroying data it cannot tell
-/// apart from data it should keep — so it names them and the caller decides.
+/// version. A probe that removed them would destroy data. The probe cannot tell
+/// that data from data it should keep. The probe names them. The caller decides.
 #[tokio::test]
 async fn an_unrecorded_entry_is_reported_and_not_removed() {
     let built = tree(3, 100_000).await;
@@ -651,14 +652,14 @@ async fn an_unrecorded_entry_is_reported_and_not_removed() {
 ///
 /// One edited file in a six-file tree, asked for as ranges, is one request and a
 /// fraction of the payload. This is the whole argument for probing rather than
-/// re-sending, and it is the test that ties the two halves together.
+/// re-sending. This test ties the two halves together.
 #[tokio::test]
 async fn what_a_probe_finds_held_is_what_the_pack_does_not_send() {
     let built = tree(6, 200_000).await;
     let pack = built.pack().await;
 
-    // Start from a copy holding the version, then edit one file — the situation a
-    // client is actually in.
+    // Start from a copy that holds the version. Then edit one file. A client is
+    // actually in this situation.
     let client = built.client().await;
 
     let all = pack.needed_bytes(&HashSet::new());
@@ -674,8 +675,8 @@ async fn what_a_probe_finds_held_is_what_the_pack_does_not_send() {
     bytes[at..at + 64].copy_from_slice(&common::untagged_stream(200, 64));
     fs::write(&path, &bytes).unwrap();
 
-    // Probed against the pack, not the set: a client updating from one does not
-    // have the other, so the answer it gets must be the same either way.
+    // Probe against the pack and not the set. A client that updates from a pack
+    // does not have the set. The answer must be the same either way.
     let from_pack = built.probe_with_pack(&client, &pack).await;
     let from_store = built.probe(&client).await;
     assert_eq!(
@@ -700,8 +701,8 @@ async fn what_a_probe_finds_held_is_what_the_pack_does_not_send() {
     );
 }
 
-/// The slices reported are the ones the ranges cover, so a fetch can be planned
-/// from the report alone.
+/// The reported slices are the slices that the ranges cover. A fetch can be
+/// planned from the report alone.
 #[tokio::test]
 async fn the_ranges_a_probe_implies_cover_exactly_what_it_says_is_missing() {
     let built = tree(4, 180_000).await;
@@ -709,8 +710,8 @@ async fn the_ranges_a_probe_implies_cover_exactly_what_it_says_is_missing() {
 
     let client = built.client().await;
 
-    // Truncate one file: several slices go short, and none of them is a whole
-    // chunk's worth of correct data anywhere else.
+    // Truncate one file. Several slices go short. None of them holds a whole
+    // chunk of correct data anywhere else.
     let path = client.join("f1.bin");
     let bytes = fs::read(&path).unwrap();
     fs::write(&path, &bytes[..bytes.len() / 3]).unwrap();
@@ -741,11 +742,11 @@ async fn the_ranges_a_probe_implies_cover_exactly_what_it_says_is_missing() {
 
 /// A file that has grown is not the version, even though every slice of it is.
 ///
-/// The finding no slice can make. Appending to a file leaves every byte the
-/// version records exactly where it was, so every slice verifies and every chunk
-/// is held — and the directory is not the version. A probe that could only answer
-/// about slices would report "holds this version" here, and a client would fetch
-/// nothing and leave the tail in place.
+/// The finding no slice can make. Appending to a file leaves every byte that the
+/// version records where it was. Every slice then verifies. Every chunk is held.
+/// The directory is still not the version. A probe that could only answer about
+/// slices would report "holds this version" here. A client would fetch nothing and
+/// leave the tail in place.
 #[tokio::test]
 async fn a_file_that_has_grown_is_reported_though_its_slices_are_right() {
     let built = tree(3, 150_000).await;
@@ -791,9 +792,10 @@ async fn a_file_that_has_grown_is_reported_though_its_slices_are_right() {
 
 /// A file that has shrunk is reported by its slices, and not a second time.
 ///
-/// The other half of the same pair. Repeating it once per file would make the
-/// report longer without making it more useful, and the slice already says which
-/// bytes are missing rather than only that the file is the wrong size.
+/// The other half of the same pair. A second report for one file would make the
+/// report longer. It would not make the report more useful. The slice already
+/// says which bytes are missing. It does not only say that the file is the wrong
+/// size.
 #[tokio::test]
 async fn a_file_that_has_shrunk_is_not_reported_twice() {
     let built = tree(3, 150_000).await;
@@ -816,7 +818,7 @@ async fn a_file_that_has_shrunk_is_not_reported_twice() {
     );
 }
 
-/// A file recorded as empty and missing is reported, because nothing else would be.
+/// A file recorded as empty and missing is reported. Nothing else reports it.
 ///
 /// An empty file has no slices at all, so every length finding about it has to come
 /// from the length pass or not come from anywhere.

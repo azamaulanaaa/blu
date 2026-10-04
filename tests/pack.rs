@@ -2,14 +2,14 @@
 //! already holds some of them needs.
 //!
 //! The tests are about the properties that make a pack usable for a delta
-//! download and safe to cache:
+//! download and safe to cache.
 //!
-//! * it is a function of the tree, so it is byte-identical every time and can be
-//!   named by its own hash;
+//! * a pack is a function of the tree, so it is byte-identical every time and can
+//!   be named by its own hash.
 //! * the index is at the end, so a client learns every offset before reading a
-//!   byte of payload;
-//! * `needed` is in terms of what a client does *not* have, and adjacent ranges
-//!   merge, which is the entire point of packing;
+//!   byte of payload.
+//! * `needed` is in terms of what a client does *not* have. Adjacent ranges
+//!   merge, and that merging is the entire point of packing.
 //! * a truncated or corrupt pack is refused rather than read as a shorter one.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
@@ -41,7 +41,8 @@ async fn snapshot_of(blob: &Path) -> Snapshot {
     Snapshot::try_from(buffer.as_slice()).unwrap()
 }
 
-/// The BLAKE3 of a set's latest snapshot — what a pack of that version names.
+/// The BLAKE3 of a set's latest snapshot. This is what a pack of that version
+/// names.
 async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
 
@@ -90,9 +91,9 @@ impl Built {
 
 /// Pack a set's latest version to `at`, recorded as version 1.
 ///
-/// The number is the set's own, and these fixtures hold one version, so 1 is what
-/// `versions` would print beside it. Stated at every call rather than worked out
-/// here because a helper that invented the number would be exactly the thing the
+/// The number is the set's own. These fixtures hold one version. So 1 is what
+/// `versions` would print beside it. The number is stated at every call rather
+/// than worked out here. A helper that invented the number would be the thing the
 /// header exists to make impossible to get wrong quietly.
 async fn pack(blob: &Path, at: &Path) -> Pack {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
@@ -128,14 +129,13 @@ async fn build(files: usize, size: usize) -> Built {
 
 /// A pack holds every chunk its version needs, each as a store record.
 ///
-/// The payload is the run of records and nothing else: `offset` is where a
-/// chunk's record starts, and the records are written end to end — which is what
-/// makes a full download one range, and what lets a range covering a chunk cover
-/// the whole of it now that the index says where each record begins rather than
-/// how long it is.
+/// The payload is the run of records and nothing else. `offset` is where a chunk's
+/// record starts. The records are written end to end. That layout makes a full
+/// download one range. It also lets a range covering a chunk cover the whole of
+/// it. The index now says where each record begins rather than how long it is.
 ///
-/// What each record holds is the chunk, in the form the store already had it, and
-/// `get` hands that back as content: a chunk whose record is a frame comes back
+/// Each record holds the chunk in the form the store already had it. `get` hands
+/// that form back as content. A chunk whose record is a frame comes back
 /// decompressed.
 #[tokio::test]
 async fn a_pack_holds_its_versions_chunks() {
@@ -160,10 +160,10 @@ async fn a_pack_holds_its_versions_chunks() {
         );
         at += record_len(&bytes, pack.payload_start(), located.offset);
 
-        // And the record at that offset is one: the store's magic, its kind, its
-        // codec byte, and the chunk's own hash in it. Read through the header the
-        // file itself carries, so the length added below is the record's own claim
-        // rather than a second one about it.
+        // The record at that offset is a real record. It holds the store's magic,
+        // its kind, its codec byte, and the chunk's own hash. The test reads it
+        // through the header the file itself carries. The length added below is
+        // therefore the record's own claim rather than a second one about it.
         let mut header = [0u8; 48];
         file.seek(SeekFrom::Start(pack.payload_start() + located.offset))
             .unwrap();
@@ -174,8 +174,9 @@ async fn a_pack_holds_its_versions_chunks() {
             header[5] <= 1,
             "chunk {i}'s record names a codec this crate does not have"
         );
-        // The hash sits after the two lengths, whose widths depend on the chunk,
-        // so where it is is worked out from the varints rather than assumed.
+        // The hash sits after the two lengths. The widths of those lengths depend
+        // on the chunk, so the test works out where the hash is from the varints
+        // rather than assuming it.
         let stored_at = 6;
         let raw_at = stored_at + varint_len(&header, stored_at);
         let hash_at = raw_at + varint_len(&header, raw_at);
@@ -227,8 +228,8 @@ async fn a_pack_holds_its_versions_chunks() {
 
 /// The index is at the end, so its cost does not grow with the payload.
 ///
-/// This is the property that lets a client decide whether it wants the pack before
-/// it has read any of it, and it is the reason the format is laid out this way.
+/// This property lets a client decide whether it wants the pack before it has read
+/// any of it. It is the reason the format is laid out this way.
 #[tokio::test]
 async fn the_index_is_at_the_end() {
     let built = build(5, 200_000).await;
@@ -246,8 +247,8 @@ async fn the_index_is_at_the_end() {
          the tail reads a small fraction of the file"
     );
 
-    // The file table travels with the payload and is still small next to it: this
-    // is what makes a pack worth handing over as one file.
+    // The file table travels with the payload and is still small next to it.
+    // That is what makes a pack worth handing over as one file.
     assert_eq!(sections.snapshot_len as u64, pack.snapshot_len());
     assert!(
         u64::try_from(sections.snapshot_len).unwrap() < pack.payload_len() / 8,
@@ -256,9 +257,9 @@ async fn the_index_is_at_the_end() {
         pack.payload_len()
     );
 
-    // The index length alone locates the index, so a client that only wants
-    // offsets never reads the snapshot — which is why it sits before the index
-    // rather than after it.
+    // The index length alone locates the index. A client that only wants offsets
+    // therefore never reads the snapshot. The snapshot sits before the index for
+    // that reason.
     assert_eq!(
         sections.snapshot_start as u64,
         pack.snapshot_start(),
@@ -266,11 +267,12 @@ async fn the_index_is_at_the_end() {
     );
     assert_eq!(u64::try_from(sections.file_len).unwrap(), file_len);
 
-    // **In payload order, on disk as well as in memory.** A client reading this
-    // file rather than this crate walks the index itself, and the order it finds
-    // is the one the records were written in — which is what makes a run of
-    // adjacent records one range for it too. The reader here sorts for itself,
-    // so nothing in this crate would notice if the writer sorted the other way.
+    // **In payload order, on disk as well as in memory.** A client that reads this
+    // file rather than this crate walks the index itself. The order it finds is
+    // the order the records were written in. That order is what makes a run of
+    // adjacent records one range for that client too. The reader here sorts for
+    // itself. Nothing in this crate would notice if the writer sorted the other
+    // way.
     let bytes = fs::read(&path).unwrap();
     let index = &bytes[sections.index_start..sections.index_start + sections.index_len];
     let offsets: Vec<u64> = index_entries(index)
@@ -298,20 +300,22 @@ async fn the_index_is_at_the_end() {
 
 /// A pack's index is held in hash order, and every chunk still resolves from it.
 ///
-/// Holding the index in the order chunks are addressed by is what turns a lookup
-/// from a scan of the whole index into a binary search. It is also what forces
-/// the byte-range questions to sort for themselves, because hash order is not the
-/// order the records sit in — so what has to survive the change is both halves: the
-/// lookup still finds every chunk, and a full download is still one range.
+/// Holding the index in the order chunks are addressed by turns a lookup from a
+/// scan of the whole index into a binary search. That order also forces the
+/// byte-range questions to sort for themselves. Hash order is not the order the
+/// records sit in. Two halves therefore have to survive the change. The lookup
+/// must still find every chunk. A full download must still be one range.
 ///
-/// The fixture is wide enough that the two orders are visibly different, and that
-/// is asserted rather than assumed: a pack of two or three chunks could come out of
-/// a sort in the same order it went in, and a test that could not tell would be a
-/// test that stops testing anything the moment the fixture changes.
+/// The fixture is wide enough that the two orders are visibly different. The test
+/// asserts that rather than assuming it. A pack of two or three chunks could come
+/// out of a sort in the same order it went in. A test that could not tell would
+/// stop testing anything the moment the fixture changes.
 ///
-/// What would falsify it: a `locate` that misses, a `get` that hands back the
-/// wrong bytes, a writer and a reader disagreeing about the order they hold the
-/// index in, or `needed` answering one range per chunk.
+/// What would falsify it:
+/// * a `locate` that misses.
+/// * a `get` that hands back the wrong bytes.
+/// * a writer and a reader that disagree about the order they hold the index in.
+/// * `needed` answering one range per chunk.
 #[tokio::test]
 async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
     let built = build(12, 180_000).await;
@@ -330,12 +334,13 @@ async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
         .all(|pair| pair[0].id.as_bytes() <= pair[1].id.as_bytes());
     assert!(by_hash, "the index should be held in hash order");
 
-    // The three ways a caller reads an index without naming the field: the slice
-    // the pack dereferences to, an iterator over the pack by reference, and the
-    // pack by value. They exist because a pack is a collection and callers should
-    // not have to know that, and they say nothing the `chunks()` calls above do
-    // not — which is why they are asserted here, in the one place that already
-    // knows what a pack holds, rather than in three.
+    // A caller reads an index in three ways without naming the field. The caller
+    // takes the slice that the pack dereferences to. The caller also takes an
+    // iterator over the pack by reference. The caller also takes the pack by
+    // value. These ways exist because a pack is a collection. A caller should not
+    // have to know that. They say nothing that the `chunks()` calls above do not.
+    // The test therefore asserts them here. This is the one place that already
+    // knows what a pack holds, rather than three.
     let as_slice: &[lepatch::pack::Located] = pack.as_ref();
     assert_eq!(as_slice.len(), pack.len());
     assert_eq!(pack.clone().into_iter().count(), pack.len());
@@ -387,11 +392,11 @@ async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
     }
 
     // A pack this build wrote and the same pack read back hold the index in the
-    // same order, so a caller may compare them.
+    // same order. A caller may therefore compare them.
     assert_eq!(Pack::open(&path).unwrap().chunks(), pack.chunks());
 
-    // And the property a pack exists for is untouched by the sort: the whole
-    // payload, as one range, and a client that records it holds every chunk.
+    // The sort leaves the property that a pack exists for untouched. The whole
+    // payload is one range. A client that records it holds every chunk.
     let needed = pack.needed(&HashSet::new());
     assert_eq!(
         needed.len(),
@@ -427,16 +432,17 @@ async fn a_client_holding_nothing_needs_one_range() {
 /// This is the measured case that justifies packing, and it is asserted on a tree
 /// built from `common::untagged_stream` rather than `common::noisy`.
 ///
-/// That matters more than it looks. `noisy` is a function of position only, so
-/// `noisy(n)` is a prefix of `noisy(m)`: a tree of them is one long byte stream cut
-/// at various points, deduplicates far more than real data would, and "rewriting"
-/// a file by asking for a shorter `noisy` leaves the original stream truncated —
-/// the best possible case for content-defined chunking. A test on that fixture
-/// shows the property is *achievable*, not that it *holds*.
+/// That choice matters more than it looks. `noisy` is a function of position only,
+/// so `noisy(n)` is a prefix of `noisy(m)`. A tree of them is one long byte
+/// stream cut at various points. Such a tree deduplicates far more than real data
+/// would. "Rewriting" a file by asking for a shorter `noisy` leaves the original
+/// stream truncated. Truncation is the best possible case for content-defined
+/// chunking. A test on that fixture shows the property is *achievable*. It does
+/// not show that the property *holds*.
 ///
 /// On this fixture the delta is a single range and about 6% of the pack, against
-/// 1.9% on the degenerate one. So the robust claim is the request count, and the
-/// fraction is fixture-dependent.
+/// 1.9% on the degenerate one. The durable claim is therefore the request count.
+/// The fraction depends on the fixture.
 #[tokio::test]
 async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
     let dir = tempfile::tempdir().unwrap();
@@ -511,9 +517,9 @@ async fn a_client_holding_everything_needs_nothing() {
 
 /// A client that records what it fetched can ask again and be told nothing.
 ///
-/// The loop a delta protocol is: fetch, record, re-ask. If the recording is wrong
-/// in either direction the protocol breaks — over-reporting and the client stalls,
-/// under-reporting and it fetches twice — so both are asserted.
+/// A delta protocol is a loop of three steps: fetch, record, re-ask. A wrong
+/// recording breaks that loop in either direction. Over-reporting makes the client
+/// stall. Under-reporting makes the client fetch twice. The test asserts both.
 #[tokio::test]
 async fn recording_a_fetch_makes_the_next_ask_empty() {
     let built = build(6, 200_000).await;
@@ -537,16 +543,17 @@ async fn recording_a_fetch_makes_the_next_ask_empty() {
 
 /// A pack is byte-identical for the same tree.
 ///
-/// The property that makes a pack nameable by its own hash, and therefore
+/// That property makes a pack nameable by its own hash. It therefore makes a pack
 /// immutable and cacheable forever. It follows from the plan being ordered by the
-/// snapshot rather than by write order, and it is worth asserting through the
-/// whole stack rather than at the plan.
+/// snapshot rather than by write order. The test asserts it through the whole
+/// stack rather than at the plan.
 #[tokio::test]
 async fn the_same_tree_packs_to_the_same_bytes() {
-    // One tree, two independent stores. The stores lay their chunks out
-    // differently — a second store has no reason to put a chunk where the first
-    // did — so identical packs prove the output depends on the tree and not on
-    // how the store happened to be written.
+    // One tree, two independent stores. The two stores lay their chunks out
+    // differently. A second store has no reason to put a chunk where the first
+    // store did. Identical packs therefore prove the output depends on the tree.
+    // They prove the output does not depend on how the store happened to be
+    // written.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     for i in 0..5 {
@@ -578,8 +585,8 @@ async fn the_same_tree_packs_to_the_same_bytes() {
 
 /// Writing the same version twice produces the same bytes.
 ///
-/// The weaker form of the property above, and the one that catches a writer that
-/// stamps a timestamp or a run number into the file. Cheap enough to be worth
+/// This is the weaker form of the property above. It catches a writer that stamps
+/// a timestamp or a run number into the file. It is cheap enough to be worth
 /// having both.
 #[tokio::test]
 async fn writing_a_version_twice_produces_the_same_bytes() {
@@ -592,15 +599,15 @@ async fn writing_a_version_twice_produces_the_same_bytes() {
 
 /// A store that hands one named chunk a byte more than the plan resolved.
 ///
-/// The set the pack was planned against moving underneath the run, which is the
-/// only thing that can make the store disagree with the plan: a set is appended
-/// to while a pack of it is written, and a record's header carries a count worked
-/// out before the run began.
+/// The set moves underneath the run. That is the only thing that can make the store
+/// disagree with the plan. The code appends to a set while a pack of it is
+/// written. A record's header carries a count worked out before the run began.
 ///
-/// One chunk rather than every chunk, and named rather than the first one the
-/// writer reaches, because the refusal says which form the store yielded and in
-/// which form the plan had it — so the chunk that disagrees is chosen to be a
-/// frame, and a refusal that never mentions one would pin half the sentence.
+/// The fixture damages one chunk rather than every chunk. It names the chunk
+/// rather than taking the first one the writer reaches. The refusal says which
+/// form the store yielded and in which form the plan had it. The chunk that
+/// disagrees is therefore chosen to be a frame. A refusal that never mentions a
+/// frame would pin half the sentence.
 struct GrowsByOne<'a, S> {
     store: &'a S,
     chunk: lepatch::storage::BlobId,
@@ -621,33 +628,34 @@ impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOn
 
 /// A pack is renamed into place, so a failed run leaves the previous one alone.
 ///
-/// `lepatch pack` overwrites, so the path is nearly always one a previous run
-/// wrote and somebody wants back. Writing in place destroyed it before the run
-/// knew it could finish — the header goes first, and the header's payload length
-/// is a count of records that have not been written yet.
+/// `lepatch pack` overwrites. The path is therefore nearly always one a previous
+/// run wrote and somebody wants back. Writing in place destroyed that pack before
+/// the run knew it could finish. The header goes first. The header's payload
+/// length is a count of records that have not been written yet.
+///
 /// A pack whose first record does not begin with a record header, or has no room
 /// for one.
 ///
-/// Two refusals in one file, because they are the same refusal seen from two
-/// sides: either the bytes at the offset the index names are not a header at all,
-/// or they are one that does not fit in the room the index gives the record. Both
-/// stop at `decode_header` and neither is a magic check — a header is only read
-/// whole if it fits, so a record whose header is wider than its own slot is
-/// refused before its magic, kind or codec is ever looked at.
+/// One file covers two refusals. Both refusals are the same refusal seen from two
+/// sides. Either the bytes at the offset the index names are not a header at all.
+/// Or they are a header that does not fit in the room the index gives the record.
+/// Both stop at `decode_header`. Neither is a magic check. The code reads a header
+/// whole only if it fits. A record whose header is wider than its own slot is
+/// therefore refused before its magic, kind or codec is looked at.
 ///
 /// **Built rather than patched**, because a real record's header cannot be widened
-/// without changing a length, and this fixture is about the room rather than about
-/// any length: the first record declares two two-byte lengths, so its header is
-/// fifty bytes, and the index gives it forty-eight. Forty-eight is also the most
-/// room a record can be given and still tile — one byte less and `open` refuses
-/// the whole pack as overlapping, which is the other test.
+/// without changing a length. This fixture is about the room rather than about any
+/// length. The first record declares two two-byte lengths. Its header is therefore
+/// fifty bytes. The index gives it forty-eight. Forty-eight is also the most room
+/// a record can be given and still tile. One byte less and `open` refuses the
+/// whole pack as overlapping. That is the other test.
 #[tokio::test]
 async fn a_record_header_that_does_not_fit_its_room_is_refused() {
     const PAYLOAD: u64 = 200;
     const HEADER: usize = 50; // 6 + two two-byte lengths + 32 + 8
     /// Magic, format, version, snapshot hash, the delta flag, a one-byte chunk
-    /// count and a two-byte payload length — where the payload, and so the first
-    /// record's magic, begins.
+    /// count and a two-byte payload length. That is where the payload begins. That
+    /// is where the first record's magic begins.
     const PACK_HEADER: usize = 4 + 4 + 4 + 32 + 1 + 1 + 2;
 
     let first = lepatch::storage::BlobId::from_bytes([0x11u8; 32]);
@@ -697,9 +705,9 @@ async fn a_record_header_that_does_not_fit_its_room_is_refused() {
     let path = dir.path().join("no-room.pack");
     fs::write(&path, &bytes).unwrap();
 
-    // The pack is otherwise sound: a second entry gives the first record forty-eight
-    // bytes of room and the index it holds still opens, so what is refused below is
-    // the room rather than the file.
+    // The pack is otherwise sound. A second entry gives the first record
+    // forty-eight bytes of room. The index it holds still opens. What is refused
+    // below is therefore the room rather than the file.
     let pack = Pack::open(&path).expect("the fixture is a pack this build can open");
 
     let error =
@@ -713,8 +721,8 @@ async fn a_record_header_that_does_not_fit_its_room_is_refused() {
         "the refusal should name the header, not the payload: {error}"
     );
 
-    // And the same file with the first record's own magic broken, which is the
-    // other side of the same refusal: there is room, and what is in it is not a
+    // The same file has the first record's own magic broken. That is the other
+    // side of the same refusal. There is room. What is in the room is not a
     // header. Nothing else moved, so the only difference is those four bytes.
     let mut wrong_magic = bytes.clone();
     wrong_magic[PACK_HEADER..PACK_HEADER + 4].copy_from_slice(b"XXXX");
@@ -737,10 +745,10 @@ async fn a_record_header_that_does_not_fit_its_room_is_refused() {
 
 #[tokio::test]
 async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
-    // Its own tree rather than `build`'s: the disagreement below is reported in
-    // both codecs' words, and `noisy` is incompressible by construction, so every
-    // record of a set built from it is raw and half of that sentence would never
-    // be written.
+    // This test uses its own tree rather than the tree from `build`. The
+    // disagreement below is reported in the words of both codecs. `noisy` is
+    // incompressible by construction. Every record of a set built from it is
+    // therefore raw. Half of that sentence would never be written.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     for i in 0..4 {
@@ -768,16 +776,16 @@ async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
     let written = built.pack(&path).await;
     let before = fs::read(&path).unwrap();
 
-    // Overwriting is the ordinary case, and it must not leave the temporary
-    // behind either: the rename consumed it.
+    // Overwriting is the ordinary case. It must not leave the temporary behind
+    // either. The rename consumed it.
     built.pack(&path).await;
 
     let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let snapshot = snapshot_of(&built.blob).await;
 
-    // Once per codec the fixture holds, because the refusal names which form the
-    // store yielded and which the plan had — and a fixture of one kind would leave
-    // half of that sentence unwritten.
+    // The test runs once per codec that the fixture holds. The refusal names
+    // which form the store yielded and which the plan had. A fixture of one kind
+    // would leave half of that sentence unwritten.
     for (codec, named) in [(Codec::Zstd, "a zstd frame"), (Codec::Raw, "raw content")] {
         let chunk = built
             .plan
@@ -835,9 +843,9 @@ async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
 
 /// Truncating a pack is detected rather than read as a shorter one.
 ///
-/// The trailing magic is what does it: a truncated file's last bytes are payload,
-/// which is indistinguishable from an index length, so without the magic a short
-/// download would be read as a valid pack missing its tail.
+/// The trailing magic is what does it. The last bytes of a truncated file are
+/// payload. Payload is indistinguishable from an index length. Without the magic a
+/// short download would be read as a valid pack missing its tail.
 #[tokio::test]
 async fn a_truncated_pack_is_refused() {
     let built = build(4, 150_000).await;
@@ -862,11 +870,12 @@ async fn a_truncated_pack_is_refused() {
 
 /// A pack whose header disagrees with its own index is refused.
 ///
-/// The two are redundant, and redundancy is the point: the index is what locates
-/// chunks, so if the header's counts and the index's entries disagree then one of
-/// them is wrong, and picking the wrong one produces a pack that reads as valid and
-/// hands out ranges covering the wrong bytes. Neither the index nor the header is
-/// trustworthy on its own, so they are checked against each other.
+/// The two are redundant, and that redundancy is the point. The index is what
+/// locates chunks. If the header's counts and the index's entries disagree then
+/// one of them is wrong. Picking the wrong one produces a pack that reads as
+/// valid. Such a pack hands out ranges covering the wrong bytes. Neither the index
+/// nor the header is trustworthy on its own. The test checks them against each
+/// other.
 #[tokio::test]
 async fn a_header_that_contradicts_its_index_is_refused() {
     let built = build(4, 150_000).await;
@@ -875,13 +884,13 @@ async fn a_header_that_contradicts_its_index_is_refused() {
 
     let good = fs::read(&path).unwrap();
 
-    // Find the two counts by decoding the varints where the header puts them,
-    // rather than assuming byte offsets — a test that hardcodes a layout breaks
-    // when the layout changes, and breaks by being unreadable rather than by
-    // failing usefully. The flag byte sits between the snapshot hash and the
-    // counts, and is clear for a full pack, so this is where they start.
-    // The `+ 4` is the version field the header now carries, which is why this
-    // offset is written out rather than imported from the module.
+    // The test finds the two counts by decoding the varints where the header puts
+    // them. The test does not assume byte offsets. A test that hardcodes a layout
+    // breaks when the layout changes. Such a test breaks by being unreadable
+    // rather than by failing usefully. The flag byte sits between the snapshot
+    // hash and the counts. That byte is clear for a full pack. The counts start
+    // there. The `+ 4` is the version field that the header now carries. That is
+    // why this offset is written out rather than imported from the module.
     let count_at = 4 + 4 + 4 + 32 + 1;
     assert_eq!(
         good[count_at - 1],
@@ -922,10 +931,11 @@ async fn a_header_that_contradicts_its_index_is_refused() {
     );
 
     // A snapshot length that runs past the start of the file. The two lengths in
-    // the trailer are how the index and the snapshot are found, and they are
-    // subtracted from the end of the file rather than added to a computed offset
-    // precisely so a file can lie about them; this is the other end of that lie,
-    // where the claim is larger than what it is subtracted from.
+    // the trailer are how the code finds the index and the snapshot. The code
+    // subtracts those lengths from the end of the file rather than adding them to
+    // a computed offset. That design lets a file lie about them. This fixture is
+    // the other end of that lie. The claim is larger than what it is subtracted
+    // from.
     let mut wrong_snapshot = good.clone();
     let trailer = wrong_snapshot.len() - 20;
     wrong_snapshot[trailer + 8..trailer + 16].copy_from_slice(&u64::MAX.to_le_bytes());
@@ -940,10 +950,10 @@ async fn a_header_that_contradicts_its_index_is_refused() {
 
 /// Where a written pack's sections are, read from its trailer.
 ///
-/// Every test that damages a pack needs to know where a section begins, and the
-/// answer is arithmetic over the trailer rather than a constant — a test that
-/// hard-coded the trailer's width would be asserting about the format it was
-/// written against, which is exactly what stops being true when the format moves.
+/// Every test that damages a pack needs to know where a section begins. The
+/// answer is arithmetic over the trailer rather than a constant. A test that
+/// hard-coded the trailer's width would assert about the format it was written
+/// against. That assertion stops being true when the format moves.
 struct Sections {
     file_len: usize,
     snapshot_start: usize,
@@ -978,10 +988,10 @@ fn sections(bytes: &[u8]) -> Sections {
 
 /// The offsets, within a pack's index, where each entry's hash begins.
 ///
-/// Walked rather than computed, because an entry is 32 bytes plus two varints
-/// and the varints' widths depend on the offsets the fixture happened to
-/// produce. A test that assumed a width would be asserting about its own fixture
-/// rather than about the pack.
+/// The code walks the index rather than computing the offsets. An entry is 32
+/// bytes plus two varints. The widths of those varints depend on the offsets the
+/// fixture happened to produce. A test that assumed a width would assert about its
+/// own fixture rather than about the pack.
 fn index_entries(index: &[u8]) -> Vec<usize> {
     let mut at = 0usize;
     let mut out = Vec::new();
@@ -1002,19 +1012,19 @@ fn varint_len(bytes: &[u8], at: usize) -> usize {
 
 /// Bytes one record occupies, read out of the record's own header.
 ///
-/// The header and the index used to both carry this number, and a test that read
-/// it from the index could not tell a pack whose records were laid out as claimed
-/// from one whose index claimed something else. So the record's own header is the
-/// only place a test reads it from too, which is what makes a disagreement between
-/// the two visible at all.
+/// The header and the index used to both carry this number. A test that read the
+/// number from the index could not tell two packs apart. It could not tell a pack
+/// whose records were laid out as claimed from one whose index claimed something
+/// else. The record's own header is therefore the only place a test reads the
+/// number from. That is what makes a disagreement between the two visible.
 fn record_len(bytes: &[u8], payload_start: u64, offset: u64) -> u64 {
     let at = usize::try_from(payload_start + offset).unwrap();
     let stored_at = at + 6;
     let stored_len = decode_varint(bytes, stored_at);
     let raw_at = stored_at + varint_len(bytes, stored_at);
 
-    // The header is the two lengths, the hash and the check; the record is that
-    // with the stored payload on the end.
+    // The header is the two lengths, the hash and the check. The record is the
+    // header with the stored payload on the end.
     let header_len = 6 + varint_len(bytes, stored_at) + varint_len(bytes, raw_at) + 32 + 8;
 
     u64::try_from(header_len)
@@ -1024,12 +1034,12 @@ fn record_len(bytes: &[u8], payload_start: u64, offset: u64) -> u64 {
 
 /// A record header carrying `stored_len` and `raw_len` for `id`, check and all.
 ///
-/// Written out rather than a length field patched in place, and that is the whole
-/// point of it: patching a length leaves the header's own eight-byte check stale,
-/// so the header stops decoding and the pack is refused for being unreadable —
-/// which says nothing about whether the index and the record disagree. This is
-/// what a header claiming those lengths *would* be, so the only thing wrong with
-/// the pack built around it is the claim.
+/// The code writes the header out rather than patching a length field in place.
+/// That is the whole point of it. Patching a length leaves the header's own
+/// eight-byte check stale. The header then stops decoding. The pack is refused for
+/// being unreadable. That refusal says nothing about whether the index and the
+/// record disagree. This is what a header claiming those lengths *would* be. The
+/// only thing wrong with the pack built around it is the claim.
 fn record_header(
     codec: u8,
     id: &lepatch::storage::BlobId,
@@ -1053,7 +1063,8 @@ fn record_header(
 /// Where a chunk's record header starts, and what it says.
 ///
 /// `(offset in the file, byte width of the header, stored length, content length,
-/// codec)` — everything a test needs to stand a different header in its place.
+/// codec)`. That is everything a test needs to stand a different header in its
+/// place.
 fn record_claim(
     bytes: &[u8],
     payload_start: u64,
@@ -1072,10 +1083,10 @@ fn record_claim(
 /// The first chunk of `codec` whose two lengths can both be nudged by one without
 /// either varint changing width.
 ///
-/// Same width means the replacement header is the same size as the one it stands
-/// in for, so every byte after it stays where it is and the only thing wrong with
-/// the file is the claim inside that header. `codec` picks the record's kind,
-/// which is not incidental: see [`an_index_and_a_record_header_cannot_disagree`].
+/// The same width means the replacement header is the same size as the header it
+/// stands in for. Every byte after it stays where it is. The only thing wrong with
+/// the file is the claim inside that header. `codec` picks the record's kind. That
+/// choice is not incidental. See [`an_index_and_a_record_header_cannot_disagree`].
 fn nudgeable<'a>(
     bytes: &[u8],
     payload_start: u64,
@@ -1097,31 +1108,31 @@ fn nudgeable<'a>(
 ///
 /// The index no longer carries a record's length, so there is no second number to
 /// catch a header that lies about one. What is left is the header checked against
-/// what the index does say: the room the index gives the record, and the content
-/// length it names. Both are refusals, at the chunk, before any bytes are served —
-/// the alternative is a chunk handed out with somebody else's bytes at the end of
-/// it.
+/// what the index does say. The index gives the room for the record. The index also
+/// names the content length. Both are refusals, at the chunk, before any bytes are
+/// served. The alternative is a chunk handed out with somebody else's bytes at the
+/// end of it.
 ///
-/// **The records damaged here are compressed ones, and that is the whole
+/// **The records damaged here are compressed ones. That is the whole
 /// subtlety.** A raw record's stored length and its content length are the same
-/// number, so a raw record damaged in either one is caught by both checks at once
-/// and neither can be seen to be doing any work: a test on raw records alone would
-/// pass with either check deleted. A frame's two lengths are different numbers, so
-/// each can be wrong on its own. The raw case is asserted too, as the last one,
-/// because a record whose two lengths move together is refused by whichever check
-/// fires first and that is worth pinning as well.
+/// number. A raw record damaged in either one is caught by both checks at once.
+/// Neither check can then be seen to be doing any work. A test on raw records
+/// alone would pass with either check deleted. A frame's two lengths are
+/// different numbers, so each can be wrong on its own. The test also asserts the
+/// raw case, as the last one. A record whose two lengths move together is refused
+/// by whichever check fires first. That is worth pinning as well.
 ///
 /// Fixture: [`common::untagged_stream`], whose second half is a repeated block and
-/// so compresses, backed up under zstd rather than under whatever the default
-/// happens to be — the two records this damages have to be of different kinds, and
-/// that is a statement about the fixture rather than about the policy. `noisy` is
+/// so compresses. The fixture is backed up under zstd rather than under whatever
+/// the default happens to be. The two records this test damages have to be of different kinds.
+/// That is a statement about the fixture rather than about the policy. `noisy` is
 /// incompressible by construction, so every record of a pack built from it is raw
 /// and this test would have nothing to work with.
 ///
 /// What would falsify it: a `get` that answered at all, or one that answered with
-/// the wrong bytes — a record served a byte too long reads the next record's
-/// header as content, and the caller is handed a chunk that does not hash to the
-/// name it asked for.
+/// the wrong bytes. A record served a byte too long reads the next record's
+/// header as content. The caller is handed a chunk that does not hash to the name
+/// it asked for.
 #[tokio::test]
 async fn an_index_and_a_record_header_cannot_disagree() {
     let dir = tempfile::tempdir().unwrap();
@@ -1160,10 +1171,11 @@ async fn an_index_and_a_record_header_cannot_disagree() {
             .unwrap();
         assert_eq!(blake3::hash(&actual), victim.id, "codec {held}");
 
-        // A frame one byte longer than the index leaves room for: the check the
-        // index's own length used to make, and the one that stops a record being
-        // read into its neighbour's bytes. A raw record cannot be damaged this way
-        // without its two lengths disagreeing, which is a different refusal.
+        // A frame one byte longer than the index leaves room for. That is the
+        // check the index's own length used to make. That check is also what stops
+        // a record being read into its neighbour's bytes. A raw record cannot be
+        // damaged this way without its two lengths disagreeing. That is a different
+        // refusal.
         if held == 1 {
             let mut too_long = good.clone();
             too_long[at..at + header_len].copy_from_slice(&record_header(
@@ -1188,8 +1200,8 @@ async fn an_index_and_a_record_header_cannot_disagree() {
         }
 
         // A content length the index does not name. On a raw record this moves the
-        // stored length with it, so the two refusals are not separable and either
-        // message is a correct answer.
+        // stored length with it. The two refusals are therefore not separable, and
+        // either message is a correct answer.
         let mut wrong_content = good.clone();
         wrong_content[at..at + header_len].copy_from_slice(&record_header(
             held,
@@ -1215,17 +1227,17 @@ async fn an_index_and_a_record_header_cannot_disagree() {
         );
     }
 
-    // And the pack each of those was cut from is an ordinary one, which is what
+    // The pack that each of those was cut from is an ordinary one. That is what
     // shows the refusals were about the claims rather than about the files.
     assert_eq!(Pack::open(&path).unwrap().len(), pack.len());
 }
 /// Decode a little-endian base-128 varint, for the test's own assertions.
 ///
 /// This was a hand-written copy of the crate's decoder, kept because the crate's
-/// was private. It had drifted: it had no ten-byte cap and no overflow check, so
-/// it accepted overlong encodings that all three production decoders refuse —
-/// which is to say the test was checking the pack's bytes with a reader more
-/// lenient than any reader that will ever see them. It now uses the real one.
+/// was private. It had drifted. It had no ten-byte cap and no overflow check. It
+/// therefore accepted overlong encodings that all three production decoders
+/// refuse. The test was checking the pack's bytes with a reader more lenient than
+/// any reader that will ever see them. The test now uses the real one.
 fn decode_varint(bytes: &[u8], at: usize) -> u64 {
     lepatch::varint::read(bytes, at)
         .map(|(value, _)| value)
@@ -1235,8 +1247,9 @@ fn decode_varint(bytes: &[u8], at: usize) -> u64 {
 /// A pack in a format this build does not know is named as such, not misread.
 ///
 /// A format version that moves forward is a normal event. The wrong response is to
-/// guess — a reader that accepts a future version will locate chunks by an index
-/// it is interpreting wrongly, and the ranges it produces look entirely plausible.
+/// guess. A reader that accepts a future version will locate chunks by an index it
+/// is interpreting wrongly. The ranges that reader produces look entirely
+/// plausible.
 #[tokio::test]
 async fn a_future_pack_format_is_named_rather_than_misread() {
     let built = build(3, 120_000).await;
@@ -1257,15 +1270,17 @@ async fn a_future_pack_format_is_named_rather_than_misread() {
 
 /// A pack records the version it was packed from, and hands it back.
 ///
-/// The number is the set's, not the pack's, so it can only come from the writer —
-/// nothing about a snapshot implies it, and two sets number independently. If it
-/// were defaulted rather than passed, every pack written by a caller that forgot
-/// would carry a `0` that reads back as a real version number.
+/// The number is the set's and not the pack's. So it can only come from the writer.
+/// Nothing about a snapshot implies it, and two sets number independently. If the
+/// number were defaulted rather than passed, every pack written by a caller that
+/// forgot would carry a `0`. That `0` reads back as a real version number.
 ///
-/// What would falsify it: a header that does not carry the field, a reader that
-/// reads it at the wrong offset (which would show up as the snapshot hash being
-/// four bytes short of a shift), or a delta — the header is the same for both, so
-/// a delta that lost the number while a full pack kept it would pass a full-pack
+/// What would falsify it:
+/// * a header that does not carry the field.
+/// * a reader that reads it at the wrong offset. That would show up as the
+///   snapshot hash being four bytes short of a shift.
+/// * a delta. The header is the same for both. A
+///   delta that lost the number while a full pack kept it would pass a full-pack
 /// test and break the case that matters most.
 #[tokio::test]
 async fn a_pack_records_the_version_it_was_packed_from() {
@@ -1286,8 +1301,8 @@ async fn a_pack_records_the_version_it_was_packed_from() {
             "the pack this crate just wrote should report the version it was given"
         );
 
-        // Through the file, not through the struct that was returned: the point
-        // is what a *reader* learns, and a field the writer kept to itself would
+        // Through the file, not through the struct that was returned. The point
+        // is what a *reader* learns. A field the writer kept to itself would
         // satisfy the line above and nothing.
         assert_eq!(
             Pack::open(&at).unwrap().version(),
@@ -1295,8 +1310,8 @@ async fn a_pack_records_the_version_it_was_packed_from() {
             "the version should survive the file: {number} did not round-trip"
         );
 
-        // And it is fixed-length in the header, so it costs nothing in the
-        // variable section: the same pack with a four-byte-larger number is the
+        // And the number is fixed-length in the header, so it costs nothing in the
+        // variable section. The same pack with a four-byte-larger number is the
         // same size.
         let delta_at = built.dir.path().join(format!("d{number}.pack"));
         let delta = Pack::write_delta(&store, &plan, &snapshot, base, number, &delta_at)
@@ -1320,29 +1335,29 @@ async fn a_pack_records_the_version_it_was_packed_from() {
 
 /// A pack in format `5` is refused by name, before a byte of it is believed.
 ///
-/// `5` is the previous format: the same run of records for a payload, but with
-/// each record's length repeated in the index beside the length its own header
-/// already carries. The two differ in the index alone, and an index whose entries
-/// are wider than this build reads them is not something a reader can notice by
-/// looking — the offsets it would decode are numbers of the right shape, pointing
-/// at the wrong bytes.
+/// `5` is the previous format. It holds the same run of records for a payload. Each
+/// record's length is repeated in the index beside the length its own header
+/// already carries. The two differ in the index alone. An index whose entries are
+/// wider than this build reads them is not something a reader can notice by
+/// looking. The offsets that reader would decode are numbers of the right shape,
+/// pointing at the wrong bytes.
 ///
-/// What this pins is *where* the refusal happens. The trailer and the index are
-/// read before the header is, because that is what makes opening a pack cheap;
-/// the format check then has to come before any field of the header is trusted —
-/// the recorded version and the snapshot hash are read after it — or a `5` would
-/// be reported with this build's numbers and a `6` field would be read out of a
-/// file that has none.
+/// What this pins is *where* the refusal happens. The code reads the trailer and
+/// the index before the header. That order is what makes opening a pack cheap. The
+/// format check then has to come before any field of the header is trusted. The
+/// recorded version and the snapshot hash are read after it. Otherwise a `5` would
+/// be reported with this build's numbers. A `6` field would be read out of a file
+/// that has none.
 #[tokio::test]
 async fn a_pack_in_the_previous_format_is_refused_by_name() {
     let built = build(3, 100_000).await;
     let path = built.dir.path().join("v1.pack");
     built.pack(&path).await;
 
-    // Patched rather than built: a real `5` pack is a file this build cannot
-    // produce, and patching the four format bytes is the only honest way to hold
-    // one. The rest of the file is a valid `6` pack's, which is the point — the
-    // only thing wrong with it is the format it claims.
+    // Patched rather than built. A real `5` pack is a file this build cannot
+    // produce. Patching the four format bytes is therefore the only honest way to
+    // hold one. The rest of the file is a valid `6` pack's. That is the point. The
+    // only thing wrong with the file is the format it claims.
     let mut bytes = fs::read(&path).unwrap();
     bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
     let at = built.dir.path().join("v5.pack");
@@ -1359,8 +1374,8 @@ async fn a_pack_in_the_previous_format_is_refused_by_name() {
         "and refused as unreadable rather than as damaged: {said}"
     );
 
-    // The same file with the format byte put back is a perfectly good pack again,
-    // which is what shows the refusal was about the format and nothing else.
+    // The same file with the format byte put back is a perfectly good pack again.
+    // That is what shows the refusal was about the format and nothing else.
     bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
     let at = built.dir.path().join("restored.pack");
     fs::write(&at, &bytes).unwrap();
@@ -1373,11 +1388,11 @@ async fn a_pack_in_the_previous_format_is_refused_by_name() {
 
 /// A pack with a damaged index is refused, whichever way the damage shows up.
 ///
-/// The index is the only thing that locates chunks, so a reader that decoded a
-/// corrupt one would hand out byte ranges that are internally consistent and point
-/// at the wrong bytes. Every way the numbers can be wrong is refused: truncated
-/// mid-number, overlong past what a `u64` holds, and running off the end of the
-/// index entirely.
+/// The index is the only thing that locates chunks. A reader that decoded a
+/// corrupt index would hand out byte ranges that are internally consistent and
+/// point at the wrong bytes. The test refuses every way the numbers can be wrong.
+/// The index can be truncated mid-number. It can be overlong past what a `u64`
+/// holds. It can run off the end of the index entirely.
 #[tokio::test]
 async fn a_damaged_index_is_refused() {
     let built = build(4, 150_000).await;
@@ -1396,12 +1411,12 @@ async fn a_damaged_index_is_refused() {
     let numbers_end = index_at + index_len;
 
     // Nothing but continuation bits, across the index's numbers and no further.
-    // Every varint read then runs past what a u64 can hold, which must be refused
-    // rather than read as a very large offset.
+    // Every varint read then runs past what a u64 can hold. The code must refuse
+    // that rather than read it as a very large offset.
     //
-    // Bounded to the index, because the snapshot and the trailer sit after it:
-    // running on to the end of the file would damage those instead and the pack
-    // would be refused for a reason that has nothing to do with the index.
+    // Bounded to the index, because the snapshot and the trailer sit after it.
+    // Running on to the end of the file would damage those instead. The pack would
+    // then be refused for a reason that has nothing to do with the index.
     let mut endless = good.clone();
     for byte in endless.iter_mut().take(numbers_end).skip(numbers_at) {
         *byte = 0x80;
@@ -1413,8 +1428,8 @@ async fn a_damaged_index_is_refused() {
         "an index number that never terminates was accepted"
     );
 
-    // A continuation bit on the last byte of the tenth, where only the final bit of
-    // a u64 is left to contribute: a value one past the type.
+    // A continuation bit on the last byte of the tenth. Only the final bit of a
+    // u64 is left to contribute there. The value is one past the type.
     let mut overlong = good.clone();
     for byte in overlong.iter_mut().take(numbers_at + 9).skip(numbers_at) {
         *byte = 0xff;
@@ -1428,9 +1443,9 @@ async fn a_damaged_index_is_refused() {
     );
 
     // An index region that stops partway into its last number. Shortening the
-    // length in the trailer is what does this: the file keeps its magic, so the
-    // index is read, and it runs out in the middle of a value. Shortening the file
-    // instead would be caught by the magic, which is the other test.
+    // length in the trailer is what does this. The file keeps its magic, so the
+    // index is read. The index then runs out in the middle of a value. Shortening
+    // the file instead would be caught by the magic. That is the other test.
     let mut cut_number = good.clone();
     let at = sections.file_len - 20;
     cut_number[at..at + 8].copy_from_slice(&u64::try_from(index_len - 1).unwrap().to_le_bytes());
@@ -1441,10 +1456,10 @@ async fn a_damaged_index_is_refused() {
         "an index ending mid-number was accepted"
     );
 
-    // An index whose last number starts at the very end of it, which is the
-    // other way a number can run out — the one above shortens a number rather
-    // than removing all of it, and a reader gets far enough along either way.
-    // Left as a continuation bit so the number *starts* and cannot finish.
+    // An index whose last number starts at the very end of it. That is the other
+    // way a number can run out. The one above shortens a number rather than
+    // removing all of it. A reader gets far enough along either way. The fixture
+    // leaves a continuation bit so the number *starts* and cannot finish.
     let mut ends_mid = good.clone();
     ends_mid[sections.index_start + index_len - 1] = 0x80;
     let path = built.dir.path().join("ends-mid.pack");
@@ -1468,17 +1483,17 @@ async fn a_damaged_index_is_refused() {
 
 /// A chunk the index places outside the payload is refused when the pack opens.
 ///
-/// The header check bounds the *payload*; nothing bounded where each chunk sits
+/// The header check bounds the *payload*. Nothing bounded where each chunk sits
 /// within it. An offset that reaches past the end is a number a client is told to
-/// add to the payload's start — `needed` and `chunks_covering` both do exactly
-/// that — so accepting it means the arithmetic that consumes a pack can hand a
+/// add to the payload's start. Both `needed` and `chunks_covering` do exactly that.
+/// Accepting such an offset means the arithmetic that consumes a pack can hand a
 /// client a range outside the file rather than failing.
 ///
 /// This is the "starts inside the payload" half of what the index claims. The
-/// other half — that no record starts before the one before it has ended — is
-/// `records_that_overlap_are_refused`, which builds the index to say so; the two
-/// fixtures here set the offset past the end or past what the type can add, which
-/// is a different claim again.
+/// other half is that no record starts before the one before it has ended. That
+/// half is `records_that_overlap_are_refused`, which builds the index to say so.
+/// The two fixtures here set the offset past the end or past what the type can
+/// add. That is a different claim again.
 #[tokio::test]
 async fn a_chunk_outside_the_payload_is_refused() {
     let built = build(4, 150_000).await;
@@ -1495,7 +1510,7 @@ async fn a_chunk_outside_the_payload_is_refused() {
 
     // The first entry's two numbers, and the width they occupy together. Filling
     // exactly those bytes with continuation-then-terminator gives an offset far
-    // past the end of the payload, without moving the entry after it.
+    // past the end of the payload. That fill does not move the entry after it.
     let first = entries[0];
     let numbers_at = first + 32;
     let numbers_len = entries[1] - numbers_at;
@@ -1522,9 +1537,12 @@ async fn a_chunk_outside_the_payload_is_refused() {
     );
 
     // The same bytes filled to the width of both numbers, so the offset is a
-    // number near the top of the type: adding the payload's start to it is
-    // arithmetic on a claim, and this is the case that has to be refused before
+    // number near the top of the type. Adding the payload's start to it is then
+    // arithmetic on a claim. This is the case that has to be refused before
     // anything does that addition.
+    //
+    // The last byte keeps only the single bit a ten-byte varint has left. That
+    // bit is what stops the value overflowing the type and keeps it in range.
     let mut wrapping = good.clone();
     for byte in wrapping
         .iter_mut()
@@ -1533,8 +1551,6 @@ async fn a_chunk_outside_the_payload_is_refused() {
     {
         *byte = 0xff;
     }
-    // The last byte keeps only the single bit a ten-byte varint has left, which
-    // is what stops the value overflowing the type and keeps it in range.
     wrapping[index_at + numbers_at + numbers_len - 1] = 0x01;
     let path = built.dir.path().join("wrapping.pack");
     fs::write(&path, &wrapping).unwrap();
@@ -1547,19 +1563,19 @@ async fn a_chunk_outside_the_payload_is_refused() {
 /// Records that do not tile the payload are refused when the pack opens.
 ///
 /// The index carries no record length, so a record's extent is "where the next
-/// one begins" — which is a range only if the records do not overlap. Everything
-/// that answers with bytes reads it that way: `needed` turns a chunk into a byte
-/// range, `chunks_covering` asks the same question, and `get` bounds a record's
-/// header by its own span. So an index naming one record inside the one before it
-/// does not produce a refused read; it produces ranges that overlap, a header
-/// read out of a neighbour, and a client with no way to tell.
+/// one begins". That is a range only if the records do not overlap. Everything that
+/// answers with bytes reads it that way. `needed` turns a chunk into a byte range.
+/// `chunks_covering` asks the same question. `get` bounds a record's header by its
+/// own span. So an index naming one record inside the one before it does not
+/// produce a refused read. It produces ranges that overlap. It produces a header
+/// read out of a neighbour. It produces a client with no way to tell.
 ///
 /// What is built here is an index that says a record starts one byte into the one
-/// before it. The offset is rewritten **in place**, which needs the two entries
-/// to agree on the width of that one number — a wider rewrite would move every
-/// entry after it, and the pack would then be refused for a truncation rather
-/// than for the overlap. Nothing else in the file changes, which is what makes
-/// the refusal the one under test.
+/// before it. The offset is rewritten **in place**. That needs the two entries to
+/// agree on the width of that one number. A wider rewrite would move every entry
+/// after it. The pack would then be refused for a truncation rather than for the
+/// overlap. Nothing else in the file changes, which is what makes the refusal the
+/// one under test.
 #[tokio::test]
 async fn records_that_overlap_are_refused() {
     let built = build(4, 150_000).await;
@@ -1570,9 +1586,9 @@ async fn records_that_overlap_are_refused() {
     let sections = sections(&good);
     let index = &good[sections.index_start..sections.index_start + sections.index_len];
 
-    // The entry whose offset is rewritten, and the one before it: a pair whose
-    // offsets are written the same width, and where this one's plus one is still
-    // that width.
+    // The entry whose offset is rewritten, and the one before it. That is a pair
+    // whose offsets are written the same width, and where this one's plus one is
+    // still that width.
     let pairs: Vec<(usize, usize)> = index_entries(index)
         .windows(2)
         .map(|pair| (pair[0], pair[1]))
@@ -1615,9 +1631,10 @@ async fn records_that_overlap_are_refused() {
 
 /// An index naming the same chunk twice is refused.
 ///
-/// `locate` answers with the first match, so a repeated hash means a client that
-/// already holds the chunk is told to fetch a different one at a different
-/// offset. `decode_index` has always claimed to catch this.
+/// `locate` answers with the first match. A repeated hash then means a client
+/// that already holds the chunk is told to fetch a different one. The different
+/// chunk sits at a different offset. `decode_index` has always claimed to catch
+/// this.
 #[tokio::test]
 async fn a_chunk_listed_twice_is_refused() {
     let built = build(4, 150_000).await;
@@ -1632,8 +1649,8 @@ async fn a_chunk_listed_twice_is_refused() {
     assert!(entries.len() >= 2, "the fixture should have a second entry");
 
     // Copy the first entry's hash over the second's, leaving both entries'
-    // numbers alone — so the index still decodes and still describes a payload
-    // of the right size, and the only thing wrong with it is the repetition.
+    // numbers alone. The index still decodes. It still describes a payload of the
+    // right size. The only thing wrong with it is the repetition.
     let mut doubled = good.clone();
     let first_hash: [u8; 32] = good[index_at..index_at + 32].try_into().unwrap();
     let second = index_at + entries[1];
@@ -1652,7 +1669,7 @@ async fn a_chunk_listed_twice_is_refused() {
 ///
 /// Both fields are public, and the type is part of the client protocol, so the
 /// inverted value is one a caller can produce. It used to panic in `len` under a
-/// debug assertion and wrap to a near-`u64::MAX` total in release.
+/// debug assertion. It used to wrap to a near-`u64::MAX` total in release.
 #[test]
 fn an_inverted_range_covers_nothing() {
     let inverted = Range { start: 10, end: 0 };
@@ -1666,9 +1683,10 @@ fn an_inverted_range_covers_nothing() {
 
 /// A file with a valid trailer but a damaged header is refused.
 ///
-/// The trailer is read first, so a file whose *header* has been damaged is the case
-/// that gets past the cheap check and has to be caught by the second one. Without
-/// it, a pack whose payload was overwritten by something else would open cleanly.
+/// The trailer is read first, so a file whose *header* has been damaged is the
+/// case that gets past the cheap check. The second check has to catch it. Without
+/// that second check a pack whose payload was overwritten by something else would
+/// open cleanly.
 #[tokio::test]
 async fn a_damaged_header_is_refused() {
     let built = build(3, 120_000).await;
@@ -1741,13 +1759,13 @@ async fn a_pack_of_an_empty_version_opens() {
 
 /// An index that names nothing over a payload that is not empty is refused.
 ///
-/// The one case the geometry check has that is not about an offset: a pack whose
-/// count and index agree — both zero — and whose payload length says there are
-/// records in it anyway. Nothing walks that payload, because a reader locates
-/// chunks through the index and the index says there are none, so the file would
-/// open as an empty version while carrying bytes this crate wrote and cannot
-/// account for. An empty *plan* is fine and is written by this crate; this is
-/// that file with its count and index taken away.
+/// The one case the geometry check has that is not about an offset. The pack has a
+/// count and an index that agree. Both are zero. Its payload length says there are
+/// records in it anyway. Nothing walks that payload. A reader locates chunks
+/// through the index, and the index says there are none. The file would open as an
+/// empty version while carrying bytes this crate wrote and cannot account for. An
+/// empty *plan* is fine and is written by this crate. This file is that file with
+/// its count and index taken away.
 #[tokio::test]
 async fn an_empty_index_over_a_payload_is_refused() {
     /// The header's chunk count: the first of the two varints after the magic, the
@@ -1771,10 +1789,10 @@ async fn an_empty_index_over_a_payload_is_refused() {
     bytes[COUNT_AT] = 0;
 
     // The index goes out of the file as well as out of the trailer, and from the
-    // middle rather than the end: the trailer's two lengths are how `open` finds
-    // the index and the snapshot, so a trailer claiming no index while the bytes
-    // were still there would be refused first for a payload that does not reach
-    // its own snapshot — a different question, and one asked elsewhere.
+    // middle rather than the end. The trailer's two lengths are how `open` finds
+    // the index and the snapshot. A trailer claiming no index while the bytes were
+    // still there would be refused first for a payload that does not reach its own
+    // snapshot. That is a different question, and one asked elsewhere.
     let start = sections.index_start;
     bytes.drain(start..start + sections.index_len);
     let trailer = bytes.len() - 20;
@@ -1792,10 +1810,10 @@ async fn an_empty_index_over_a_payload_is_refused() {
 
 /// A pack carries the version it was built from, and names it correctly.
 ///
-/// This is the property that makes a pack self-contained. Without the snapshot in
-/// the file, a client can locate every chunk in it and cannot put one of them
-/// anywhere — the file table is what says which slice of which chunk lands at
-/// which offset in which file, and it is not derivable from the payload.
+/// This property makes a pack self-contained. Without the snapshot in the file, a
+/// client can locate every chunk in it. The client cannot put one of them
+/// anywhere. The file table says which slice of which chunk lands at which offset
+/// in which file. The file table is not derivable from the payload.
 #[tokio::test]
 async fn a_pack_carries_the_version_it_was_built_from() {
     let built = build(3, 100_000).await;
@@ -1804,7 +1822,7 @@ async fn a_pack_carries_the_version_it_was_built_from() {
 
     assert_eq!(pack.snapshot().unwrap(), expected);
 
-    // The header's hash is over exactly the bytes that follow the payloads, so a
+    // The header's hash is over exactly the bytes that follow the payloads. A
     // client with its own copy of the snapshot can confirm the two go together
     // without either having to be decoded.
     assert_eq!(pack.snapshot_id(), snapshot_id(&built.blob).await);
@@ -1815,9 +1833,9 @@ async fn a_pack_carries_the_version_it_was_built_from() {
 
 /// The file table is checked against the header's hash before it is parsed.
 ///
-/// A pack is a file that was downloaded, and a damaged snapshot section would
-/// otherwise decode into a file table describing a different tree — one that
-/// writes real bytes to the wrong paths. Refused instead.
+/// A pack is a file that was downloaded. A damaged snapshot section would
+/// otherwise decode into a file table describing a different tree. That tree would
+/// write real bytes to the wrong paths. The section is refused instead.
 #[tokio::test]
 async fn a_pack_refuses_a_snapshot_that_is_not_the_one_it_names() {
     let built = build(3, 100_000).await;
@@ -1831,8 +1849,8 @@ async fn a_pack_refuses_a_snapshot_that_is_not_the_one_it_names() {
     damaged[at] ^= 0x01;
     fs::write(&path, &damaged).unwrap();
 
-    // The geometry is still sound, so opening it succeeds — and that is the point:
-    // the damage is invisible to a reader that only wants offsets.
+    // The geometry is still sound, so opening it succeeds. That is the point. The
+    // damage is invisible to a reader that only wants offsets.
     let reopened = Pack::open(&path).unwrap();
     assert_eq!(reopened.len(), pack.len());
 
@@ -1847,10 +1865,10 @@ async fn a_pack_refuses_a_snapshot_that_is_not_the_one_it_names() {
 
 /// A pack yields the same chunk bytes a store does, so it can stand in for one.
 ///
-/// This is the property that makes a pack usable as a delivered artifact rather
-/// than only as an inspection format: `restore` takes a snapshot and a
-/// `StorageGet`, and a pack now satisfies the second. Without it a client would
-/// have to reassemble a tree out of ranges itself.
+/// This property makes a pack usable as a delivered artifact rather than only as
+/// an inspection format. `restore` takes a snapshot and a `StorageGet`. A pack now
+/// satisfies the second. Without it a client would have to reassemble a tree out
+/// of ranges itself.
 #[tokio::test]
 async fn a_pack_yields_the_bytes_a_store_would() {
     let built = build(4, 150_000).await;
@@ -1880,8 +1898,8 @@ async fn a_pack_yields_the_bytes_a_store_would() {
 /// A chunk a pack does not hold is refused, not answered with the wrong bytes.
 ///
 /// The stream is bounded to one chunk, so a caller that read past the end would
-/// otherwise be handed the next chunk's data — which is a plausible-looking
-/// stream, and the sort of thing that produces a tree nobody can account for.
+/// otherwise be handed the next chunk's data. That data looks like a plausible
+/// stream. Such a stream produces a tree nobody can account for.
 #[tokio::test]
 async fn a_pack_will_not_hand_out_a_chunk_it_does_not_hold() {
     let built = build(3, 100_000).await;
@@ -1889,13 +1907,14 @@ async fn a_pack_will_not_hand_out_a_chunk_it_does_not_hold() {
 
     let absent = lepatch::storage::BlobId::from_bytes([0xABu8; 32]);
     // Matched rather than `unwrap_err`, which would need the stream type to be
-    // `Debug` — a boxed trait object with no useful representation either way.
+    // `Debug`. That would be a boxed trait object with no useful representation
+    // either way.
     let Err(error) = pack.get(&absent).await else {
         panic!("a pack handed out a chunk it does not hold");
     };
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 
-    // And one it does hold reads back as exactly its own bytes: nothing past the
+    // And one it does hold reads back as exactly its own bytes. Nothing past the
     // end leaks into it.
     let held = built.plan.chunks()[0].id;
     let mut reader = pack.get(&held).await.unwrap();
@@ -1911,7 +1930,7 @@ async fn a_pack_will_not_hand_out_a_chunk_it_does_not_hold() {
 
 /// `chunks_covering` reports what a range actually contains, not what it is near.
 ///
-/// A range that covers part of a chunk is not that chunk, and recording it anyway
+/// A range that covers part of a chunk is not that chunk. Recording it anyway
 /// would leave a client believing it holds data it does not.
 #[tokio::test]
 async fn a_partial_range_records_nothing() {
@@ -1942,8 +1961,8 @@ async fn a_partial_range_records_nothing() {
 /// A placement for a chunk a plan does not have to locate.
 ///
 /// These two tests are about set arithmetic on the chunk table, so where the chunks
-/// live is noise. Every placement is raw and at offset zero, which is not a real
-/// arrangement and never read.
+/// live is noise. Every placement is raw and at offset zero. That is not a real
+/// arrangement and is never read.
 fn placed() -> lepatch::storage::Placement {
     lepatch::storage::Placement {
         segment: 0,
@@ -1956,10 +1975,10 @@ fn placed() -> lepatch::storage::Placement {
 
 /// A snapshot of one file holding `chunks` back to back, ten bytes each.
 ///
-/// Built with real slices because `Plan::from_snapshot` drops any chunk no slice
-/// reaches — a chunk table alone plans to nothing, which is correct (a version
-/// listing a chunk it never reads has nothing to read it for) and would have made
-/// both tests above vacuous.
+/// The code builds this with real slices because `Plan::from_snapshot` drops any
+/// chunk that no slice reaches. A chunk table alone plans to nothing. That is
+/// correct. A version listing a chunk it never reads has nothing to read it for.
+/// That chunk table would have made both tests above vacuous.
 fn one_file(chunks: &[lepatch::storage::BlobId]) -> Snapshot {
     let mut snapshot = Snapshot {
         chunks: chunks.to_vec(),
@@ -1987,9 +2006,9 @@ fn one_file(chunks: &[lepatch::storage::BlobId]) -> Snapshot {
 
 /// A snapshot of one ten-byte file per entry, each holding that entry's chunk.
 ///
-/// Distinct chunks are listed once, in the order they are first seen — the same
-/// rule a real snapshot's chunk table follows, and the one `Plan::from_snapshot`
-/// assumes when it flattens slices to one entry per chunk.
+/// Distinct chunks are listed once, in the order they are first seen. That is the
+/// same rule a real snapshot's chunk table follows. It is the rule that
+/// `Plan::from_snapshot` assumes when it flattens slices to one entry per chunk.
 fn tree(files: &[(&str, lepatch::storage::BlobId)]) -> Snapshot {
     let mut snapshot = Snapshot::new();
     let mut chunks: Vec<lepatch::storage::BlobId> = Vec::new();
@@ -2023,9 +2042,9 @@ fn tree(files: &[(&str, lepatch::storage::BlobId)]) -> Snapshot {
 
 /// A delta plan is what the target places that the base does not already place.
 ///
-/// The whole of `Plan::since`, apart from any file. Determinism is the part worth
-/// pinning: a delta that reordered itself between runs would not be the same bytes
-/// twice, and a pack's content hash is that property.
+/// This is the whole of `Plan::since`, apart from any file. Determinism is the
+/// part worth pinning. A delta that reordered itself between runs would not be the
+/// same bytes twice. A pack's content hash is that property.
 #[test]
 fn a_delta_plan_is_what_the_base_does_not_already_place() {
     let a = blake3::hash(b"a");
@@ -2050,14 +2069,14 @@ fn a_delta_plan_is_what_the_base_does_not_already_place() {
 
 /// A chunk the base holds in one file is still sent for another.
 ///
-/// The bug a chunk-set subtraction has and a placement comparison does not. The same
-/// bytes appear in two files; the base has one of them, so the delta must carry the
-/// chunk — or the second file is never written and the apply reports success on a
-/// tree missing a file.
+/// A chunk-set subtraction has this bug. A placement comparison does not. The same
+/// bytes appear in two files. The base has one of them. The delta must carry the
+/// chunk. Otherwise the second file is never written. The apply then reports
+/// success on a tree missing a file.
 ///
-/// Not a contrived shape: a tree of identical files, or a new file whose content
-/// happens to repeat something already there, both produce it. It is how this was
-/// found.
+/// The shape is not contrived. A tree of identical files produces it. So does a new
+/// file whose content happens to repeat something already there. That is how this
+/// was found.
 #[test]
 fn a_chunk_the_base_holds_in_one_place_is_still_sent_for_another() {
     let shared = blake3::hash(b"same bytes in two files");
@@ -2084,8 +2103,8 @@ fn a_chunk_the_base_holds_in_one_place_is_still_sent_for_another() {
 
 /// A chunk the base places identically in every place it is needed is omitted.
 ///
-/// The other half, and the case the omission is sound for: if the base already has
-/// these exact bytes at these exact offsets, the directory is right there.
+/// The other half, and the case the omission is sound for. The base already has
+/// these exact bytes at these exact offsets, so the directory is right there.
 #[test]
 fn a_chunk_the_base_places_identically_is_left_out() {
     let shared = blake3::hash(b"same bytes in two files");
@@ -2102,8 +2121,8 @@ fn a_chunk_the_base_places_identically_is_left_out() {
 
 /// A delta of a tree with nothing in common is the whole thing.
 ///
-/// Not an optimisation to detect: a delta against an unrelated base *is* the whole
-/// version, and saying so is more useful than refusing.
+/// This case is not an optimisation to detect. A delta against an unrelated base
+/// *is* the whole version. Saying so is more useful than refusing.
 #[test]
 fn a_delta_from_an_unrelated_base_is_the_whole_version() {
     let x = blake3::hash(b"x");
@@ -2124,18 +2143,17 @@ fn a_delta_from_an_unrelated_base_is_the_whole_version() {
 
 /// A delta pack is a pack of fewer chunks, and applies to its holder.
 ///
-/// The end-to-end claim: `--from 7` writes something smaller that a client on
-/// version 7 can actually use, and the result is the same tree either way. The
-/// bytes come from two different packs, and nothing downstream should be able to
-/// tell.
+/// `--from 7` writes something smaller that a client on version 7 can actually
+/// use. The result is the same tree either way. The bytes come from two different
+/// packs. Nothing downstream should be able to tell.
 #[tokio::test]
 async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
     let built = build(6, 200_000).await;
     let source = built.dir.path().join("source");
     let client = built.dir.path().join("client");
 
-    // The base pack is written *before* the update, because `snapshot_of` reads the
-    // newest version and after a later backup that would be the other one.
+    // The base pack is written *before* the update. `snapshot_of` reads the newest
+    // version. After a later backup that would be the other one.
     let first = BlobStore::open_for_reading(&built.blob).await.unwrap();
     let v1 = snapshot_of(&built.blob).await;
     let v1_full = Plan::from_snapshot(&v1, |id| first.locate(id)).unwrap();
@@ -2179,8 +2197,8 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
         "one rewritten file out of six should not need every chunk"
     );
 
-    // It names the version it assumes, which is the only thing that makes it safe to
-    // omit the rest.
+    // It names the version it assumes. That is the only thing that makes it safe
+    // to omit the rest.
     assert_eq!(
         packed.base(),
         Some(v1_pack.snapshot_id()),
@@ -2210,10 +2228,10 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
 /// A delta pack will not apply to a client that is not on the version it names.
 ///
 /// The failure the whole feature rests on, stated as a test. A delta omits the
-/// chunks its assumed holder has, and nothing in it can tell whether they are there
-/// — the bytes that would prove it are the bytes it left out. So a client on a
-/// different version must be **refused**, before anything is written, rather than
-/// having the delta applied to whatever it happens to hold.
+/// chunks its assumed holder has. Nothing in the delta can tell whether they are
+/// there. The bytes that would prove it are the bytes it left out. So a client on
+/// a different version must be **refused**. The refusal must come before anything
+/// is written. Otherwise the delta is applied to whatever the client holds.
 #[tokio::test]
 async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     let built = build(5, 200_000).await;
@@ -2232,7 +2250,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     .await
     .unwrap();
 
-    // Move the client to version 2 — one update past the delta's base.
+    // Move the client to version 2. That is one update past the delta's base.
     fs::write(source.join("f0.bin"), common::untagged_stream(11, 240_000)).unwrap();
     common::run_backup(&source, &built.blob).await;
     let second = BlobStore::open_for_reading(&built.blob).await.unwrap();
@@ -2250,8 +2268,8 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
         .await
         .unwrap();
 
-    // What version 2's version of the file version 3 changes looks like, so the
-    // refusal can be checked to have left it alone.
+    // Copy the file that version 3 changes in version 2's form. The test then
+    // checks that the refusal left that file alone.
     let before = fs::read(client.join("f1.bin")).unwrap();
 
     // Version 3, and a delta for a client on version 1.
@@ -2295,8 +2313,8 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
         "and what to do instead, got: {error}"
     );
 
-    // And the tree is untouched: the refusal came before the first write, so the
-    // client is still exactly version 2 and nothing partial was left behind.
+    // The tree is untouched. The refusal came before the first write. The client is
+    // still exactly version 2 and nothing partial was left behind.
     assert_eq!(
         fs::read(client.join("f1.bin")).unwrap(),
         before,
@@ -2311,9 +2329,9 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
 
 /// A delta needs the base, and a full pack does not.
 ///
-/// The two are told apart by the header rather than by payload length, because a
-/// delta's payload is short for the ordinary reason that it holds fewer chunks — a
-/// small full pack is not a delta, and a delta is not a small full pack.
+/// The code tells the two apart by the header rather than by payload length. A
+/// delta's payload is short for the ordinary reason that it holds fewer chunks. A
+/// small full pack is not a delta. A delta is not a small full pack.
 #[tokio::test]
 async fn a_full_pack_names_no_base_and_a_delta_names_one() {
     let built = build(4, 150_000).await;
@@ -2384,17 +2402,19 @@ async fn a_delta_is_a_function_of_the_two_versions() {
 
 /// The layout, written out by hand rather than read back through the pack.
 ///
-/// Every other test here asks a `Pack` where things are, so a change to the
-/// format would move the writer and the reader together and nothing would fail.
+/// Every other test here asks a `Pack` where things are. A change to the format
+/// would therefore move the writer and the reader together and nothing would fail.
 /// The offsets below are therefore arithmetic on the header's field widths,
-/// stated here rather than imported from the module that writes them — and the
-/// first record's magic is read at the byte that arithmetic puts it at, which is
-/// the one thing in a pack that cannot be arranged by accident.
+/// stated here rather than imported from the module that writes them. The first
+/// record's magic is read at the byte that arithmetic puts it at. That is the one
+/// thing in a pack that cannot be arranged by accident.
 ///
-/// What would falsify it: a header field moved, a count that stopped being a
-/// varint, the payload no longer starting where the two counts end, or a payload
-/// that is not records — the last of which would show up here as a first record
-/// without a record's magic in it.
+/// What would falsify it:
+/// * a header field moved.
+/// * a count that stopped being a varint.
+/// * the payload no longer starting where the two counts end.
+/// * a payload that is not records. That fault would show up here as a first
+///   record without a record's magic in it.
 #[tokio::test]
 async fn the_layout_is_the_one_this_test_writes_out() {
     let built = build(3, 120_000).await;
@@ -2450,9 +2470,9 @@ async fn the_layout_is_the_one_this_test_writes_out() {
         "and what is at that offset is a store record, not a file's bytes"
     );
 
-    // The trailer: index length, snapshot length, magic — twenty bytes at the end,
-    // and the sections are located by subtracting from it rather than by trusting
-    // an offset.
+    // The trailer holds the index length, the snapshot length and the magic. That
+    // is twenty bytes at the end. The code locates the sections by subtracting from
+    // the trailer rather than by trusting an offset.
     let end = bytes.len();
     let trailer = &bytes[end - 20..];
     assert_eq!(&trailer[16..], b"LPK1", "a pack ends with its magic too");
@@ -2473,19 +2493,19 @@ async fn the_layout_is_the_one_this_test_writes_out() {
 /// A record whose header does not verify is refused, not read as content.
 ///
 /// The eight-byte check at the end of a store record header is what makes a
-/// record self-synchronising, and it has to be load-bearing for a pack too: a pack
-/// is a file that was downloaded, and the payload region is now records rather
-/// than a file's own bytes, so a header that is wrong would otherwise be read as
-/// somebody's content. The codec byte is the byte to flip — everything ahead of it
-/// that matters is a length or a hash, and this one is what decides how the rest is
-/// interpreted.
+/// record self-synchronising. It has to be load-bearing for a pack too. A pack is
+/// a file that was downloaded. Its payload region is now records rather than a
+/// file's own bytes. A header that is wrong would otherwise be read as somebody's
+/// content. The codec byte is the byte to flip. Everything ahead of it that
+/// matters is a length or a hash. That byte decides how the rest is interpreted.
 ///
-/// Opening still succeeds, which is the point: the damage is invisible to a reader
-/// that only wants offsets, so the refusal has to be where the bytes are read.
+/// Opening still succeeds. That is the point. The damage is invisible to a reader
+/// that only wants offsets. The refusal therefore has to be where the bytes are
+/// read.
 ///
 /// What would falsify it: a `get` that returned the chunk anyway, a refusal that
-/// came from somewhere else — the index and the header still agree with each other
-/// here — or a message that named a different fault.
+/// came from somewhere else. The index and the header still agree with each other
+/// here. A message that named a different fault would also falsify this.
 #[tokio::test]
 async fn a_record_whose_header_does_not_verify_is_refused() {
     let built = build(3, 100_000).await;
@@ -2532,19 +2552,20 @@ async fn a_record_whose_header_does_not_verify_is_refused() {
 
 /// A record whose payload byte is flipped is refused, and publishes nothing.
 ///
-/// The header's own check covers the header; a flipped byte in the payload is
-/// caught by the chunk's hash instead, and this is where that is enforced for a
-/// pack: `put` hashes what it is given against the name the chunk is addressed by,
-/// so a merge of a damaged pack fails rather than storing bytes under a hash they
-/// are not.
+/// The header's own check covers the header. A flipped byte in the payload is
+/// caught by the chunk's hash instead. This is where that is enforced for a pack.
+/// `put` hashes what it is given against the name the chunk is addressed by. A
+/// merge of a damaged pack therefore fails rather than storing bytes under a hash
+/// they are not.
 ///
-/// A *raw* record is the one to damage for this, deliberately: flipping a byte of
-/// a frame is caught by the codec instead, which would leave this test passing for
-/// the wrong reason — a frame that happens not to decode says nothing about the
-/// hash check.
+/// A *raw* record is the one to damage for this, deliberately. Flipping a byte of
+/// a frame is caught by the codec instead. That would leave this test passing for
+/// the wrong reason. The fixture's data is compressible. That is the point. A
+/// frame that happens not to decode says nothing about the hash check.
 ///
 /// What would falsify it: a merge that succeeded, or one that failed after
-/// publishing a version — so the set is checked for having published nothing.
+/// publishing a version. The set is therefore checked for having published
+/// nothing.
 #[tokio::test]
 async fn a_record_whose_payload_byte_is_flipped_is_refused() {
     let built = build(3, 100_000).await;
@@ -2562,8 +2583,8 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
         .copied();
     let raw = raw.expect("the fixture should hold at least one uncompressed record");
 
-    // The last byte of a record is in its payload: a record is a header and a
-    // payload, and the header is at most 66 of the record's bytes.
+    // The last byte of a record is in its payload. A record is a header and a
+    // payload. The header is at most 66 of the record's bytes.
     let at = usize::try_from(
         pack.payload_start() + raw.offset + record_len(&bytes, pack.payload_start(), raw.offset)
             - 1,
@@ -2604,18 +2625,18 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
 /// The verbatim write path refuses a damaged record too, and publishes nothing.
 ///
 /// The test above pins this for the re-encoding path, where the chunk reaches the
-/// store as content. `keep` is the path where it is *not* obvious: the bytes go in
-/// as the pack carries them, so the store is handed a frame and a pair of lengths
-/// rather than a hash of the thing it can see — and the tempting implementation is
-/// to take the pack's word for it, which is exactly what would let a damaged or
+/// store as content. `keep` is the path where it is *not* obvious. The bytes go in
+/// as the pack carries them. The store is handed a frame and a pair of lengths
+/// rather than a hash of the thing it can see. The tempting implementation is to
+/// take the pack's word for it. That is exactly what would let a damaged or
 /// hostile pack store bytes under a name they are not.
 ///
-/// So the decode that looks like waste is the property. This test is what says so:
-/// a byte flipped in a *raw* record's payload leaves the codec alone and the
-/// lengths alone, so nothing but hashing the decoded content can catch it.
+/// So the decode that looks like waste is the property. This test is what says so.
+/// A byte flipped in a *raw* record's payload leaves the codec alone and the
+/// lengths alone. Nothing but hashing the decoded content can catch it.
 ///
 /// What would falsify it: a `put_stored` that skips the decode, or that trusts the
-/// pack — the merge would succeed, and the set would hold a record under `id`
+/// pack. The merge would then succeed. The set would hold a record under `id`
 /// whose bytes are not what `id` names. Publishing a version as well as storing
 /// the record is the second half, so the set is checked for having published
 /// nothing.
@@ -2672,26 +2693,27 @@ async fn a_flipped_payload_byte_is_refused_on_the_verbatim_path_too() {
 
 /// A frame no smaller than its content is stored raw, on the verbatim path.
 ///
-/// The size invariant is the store's, not the pack's: a frame is kept only when it
-/// is strictly smaller than the content it stands for, so a pack carrying a frame
-/// that did not win cannot make the receiving set bigger than the version it
-/// merged. Both lengths are in the record, so the check is two integer comparisons
-/// — and skipping it would be a way for a merge to *grow* a store, which is the one
-/// thing the verbatim path exists not to do.
+/// The size invariant is the store's and not the pack's. A frame is kept only when
+/// it is strictly smaller than the content it stands for. A pack carrying a frame
+/// that did not win therefore cannot make the receiving set bigger than the version
+/// it merged. Both lengths are in the record, so the check is two integer
+/// comparisons. Skip that check and a merge could *grow* a store. Growing a store is
+/// the one thing the verbatim path exists not to do.
 ///
-/// The fixture is a record rewritten to name `Zstd` about a payload that is a frame
-/// of its content which came out no smaller, which is the only shape that reaches
-/// the rule: a record the store wrote would never carry one.
+/// The fixture is a record rewritten to name `Zstd` about a payload that is a
+/// frame of its content which came out no smaller. That is the only shape that
+/// reaches the rule. A record the store wrote would never carry such a frame.
 ///
 /// Two constraints keep the fixture to one splice rather than a rebuilt pack. The
-/// victim is the **last** record in the payload, so nothing after it moves; and its
+/// victim is the **last** record in the payload, so nothing after it moves. Its
 /// replacement is the same width of varint, so the payload length can be patched
 /// where it is rather than re-encoded. Both are asserted, so a fixture that stopped
 /// satisfying either says so instead of quietly testing something else.
 ///
 /// What would falsify it: a merge that stored the frame as it stood. The tree would
-/// still restore — the frame is a genuine one — so the assertion is on the record
-/// the store wrote. A test that only restored would pass with this rule deleted.
+/// still restore. The frame is a genuine one. The assertion is therefore on the
+/// record the store wrote. A test that only restored would pass with this rule
+/// deleted.
 #[tokio::test]
 async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     let built = build(3, 100_000).await;
@@ -2726,7 +2748,7 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     assert_eq!(blake3::hash(&content), victim.id, "sanity: the content");
 
     // A real frame of that content, asserted not to be smaller. Left to chance it
-    // would compress — the fixture's data is compressible, which is the point: a
+    // would compress. The fixture's data is compressible, which is the point. A
     // frame that won is the ordinary case and would not reach the rule at all.
     let frame = zstd::bulk::compress(&content, 1).unwrap();
     let frame_len = u64::try_from(frame.len()).unwrap();
@@ -2767,7 +2789,7 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     let at_grown = built.dir.path().join("grown-frame.pack");
     fs::write(&at_grown, &grown).unwrap();
 
-    // The pack opens and the record still reads back as the chunk it names, so the
+    // The pack opens and the record still reads back as the chunk it names. The
     // only thing wrong with it is that its frame did not win.
     let reopened = Pack::open(&at_grown).unwrap();
     let mut read_back = Vec::new();
@@ -2810,20 +2832,20 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     );
 }
 
-/// `keep` carries the pack's own records across; anything else re-encodes them.
+/// `keep` carries the pack's own records across. Anything else re-encodes them.
 ///
-/// The routing is what the flag is, and the two halves are opposites: `keep` must
-/// reproduce the codecs the pack arrived with, and a re-encoding merge must produce
+/// The routing is what the flag is. The two halves are opposites. `keep` must
+/// reproduce the codecs the pack arrived with. A re-encoding merge must produce
 /// whatever the *receiving* set's policy says. Both are checked against the store's
-/// own index rather than against a size, because a size can come out the same either
-/// way and a codec cannot.
+/// own index rather than against a size. A size can come out the same either way. A
+/// codec cannot.
 ///
 /// The receiving set is opened with compression **off** on purpose. That is what
-/// makes the two answers opposites rather than two views of the same thing: a
+/// makes the two answers opposites rather than two views of the same thing. A
 /// re-encoding merge into an uncompressed set stores every chunk raw whatever the
-/// pack carried, while `keep` still brings the frames across. A test whose store
-/// compressed would see `keep` and `Reencode` agree on every chunk that compresses,
-/// and would pass with the routing broken.
+/// pack carried. `keep` still brings the frames across. A test whose store
+/// compressed would see `keep` and `Reencode` agree on every chunk that compresses.
+/// Such a test would pass with the routing broken.
 ///
 /// What would falsify it: `keep` storing content (every record raw here), or
 /// `Reencode` storing frames (every record compressed here). Either way the flag
@@ -2834,7 +2856,7 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
     let source = common::source(dir.path());
 
     // Half the tree compresses and half cannot, so the pack carries both kinds of
-    // record and neither answer can be right "by accident" on all of them.
+    // record. Neither answer can then be right "by accident" on all of them.
     for i in 0..3 {
         fs::write(
             source.join(format!("c{i}.bin")),
@@ -2924,11 +2946,12 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
 
 /// A pack's header, up to and including a payload length of `payload_len`.
 ///
-/// A patch rather than a rebuild, and it can only be a patch because the number it
-/// writes has the same width of varint as the one already there: a header is at the
-/// front of the file, so a number that changed width would move every byte behind
-/// it and the index with it. Asserted rather than assumed, so a fixture that grew
-/// past a varint boundary says why instead of producing a pack that will not open.
+/// The code writes a patch rather than a rebuild. It can only be a patch because
+/// the number it writes has the same width of varint as the one already there. A
+/// header is at the front of the file. A number that changed width would move
+/// every byte behind it and the index with it. The test asserts that rather than
+/// assuming it. A fixture that grew past a varint boundary then says why instead
+/// of producing a pack that will not open.
 fn grown_header(bytes: &[u8], len_at: usize, payload_len: u64) -> Vec<u8> {
     let mut encoded = Vec::new();
     lepatch::varint::write(&mut encoded, payload_len);
@@ -2948,10 +2971,10 @@ fn grown_header(bytes: &[u8], len_at: usize, payload_len: u64) -> Vec<u8> {
 /// The codec byte in the record at `offset`, read out of the pack's own bytes.
 ///
 /// The pack's index says where a chunk is and how much content it has, and neither
-/// says how the record stores it — the record's own header does, and it is the same
-/// header a reader decodes. Read here rather than through a public accessor because
-/// what this test needs is a fact about the *file*, which is what the receiving set
-/// has to reproduce.
+/// says how the record stores it. The record's own header does. It is the same
+/// header a reader decodes. The code reads it here rather than through a public
+/// accessor. What this test needs is a fact about the *file*. The file is what
+/// the receiving set has to reproduce.
 fn frame_codec(path: &Path, payload_start: u64, chunk: &lepatch::pack::Located) -> Codec {
     let bytes = fs::read(path).unwrap();
     let at = usize::try_from(payload_start + chunk.offset).unwrap();
@@ -2965,10 +2988,11 @@ fn frame_codec(path: &Path, payload_start: u64, chunk: &lepatch::pack::Located) 
 
 /// The three forms a pack can be built in, as a command line would name them.
 ///
-/// The same three answers `merge --compression` gives, at the other end of the
-/// transfer, and deliberately the same list: the matrix below is a product of two
-/// choices from one vocabulary, and a fixture that listed a fourth case here and a
-/// different third case there would be testing two features rather than one.
+/// These are the same three answers that `merge --compression` gives, at the other
+/// end of the transfer. The list is deliberately the same. The matrix below is a
+/// product of two choices from one vocabulary. A fixture that listed a fourth case
+/// here and a different third case there would be testing two features rather than
+/// one.
 fn pack_forms() -> [(&'static str, Option<lepatch::storage::Compression>); 3] {
     [
         ("keep", None),
@@ -2979,11 +3003,11 @@ fn pack_forms() -> [(&'static str, Option<lepatch::storage::Compression>); 3] {
 
 /// The same three answers, as what a merge takes.
 ///
-/// A level is not in [`lepatch::command::MergeCompression`] and cannot be: which
-/// frames a merge writes is the *receiving store's* policy, not an argument, since
-/// the store's compressor is a type parameter the command does not get to change.
-/// So "under a level" here is `Reencode` into a store opened at one, and the two
-/// are the same run as far as anything observable is concerned.
+/// A level is not in [`lepatch::command::MergeCompression`] and cannot be. Which
+/// frames a merge writes is the *receiving store's* policy. It is not an argument.
+/// The store's compressor is a type parameter that the command does not change.
+/// So "under a level" here is `Reencode` into a store opened at one. The two are
+/// the same run as far as anything observable is concerned.
 fn merge_forms() -> Vec<(
     &'static str,
     lepatch::command::MergeCompression,
@@ -3010,12 +3034,12 @@ fn merge_forms() -> Vec<(
 
 /// A source set holding both kinds of record, packed and merged through the matrix.
 ///
-/// The fixture is half compressible and half not, and that is load-bearing rather
-/// than decoration: a frame is stored only where it is strictly smaller than its
-/// content, so a tree of one kind gives an answer that every codec agrees with by
-/// accident and a test over it cannot tell `keep` from `0`. With both, the codecs
-/// recorded in the matrix's sets are genuinely different and a routing mistake
-/// shows up as a difference rather than as nothing.
+/// The fixture is half compressible and half not. That is load-bearing rather than
+/// decoration. A frame is stored only where it is strictly smaller than its
+/// content. A tree of one kind gives an answer that every codec agrees with by
+/// accident. A test over such a tree cannot tell `keep` from `0`. With both, the
+/// codecs recorded in the matrix's sets are genuinely different. A routing mistake
+/// then shows up as a difference rather than as nothing.
 fn mixed_source(dir: &Path) -> std::path::PathBuf {
     let source = common::source(dir);
 
@@ -3038,11 +3062,11 @@ fn mixed_source(dir: &Path) -> std::path::PathBuf {
 /// The same tree, backed up into a set under a policy that is named rather than
 /// defaulted.
 ///
-/// `Compression::zstd(1)` is what the default is today, and that is the point of
-/// writing it out: every test that uses this asserts the set holds at least one
-/// frame, and a default that moved would fail them with "the fixture should hold a
-/// record stored as codec 1" — a complaint about the fixture rather than about the
-/// policy that changed under a test about codecs.
+/// `Compression::zstd(1)` is what the default is today. That is the point of
+/// writing it out. Every test that uses this asserts the set holds at least one
+/// frame. A default that moved would fail them with "the fixture should hold a
+/// record stored as codec 1". That is a complaint about the fixture. It is not a
+/// complaint about the policy that changed under a test about codecs.
 async fn mixed_set(dir: &Path, at: &Path) {
     let source = mixed_source(dir);
     common::run_backup_compressed(&source, at, lepatch::storage::Compression::zstd(1)).await;
@@ -3087,25 +3111,27 @@ async fn packed_with(
 ///
 /// The option chooses an *encoding*, and the only thing it is allowed to change is
 /// the bytes in the records. So each of the nine combinations has to restore to
-/// exactly what a restore from the source set gives — and each is checked against
-/// that same answer rather than against each other, because two sets that were
-/// wrong in the same way would otherwise agree.
+/// exactly what a restore from the source set gives. Each is checked against that
+/// same answer rather than against each other. Two sets that were wrong in the same
+/// way would otherwise agree.
 ///
 /// Every setting is checked against the *source set's own restore*, taken once
 /// before the matrix runs. This is the test that would catch an option honoured in
-/// one direction and ignored in the other, which is the failure a flag like this
-/// invites: `keep` writing content while claiming to keep frames would still
-/// restore, and so would a level that re-read a pack's stored bytes as if they
-/// were content.
+/// one direction and ignored in the other. That is the failure a flag like this
+/// invites. `keep` writing content while claiming to keep frames would still
+/// restore. So would a level that re-read a pack's stored bytes as if they were
+/// content.
 ///
 /// **What this cannot see, and what the test below it is for.** Restoring is
-/// invariant under the encoding: every form decodes to the same content, so all
-/// nine rows here would pass with the routing wired up wrongly — a routing bug that
-/// passed a restore-only test, once already, in this same feature. The matrix
-/// proves the option is safe. It does not prove the option does anything.
+/// invariant under the encoding. Every form decodes to the same content. So all
+/// nine rows here would pass with the routing wired up wrongly. A routing bug of
+/// that kind passed a restore-only test once already, in this same feature. The
+/// matrix proves the option is safe. It does not prove the option does anything.
 ///
-/// What would falsify it: any cell restoring differently by a byte, a form that
-/// refused to build or merge, or a merge that published no version.
+/// What would falsify it:
+/// * any cell restoring differently by a byte.
+/// * a form that refused to build or merge.
+/// * a merge that published no version.
 #[tokio::test]
 async fn every_pack_form_restores_through_every_merge_form() {
     let dir = tempfile::tempdir().unwrap();
@@ -3141,9 +3167,9 @@ async fn every_pack_form_restores_through_every_merge_form() {
                 });
 
             // Every cell also re-reads every chunk through the merged set and checks
-            // it against the hash it is addressed by: the store's own statement that
-            // what it holds is what it says it holds, which is the property the
-            // verbatim paths keep while skipping the encode.
+            // it against the hash it is addressed by. That hash is the store's own
+            // statement that what it holds is what it says it holds. That is the
+            // property the verbatim paths keep while skipping the encode.
             let reopened = BlobStore::open_for_reading(&name).await.unwrap();
             let report = lepatch::command::verify(reopened.snapshot(1).unwrap(), reopened)
                 .await
@@ -3163,21 +3189,21 @@ async fn every_pack_form_restores_through_every_merge_form() {
 
 /// `keep` is not the same as `0`, and the codecs recorded say which is which.
 ///
-/// The matrix above cannot tell the two apart, and that is not a gap in it: every
-/// form decodes to the same content, so a restore is invariant under the encoding
-/// and a routing bug passes a restore-only test. This is the test that closes that
-/// door, and it asserts on **the codecs actually recorded in the merged set** rather
-/// than on the restore or on a size.
+/// The matrix above cannot tell the two apart. That is not a gap in it. Every form
+/// decodes to the same content, so a restore is invariant under the encoding. A
+/// routing bug passes a restore-only test. This test closes that door. It asserts
+/// on **the codecs actually recorded in the merged set** rather than on the restore
+/// or on a size.
 ///
-/// Sizes would be nearly as weak: a frame at level 9 of content that compresses is
-/// smaller than the same content raw, but "nearly smaller" is a range, and a
-/// fixture at one end of it would let a level silently do nothing. A codec is a
-/// single bit that cannot come out the same way twice by accident.
+/// Sizes would be nearly as weak. A frame at level 9 of content that compresses is
+/// smaller than the same content raw. But "nearly smaller" is a range. A fixture at
+/// one end of it would let a level silently do nothing. A codec is a single bit
+/// that cannot come out the same way twice by accident.
 ///
-/// The receiving store is opened with compression **off** on purpose, so the codecs
-/// in the merged set are the ones the *pack* chose rather than ones the receiving
-/// policy overwrote: with `keep` the pack's own frames arrive, and with `0` every
-/// record is raw however well it would compress. A test whose receiving store
+/// The receiving store is opened with compression **off** on purpose. The codecs
+/// in the merged set are then the ones the *pack* chose rather than ones the
+/// receiving policy overwrote. With `keep` the pack's own frames arrive. With `0`
+/// every record is raw however well it would compress. A test whose receiving store
 /// compressed would see the two agree on every chunk that compresses.
 ///
 /// What would falsify it: `keep` writing content (every record raw), or `0`
@@ -3244,8 +3270,8 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
             }
         }
 
-        // And the size moves with the choice, which is the same claim about the
-        // encodings that the codecs make about the records: a set built from a pack
+        // And the size moves with the choice. That is the same claim about the
+        // encodings that the codecs make about the records. A set built from a pack
         // of raw content is larger than one built from a pack of the frames the set
         // already held.
         sizes.push((form, common::set_size(&name)));
@@ -3272,17 +3298,19 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
 ///
 /// Two claims, and the second is the one that is easy to lose by adding a parameter
 /// to a path that used to take none. The figures: under a level the plan is
-/// resolved through the same encoder the writer uses, so `payload` is the size of
+/// resolved through the same encoder the writer uses. So `payload` is the size of
 /// the records that *would* be written rather than the size of the ones the set
-/// holds — which is what makes the plan worth reading. The absence: no file at
+/// holds. That is what makes the plan worth reading. The absence: no file at
 /// `--out`, created or overwritten.
 ///
 /// The plan and the run are compared figure for figure, on every number the report
-/// carries. A plan that reported the source set's sizes would be reporting about a
-/// file that was not written, and the only way to see that is to compare.
+/// carries. A plan that reported the source set's sizes would report about a file
+/// that was not written. Comparing is the only way to see that.
 ///
-/// What would falsify it: a plan whose figures differ from the run's, a file at the
-/// output path afterwards, or a plan whose payload did not move with the flag.
+/// What would falsify it:
+/// * a plan whose figures differ from the run's.
+/// * a file at the output path afterwards.
+/// * a plan whose payload did not move with the flag.
 #[tokio::test]
 async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
     let dir = tempfile::tempdir().unwrap();
@@ -3374,8 +3402,8 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
         payloads.push((form, plan.payload));
     }
 
-    // The figure is *meant* to move with the option — that is the resolution this
-    // crate made of what `payload` means under a non-default one — so a plan that
+    // The figure is *meant* to move with the option. That is the resolution this
+    // crate made of what `payload` means under a non-default one. A plan that
     // reported one number for all three would be the bug, not the fix.
     let by = |form: &str| payloads.iter().find(|(f, _)| *f == form).unwrap().1;
     assert!(
@@ -3390,28 +3418,29 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
 /// before anything is decoded.
 ///
 /// The ceiling is `fastcdc`'s maximum, which is 2^30, and a varint that can hold
-/// it is five bytes wide — which is why this builds its pack rather than
+/// it is five bytes wide. That is why this test builds its pack rather than
 /// patching one. Widening a real record's length would shift everything after it
-/// by a byte, and each thing that shift touches (the index entry's own length, the
-/// trailer's index length, the header's payload total) is separately checked, so a
-/// splice that got one of them wrong would be refused for a reason that has
-/// nothing to do with the ceiling. This way every width is chosen, and the only
-/// thing wrong with the file is the claim.
+/// by a byte. Each thing that shift touches is separately checked. Those things
+/// are the index entry's own length, the trailer's index length, and the header's
+/// payload total. A splice that got one of them wrong would be refused for a
+/// reason that has nothing to do with the ceiling. This way every width is chosen,
+/// and the only thing wrong with the file is the claim.
 ///
-/// What it pins is the **order**, not merely that a merge fails. The frame here
-/// is a stand-in rather than a real one, so with the bound in place the refusal
-/// names the ceiling, and with it removed the decode is reached and the refusal
-/// names the frame instead. A real frame declaring that size would reserve a
-/// gigabyte before finding out, and a failed reserve aborts rather than returning
-/// an error — which is the reason the bound is here at all.
+/// What this pins is the **order**, not merely that a merge fails. The frame here
+/// is a stand-in rather than a real one. With the bound in place, the refusal
+/// names the ceiling. With it removed, the decode is reached and the refusal
+/// names the frame instead. A real frame declaring that size would reserve
+/// a gigabyte before finding out. A failed reserve aborts rather than returning an
+/// error. That is the reason the bound is here at all.
 ///
-/// It also pins that a refused merge publishes nothing, which the earlier refusal
-/// tests already established and this one re-checks on the route that bypasses
-/// the reading path — and, now that the reading path reads the same record
-/// through the same code, that *it* refuses the same fixture for the same reason.
-/// The bound used to be on one route and not the other, and the commit that added
-/// it to the second said neither had a test, which is how one of the two routes
-/// came to be the only thing this fixture ever exercised.
+/// It also pins that a refused merge publishes nothing. The earlier refusal tests
+/// already established that. This test re-checks it on the route that bypasses
+/// the reading path. The reading path now reads the same record through the same
+/// code. This test also checks that the reading path refuses the same fixture for
+/// the same reason.
+/// The bound used to be on one route and not the other. The commit that added it to
+/// the second said neither route had a test. That is how one of the two routes came
+/// to be the only thing this fixture ever exercised.
 #[tokio::test]
 async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first() {
     const CEILING: u64 = (1 << 30) + 1; // one past it: the bound is "more than"
@@ -3480,9 +3509,9 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
     );
 
     // The same fixture through the two routes a reader takes. `get` is what a
-    // restore and an apply call; `stored` is what a merge that keeps the frame
-    // calls, and it is the route that was already refusing it above. Both bound
-    // the claim before anything reserves it, and both must say so by name.
+    // restore and an apply call. `stored` is what a merge that keeps the frame
+    // calls. It is the route that was already refusing it above. Both bound the
+    // claim before anything reserves it. Both must say so by name.
     for (route, error) in [
         ("get", pack.get(&id).await.err()),
         ("stored", pack.stored(&id).await.err()),
@@ -3497,8 +3526,8 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
     }
 }
 
-/// The varint the format's own lengths are written in: seven bits per byte, least
-/// significant first, with the top bit set on every byte but the last.
+/// The varint the format's own lengths are written in. Seven bits per byte, least
+/// significant first. The top bit is set on every byte but the last.
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = u8::try_from(value & 0x7f).unwrap();

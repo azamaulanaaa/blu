@@ -1,10 +1,12 @@
 //! Deduplication: repeated content must be stored once, both within a single
 //! run and across runs against a store that already holds it.
 //!
-//! There is no base snapshot any more. Deduplication is the store's own
-//! business — it holds every version it has ever been given, and a `put` of
-//! content it already has writes nothing — so these tests are about the
-//! property a caller gets for free rather than about a knob it sets.
+//! There is no base snapshot any more.
+//! Deduplication is the store's own business.
+//! The store holds every version it has ever been given.
+//! A `put` of content it already has writes nothing.
+//! So these tests are about the property a caller gets for free rather than about
+//! a knob it sets.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -34,8 +36,9 @@ async fn repeated_content_within_one_run_is_stored_once() {
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
 
-    // The same 64 KiB block in three files. Identical content at an identical
-    // offset, so the chunker is guaranteed to cut it the same way each time.
+    // The same 64 KiB block in three files.
+    // Identical content at an identical offset, so the chunker is guaranteed to
+    // cut it the same way each time.
     let block = vec![0x5au8; 64 * 1024];
     for name in ["a.bin", "b.bin", "c.bin"] {
         fs::write(source.join(name), &block).unwrap();
@@ -52,9 +55,10 @@ async fn repeated_content_within_one_run_is_stored_once() {
         snapshot.chunks.len()
     );
 
-    // 192 KiB of input must not have grown the store by 192 KiB. The store file
-    // carries record headers and the snapshot on top of the chunk data, so this
-    // is a loose bound rather than an exact one.
+    // 192 KiB of input must not have grown the store by 192 KiB.
+    // The store file carries record headers and the snapshot on top of the chunk
+    // data.
+    // So this is a loose bound rather than an exact one.
     let stored = common::set_size(&blob);
     assert!(
         stored < 128 * 1024,
@@ -64,12 +68,14 @@ async fn repeated_content_within_one_run_is_stored_once() {
 
 /// Re-backing up an unchanged tree stores nothing.
 ///
-/// This is the property the redesign is for. The old design deduplicated a run
-/// only against a snapshot the caller named, which meant a run had to know which
-/// version came before it and that version had to still be intact. The store
-/// holds every version it has ever been given, so a run hands over every chunk
-/// it read and the store recognises the content however far back it was last
-/// seen — including content from a version that is not the latest.
+/// This is the property the redesign is for.
+/// The old design deduplicated a run only against a snapshot the caller named.
+/// A run had to know which version came before it.
+/// That version had to still be intact.
+/// The store holds every version it has ever been given.
+/// A run hands over every chunk it read, and the store recognises the content
+/// however far back it was last seen.
+/// That includes content from a version that is not the latest.
 #[tokio::test]
 async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
     let dir = tempfile::tempdir().unwrap();
@@ -93,8 +99,8 @@ async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
         "an unchanged tree describes the same snapshot, so it should be the same bytes"
     );
 
-    // The second run writes a commit record and nothing else: the snapshot blob
-    // is already there, and no chunk data is new.
+    // The second run writes a commit record and nothing else.
+    // The snapshot blob is already there, and no chunk data is new.
     let growth = after_second - after_first;
     assert!(
         growth < 1024,
@@ -110,16 +116,19 @@ async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
 
 /// Content last seen in an *earlier* version is still recognised.
 ///
-/// The old design could only reuse what the immediately previous snapshot held,
-/// so a file whose content had been absent from the last version was stored
-/// again, however recently the store had last seen it. Dedup against a named base
-/// cannot express this; a store that remembers every version it has been given
-/// can, and this is the test for it.
+/// The old design could only reuse what the immediately previous snapshot held.
+/// So a file whose content was absent from the last version was stored again.
+/// That happened however recently the store had last seen the content.
+/// Dedup against a named base cannot express this.
+/// A store that remembers every version it has been given can, and this is the
+/// test for it.
 ///
 /// The tree keeps the same shape throughout, so the chunker cuts the same
-/// boundaries each time and version 3's chunks really are version 1's. That is
-/// deliberate: the property under test is the *store* recognising content, and
-/// varying the file set would move the boundaries and test something else.
+/// boundaries each time.
+/// Version 3's chunks really are version 1's.
+/// That is deliberate: the property under test is the *store* recognising
+/// content.
+/// Varying the file set would move the boundaries and test something else.
 #[tokio::test]
 async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
     let dir = tempfile::tempdir().unwrap();
@@ -152,15 +161,17 @@ async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
     common::run_backup(&source, &blob).await;
     let after_second = common::set_size(&blob);
 
-    // Version 3 puts the first file's content back. It is in the store — it has
-    // been there since version 1 — and it is not in the version that came before.
+    // Version 3 puts the first file's content back.
+    // It is in the store, because it has been there since version 1.
+    // It is not in the version that came before.
     fs::write(source.join("changing.bin"), &changing).unwrap();
     let third = common::run_backup(&source, &blob).await;
     let after_third = common::set_size(&blob);
 
-    // Version 3 costs what publishing a version costs — a snapshot blob and a
-    // commit record — and none of the chunk data, because every chunk it names
-    // was already in the store.
+    // Version 3 costs what publishing a version costs.
+    // That is a snapshot blob and a commit record.
+    // Version 3 costs none of the chunk data, because every chunk it names was
+    // already in the store.
     let reused = after_third - after_second;
     assert!(
         reused * 4 < cold,
@@ -168,8 +179,8 @@ async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
          {cold} bytes to store it the first time, so it was written again"
     );
 
-    // And the version is genuinely restorable, which is the part that matters:
-    // skipping the write is only correct if the bytes were already there.
+    // And the version is genuinely restorable, which is the part that matters.
+    // Skipping the write is only correct if the bytes were already there.
     let destination = dir.path().join("restored");
     common::run_restore(&blob, third.snapshot, &destination).await;
     assert_eq!(fs::read(destination.join("stable.bin")).unwrap(), stable);
@@ -199,11 +210,13 @@ async fn deduplication_does_not_change_the_restored_tree() {
 
 #[tokio::test]
 async fn chunks_are_deduplicated_however_many_are_in_flight() {
-    // Every one of these files is one 64 KiB run of identical bytes, which the
-    // chunker cuts at its maximum size — so each file is exactly one chunk and
-    // all of them hash the same. That is the case worth racing on: the same
-    // content reaching several stores at once, where a deduplication check that
-    // only works in sequence would store a copy per worker.
+    // Every one of these files is one 64 KiB run of identical bytes.
+    // The chunker cuts the run at its maximum size.
+    // So each file is exactly one chunk, and all of them hash the same.
+    // That is the case worth racing on: the same content reaching several stores
+    // at once.
+    // A deduplication check that only works in sequence would store a copy per
+    // worker.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
 
@@ -255,15 +268,16 @@ async fn count_at(blob: &std::path::Path, source: &std::path::Path, concurrency:
 #[tokio::test]
 async fn concurrency_does_not_change_the_snapshot() {
     // Uploads finish in whatever order the store lets them, but the snapshot
-    // must depend only on the order chunks were read in. If this drifts, two
-    // backups of the same tree stop being comparable and the concurrency knob
-    // stops being safe to touch.
+    // must depend only on the order chunks were read in.
+    // If this drifts, two backups of the same tree stop being comparable.
+    // The concurrency knob then stops being safe to touch.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
 
     // Several distinct files plus shared content between them, so a run has
-    // chunks to deduplicate as well as chunks to keep in order. The shared part
-    // is what makes two chunks with the same hash race for the same cell.
+    // chunks to deduplicate as well as chunks to keep in order.
+    // The shared part is what makes two chunks with the same hash race for the
+    // same cell.
     let shared = common::noisy(48 * 1024);
     for i in 0..6 {
         let mut bytes = common::noisy(40 * 1024 + i * 997);
@@ -286,10 +300,11 @@ async fn concurrency_does_not_change_the_snapshot() {
     };
 
     for concurrency in [2, 8, 32] {
-        // Repeated, because the failure this guards against is a race: it takes
-        // a later-read duplicate reaching a hash's cell before the earlier-read
-        // one does, which is a matter of scheduling rather than of input. A
-        // single run can pass by luck, and did.
+        // Repeated, because the failure this guards against is a race.
+        // It takes a later-read duplicate reaching a hash's cell before the
+        // earlier-read one does.
+        // That is a matter of scheduling rather than of input.
+        // A single run can pass by luck, and did.
         for _ in 0..4 {
             let blob = dir.path().join(format!("parallel{concurrency}.bin"));
             let committed = common::run_backup_with(
@@ -306,11 +321,12 @@ async fn concurrency_does_not_change_the_snapshot() {
             // Compared on what the design actually promises.
             //
             // `file_chunks` carries the chunk *indices*, so it transitively pins
-            // the hash-to-index mapping, which is the part that has to be a
-            // function of read order. `chunks` is a bare hash now, so comparing
-            // it directly is comparing content identity: there is no offset in
-            // it any more, and nothing about which store a run happened to write
-            // to can leak into a snapshot.
+            // the hash-to-index mapping.
+            // That mapping is the part that has to be a function of read order.
+            // `chunks` is a bare hash now, so comparing it directly is comparing
+            // content identity.
+            // There is no offset in it any more.
+            // Nothing about which store a run wrote to can leak into a snapshot.
             assert_eq!(
                 serial.file_chunks, parallel.file_chunks,
                 "concurrency {concurrency} laid the chunks out differently"
@@ -329,18 +345,21 @@ async fn concurrency_does_not_change_the_snapshot() {
 
 #[tokio::test]
 async fn no_two_stored_chunks_share_content() {
-    // The invariant the commit order exists to keep: one entry per distinct
-    // content, however many chunks referred to it and in whatever order they
-    // finished storing.
+    // The invariant the commit order exists to keep.
+    // It is one entry per distinct content.
+    // Many chunks may refer to that entry, and they may finish storing in any
+    // order.
     //
-    // Asserted directly rather than inferred, because the bug it guards against
-    // surfaced as a failed backup rather than as a wrong snapshot, so nothing
-    // about the output would have given it away.
+    // Asserted directly rather than inferred.
+    // The bug it guards against surfaced as a failed backup rather than as a
+    // wrong snapshot.
+    // Nothing about the output would have given it away.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
 
     // Constant content, so the chunker cuts at its maximum size and every file
-    // is a single chunk. That maximises how many chunks collide on one hash.
+    // is a single chunk.
+    // That maximises how many chunks collide on one hash.
     let shared = vec![0x5au8; 64 * 1024];
     for name in ["a", "b", "c", "d"] {
         fs::write(source.join(format!("{name}.bin")), &shared).unwrap();

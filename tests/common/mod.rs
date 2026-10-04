@@ -1,8 +1,9 @@
 //! Shared helpers for the integration tests.
 
-// These are plain functions that tests call, so they fall outside the
-// `#[test]`-only exemption in `.clippy.toml`: a helper that cannot read the tree
-// it was asked to describe has nothing useful to report.
+// These are plain functions that tests call.
+// They fall outside the `#[test]`-only exemption in `.clippy.toml`.
+// A helper that cannot read the tree it was asked to describe has nothing useful
+// to report.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![allow(dead_code)]
 
@@ -21,14 +22,15 @@ use lepatch::{
 
 /// An empty source tree inside `dir`, ready to be written into.
 ///
-/// Fifty-one tests opened with the same two lines, and the pair is a unit: a
-/// directory that has not had its `source` subdirectory created is a thing every
-/// one of them then had to remember. Creating it here means a test that wants a
-/// tree cannot forget to, and a change to what a "source tree" is — a name, a
-/// pre-created subdirectory — is one edit rather than fifty-one.
+/// Fifty-one tests opened with the same two lines, and the pair is a unit.
+/// A directory that has not had its `source` subdirectory created is a thing every
+/// one of them then had to remember.
+/// Creating it here means a test that wants a tree cannot forget to.
+/// A "source tree" is a name and a pre-created subdirectory.
+/// A change to either is one edit rather than fifty-one.
 ///
-/// Takes a path rather than a `TempDir`, because the tests that pass a fixture
-/// down to a helper have only a `&Path` by then.
+/// Takes a path rather than a `TempDir`.
+/// The tests that pass a fixture down to a helper have only a `&Path` by then.
 pub(crate) fn source(dir: &Path) -> PathBuf {
     let source = dir.join("source");
     fs::create_dir_all(&source).expect("a source directory in a fresh temp dir");
@@ -52,10 +54,11 @@ pub(crate) fn len_of(bytes: &[u8]) -> u64 {
 
 /// Pseudo-random bytes with no long runs.
 ///
-/// Deliberately not a repeating pattern: content-defined chunking finds
-/// boundaries where the data changes, so a constant or short-cycle byte stream
-/// either produces one enormous chunk or collapses to a single deduplicated
-/// entry, and neither exercises what these tests are for.
+/// Deliberately not a repeating pattern.
+/// Content-defined chunking finds boundaries where the data changes.
+/// A constant byte stream produces one enormous chunk.
+/// A short-cycle byte stream collapses to a single deduplicated entry.
+/// Neither exercises what these tests are for.
 pub(crate) fn noisy(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| {
@@ -74,16 +77,20 @@ pub(crate) fn noisy(len: usize) -> Vec<u8> {
 /// Pseudo-random bytes that are not a prefix of [`noisy`], one distinct stream per
 /// `tag`.
 ///
-/// [`noisy`] is a *function of position only*, so `noisy(n)` is the first n bytes
-/// of `noisy(m)` for any larger m. A tree built from it is therefore degenerate in
-/// two ways at once: every file is a prefix of the next, so deduplication collapses
-/// far more than it would on real data, and rewriting a file by asking for a
-/// shorter `noisy` leaves the same byte stream truncated, which is the single most
-/// favourable thing that can happen to content-defined chunking.
+/// [`noisy`] is a *function of position only*.
+/// So `noisy(n)` is the first n bytes of `noisy(m)` for any larger m.
+/// A tree built from it is therefore degenerate in two ways at once.
+/// Every file is a prefix of the next.
+/// Deduplication then collapses far more than it would on real data.
+/// Rewriting a file by asking for a shorter `noisy` leaves the same byte stream
+/// truncated.
+/// That truncation is the single most favourable thing that can happen to
+/// content-defined chunking.
 ///
-/// Tests about *deltas* need a tree where those two shortcuts are unavailable, so
-/// this splices a per-tag block over the second half of the stream: no file is a
-/// prefix of another, and a rewrite is new content rather than a truncation.
+/// Tests about *deltas* need a tree where those two shortcuts are unavailable.
+/// This splices a per-tag block over the second half of the stream.
+/// No file is a prefix of another.
+/// A rewrite is new content rather than a truncation.
 pub(crate) fn untagged_stream(tag: u8, len: usize) -> Vec<u8> {
     let mut bytes = noisy(len);
     let block = blake3::hash(&[tag]).to_hex().to_string().into_bytes();
@@ -101,14 +108,15 @@ pub(crate) enum Entry {
     File(Vec<u8>),
     /// A symbolic link and the raw text of its target.
     Symlink(PathBuf),
-    /// A hard link, identified by the target it shares an inode with.
+    /// A hard link, with the path that shares its inode.
     HardLink(PathBuf),
     /// A directory.
     Dir,
 }
 
-/// Recursively describe `root`, resolving hard links to the first path that
-/// shares their inode so that link structure is compared rather than contents.
+/// Describe `root` recursively, and resolve hard links to the first path that
+/// shares their inode.
+/// The comparison then uses link structure rather than contents.
 pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
     fn walk(
         root: &Path,
@@ -177,9 +185,10 @@ pub(crate) fn describe(root: &Path) -> BTreeMap<PathBuf, Entry> {
 /// Total bytes of the set at `base`, across every segment.
 ///
 /// A set is several files, so a test that wants to know how much a run added has
-/// to add them up. Deliberately sums the whole set rather than one segment: a
-/// backup that rolled over grew by more than a segment, and a test measuring only
-/// the last one would call that no growth at all.
+/// to add them up.
+/// Deliberately sums the whole set rather than one segment.
+/// A backup that rolled over grew by more than a segment.
+/// A test measuring only the last one would call that no growth at all.
 pub(crate) fn set_size(base: &Path) -> u64 {
     IndexSet::new(base)
         .segments()
@@ -191,8 +200,10 @@ pub(crate) fn set_size(base: &Path) -> u64 {
 
 /// Back up `source` into a fresh store and return what was committed.
 ///
-/// There is no base snapshot to pass: deduplication is the store's own business,
-/// so a run hands it every chunk it read and the store decides what is new.
+/// There is no base snapshot to pass.
+/// Deduplication is the store's own business.
+/// A run hands the store every chunk it read.
+/// The store decides what is new.
 pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
     run_backup_with(source, blob, Options::default()).await
 }
@@ -209,9 +220,10 @@ pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -
 
 /// Back up `source` into a store with a given segment limit.
 ///
-/// The limit belongs to the store rather than to the run — it is a property of
-/// the files on disk — so a test that wants a small one has to open the store
-/// itself, which is what this does.
+/// The limit belongs to the store rather than to the run.
+/// The limit is a property of the files on disk.
+/// A test that wants a small limit has to open the store itself.
+/// This function opens the store itself.
 pub(crate) async fn run_backup_limited(
     source: &Path,
     blob: &Path,
@@ -231,9 +243,9 @@ pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Pat
 
 /// Back up `source` into a store with a given compression policy.
 ///
-/// Compression is a property of the *store* rather than of the run's options,
-/// because it is the store that frames and writes each record, so this opens the
-/// store itself rather than going through [`run_backup`].
+/// Compression is a property of the *store* rather than of the run's options.
+/// The store frames and writes each record.
+/// So this opens the store itself rather than going through [`run_backup`].
 pub(crate) async fn run_backup_compressed(
     source: &Path,
     blob: &Path,
@@ -254,17 +266,20 @@ pub(crate) async fn run_restore_version(blob: &Path, destination: &Path, version
 
 /// Assert that two trees are identical, naming every difference.
 ///
-/// Shared by the round-trip tests and the apply tests, which assert the same thing
-/// by different routes: `assert_round_trip` is "back this up and get it back",
-/// and an apply test is "bring this directory up to that version". Both end here.
+/// Shared by the round-trip tests and the apply tests.
+/// Both assert the same thing by different routes.
+/// `assert_round_trip` is "back this up and get it back".
+/// An apply test is "bring this directory up to that version".
+/// Both end here.
 pub(crate) fn assert_same_tree(left: &Path, right: &Path) {
     let before = describe(left);
     let after = describe(right);
 
     let mut problems = Vec::new();
     for (path, expected) in &before {
-        // The comparison is exact; only the failure message renders the path
-        // lossily, which is the right trade for readability.
+        // The comparison is exact.
+        // Only the failure message renders the path lossily.
+        // That is the right trade for readability.
         match after.get(path) {
             Some(actual) if actual == expected => {}
             Some(actual) => {

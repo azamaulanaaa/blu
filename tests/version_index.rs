@@ -1,18 +1,20 @@
 //! The per-version index file, and the rule that governs it: it is a cache, so it
 //! is checked rather than believed.
 //!
-//! Every test here can be stated as one sentence: an index file is allowed to be
-//! wrong, and the question is only ever "wrong in which direction, and does
-//! anything act on it".
+//! Every test here can be stated as one sentence.
+//! An index file is allowed to be wrong.
+//! The question is only ever which way it is wrong, and whether anything acts
+//! on it.
 //!
 //! # What this file is and is not for
 //!
-//! It is not a fast path for a restore. A restore needs every chunk a snapshot
-//! names, locating those is the blob index, and only a scan builds that — so a
-//! caller wanting one version still pays for the scan. What the file removes is
-//! the scan for the *version list*, which is what `lepatch versions` and "how far
-//! does this set go" are, and both are O(versions) in file names rather than
-//! O(records) in the whole set.
+//! It is not a fast path for a restore.
+//! A restore needs every chunk a snapshot names.
+//! Locating those is the blob index, and only a scan builds that.
+//! So a caller wanting one version still pays for the scan.
+//! What the file removes is the scan for the *version list*.
+//! That is what `lepatch versions` and "how far does this set go" are.
+//! Both are O(versions) in file names rather than O(records) in the whole set.
 //!
 //! So the tests below are about safety, not speed, and the one that matters most
 //! is `an_index_cannot_invent_a_version`.
@@ -160,10 +162,10 @@ async fn every_published_version_gets_an_index() {
 
 /// The fast path agrees with the slow one.
 ///
-/// This is the property the whole file exists for, so it is checked against the
-/// scan rather than against itself: the index's answer and the store's answer must
-/// be the same snapshot, and resolving must be confirmed rather than merely
-/// accepted.
+/// This is the property the whole file exists for.
+/// So the test checks the fast path against the scan rather than against itself.
+/// The index's answer and the store's answer must be the same snapshot.
+/// Resolving must be confirmed rather than merely accepted.
 #[tokio::test]
 async fn a_resolve_agrees_with_the_scan() {
     let dir = tempfile::tempdir().unwrap();
@@ -222,9 +224,10 @@ async fn a_corrupt_index_is_absent() {
 
 /// An index from another set is refused.
 ///
-/// The dangerous direction. A stale index that under-reaches costs a scan; one
-/// that over-reaches would answer for a version this set does not have, and that
-/// is the case the whole "never believed" rule exists for.
+/// The dangerous direction.
+/// A stale index that under-reaches costs a scan.
+/// An index that over-reaches would answer for a version this set does not have.
+/// That is the case the whole "never believed" rule exists for.
 #[tokio::test]
 async fn an_index_naming_a_version_this_set_does_not_hold_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -250,10 +253,11 @@ async fn an_index_naming_a_version_this_set_does_not_hold_is_refused() {
 
 /// An index whose segment does not hold the snapshot it names is refused.
 ///
-/// This is the check that makes the file safe to keep. Without it, an index copied
-/// between sets — or left behind by a set that was replaced — would name a segment
-/// that exists and a snapshot that is not in it, and the read would return
-/// whatever is at that offset.
+/// This is the check that makes the file safe to keep.
+/// Without it, an index copied between sets would name a segment that exists and a
+/// snapshot that is not in it.
+/// The read would then return whatever is at that offset.
+/// An index left behind by a replaced set does the same.
 #[tokio::test]
 async fn an_index_naming_a_snapshot_the_segment_does_not_hold_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -302,9 +306,9 @@ async fn an_index_naming_a_missing_segment_is_refused() {
 
 /// The segment an index names is the one the snapshot is really in.
 ///
-/// The check above refuses a *wrong* index; this asserts the positive case is
-/// picking the right segment rather than always resolving through segment 0 and
-/// relying on the fallback.
+/// The check above refuses a *wrong* index.
+/// This asserts the positive case is picking the right segment.
+/// It also asserts the resolve is not always falling back through segment 0.
 #[tokio::test]
 async fn an_index_names_the_segment_the_snapshot_is_in() {
     let dir = tempfile::tempdir().unwrap();
@@ -312,10 +316,12 @@ async fn an_index_names_the_segment_the_snapshot_is_in() {
 
     // A set with a small limit, so the segments genuinely differ.
     //
-    // This used to build a second, default-limit set first — seven backups, about
-    // 1.4 MB of chunking — and then assert nothing about it, which the compiler
-    // had to be told about explicitly with a `let _ = set;`. Every assertion here
-    // is about the set with the small limit, and that is the only one there is.
+    // This used to build a second, default-limit set first.
+    // That was seven backups, about 1.4 MB of chunking.
+    // The test then asserted nothing about it.
+    // The compiler had to be told about that explicitly with a `let _ = set;`.
+    // Every assertion here is about the set with the small limit.
+    // That is the only set there is.
     let rolled = dir.path().join("rolled");
     let source = common::source(dir.path());
     for i in 0..4 {
@@ -341,11 +347,13 @@ async fn an_index_names_the_segment_the_snapshot_is_in() {
 
     // And the resolve is confirmed rather than falling back.
     //
-    // An equality, not a `matches!`. The pattern form throws away `segment` and
-    // `snapshot`, so an index resolving to the wrong segment passed — in the one
-    // test whose entire claim is that it resolves to the right one. What is
-    // asserted here is what each version's index already said, checked against
-    // where the store actually holds the snapshot.
+    // An equality, not a `matches!`.
+    // The pattern form throws away `segment` and `snapshot`.
+    // So an index resolving to the wrong segment passed.
+    // That happened in the one test whose entire claim is that it resolves to the
+    // right one.
+    // What is asserted here is what each version's index already said, checked
+    // against where the store actually holds the snapshot.
     for v in 1..=4 {
         let index = VersionIndex::read(&rolled_set.index_path(v))
             .unwrap_or_else(|| panic!("version {v} should have an index"));
@@ -365,10 +373,11 @@ async fn an_index_names_the_segment_the_snapshot_is_in() {
 /// The index files can all be deleted and rebuilt.
 ///
 /// This is the property that makes them a cache rather than a second source of
-/// truth, and it is the operation the previous layout had no equivalent of:
-/// there, an index file was the only record that a version existed, so deleting
-/// one deleted the backup. Here the commit records are the record, and the files
-/// are derived from them.
+/// truth.
+/// It is also the operation the previous layout had no equivalent of.
+/// There, an index file was the only record that a version existed.
+/// Deleting one there deleted the backup.
+/// Here the commit records are the record, and the files are derived from them.
 #[tokio::test]
 async fn the_index_files_can_all_be_deleted_and_rebuilt() {
     let dir = tempfile::tempdir().unwrap();
@@ -414,7 +423,8 @@ async fn the_index_files_can_all_be_deleted_and_rebuilt() {
 /// A rebuilt index resolves, so it is not merely present but correct.
 ///
 /// A rebuild that wrote plausible files pointing at the wrong commit record would
-/// pass every test above except this one, which is why it is separate.
+/// pass every test above except this one.
+/// That is why this one is separate.
 #[tokio::test]
 async fn a_rebuilt_index_resolves_to_the_right_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -447,8 +457,9 @@ async fn a_rebuilt_index_resolves_to_the_right_commit() {
 
 /// Nothing in this file can make a set report a version it does not hold.
 ///
-/// The property every other test is a case of, and the reason the store's commit
-/// records — not these files — are the record of what exists.
+/// The property every other test is a case of.
+/// It is also the reason the store's commit records are the record of what
+/// exists, and not these files.
 #[tokio::test]
 async fn an_index_cannot_invent_a_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -482,27 +493,33 @@ async fn an_index_cannot_invent_a_version() {
 
 /// An index path that is a directory is no index, and the set still reads.
 ///
-/// The doc on `VersionIndex::read` used to call this out as the one failure it
-/// did *not* swallow: "a directory that cannot be read at all is not swallowed —
-/// that is a problem with the set". The implementation is `fs::read(path).ok()?`,
-/// which discards the `io::Error` whole, so a directory and a permission problem
-/// both arrive as `None` and no distinction is made. The sentence described an
-/// intention the code never had.
+/// The doc on `VersionIndex::read` used to call this out as the one failure it did
+/// *not* swallow.
+/// The doc said: "a directory that cannot be read at all is not swallowed, because
+/// that is a problem with the set".
+/// The implementation is `fs::read(path).ok()?`, which discards the `io::Error`
+/// whole.
+/// So a directory and a permission problem both arrive as `None`, and no
+/// distinction is made.
+/// The sentence described an intention the code never had.
 ///
-/// An index file is a cache. One that cannot be read — for any reason, including
-/// being the wrong type of file entirely — is one to rebuild, and rebuilding is
-/// always available, so refusing the whole set over it would be the wrong answer
-/// anyway. The set's own problems are reported where the set is read: listing the
-/// directory cannot read, or the store's scan refusing to open.
+/// An index file is a cache.
+/// One that cannot be read is one to rebuild, for any reason.
+/// Being the wrong type of file entirely counts as a reason.
+/// Rebuilding is always available, so refusing the whole set over it would be the
+/// wrong answer anyway.
+/// The set's own problems are reported where the set is read.
+/// That is where listing a directory cannot read, or the store's scan refuses to
+/// open.
 #[tokio::test]
 async fn an_index_path_that_is_a_directory_is_treated_as_no_index() {
     let dir = tempfile::tempdir().unwrap();
     let (blob, _store) = set_with_versions(dir.path(), 3).await;
     let set = IndexSet::new(&blob);
 
-    // What each version's own index says, read from the files rather than
-    // worked out — the snapshot hash is the hash of the snapshot, not of the
-    // version number.
+    // What each version's own index says, read from the files rather than worked
+    // out.
+    // The snapshot hash is the hash of the snapshot, not of the version number.
     let indexed: Vec<VersionIndex> = (1..=3)
         .map(|v| {
             VersionIndex::read(&set.index_path(v))

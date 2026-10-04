@@ -8,11 +8,13 @@ use common::assert_round_trip;
 use lepatch::layout::IndexSet;
 
 /// A filename that is not valid UTF-8 must survive the round trip rather than
-/// aborting the whole backup, which is what `PathBuf`'s default `Serialize`
-/// impl did when the snapshot encoding was delegated to a serialisation crate.
-/// Both are gone: the encoding is hand-written and the path is written as its
-/// raw bytes (`Writer::path` in `src/metadata/codec.rs`), so this test now
-/// guards a property rather than a regression.
+/// aborting the whole backup.
+/// `PathBuf`'s default `Serialize` impl did abort the backup when the snapshot
+/// encoding was delegated to a serialisation crate.
+/// Both of those are gone.
+/// The encoding is hand-written and the path is written as its raw bytes
+/// (`Writer::path` in `src/metadata/codec.rs`).
+/// So this test now guards a property rather than a regression.
 #[cfg(unix)]
 #[tokio::test]
 async fn round_trip_preserves_paths_that_are_not_valid_utf8() {
@@ -38,25 +40,32 @@ async fn round_trip_preserves_paths_that_are_not_valid_utf8() {
 
 /// Where a path is text, a name the encoding cannot hold is refused.
 ///
-/// The unix arm above is the interesting one and gets most of the attention,
-/// because on unix a path is a byte string and writing the bytes round-trips
-/// exactly. This is the other platform, and it had the opposite behaviour.
+/// The unix arm above is the interesting one and gets most of the attention.
+/// On unix a path is a byte string and writing the bytes round-trips exactly.
+/// This is the other platform, and it had the opposite behaviour.
 ///
-/// `Writer::path` used to reach for `to_string_lossy` off unix. That does not
-/// fail — it replaces whatever it cannot represent with `U+FFFD` and returns a
-/// perfectly good `&str`. So two names differing only in an unrepresentable byte
-/// would encode to *the same bytes*, and a restore would write both at one place,
-/// having recorded a path that was never on disk. The decoder was strict while the
-/// encoder was lossy, which is the worst pairing: the lossy half is the one nobody
-/// sees.
+/// `Writer::path` used to reach for `to_string_lossy` off unix.
+/// That call does not fail.
+/// It replaces whatever it cannot represent with `U+FFFD` and returns a perfectly
+/// good `&str`.
+/// So two names differing only in an unrepresentable byte would encode to *the
+/// same bytes*, and a restore would write both at one place.
+/// The restore would then have recorded a path that was never on disk.
+/// The decoder was strict while the encoder was lossy, which is the worst
+/// pairing.
+/// The lossy half is the one nobody sees.
 ///
-/// Now it refuses, and says why. A tree the format cannot represent is refused
-/// at the point of encoding, which is where a person is told.
+/// Now the encoder refuses, and says why.
+/// A tree the format cannot represent is refused at the point of encoding.
+/// That is where a person is told.
 ///
-/// This test cannot run on unix — there, the same tree round-trips, which is the
-/// test above. It was written against the `not(unix)` arm by compiling that arm
-/// on unix (`#[cfg(not(unix))]` → `#[cfg(all())]` in `src/metadata/codec.rs`) and
-/// running it, so the code path is verified even though CI here never executes it.
+/// This test cannot run on unix, because the same tree round-trips there.
+/// That case is the test above.
+/// The test was written against the `not(unix)` arm by compiling that arm on unix.
+/// The change was `#[cfg(not(unix))]` to `#[cfg(all())]` in
+/// `src/metadata/codec.rs`.
+/// Running it that way verifies the code path, even though CI here never executes
+/// it.
 #[cfg(not(unix))]
 #[tokio::test]
 async fn a_path_this_platform_cannot_represent_is_refused() {
@@ -68,9 +77,9 @@ async fn a_path_this_platform_cannot_represent_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
 
-    // A file name that is not valid UTF-8, built the way Windows allows: valid
-    // UTF-16 with an unpaired surrogate, which is a legal name there and
-    // impossible to express as text.
+    // A file name that is not valid UTF-8, built the way Windows allows.
+    // It is valid UTF-16 with an unpaired surrogate.
+    // Such a name is legal there and impossible to express as text.
     let raw = {
         #[cfg(windows)]
         {
@@ -108,14 +117,16 @@ async fn a_path_this_platform_cannot_represent_is_refused() {
 /// A segment's path names the set it belongs to, so either spelling opens the
 /// same set.
 ///
-/// `photos.0000.bin` is the name a directory listing shows and the one a person
-/// copies out of it. If only `photos` worked, the obvious thing to type would be
-/// the thing that does not, and the resulting error — a new empty set beside the
-/// old one — is the kind that costs an afternoon.
+/// `photos.0000.bin` is the name a directory listing shows.
+/// It is also the name a person copies out of that listing.
+/// If only `photos` worked, the obvious thing to type would be the thing that
+/// does not.
+/// The resulting error, a new empty set beside the old one, is the kind that
+/// costs an afternoon.
 ///
 /// What would falsify it: a name that is not shaped like a segment being
-/// unwrapped anyway, which is the other half of this rule and is tested beside
-/// it.
+/// unwrapped anyway.
+/// That is the other half of this rule, and it is tested beside it.
 #[test]
 fn a_segment_path_names_the_set_it_belongs_to() {
     use lepatch::layout::IndexSet;
@@ -139,11 +150,13 @@ fn a_segment_path_names_the_set_it_belongs_to() {
         ("photos.000.bin", "photos.000.bin"),
         ("photos.000a.bin", "photos.000a.bin"),
         (".0000.bin", ".0000.bin"),
-        // A base whose last character is two bytes, so the tail's arithmetic
-        // counts four bytes off a three-character name and lands in the middle of
-        // it. Left exactly as it was given: unwrapping it needs a byte boundary
-        // the name does not have, and a panic here is what a set named by a
-        // person rather than a script would get.
+        // A base whose last character is two bytes.
+        // The tail's arithmetic counts four bytes off a three-character name and
+        // lands in the middle of it.
+        // The name is left exactly as it was given.
+        // Unwrapping it needs a byte boundary the name does not have.
+        // A panic here is what a set named by a person rather than a script would
+        // get.
         ("café0000.bin", "café0000.bin"),
         ("café.0000.bin", "café"),
     ] {
@@ -157,16 +170,18 @@ fn a_segment_path_names_the_set_it_belongs_to() {
 
 /// The two spellings must be one set on disk, not two.
 ///
-/// Unwrapping the name is only half of it: what a backup writes has to land where
-/// the other spelling looks, or `backup src photos` followed by
-/// `restore out photos.0000.bin` would be two sets that each think they hold
-/// nothing.
+/// Unwrapping the name is only half of it.
+/// What a backup writes has to land where the other spelling looks.
+/// Otherwise `backup src photos` followed by `restore out photos.0000.bin` would
+/// be two sets that each think they hold nothing.
 ///
-/// Which is the scenario this used to describe and not run: it wrote the same
-/// spelling into two different directories and asserted the same two things twice,
-/// so a set written as `photos` and read as `photos.0000.bin` — the case the
-/// rule exists for — was never put through a backup at all. It is now the only
-/// thing here: one set, written one way and read the other.
+/// This used to describe that scenario and not run it.
+/// The test wrote the same spelling into two different directories and asserted
+/// the same two things twice.
+/// So a set written as `photos` and read as `photos.0000.bin` was never put
+/// through a backup at all.
+/// That is the case the rule exists for.
+/// It is now the only thing here: one set, written one way and read the other.
 #[tokio::test]
 async fn a_backup_named_by_a_segment_path_lands_in_that_set() {
     let dir = tempfile::tempdir().unwrap();
@@ -183,8 +198,9 @@ async fn a_backup_named_by_a_segment_path_lands_in_that_set() {
     // Written as the plain name, which is what a person says.
     common::run_backup(&source, &parent.join("photos")).await;
 
-    // And read back as the name a directory listing shows, which is the other
-    // thing a person says and the one a copy out of the directory brings with it.
+    // And read back as the name a directory listing shows.
+    // That is the other thing a person says.
+    // It is also the name a copy out of the directory brings with it.
     let by_name = parent.join("photos");
     let by_segment = parent.join("photos.0000.bin");
     let named = IndexSet::new(&by_name);
@@ -206,8 +222,9 @@ async fn a_backup_named_by_a_segment_path_lands_in_that_set() {
         "and the version the backup published, found through the other spelling"
     );
 
-    // A restore naming the segment reads that version out of it, which is the
-    // whole claim: the bytes land where the version 1 the backup committed is.
+    // A restore naming the segment reads that version out of it.
+    // That is the whole claim.
+    // The bytes land where the version 1 the backup committed is.
     let restored = dir.path().join("restored");
     common::run_restore_version(&by_segment, &restored, 1).await;
     common::assert_same_tree(&source, &restored);

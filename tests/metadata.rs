@@ -17,8 +17,9 @@ fn sample() -> Snapshot {
         },
     });
     // A chunk is the BLAKE3 of its contents, and that is also how the store
-    // finds it — so a snapshot records content identity and nothing about where
-    // the bytes happen to sit in a file.
+    // finds it.
+    // So a snapshot records content identity and nothing about where the bytes
+    // happen to sit in a file.
     snapshot.chunks.push(BlobId::from_bytes([7u8; 32]));
     snapshot.file_chunks.push(metadata::FileChunk {
         chunk_index: 0,
@@ -36,19 +37,21 @@ fn snapshot_round_trips_through_the_framed_encoding() {
 
     assert_eq!(&encoded[..metadata::MAGIC.len()], metadata::MAGIC);
 
-    // One comparison, not five. `Snapshot` could not be compared at all before,
-    // so this test compared its fields one at a time and would have silently
-    // stopped checking two of them the day a sixth was added.
+    // One comparison, not five.
+    // `Snapshot` could not be compared at all before.
+    // So this test compared its fields one at a time.
+    // That test would have silently stopped checking two of them the day a sixth
+    // was added.
     let decoded = Snapshot::try_from(encoded.as_slice()).unwrap();
     assert_eq!(decoded, sample());
 }
 
 /// The version in the frame is this build's, whatever the snapshot contains.
 ///
-/// There is no field to set any more: the version belongs to the encoder. The
-/// frame still carries it, because that is the format, and `TryFrom` still
-/// checks it — so a blob written by another build's layout is refused rather
-/// than misread.
+/// There is no field to set any more: the version belongs to the encoder.
+/// The frame still carries it, because that is the format.
+/// `TryFrom` still checks it.
+/// So a blob written by another build's layout is refused rather than misread.
 #[test]
 fn the_frame_carries_this_builds_version() {
     let encoded = sample().to_bytes().expect("encodes");
@@ -108,10 +111,13 @@ fn a_corrupt_body_is_reported_as_a_decode_error() {
     encoded[last] ^= 0xff;
 
     // An equality rather than a `matches!`, now that the error is comparable.
-    // Which it is worth knowing: flipping the last byte of a snapshot makes the
-    // final value's length run past the end, so this is a truncation and not the
-    // trailing-bytes case a reader would guess. A `matches!(.., Err(Decode(_)))`
-    // could not tell those apart, which is the whole reason for the change.
+    // It is worth knowing which error this produces.
+    // Flipping the last byte of a snapshot makes the final value's length run
+    // past the end.
+    // So this is a truncation and not the trailing-bytes case a reader would
+    // guess.
+    // A `matches!(.., Err(Decode(_)))` could not tell those apart, and that is the
+    // whole reason for the change.
     assert_eq!(
         Snapshot::try_from(encoded.as_slice()),
         Err(Error::Decode(Malformed(
@@ -125,9 +131,9 @@ fn trailing_bytes_after_a_snapshot_are_refused_rather_than_ignored() {
     let mut encoded = sample().to_bytes().expect("encodes");
     encoded.push(0);
 
-    // The other half of the case above, and the reason it needed naming: two
-    // different malformations that a caller would otherwise have to tell apart by
-    // reading the message.
+    // The other half of the case above, and the reason it needed naming.
+    // These are two different malformations that a caller would otherwise have to
+    // tell apart by reading the message.
     assert_eq!(
         Snapshot::try_from(encoded.as_slice()),
         Err(Error::Decode(Malformed("the snapshot has trailing bytes"))),
@@ -155,9 +161,9 @@ fn timestamps_round_trip_on_both_sides_of_the_epoch() {
 
 #[test]
 fn an_extreme_timestamp_does_not_wrap_into_the_opposite_of_itself() {
-    // A negative `secs` must stay negative on the way back, or the pre-epoch
-    // branch subtracts a huge unsigned duration from the epoch and lands
-    // billions of years in the future.
+    // A negative `secs` must stay negative on the way back.
+    // Otherwise the pre-epoch branch subtracts a huge unsigned duration from the
+    // epoch and lands billions of years in the future.
     let before_epoch = metadata::Timestamp {
         secs: -1_000_000_000,
         nanos: 500,
@@ -177,11 +183,13 @@ fn an_extreme_timestamp_does_not_wrap_into_the_opposite_of_itself() {
 
 /// A blob written by a pre-release build must be reported, not misread.
 ///
-/// Version 1 was bincode — fixed-width little endian. Version 2 introduced the
-/// hand-written encoding, and version 3 changed what a chunk is named by. They
-/// share a magic prefix and nothing else, so a decoder that guessed rather than
-/// checked would turn an old backup set into a plausible-looking and completely
-/// wrong one. This is the test that says it does not.
+/// Version 1 was bincode, which is fixed-width little endian.
+/// Version 2 introduced the hand-written encoding.
+/// Version 3 changed what a chunk is named by.
+/// They share a magic prefix and nothing else.
+/// So a decoder that guessed rather than checked would turn an old backup set
+/// into a plausible-looking and completely wrong one.
+/// This is the test that says it does not.
 #[test]
 fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
     let mut encoded = sample().to_bytes().expect("encodes");
@@ -201,15 +209,16 @@ fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
 
 /// The encoded form should not have the same size as the old one by accident.
 ///
-/// Not a strong property on its own, but a sanity check that the header really
-/// is being written and the body really is variable width.
+/// Not a strong property on its own.
+/// It is a sanity check that the header really is being written and the body
+/// really is variable width.
 #[test]
 fn the_encoding_is_compact_for_small_numbers() {
     let snapshot = sample();
     let encoded = snapshot.to_bytes().expect("encodes");
 
-    // A path, a count and a handful of small indices should cost tens of bytes,
-    // not the ~150 a fixed-width encoding of the same values would.
+    // A path, a count and a handful of small indices should cost tens of bytes.
+    // A fixed-width encoding of the same values would cost about 150 bytes.
     assert!(
         encoded.len() < 120,
         "expected a compact encoding, got {} bytes",

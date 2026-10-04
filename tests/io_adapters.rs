@@ -48,8 +48,8 @@ async fn a_zero_limit_yields_nothing() {
 async fn a_reader_offered_no_space_does_not_poison_the_inner_reader() {
     let data = bytes(100);
 
-    // Polling with a buffer that has no room must consume nothing and must
-    // leave the inner reader at the start.
+    // Polling with a buffer that has no room must consume nothing.
+    // It must also leave the inner reader at the start.
     let mut reader = SliceAsyncReader::new(Cursor::new(data.clone()), 50);
     let mut empty: [u8; 0] = [];
     let filled = reader.read(&mut empty).await.unwrap();
@@ -105,9 +105,10 @@ async fn a_slice_writer_stops_at_its_limit() {
     let mut sink = Vec::new();
     {
         let mut writer = SliceAsyncWriter::new(&mut sink, 10);
-        // `write_all` would fail with `WriteZero` once the limit is reached,
-        // which is the documented reason this type is for `copy` rather than
-        // for `write_all`. Drive it the way `copy` does instead.
+        // `write_all` would fail with `WriteZero` once the limit is reached.
+        // That failure is the documented reason this type is for `copy` rather
+        // than for `write_all`.
+        // Drive it the way `copy` does instead.
         let written = writer.write(&bytes(100)).await.unwrap();
         assert_eq!(written, 10);
         assert_eq!(writer.remaining(), 0);
