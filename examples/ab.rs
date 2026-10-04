@@ -1,13 +1,14 @@
 //! Throughput measurement that survives a shared machine.
 //!
 //! `cargo bench` (criterion) is the right tool for the component costs in
-//! `benches/hotpath.rs`, and for the `concurrency_*` ratios in
+//! `benches/hotpath.rs`.
+//! It is also the right tool for the `concurrency_*` ratios in
 //! `benches/throughput.rs`, which are measured inside a single run under
-//! identical conditions. It is the wrong tool for answering "is this change
-//! faster?", because its confidence interval only covers sampling noise within
-//! one run.
+//! identical conditions.
+//! It is the wrong tool for answering "is this change faster?".
+//! Its confidence interval only covers sampling noise within one run.
 //!
-//! Measured on this machine, four cores with a background load average above 2:
+//! Measured on this machine, four cores with a background load average above 2.
 //!
 //! ```text
 //!                              within-run interval   across-run shift
@@ -18,25 +19,28 @@
 //! ```
 //!
 //! So criterion reported a 0.9% interval around a number that then moved 16% on
-//! the next run, and would have called that "no change". Anything under about
-//! 20% is not measurable here by comparing two separate runs.
+//! the next run.
+//! Criterion would have called that "no change".
+//! Anything under about 20% is not measurable here by comparing two separate
+//! runs.
 //!
-//! Two things fix that, and both are in this file:
+//! Two things fix that. Both are in this file.
 //!
 //! * **Minimum, not mean.** Interference can only ever make a run slower, never
-//!   faster, so the fastest of N runs is the closest observation to the
+//!   faster. The fastest of N runs is the closest observation to the
 //!   uncontaminated cost. On the same measurements the minimum held steady
 //!   across configurations (59.6 / 58.8 / 63.4 ms) where the mean swung 63.6 to
 //!   84.4 ms.
-//! * **Interleaving.** Variants alternate within one process rather than being
-//!   measured in separate runs, so a slow patch from a neighbour lands on both
-//!   of them instead of on whichever one happened to be running.
+//! * **Interleaving.** Variants alternate within one process. They are not
+//!   measured in separate runs. A slow patch from a neighbour then lands on both
+//!   of them, not on the one that happened to be running.
 //!
-//! And one thing that does not work, recorded here so nobody repeats it:
+//! And one thing does not work. It is recorded here so nobody repeats it.
 //! **pinning the CPU with `taskset` makes it worse.** Constraining the process to
-//! a subset of the cores guarantees sharing those specific cores with whatever
-//! else is on the box, and the scheduler's ability to drift onto a quiet core is
-//! worth more than the migration it costs:
+//! a subset of the cores forces sharing. Those specific cores then run the other
+//! programs too.
+//! The scheduler can drift onto a quiet core. That move is worth more than the
+//! migration it costs.
 //!
 //! ```text
 //!                 max/min   median/min
@@ -47,13 +51,14 @@
 //!
 //! # What this harness's own numbers are worth
 //!
-//! **The ratios, yes. The absolute throughput, no — it is well above the real
-//! binary's, and the gap is unexplained.** On a 50 MiB tree, byte for byte the
-//! same, with an identical `Options::default()` on four cores: the binary takes
-//! 0.14s, this takes 0.36s, with about half again as much CPU. Ruled out by
-//! measurement, not by argument: the fixture, the data, the store's location, the
-//! number of trees left resident, the concurrency, the worker count, building
-//! the fixture before any runtime exists, and letting writeback settle.
+//! **The ratios, yes. The absolute throughput, no. It is well above the
+//! real binary's. The gap is unexplained.** On a 50 MiB tree, byte for byte
+//! the same, with an identical `Options::default()` on four cores: the binary
+//! takes 0.14s. This takes 0.36s, with about half again as much CPU.
+//! Ruled out by measurement, not by argument: the fixture, the data, the store's
+//! location, and the number of trees left resident. Ruled out as well: the
+//! concurrency, the worker count, building the fixture before any runtime exists,
+//! and letting writeback settle.
 //!
 //! Every variant is measured the same way here, so a comparison between two
 //! configurations is sound and is what this file is for. But the throughput it
@@ -61,7 +66,7 @@
 //!
 //! # Use
 //!
-//! Compare configurations, interleaved, in one process:
+//! Compare configurations, interleaved, in one process.
 //!
 //! ```console
 //! $ cargo run --release --example ab -- compare
@@ -101,9 +106,10 @@ const ROUNDS: usize = 9;
 const NOISE_FLOOR: f64 = 0.20;
 
 // The byte generator lives in its own file so `tests/fixtures.rs` can check the
-// properties that guard it. An example is the first thing anyone deletes, and
-// three property tests used to live here under `#[cfg(test)]` — a target
-// `cargo test` does not run.
+// properties that guard it.
+// An example is the first thing anyone deletes, and three property tests used to
+// live here under `#[cfg(test)]`.
+// `cargo test` does not run that target.
 #[path = "../tests/fixtures/ab.rs"]
 mod fixture;
 
@@ -114,12 +120,14 @@ use fixture::noisy;
 /// `shared` is a fraction, and it is the single most consequential thing about
 /// this fixture, so it is a parameter rather than a constant.
 ///
-/// It matters because deduplication moves work *out of the store*. Half-shared
-/// files still have to be read and hashed in full, but only half their bytes
-/// reach the store, so the store is a smaller share of the run and changes to it
-/// look smaller than they are. Measured on this machine: removing the store's
-/// write lock was worth 2.5x on a tree that shares nothing and 1.1x on one that
-/// shares half — a real difference that a single fixture hides completely.
+/// It matters because deduplication moves work *out of the store*.
+/// Half-shared files still have to be read and hashed in full, but only half
+/// their bytes reach the store.
+/// So the store is a smaller share of the run and changes to it look smaller than
+/// they are.
+/// Measured on this machine: removing the store's write lock was worth 2.5x on a
+/// tree that shares nothing and 1.1x on one that shares half.
+/// That is a real difference that a single fixture hides completely.
 ///
 /// So the curve is measured on both, and the share is printed next to it.
 fn build(dir: &std::path::Path, shared: usize) -> std::path::PathBuf {
@@ -162,11 +170,12 @@ impl Samples {
 
     /// CPU seconds of the run that took least wall time.
     ///
-    /// Reported next to the wall time because the two answer different questions,
-    /// and on a shared machine only one of them is about this program. A run that
-    /// is short in wall time and long in CPU is compute-bound; a run that is long
-    /// in both is doing too much work; a run that is long in wall and short in
-    /// CPU is waiting for the neighbour, and no amount of tuning will show up.
+    /// Reported next to the wall time because the two answer different questions.
+    /// On a shared machine only one of them is about this program.
+    /// A run that is short in wall time and long in CPU is compute-bound.
+    /// A run that is long in both is doing too much work.
+    /// A run that is long in wall and short in CPU is waiting for the neighbour.
+    /// No amount of tuning changes that.
     fn cpu_min(&self) -> f64 {
         self.cpu.iter().copied().fold(f64::MAX, f64::min)
     }
@@ -184,9 +193,10 @@ impl Samples {
 
     /// How much slower the median was than the minimum.
     ///
-    /// A contamination indicator rather than a result: near 1.0 means a quiet
-    /// machine, and anything much above it means the numbers below deserve
-    /// scepticism no matter how they compare.
+    /// A contamination indicator rather than a result.
+    /// Near 1.0 means a quiet machine.
+    /// Anything much above it means the numbers below deserve scepticism no matter
+    /// how they compare.
     fn contamination(&self) -> f64 {
         self.median() / self.min()
     }
@@ -235,7 +245,8 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
 /// The path of segment `segment` of the set at `base`.
 ///
 /// A set is several files, and a benchmark that measures one backup wants a clean
-/// one every round — so it has to remove all of them, not just the first.
+/// one every round.
+/// So it has to remove all of them, not just the first.
 fn store_segment(base: &std::path::Path, segment: u32) -> std::path::PathBuf {
     IndexSet::new(base).segment_path(segment)
 }
@@ -290,9 +301,9 @@ async fn curve(stores: &std::path::Path, src: &std::path::Path, shared: usize) {
     let total = mib(u64::try_from(FILE_BYTES * FILES).expect("fits in u64"));
     let baseline = samples[0].min();
 
-    // The size of the store the fastest setting produced, which is the honest
-    // measure of how much work the store was handed. Everything else in the tree
-    // was read and hashed but deduplicated away.
+    // The size of the store the fastest setting produced.
+    // That is the honest measure of how much work the store was handed.
+    // Everything else in the tree was read and hashed but deduplicated away.
     let store_bytes = std::fs::metadata(stores.join("store1.bin")).map_or(0, |m| m.len());
     let on_disk = mib(store_bytes);
 
@@ -376,9 +387,10 @@ fn load_average() -> String {
 /// CPU seconds this process has used, user plus system.
 ///
 /// The counterpart to wall time, and the thing that says whether a run is doing
-/// too much work or merely waiting. Wall time on a shared box is mostly a
-/// measure of the neighbour; CPU time is a measure of this program, and it is
-/// stable enough to compare across runs even when wall time is not.
+/// too much work or merely waiting.
+/// Wall time on a shared box is mostly a measure of the neighbour.
+/// CPU time is a measure of this program.
+/// CPU time is stable enough to compare across runs even when wall time is not.
 fn cpu_seconds() -> f64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
     // After the comm field, which may itself contain spaces.
@@ -386,28 +398,29 @@ fn cpu_seconds() -> f64 {
         return 0.0;
     };
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    // utime is field 14 and stime field 15 of the whole line; `rest` starts at
-    // field 3, so they are at indices 11 and 12.
+    // utime is field 14 and stime field 15 of the whole line.
+    // `rest` starts at field 3, so they are at indices 11 and 12.
     let ticks = |i: usize| -> f64 {
         fields
             .get(i)
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0)
     };
-    // _SC_CLK_TCK is 100 on every platform this runs on, and the alternative is
-    // an FFI dependency for a diagnostic.
+    // _SC_CLK_TCK is 100 on every platform this runs on.
+    // The alternative is an FFI dependency for a diagnostic.
     (ticks(11) + ticks(12)) / 100.0
 }
 
 /// Synchronous on purpose.
 ///
 /// `build` writes tens of megabytes and takes a couple of hundred milliseconds.
-/// Under `#[tokio::main]` that runs *on a runtime worker thread*, which parks the
-/// rest of the runtime and leaves it in a state that costs the measurement
-/// afterwards: with the trees built this way the harness reported 2.6x the wall
-/// time and 1.5x the CPU of the real binary, on identical bytes with identical
-/// settings and an identical `Options::default()` — a difference no amount of
-/// waiting or of data explains.
+/// Under `#[tokio::main]` that runs *on a runtime worker thread*.
+/// That parks the rest of the runtime and leaves it in a state that costs the
+/// measurement afterwards.
+/// With the trees built this way the harness reported 2.6x the wall time and
+/// 1.5x the CPU of the real binary. It used identical bytes, identical settings,
+/// and an identical `Options::default()`.
+/// No amount of waiting or of data explains that difference.
 ///
 /// Building before a runtime exists is also simply the honest order: fixture
 /// first, then measure.
@@ -422,9 +435,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_default();
 
-    // Only the tree that is about to be measured gets built. Building both
-    // leaves 100 MiB of tmpfs resident that nothing reads, and `/tmp` here is a
-    // 2 GiB tmpfs shared with whatever else the machine is doing.
+    // Only the tree that is about to be measured gets built.
+    // Building both leaves 100 MiB of tmpfs resident that nothing reads.
+    // `/tmp` here is a 2 GiB tmpfs shared with whatever else the machine is
+    // doing.
     match command.as_str() {
         "compare" => {
             build(&tmp, 0);
@@ -435,9 +449,9 @@ fn main() {
         }
         "gen" => {
             // Build the trees and leave them, so the in-process harness can be
-            // cross-checked against the real binary on the same bytes. Worth
-            // having: the two disagreeing is how the broken generator was found,
-            // and neither one alone would have shown it.
+            // cross-checked against the real binary on the same bytes.
+            // Worth having: the two disagreeing is how the broken generator was
+            // found, and neither one alone would have shown it.
             let out = args
                 .get(1)
                 .cloned()
@@ -469,8 +483,9 @@ fn main() {
             let label = args.get(1).cloned().unwrap_or_else(|| "run".to_owned());
             let rounds = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(ROUNDS);
             // The unique tree: a store change is worth about twice as much on a
-            // tree that shares nothing, and `report` exists to compare two
-            // builds, so it should compare them where the difference shows.
+            // tree that shares nothing.
+            // `report` exists to compare two builds, so it should compare them
+            // where the difference shows.
             report(&stores, &tmp.join("src-unique"), &label, rounds).await;
         }
     });

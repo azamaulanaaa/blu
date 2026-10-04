@@ -1,7 +1,8 @@
 // The crate denies `unwrap_used` and `expect_used`, and `allow-expect-in-tests`
-// only covers code inside a `#[test]` function. The helpers below are plain
-// functions that a benchmark calls, so they need the exemption spelled out: a
-// benchmark that cannot build its fixture has nothing useful to measure.
+// only covers code inside a `#[test]` function.
+// The helpers below are plain functions that a benchmark calls.
+// They need the exemption spelled out.
+// A benchmark that cannot build its fixture has nothing useful to measure.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Benchmarks for the unit-level work a backup is made of.
@@ -16,23 +17,28 @@
 //! plumbing              ~28%   (channel and task handoffs — not here)
 //! ```
 //!
-//! The "read + chunk" row is the `chunking/read_and_cut` benchmark, and it is a
-//! little more than its name: one iteration there includes building the
-//! `Chunker`, which stats every file in the tree before the first byte is read.
-//! That cannot be timed separately within one iteration — a `Chunker` is a stream
-//! that can only be consumed once — so `chunking/registering` measures that half
-//! on its own and the difference is the chunking.
+//! The "read + chunk" row is the `chunking/read_and_cut` benchmark.
+//! That benchmark is a little more than its name.
+//! One iteration there includes building the `Chunker`, which stats every file in
+//! the tree before the first byte is read.
+//! That cannot be timed separately within one iteration, because a `Chunker` is a
+//! stream that can only be consumed once.
+//! So `chunking/registering` measures that half on its own, and the difference is
+//! the chunking.
 //!
 //! The split is indicative, and the third line is a plug rather than a
-//! measurement: it is the remainder once the other two are subtracted, which is
-//! why the parenthesis says "not here". These were taken on a 200 MiB tree,
-//! which this file does not reproduce — its own fixture is 32 MiB — so treat the
-//! proportions as a starting point for deciding what to measure, and take the
-//! absolute figures from `benches/throughput.rs` or from the binary.
+//! measurement.
+//! The third line is the remainder once the other two are subtracted.
+//! That is why the parenthesis says "not here".
+//! These were taken on a 200 MiB tree, which this file does not reproduce.
+//! This file's own fixture is 32 MiB.
+//! So treat the proportions as a starting point for deciding what to measure.
+//! Take the absolute figures from `benches/throughput.rs` or from the binary.
 //!
-//! Criterion is reliable for a ratio within one run and unreliable for a
-//! comparison against a previous run on a shared machine; `examples/ab.rs`
-//! documents why, with the measurements.
+//! Criterion is reliable for a ratio within one run.
+//! Criterion is unreliable for a comparison against a previous run on a shared
+//! machine.
+//! `examples/ab.rs` documents why, with the measurements.
 
 use std::{hint::black_box, io::Cursor, path::PathBuf};
 
@@ -95,8 +101,9 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
     });
 
     for i in 0..chunks {
-        // A chunk is the BLAKE3 of its contents, and that is also its address in
-        // the store, so a snapshot records no location of its own.
+        // A chunk is the BLAKE3 of its contents, and that is also its address in the
+        // store.
+        // So a snapshot records no location of its own.
         snapshot
             .chunks
             .push(blake3::hash(&u64::try_from(i).unwrap_or(0).to_le_bytes()));
@@ -117,15 +124,20 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
 /// because each boundary is derived from the bytes before it.
 ///
 /// One iteration is one whole pass over the fixture, and it includes building the
-/// `Chunker` — which is `64` × `stat` and a `Vec<PathBuf>` clone, not chunking.
-/// That cannot be hoisted out of the timed region: `Chunker::new` takes the paths
-/// by value and a `Chunker` is a stream that can only be consumed once, so the
-/// registry and the reading are one indivisible unit of work.
+/// `Chunker`.
+/// Building the `Chunker` is `64` × `stat` and a `Vec<PathBuf>` clone, not
+/// chunking.
+/// That cannot be hoisted out of the timed region.
+/// `Chunker::new` takes the paths by value, and a `Chunker` is a stream that can
+/// only be consumed once.
+/// So the registry and the reading are one indivisible unit of work.
 ///
-/// Which is why `registering` below measures the registry on its own. The
-/// difference between the two is the chunking, and the doc comment at the top of
-/// this file attributes a share of a *backup* to chunking, so the share of this
-/// number that is not chunking is worth being able to subtract.
+/// Which is why `registering` below measures the registry on its own.
+/// The difference between the two is the chunking.
+/// The doc comment at the top of this file attributes a share of a *backup* to
+/// chunking.
+/// So the share of this number that is not chunking is worth being able to
+/// subtract.
 fn chunking(c: &mut Criterion) {
     let dir = TempDir::new().expect("tempdir");
     let paths = tree(&dir);
@@ -148,9 +160,11 @@ fn chunking(c: &mut Criterion) {
     });
 
     // The setup half, measured so the number above can be read as a difference
-    // rather than taken whole. `Chunker::new` stats every file before the first
-    // byte is read, so this is not nothing, and a reader told "46% of a backup is
-    // chunking" deserves to know how much of the measurement is bookkeeping.
+    // rather than taken whole.
+    // `Chunker::new` stats every file before the first byte is read, so this is
+    // not nothing.
+    // A reader told "46% of a backup is chunking" deserves to know how much of the
+    // measurement is bookkeeping.
     group.throughput(Throughput::Elements(u64::try_from(FILES).unwrap_or(0)));
     group.bench_function("registering", |b| {
         b.iter(|| {
@@ -274,10 +288,12 @@ fn the_benchmark_tree_is_not_empty() {
 
 /// Run every benchmark in this file.
 ///
-/// Written out rather than using `criterion_main!`, whose expansion is an
-/// undocumented function that the crate-level `missing_docs` deny rejects, and
-/// an attribute on the macro invocation is ignored. Spelling the same four lines
-/// out keeps the lint switched on for the benchmarks themselves.
+/// Written out rather than using `criterion_main!`.
+/// The expansion of that macro is an undocumented function, and the crate-level
+/// `missing_docs` deny rejects it.
+/// An attribute on the macro invocation is ignored.
+/// Spelling the same four lines out keeps the lint switched on for the benchmarks
+/// themselves.
 fn main() {
     let mut criterion = Criterion::default().configure_from_args();
     chunking(&mut criterion);

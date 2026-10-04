@@ -1,50 +1,60 @@
 // The crate denies `unwrap_used` and `expect_used`, and `allow-expect-in-tests`
-// only covers code inside a `#[test]` function. The helpers below are plain
-// functions that a benchmark calls, so they need the exemption spelled out: a
-// benchmark that cannot build its fixture has nothing useful to measure.
+// only covers code inside a `#[test]` function.
+// The helpers below are plain functions that a benchmark calls.
+// They need the exemption spelled out.
+// A benchmark that cannot build its fixture has nothing useful to measure.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! End-to-end throughput for a whole backup and a whole restore.
 //!
-//! These are the numbers to look at before and after a change. Everything in
-//! `hotpath` is a component; this is whether the components add up to something
-//! a user would feel.
+//! These are the numbers to look at before and after a change.
+//! Everything in `hotpath` is a component, and this is whether the components add
+//! up to something a user would feel.
 //!
 //! # What these numbers can and cannot tell you
 //!
 //! **The `concurrency_*` rows are trustworthy.** They are measured inside one run
-//! under identical conditions, so the ratio between them is a ratio between
-//! observations that shared the same machine state.
+//! under identical conditions.
+//! The ratio between them is then a ratio between observations that shared the
+//! same machine state.
 //!
 //! **Comparing one of these rows against a previous run of criterion is not.**
-//! Criterion's interval covers sampling noise within a run, which is not the
-//! dominant noise source on a shared machine, and an effect under about 20% is
-//! not measurable that way. `examples/ab.rs` documents this with the
+//! Criterion's interval covers sampling noise within a run.
+//! On a shared machine, sampling noise is not the dominant noise source.
+//! An effect under about 20% is not measurable that way. `examples/ab.rs` documents this with the
 //! measurements behind it, and is what a before/after claim should use.
 //!
 //! **The absolute throughput here is higher than the real binary's, and that gap
-//! is unexplained.** The *ratios* are sound — every variant is measured the same
-//! way — but for a number to quote about how fast a backup is, time the binary.
+//! is unexplained.**
+//! The *ratios* are sound.
+//! Every variant is measured the same way.
+//! For a number to quote about how fast a backup is, time the binary.
 //!
 //! Setup is deliberately outside the timed region: the tree is built once, and
 //! each iteration starts from an empty store. A backup that deduped against its
 //! own previous run would report a throughput no user would ever see.
 //!
-//! Backup is measured across a range of `Options::concurrency` rather than at
-//! one value, because the interesting question is not "how fast is this" but
-//! "where does it stop getting faster". On a four-core box the curve is strongly
-//! rising to a default of 8 and still climbing at the top of the range, with CPU
-//! time falling as concurrency rises rather than staying flat, which is why 8 is
-//! the default.
+//! Backup is measured across a range of `Options::concurrency` rather than at one
+//! value.
+//! The interesting question is not "how fast is this" but "where does it stop
+//! getting faster".
+//! On a four-core box the curve is strongly rising to a default of 8.
+//! The curve is still climbing at the top of the range.
+//! CPU time falls as concurrency rises rather than staying flat.
+//! That is why 8 is the default.
 //!
-//! **The 3.0x figure this used to quote was measured on a broken fixture and is
-//! gone.** The byte generator was a function of `seed + position`, so the 50 MiB
-//! tree was one 128 KiB stream repeated 200 times and deduplicated away almost
-//! entirely: the benchmark was timing the cost of storing 128 KiB. The shape of
-//! the curve above was re-measured on the fixed fixture, but the number is not
-//! reproduced here — it is a property of the machine, and this file's own header
-//! already says the absolute figures are not a number to quote about how fast a
-//! backup is. `benches/fixture.rs` records what was wrong with the old one, and
+//! **The 3.0x figure this used to quote was measured on a broken fixture.
+//! It is gone.**
+//! The byte generator was a function of `seed + position`.
+//! So the 50 MiB tree was one 128 KiB stream repeated 200 times and deduplicated
+//! away almost entirely.
+//! The benchmark was timing the cost of storing 128 KiB.
+//! The shape of the curve above was re-measured on the fixed fixture, but the
+//! number is not reproduced here.
+//! That number is a property of the machine.
+//! This file's own header already says the absolute figures are not a number to
+//! quote about how fast a backup is.
+//! `benches/fixture.rs` records what was wrong with the old one, and
 //! `tests/fixtures.rs` is what stops it coming back.
 
 use std::{
@@ -203,8 +213,9 @@ fn bench_restore(c: &mut Criterion) {
 /// Whether a restore actually reproduced the tree.
 ///
 /// A throughput benchmark that measures a broken restore is worse than no
-/// benchmark, and `restore` returning `Ok` says nothing about the bytes it
-/// wrote. Checked once, outside the timed region.
+/// benchmark.
+/// `restore` returning `Ok` says nothing about the bytes it wrote.
+/// Checked once, outside the timed region.
 #[test]
 fn the_throughput_benchmark_restores_what_it_backed_up() {
     let dir = TempDir::new().expect("tempdir");
@@ -240,10 +251,12 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
 
 /// Run every benchmark in this file.
 ///
-/// Written out rather than using `criterion_main!`, whose expansion is an
-/// undocumented function that the crate-level `missing_docs` deny rejects, and
-/// an attribute on the macro invocation is ignored. Spelling the same four lines
-/// out keeps the lint switched on for the benchmarks themselves.
+/// Written out rather than using `criterion_main!`.
+/// The expansion of that macro is an undocumented function, and the crate-level
+/// `missing_docs` deny rejects it.
+/// An attribute on the macro invocation is ignored.
+/// Spelling the same four lines out keeps the lint switched on for the benchmarks
+/// themselves.
 fn main() {
     let mut criterion = Criterion::default().configure_from_args();
     bench_backup(&mut criterion);

@@ -1,10 +1,13 @@
 //! Isolate `BlobStore::put` from everything else.
 //!
 //! The end-to-end numbers cannot separate "the store is slow" from "the machine
-//! is busy", and both halves of the pipeline have been blamed incorrectly in
-//! this codebase's history. This does the one thing that settles it: put N
-//! blobs through the real store and compare against the same bytes written by
-//! `std::fs` with a large buffer, on the same machine, back to back.
+//! is busy".
+//! Both halves of the pipeline have been blamed incorrectly in this codebase's
+//! history.
+//! This example does the one thing that settles it.
+//! It puts N blobs through the real store.
+//! It compares that against the same bytes written by `std::fs` with a large
+//! buffer, on the same machine, back to back.
 //!
 //! The gap between those two numbers is the part of the store that is ours.
 
