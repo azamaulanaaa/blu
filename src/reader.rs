@@ -724,7 +724,7 @@ mod tests {
 /// ```
 #[test]
 #[ignore = "builds a registry and takes a second; run it by hand"]
-fn resolve_chunk_costs_one_refcount_bump() {
+fn resolve_chunk_cost() {
     /// Files in the registry. Enough that a chunk lands in one of them, so the
     /// clone is the per-chunk work rather than a special case.
     const FILES: usize = 200;

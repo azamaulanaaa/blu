@@ -458,7 +458,7 @@ mod compression_tests {
     /// `"decompression panicked: …"` so a panic cannot take the run down with it.
     /// It is not mapped there because a test gets there.
     #[tokio::test]
-    async fn a_byte_string_that_is_not_a_frame_is_reported_as_such() {
+    async fn bytes_that_are_not_a_frame_are_reported_as_such() {
         let err = Zstd
             .decompress(NOT_A_FRAME.to_vec(), 1024)
             .await
