@@ -735,7 +735,7 @@ mod tests {
     /// walkdir yields the `io::Error` underneath, and the question is what comes
     /// out the other side.
     #[test]
-    fn a_walk_failure_is_not_flattened_to_other() {
+    fn a_walk_failure_keeps_its_kind_and_its_error() {
         let missing = std::path::Path::new("/nonexistent-lepatch-walk-test");
 
         let failure = WalkDir::new(missing)

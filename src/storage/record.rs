@@ -1028,7 +1028,7 @@ mod golden {
     /// therefore not only a header constant. Getting it wrong does not produce a
     /// rejected write. It produces a store that refuses to open itself.
     #[test]
-    fn the_header_bounds_are_the_formats_own() {
+    fn a_header_bound_is_the_size_the_format_specifies() {
         // 6 (magic, kind, codec) + 2 (two one-byte lengths) + 32 + 8
         assert_eq!(super::MIN_HEADER, 48);
         // The same, with both varints at their ten-byte maximum.
@@ -1065,7 +1065,7 @@ mod golden {
 /// would be a bug rather than a tuning finding.
 #[test]
 #[ignore = "writes a temporary file and takes a second; run it by hand"]
-fn scan_read_size() {
+fn a_scan_read_size_measurement_reports_the_same_records() {
     /// Records, and bytes per record, chosen so the file is a few tens of
     /// megabytes. That is big enough that the read count is the thing being timed.
     /// It is small enough to build in a test.

@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_and_the_boundaries_encode_to_what_they_should() {
+    fn a_boundary_value_encodes_to_its_own_length() {
         for value in [0, 1, 127, 128, u64::from(u32::MAX), u64::MAX] {
             let mut out = Vec::new();
             write(&mut out, value);

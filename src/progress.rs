@@ -334,7 +334,7 @@ mod tests {
             .collect()
     }
     #[test]
-    fn counters_accumulate() {
+    fn the_counters_accumulate_into_one_total() {
         let mut progress = Progress::new(Phase::Backup);
         progress.add(Counter::Files, 2);
         progress.add(Counter::Files, 3);

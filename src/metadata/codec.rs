@@ -599,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_bytes_are_refused() {
+    fn a_body_with_trailing_bytes_is_refused() {
         let mut bytes = encode_body(&sample()).expect("encodes");
         bytes.push(0);
         assert!(
