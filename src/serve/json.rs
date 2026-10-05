@@ -1,6 +1,7 @@
-//! The JSON this service speaks, written by hand.
+//! The JSON this service speaks. Responses are written by hand; requests are
+//! parsed by `serde_json`.
 //!
-//! **No serialisation crate, and the argument for that does not change here.**
+//! **The no-serde rule is about the on-disk format, and does not reach here.**
 //! `Cargo.toml` explains why `bincode` was removed: so that no upstream's release
 //! cadence or security policy can decide whether a backup set is still readable.
 //! That argument is about the *on-disk format*. A response body is not read by a
@@ -17,11 +18,15 @@
 //! is a second thing to keep in step with the first.
 //!
 //! Second, and more plainly: what a response contains here is eleven small
-//! structs of strings and integers. `serde_json` would be a dependency, a proc
-//! macro, and a derive on every type, in exchange for writing the same eleven
-//! structs out. The hand-written encoder below is about a hundred lines and it
-//! makes the bytes the server sends visible in one place, which is the property
-//! that actually matters for a wire format.
+//! structs of strings and integers, and `serde_json` **is** a direct dependency
+//! — it parses every request body, and it was already in the graph under
+//! `actix-web` before this crate named it. So the argument is no longer "no
+//! dependency". It is what the dependency would be used *for*: writing a response
+//! with it means a `#[derive(Serialize)]` on the types named above, in exchange
+//! for encoding the same eleven structs out. The encoder below is about a hundred
+//! lines, it puts a derive on nothing, and it makes the bytes the server sends
+//! visible in one place — which is the property that actually matters for a wire
+//! format.
 
 use std::fmt;
 
@@ -92,47 +97,50 @@ impl Json {
         value.unwrap_or(Self::Null)
     }
 
-    /// Read a JSON object from `text`.
+    /// Read a request body, and refuse anything that is not the shape we accept.
     ///
-    /// **Not a JSON parser, and it does not pretend to be one.** It reads what
-    /// this service's three request shapes use: a flat object of strings,
-    /// integers, booleans, `null` and arrays of strings. Anything else is an
-    /// error carrying a sentence saying what it found, which the handler turns
-    /// into a `400`.
+    /// **Parsing is `serde_json`'s. Validating is ours**, and the split is the
+    /// point of this function existing.
     ///
-    /// A general parser is a dependency, a CVE feed and a maintenance
-    /// obligation, in exchange for reading three bodies that hold eleven fields
-    /// between them. What is here is about a hundred lines and it is the only
-    /// JSON this crate parses.
+    /// A general parser accepts a whole grammar; a request body is a flat object
+    /// of strings, non-negative integers, `null` and arrays of strings, and every
+    /// other shape is a client that has misunderstood the API. So this rejects a
+    /// nested object, a fraction, a negative number, a boolean and a non-string
+    /// array element, **naming what it found** — a client that sent the wrong
+    /// shape needs to be told the shape, not told it failed.
+    ///
+    /// That is what the hand-rolled parser was reaching for, and it is worth
+    /// keeping. What is not worth keeping is owning the grammar underneath it.
+    ///
+    /// **Field order is not preserved.** `serde_json` stores an object in a
+    /// `Map`, which sorts its keys, so the fields come back in name order rather
+    /// than in the order they were sent. That matters for nothing here — every
+    /// reader looks a field up by name — and it is worth stating because
+    /// [`Json::Object`] otherwise promises an order. **Writing** preserves order,
+    /// because a response's field order is part of its reviewable bytes; reading
+    /// has no such obligation.
     ///
     /// # Errors
     ///
-    /// Returns an error if `text` is not an object, or holds anything the above
-    /// does not cover. The message names what was found, because a client that
-    /// sent the wrong shape needs to be told the shape, not told it failed.
-    pub fn parse_object(text: &str) -> Result<Self, String> {
-        let bytes = text.trim().as_bytes();
-        let mut at = 0usize;
+    /// Returns an error naming the problem: not JSON at all, not an object, or a
+    /// field this does not read.
+    pub fn checked(text: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("this is not JSON: {e}"))?;
 
-        let value = parse_value(bytes, &mut at, 0)?;
-        skip_space(bytes, &mut at);
-
-        if at != bytes.len() {
+        let serde_json::Value::Object(fields) = value else {
             return Err(format!(
-                "there is more after the value at byte {at}, which is not JSON this reads"
+                "a request body must be a JSON object, and this one is {}",
+                describe(&value)
             ));
+        };
+
+        let mut out = Vec::with_capacity(fields.len());
+        for (name, field) in fields {
+            out.push((name.clone(), convert(&name, &field)?));
         }
 
-        // Enforced here rather than left to each caller. The name says object, and
-        // a `parse_object` that returns an array is a function whose name is a
-        // lie that three call sites would have to remember to check.
-        match value {
-            Json::Object(_) => Ok(value),
-            other => Err(format!(
-                "a request body must be a JSON object, and this one is {}",
-                describe(&other)
-            )),
-        }
+        Ok(Json::Object(out))
     }
 
     /// Write this value, and everything under it, into `out`.
@@ -175,314 +183,6 @@ impl Json {
     }
 }
 
-/// What a parsed value is, for an error that has to say so.
-fn describe(value: &Json) -> &'static str {
-    match value {
-        Json::Object(_) => "an object",
-        Json::Array(_) => "an array",
-        Json::Str(_) => "a string",
-        Json::Int(_) => "a number",
-        Json::Bool(_) => "a boolean",
-        Json::Null => "null",
-    }
-}
-
-/// How deep [`parse_value`] will go before refusing.
-///
-/// Three is the deepest thing this service reads: an object, an array inside it,
-/// a string inside that. A bound rather than a limit, because a body nested
-/// deeper than anything this API defines is a body someone has not thought about,
-/// and the failure should be a `400` rather than a stack overflow.
-const MAX_DEPTH: usize = 4;
-
-/// Skip whitespace.
-fn skip_space(bytes: &[u8], at: &mut usize) {
-    while *at < bytes.len() && matches!(bytes[*at], b' ' | b'\t' | b'\n' | b'\r') {
-        *at += 1;
-    }
-}
-
-/// One value at `at`, advancing past it.
-fn parse_value(bytes: &[u8], at: &mut usize, depth: usize) -> Result<Json, String> {
-    if depth > MAX_DEPTH {
-        return Err("this is nested too deeply to be a request body".to_string());
-    }
-
-    skip_space(bytes, at);
-    let Some(&byte) = bytes.get(*at) else {
-        return Err(format!(
-            "the body ended at byte {at}, where a value was expected"
-        ));
-    };
-
-    match byte {
-        b'{' => parse_object_body(bytes, at, depth),
-        b'[' => parse_array(bytes, at, depth),
-        b'"' => parse_string(bytes, at).map(Json::Str),
-        b't' => literal(bytes, at, "true").map(|()| Json::Bool(true)),
-        b'f' => literal(bytes, at, "false").map(|()| Json::Bool(false)),
-        b'n' => literal(bytes, at, "null").map(|()| Json::Null),
-        b'-' | b'0'..=b'9' => parse_number(bytes, at),
-        other => Err(format!(
-            "{} at byte {at} is not the start of a JSON value",
-            char::from(other)
-        )),
-    }
-}
-
-/// `{ "key": value, … }`.
-fn parse_object_body(bytes: &[u8], at: &mut usize, depth: usize) -> Result<Json, String> {
-    *at += 1; // the brace
-    let mut fields = Vec::new();
-    // Set once a comma has been read. A `}` after one is a **trailing comma**,
-    // which RFC 8259 does not allow, and this reads it as an error rather than as
-    // the end of the object — because a client whose serialiser emits one is a
-    // client whose serialiser is not this, and the body is not the shape it
-    // thinks it is.
-    let mut after_comma = false;
-
-    loop {
-        skip_space(bytes, at);
-
-        match bytes.get(*at) {
-            None => return Err("the body ended inside an object".to_string()),
-            Some(b'}') if !after_comma => {
-                *at += 1;
-                return Ok(Json::Object(fields));
-            }
-            Some(b'}') => {
-                return Err(format!(
-                    "a `,` before the `}}` at byte {at} is a trailing comma, which JSON does \
-                     not allow"
-                ));
-            }
-            Some(b'"') => {}
-            Some(other) => {
-                return Err(format!(
-                    "{} at byte {at} is not a quoted key; an object's keys are strings",
-                    char::from(*other)
-                ));
-            }
-        }
-
-        let key = parse_string(bytes, at)?;
-
-        skip_space(bytes, at);
-        if bytes.get(*at) != Some(&b':') {
-            return Err(format!(
-                "the key {key:?} at byte {at} is not followed by `:`"
-            ));
-        }
-        *at += 1;
-
-        let value = parse_value(bytes, at, depth + 1)?;
-        fields.push((key, value));
-
-        skip_space(bytes, at);
-        match bytes.get(*at) {
-            Some(b',') => {
-                *at += 1;
-                after_comma = true;
-            }
-            Some(b'}') => {
-                *at += 1;
-                return Ok(Json::Object(fields));
-            }
-            None => return Err("the body ended inside an object".to_string()),
-            Some(other) => {
-                return Err(format!(
-                    "{} at byte {at} is not `,` or `}}` after a field",
-                    char::from(*other)
-                ));
-            }
-        }
-    }
-}
-
-/// `[ value, … ]`.
-fn parse_array(bytes: &[u8], at: &mut usize, depth: usize) -> Result<Json, String> {
-    *at += 1; // the bracket
-    let mut items = Vec::new();
-
-    loop {
-        skip_space(bytes, at);
-
-        if bytes.get(*at) == Some(&b']') {
-            *at += 1;
-            return Ok(Json::Array(items));
-        }
-
-        items.push(parse_value(bytes, at, depth + 1)?);
-
-        skip_space(bytes, at);
-        match bytes.get(*at) {
-            Some(b',') => *at += 1,
-            Some(b']') => {
-                *at += 1;
-                return Ok(Json::Array(items));
-            }
-            None => return Err("the body ended inside an array".to_string()),
-            Some(other) => {
-                return Err(format!(
-                    "{} at byte {at} is not `,` or `]` after a value",
-                    char::from(*other)
-                ));
-            }
-        }
-    }
-}
-
-/// A quoted string, with the escapes [`escape`] writes.
-fn parse_string(bytes: &[u8], at: &mut usize) -> Result<String, String> {
-    *at += 1; // the opening quote
-    let mut out = String::new();
-
-    loop {
-        let Some(&byte) = bytes.get(*at) else {
-            return Err("the body ended inside a string".to_string());
-        };
-        *at += 1;
-
-        match byte {
-            b'"' => return Ok(out),
-            b'\\' => {
-                let Some(&escape) = bytes.get(*at) else {
-                    return Err("the body ended inside an escape".to_string());
-                };
-                *at += 1;
-
-                out.push(match escape {
-                    b'"' => '"',
-                    b'\\' => '\\',
-                    b'/' => '/',
-                    b'n' => '\n',
-                    b'r' => '\r',
-                    b't' => '\t',
-                    b'b' => '\u{8}',
-                    b'f' => '\u{c}',
-                    b'u' => {
-                        // Four hex digits. A `\u` carrying a surrogate pair is
-                        // legal JSON and this does not read it; a body that used
-                        // one would be refused rather than mangled.
-                        let mut code = 0u32;
-                        for _ in 0..4 {
-                            let Some(&digit) = bytes.get(*at) else {
-                                return Err("the body ended inside a \\u escape".to_string());
-                            };
-                            let Some(value) = (digit as char).to_digit(16) else {
-                                return Err(format!(
-                                    "{} is not a hexadecimal digit in a \\u escape",
-                                    char::from(digit)
-                                ));
-                            };
-                            code = code.saturating_mul(16).saturating_add(value);
-                            *at += 1;
-                        }
-                        char::from_u32(code)
-                            .ok_or_else(|| format!("\\u{code:04x} is not a character this reads"))?
-                    }
-                    other => {
-                        return Err(format!(
-                            "\\{} is not an escape this reads",
-                            char::from(other)
-                        ));
-                    }
-                });
-            }
-            byte if byte < 0x20 => {
-                return Err(format!(
-                    "a control character at byte {} is not allowed in a JSON string",
-                    *at - 1
-                ));
-            }
-            // Anything else is UTF-8 and is copied through. The bytes are already
-            // validated as UTF-8 by being a `&str`, so a multi-byte sequence
-            // arrives whole.
-            byte => {
-                // Find where this character ends and copy it, rather than pushing
-                // a single byte as a `char` — which would truncate it.
-                let width = utf8_width(byte);
-                let end = (*at - 1 + width).min(bytes.len());
-                out.push_str(
-                    std::str::from_utf8(&bytes[*at - 1..end])
-                        .map_err(|_| "the body is not valid UTF-8".to_string())?,
-                );
-                *at = end;
-            }
-        }
-    }
-}
-
-/// Bytes in the UTF-8 sequence that starts with `byte`.
-///
-/// The continuation bytes of a multi-byte character are all `0b10xx_xxxx`, which
-/// no lead byte of a valid sequence is, so this is unambiguous.
-const fn utf8_width(byte: u8) -> usize {
-    if byte < 0x80 {
-        1
-    } else if byte >= 0xF0 {
-        4
-    } else if byte >= 0xE0 {
-        3
-    } else if byte >= 0xC0 {
-        2
-    } else {
-        1
-    }
-}
-
-/// A bare `word`, if that is what is at `at`.
-fn literal(bytes: &[u8], at: &mut usize, word: &str) -> Result<(), String> {
-    let end = *at + word.len();
-    if bytes.get(*at..end) == Some(word.as_bytes()) {
-        *at = end;
-        return Ok(());
-    }
-
-    Err(format!("{word:?} is expected at byte {at}"))
-}
-
-/// A number.
-///
-/// **Integers only, and a fraction or an exponent is refused.** Every number this
-/// service reads is a version number or a chunk count. A body that sent `1.0` or
-/// `1e3` for either is a client that has misunderstood the schema, and reading
-/// it as an integer would hide that.
-fn parse_number(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
-    let start = *at;
-
-    if bytes.get(*at) == Some(&b'-') {
-        *at += 1;
-    }
-
-    while matches!(bytes.get(*at), Some(b'0'..=b'9')) {
-        *at += 1;
-    }
-
-    let text = std::str::from_utf8(&bytes[start..*at])
-        .map_err(|_| format!("the number at byte {start} is not valid UTF-8"))?;
-
-    if let Some(b'.' | b'e' | b'E') = bytes.get(*at) {
-        return Err(format!(
-            "{text:?} has a fraction or an exponent; this reads whole numbers only"
-        ));
-    }
-
-    // A leading `-` is refused outright rather than parsed and then rejected at
-    // the consumer. Every number in a request body is a version or a chunk count,
-    // and this is the place that knows that; the alternative is a variant plus a
-    // match arm at each of the three places that read a number.
-    if text.starts_with('-') {
-        return Err(format!(
-            "{text:?} is negative; this reads whole numbers only"
-        ));
-    }
-
-    text.parse::<u64>()
-        .map(Json::int)
-        .map_err(|_| format!("{text:?} is not a number this reads"))
-}
-
 /// Write `value` as a JSON string, quotes included.
 ///
 /// JSON strings are delimited by `"` and cannot carry an unescaped control
@@ -511,6 +211,64 @@ fn escape(value: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+/// What a parsed value is, for an error that has to say so.
+fn describe(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Object(_) => "an object",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Null => "null",
+    }
+}
+
+/// One field, converted or refused.
+///
+/// **No boolean.** No request field takes one — the three bodies hold versions, a
+/// compression policy and a list of chunk hashes — so accepting one here would be
+/// permissiveness with no reader behind it. It would be caught later, by the
+/// field reader, with a message about that field rather than about its type.
+/// `Json::Bool` still exists because responses carry booleans; it just cannot
+/// arrive in a request.
+fn convert(name: &str, value: &serde_json::Value) -> Result<Json, String> {
+    match value {
+        serde_json::Value::String(text) => Ok(Json::Str(text.clone())),
+        serde_json::Value::Null => Ok(Json::Null),
+        serde_json::Value::Number(number) => {
+            // `as_u64` is the whole of the check: it is `None` for a negative, a
+            // fraction, an exponent that is not integral, and anything past
+            // `u64::MAX`. Every number in a request body is a version or a chunk
+            // count, so all four are a client that has misunderstood.
+            let Some(number) = number.as_u64() else {
+                return Err(format!(
+                    "`{name}` is {number}, and this reads whole numbers from 0 to u64::MAX only"
+                ));
+            };
+            Ok(Json::Int(number))
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let serde_json::Value::String(text) = item else {
+                    return Err(format!(
+                        "`{name}` must be a list of strings, and it holds {}",
+                        describe(item)
+                    ));
+                };
+                out.push(Json::Str(text.clone()));
+            }
+            Ok(Json::Array(out))
+        }
+        // `describe` carries its own article, so this reads "is a boolean" rather
+        // than "is a a boolean".
+        other => Err(format!(
+            "`{name}` is {}, and this reads strings, whole numbers, null and lists of strings",
+            describe(other)
+        )),
+    }
 }
 
 impl fmt::Display for Json {
@@ -591,9 +349,9 @@ mod tests {
         assert_eq!(rendered(&Json::int(0)), "0");
         assert_eq!(rendered(&Json::int(1000)), "1000");
         assert_eq!(rendered(&Json::int(u64::from(u32::MAX))), "4294967295");
-        // A negative number is refused at the parser, so there is no variant to
-        // render. See `parse_number`.
-        assert!(Json::parse_object(r#"{"v":-1}"#).is_err());
+        // A negative number is refused rather than rendered, so there is no
+        // variant to render. See `convert`.
+        assert!(Json::checked(r#"{"v":-1}"#).is_err());
     }
 
     #[test]
@@ -633,10 +391,17 @@ mod tests {
     }
 
     #[test]
-    fn a_body_round_trips_through_the_parser() {
-        // The direction that matters: anything [`Json`] writes, the parser reads
-        // back as the same value. A server that writes a body it cannot parse is
-        // a server whose own examples do not work.
+    fn a_written_body_reads_back_as_the_same_fields() {
+        // The direction that matters now that there are two halves: anything this
+        // module writes must be something `checked` reads back. A server that
+        // emits a body its own reader would refuse is a server whose examples do
+        // not work.
+        //
+        // **Compared field by field, not as one `Json`.** `serde_json::Map` sorts
+        // keys, so a parsed object's fields come back in name order while a
+        // written one goes out in the order it was written. Comparing whole values
+        // would be comparing the order rather than the content — which is the one
+        // thing about a parsed body that does not matter.
         let document = Json::object(vec![
             ("upload", Json::string("abc123")),
             ("version", Json::int(7)),
@@ -645,84 +410,75 @@ mod tests {
                 Json::Array(vec![Json::string("aa"), Json::string("bb")]),
             ),
             ("compression", Json::Null),
-            ("flag", Json::Bool(true)),
+            ("absent", Json::Null),
+            ("zero", Json::int(0)),
         ]);
 
-        assert_eq!(Json::parse_object(&document.to_string()).unwrap(), document);
-    }
+        let Json::Object(read) = Json::checked(&document.to_string()).unwrap() else {
+            unreachable!("`checked` yields an object or an error");
+        };
 
-    #[test]
-    fn the_parser_reads_what_the_encoders_escapes() {
-        // The two halves of the module have to agree. An escape that is written
-        // and not read is a body no client can hand back.
-        let awkward = "quote\" slash\\ newline\n tab\t bell\u{0007}";
-        let document = Json::string(awkward).to_string();
+        let field = |name: &str| {
+            read.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
 
+        assert_eq!(field("upload"), Some(Json::string("abc123")));
+        assert_eq!(field("version"), Some(Json::int(7)));
         assert_eq!(
-            Json::parse_object(&format!("{{\"x\":{document}}}")).unwrap(),
-            Json::Object(vec![("x".to_string(), Json::string(awkward))])
+            field("have"),
+            Some(Json::Array(vec![Json::string("aa"), Json::string("bb")]))
         );
+        assert_eq!(field("compression"), Some(Json::Null));
+        assert_eq!(field("absent"), Some(Json::Null));
+        assert_eq!(field("zero"), Some(Json::int(0)));
+        assert_eq!(read.len(), 6, "no field was lost or invented");
     }
 
     #[test]
-    fn the_parser_reads_a_surrogate_free_unicode_escape() {
-        // `\\u00e9` is what a client may send for a character. A body that used a
-        // surrogate pair is refused rather than mangled, and says so.
-        let parsed = Json::parse_object(r#"{"x":"\u00e9"}"#).unwrap();
+    fn a_parsed_body_loses_field_order_and_that_is_fine() {
+        // Stated because it is a behaviour change from the hand-rolled parser, and
+        // a reader who assumed otherwise would write a lookup that depends on
+        // position. Nothing here does: every field is fetched by name.
+        let Json::Object(read) = Json::checked(r#"{"z":1,"a":2,"m":3}"#).unwrap() else {
+            unreachable!("`checked` yields an object or an error");
+        };
 
-        assert_eq!(
-            parsed,
-            Json::Object(vec![(
-                "x".to_string(),
-                Json::string("caf\u{e9}".replace("caf\u{e9}", "\u{e9}"))
-            )])
-        );
+        let names: Vec<&str> = read.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(names, vec!["a", "m", "z"], "serde_json sorts its keys");
     }
 
     #[test]
-    fn the_parser_refuses_a_number_it_cannot_mean() {
-        // Every number in a request body is a version or a count. A fraction or
-        // an exponent is a client that has misunderstood, and reading it as an
-        // integer would hide that.
-        for body in [r#"{"v":1.5}"#, r#"{"v":1e3}"#, r#"{"v":-}"#, r#"{"v":}"#] {
-            assert!(Json::parse_object(body).is_err(), "{body} should not parse");
+    fn checked_refuses_what_a_request_body_cannot_be() {
+        // The shape validation, which is what the hand-rolled parser was for and
+        // what survived its removal. Each names the field and the problem.
+        for (body, expects) in [
+            (r#"{"v":-1}"#, "-1"),
+            (r#"{"v":1.5}"#, "1.5"),
+            (r#"{"v":1e3}"#, "whole numbers"),
+            (r#"{"v":{"a":1}}"#, "`v`"),
+            (r#"{"have":[1]}"#, "holds a number"),
+            (r#"{"have":[{"a":1}]}"#, "holds an object"),
+            (r#"{"v":true}"#, "`v` is a boolean"),
+        ] {
+            let error = Json::checked(body).unwrap_err();
+            assert!(
+                error.contains(expects),
+                "{body} produced {error:?}, which does not mention {expects:?}"
+            );
         }
+
+        // Not JSON at all, and JSON that is not an object.
+        assert!(Json::checked("{").is_err());
+        assert!(Json::checked("[]").is_err());
+        assert!(Json::checked("\"a\"").is_err());
     }
 
     #[test]
-    fn the_parser_refuses_what_it_does_not_read() {
-        // Each of these says what it found, because a client that sent the wrong
-        // shape needs the shape and not a refusal.
-        assert!(Json::parse_object("[]").is_err());
-        assert!(Json::parse_object("{} {}").is_err());
-        assert!(Json::parse_object("{unquoted: 1}").is_err());
-        assert!(Json::parse_object(r#"{"a" 1}"#).is_err());
-        assert!(Json::parse_object(r#"{"a":1,}"#).is_err());
-        assert!(Json::parse_object("{'a':1}").is_err());
-        assert!(Json::parse_object("").is_err());
-        assert!(Json::parse_object(r#"{"a":1"#).is_err());
-    }
-
-    #[test]
-    fn the_parser_refuses_a_body_nested_past_what_this_api_defines() {
-        // A bound rather than a limit, so the failure is a `400` and not a stack
-        // overflow.
-        let deep = "[".repeat(32) + &"]".repeat(32);
-
-        assert!(Json::parse_object(&format!("{{\"a\":{deep}}}")).is_err());
-    }
-
-    #[test]
-    fn the_parser_refuses_a_truncated_multi_byte_character() {
-        // UTF-8 must not be copied one byte at a time, or a character becomes
-        // several.
-        let body = "{\"x\":\"\u{f0}\u{9f}\u{98}\u{80}\"}";
-
-        assert!(Json::parse_object(body).is_ok(), "{body} should parse");
-        assert!(
-            Json::parse_object(body).unwrap().to_string().contains('x'),
-            "the key must survive, which it does not if a character was copied a byte at a time"
-        );
+    fn checked_accepts_an_empty_object() {
+        // Which every one of these endpoints treats as "use the defaults".
+        assert_eq!(Json::checked("{}").unwrap(), Json::Object(Vec::new()));
     }
 
     #[test]

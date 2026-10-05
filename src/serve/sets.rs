@@ -242,20 +242,32 @@ impl Sets {
     ///
     /// Holding the mutex across the open is what makes "one handle at a time" a
     /// fact rather than an intention.
-    pub async fn writing(&self, name: &str) -> io::Result<WriteGuard> {
-        let key = name.to_string();
+    ///
+    /// **`work` is a closure, and that is not a style choice.** This used to
+    /// return a `WriteGuard`, which the caller held for as long as it wanted —
+    /// so a caller could drop it early and let a second merge in, or keep it
+    /// alive past the merge and block one. Both are the bug this lock exists to
+    /// prevent, and both were possible. A closure makes the extent of the lock
+    /// the closure's own body, so the only way to get the scope wrong is to move
+    /// the call.
+    pub async fn writing<F, Fut, T>(&self, name: &str, work: F) -> io::Result<T>
+    where
+        F: FnOnce(Arc<BlobStore<Write, Compression>>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
         let base = self.base(name)?;
 
         let entry = {
             let mut map = Self::locked(&self.writes, "writing")?;
-            map.entry(key)
+            map.entry(name.to_string())
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()
         };
 
-        // Held for the whole merge, including the open. The file lock on the set
-        // is taken by the caller inside this, against other processes.
-        let held = Arc::clone(&entry).lock_owned().await;
+        // Held across the open, and across `work`. The file lock on the set is
+        // taken by `work`, against other processes.
+        let _held = Arc::clone(&entry).lock_owned().await;
+
         let store = Arc::new(
             BlobStore::open_for_writing(
                 base,
@@ -265,7 +277,7 @@ impl Sets {
             .await?,
         );
 
-        Ok(WriteGuard { store, _held: held })
+        Ok(work(store).await)
     }
 
     /// Drop a set's cached read handle.
@@ -293,28 +305,6 @@ impl Sets {
         map.lock().map_err(|_| {
             io::Error::other(format!("the {what} lock was poisoned by an earlier panic"))
         })
-    }
-}
-
-/// A set's write handle, and the lock that makes it the only one.
-///
-/// Holding this is what serialises merges into one set. Both halves matter and
-/// they do different jobs. The `_held` guard keeps other merges in this process
-/// out; the caller takes the set's own file lock inside, which keeps other
-/// processes — and a `lepatch merge` on the same set — out.
-#[derive(Debug)]
-pub struct WriteGuard {
-    /// The store to merge into.
-    store: Arc<BlobStore<Write, Compression>>,
-    /// The per-set lock, held for as long as this guard is.
-    _held: tokio::sync::OwnedMutexGuard<()>,
-}
-
-impl WriteGuard {
-    /// The store.
-    #[must_use]
-    pub fn store(&self) -> &Arc<BlobStore<Write, Compression>> {
-        &self.store
     }
 }
 

@@ -17,6 +17,16 @@ use std::{
 /// the terminal.
 const INTERVAL: Duration = Duration::from_millis(300);
 
+/// The `tracing` target a reported line is emitted on.
+///
+/// **A constant rather than a literal at the callsite, and not only for tidiness.**
+/// It is half of the contract between this module and [`crate::serve::progress_layer`],
+/// which reads events on this target and ignores every other one. A literal that
+/// drifted from the reader's would mean no progress ever reaches a client, with
+/// nothing failing — so the reader names this one, and
+/// `every_callsite_the_layer_reads_is_admitted` checks the two against each other.
+pub(crate) const TARGET: &str = "lepatch::progress";
+
 /// What is being reported on.
 ///
 /// A value rather than a `&'static str`, for the same reason the counters are.
@@ -36,6 +46,8 @@ pub enum Phase {
     Apply,
     /// Reading every chunk back and hashing it.
     Verify,
+    /// Adding a pack to a backup set.
+    Merge,
 }
 
 impl Phase {
@@ -46,6 +58,7 @@ impl Phase {
             Self::Restore => "restore",
             Self::Apply => "apply",
             Self::Verify => "verify",
+            Self::Merge => "merge",
         }
     }
 }
@@ -118,6 +131,17 @@ impl Counter {
             Self::Written => 6,
         }
     }
+}
+
+/// Every counter's wire name, for a reader that is not this module.
+///
+/// **This is the contract between the emitter and `lepatch serve`**, which
+/// forwards these as `tracing` fields and matches on the names. A counter added to
+/// [`Counter`] without appearing here reaches no client, and nothing fails — so
+/// the sink compares the two lists rather than trusting either.
+#[must_use]
+pub fn counter_names() -> Vec<&'static str> {
+    Counter::ALL.iter().map(|counter| counter.name()).collect()
 }
 
 /// Accumulates what a run has done and decides when to say so.
@@ -211,8 +235,30 @@ impl Progress {
         }
 
         let elapsed = self.started.elapsed();
+
+        // **The counters go on the event as structured fields as well as into the
+        // message.** The message is for a person and its shape is free to change;
+        // the fields are for a program, and `lepatch serve` needs the numbers
+        // without parsing prose.
+        //
+        // The message is byte-identical to what it was before the fields were
+        // added, so `RUST_LOG=lepatch=info,lepatch::progress=warn` keeps working
+        // and every assertion on log text is unaffected. The fields are named
+        // after `Counter::name`, which is what a client is told to expect.
+        //
+        // This costs nothing when progress is filtered out: `tracing` checks the
+        // callsite before it evaluates arguments, and the fields are arguments.
+        // The hot-path note below is why that matters here.
         tracing::info!(
-            target: "lepatch::progress",
+            target: TARGET,
+            phase = self.what.name(),
+            files = self.counters[Counter::Files.slot()],
+            chunks = self.counters[Counter::Chunks.slot()],
+            distinct = self.counters[Counter::Distinct.slot()],
+            checked = self.counters[Counter::Checked.slot()],
+            done = self.counters[Counter::Done.slot()],
+            read = self.counters[Counter::Read.slot()],
+            written = self.counters[Counter::Written.slot()],
             "{} in progress: {}",
             self.what.name(),
             describe(&self.seen, &self.counters, elapsed)
@@ -457,10 +503,19 @@ mod tests {
     /// signal.
     #[test]
     fn every_phase_is_named() {
-        let names: Vec<&str> = [Phase::Backup, Phase::Restore, Phase::Verify]
-            .iter()
-            .map(|p| p.name())
-            .collect();
-        assert_eq!(names, ["backup", "restore", "verify"]);
+        // Every variant, spelled out. `Apply` was absent here and `Merge` would
+        // have joined it: the list was written by hand, so a phase added above
+        // without being added here was a phase whose name nothing checked.
+        let names: Vec<&str> = [
+            Phase::Backup,
+            Phase::Restore,
+            Phase::Apply,
+            Phase::Verify,
+            Phase::Merge,
+        ]
+        .iter()
+        .map(|p| p.name())
+        .collect();
+        assert_eq!(names, ["backup", "restore", "apply", "verify", "merge"]);
     }
 }

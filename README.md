@@ -1000,6 +1000,13 @@ translate them into a second vocabulary. And long work returns `202` with a job:
 `DELETE /v1/jobs/{id}` to stop it. Stopping needs no rollback, because a store is
 append-only with one commit record at the end of a run.
 
+**A job's progress is not the terminal's business.** `--quiet` and `RUST_LOG`
+decide what goes to stderr, and nothing else: a job's counters reach a client over
+HTTP whatever the operator set them to, and `lepatch --quiet serve` still reports
+progress to `GET /v1/jobs/{id}`. They are separate questions asked of separate
+things, so turning the terminal down cannot silence a client that is watching a
+merge over the network.
+
 **There is no authentication, and there is no TLS.** Anyone who can reach the port
 can read every set under the root and can append versions to them. That is a
 decision rather than an oversight, and the bind address defaults to `127.0.0.1` so

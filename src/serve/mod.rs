@@ -76,6 +76,7 @@ mod error;
 mod handlers;
 mod jobs;
 mod json;
+pub(crate) mod observe;
 mod openapi;
 mod pack;
 mod sets;
@@ -84,6 +85,40 @@ mod versions;
 
 pub use error::ApiError;
 pub use jobs::{Job, JobEvent, JobHandle, JobId, Jobs, State};
+pub use observe::Handle as ProgressLayer;
+pub use observe::filter as progress_filter;
+
+/// The `tracing` layer that forwards a running job's progress counters into its
+/// registry, for `main.rs` to install on the subscriber.
+///
+/// **The library does not install it.** A subscriber is process-global and this
+/// crate is a library first: a caller embedding `lepatch` owns its own tracing
+/// setup and would not find one of these under it. So this hands back a layer and
+/// leaves installation to the caller, who is the only one who knows where the
+/// subscriber lives.
+///
+/// **Install it with [`progress_filter`].** An unfiltered layer is offered every
+/// event in the process and does a target comparison on each; the filter admits
+/// this crate's callsites and refuses the rest. It is not optional in the sense
+/// that matters: it is what makes the layer's input small, and
+/// `progress_filter` deliberately ignores `RUST_LOG`, so a client's view of a
+/// job does not move when the terminal is turned down.
+///
+/// # Panics
+///
+/// Never. A subscriber can only be installed once per process, so this builds a
+/// layer rather than installing one — there is nothing here that can fail.
+#[must_use]
+pub fn progress_layer(jobs: Jobs) -> ProgressLayer {
+    ProgressLayer::new(jobs)
+}
+
+/// The event names `GET /v1/jobs/{id}/events` can put on the wire.
+///
+/// Public for the same reason [`SCHEMAS`] is: the document's description of that
+/// endpoint promises a closed set of names to switch on, and only `tests/openapi.rs`
+/// comparing it against this list makes the promise one somebody checks.
+pub use handlers::EVENT_NAMES;
 pub use json::Json;
 /// The `OpenAPI` document, served at `GET /openapi.json`.
 pub use openapi::DOCUMENT;
@@ -93,7 +128,7 @@ pub use openapi::DOCUMENT;
 /// server's own idea of what it serves, without reaching into a private module.
 pub use openapi::SCHEMAS;
 pub use pack::{ByteRange, Requested, Resolved};
-pub use sets::{Sets, WriteGuard};
+pub use sets::Sets;
 pub use upload::Uploads;
 
 /// Where the server keeps sets, where it binds, and where it puts scratch files.

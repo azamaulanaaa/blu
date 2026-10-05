@@ -247,6 +247,75 @@ fn every_path_parameter_the_router_uses_is_declared() {
 }
 
 #[test]
+fn the_events_description_names_every_event_the_stream_can_carry() {
+    // **A promise a client switches on.** The description of
+    // `GET /v1/jobs/{id}/events` tells a client which `event:` names exist, and a
+    // client that reads `error` from that paragraph cannot handle a failing job
+    // without falling back to polling. The paragraph drifted when the `error`
+    // frame was added and the document was not, so it is checked against
+    // [`lepatch::serve::EVENT_NAMES`] rather than trusted.
+    //
+    // That constant is the renderer's own list: `render_event` matches on
+    // `JobEvent`, and `every_rendered_event_is_a_named_one` in `handlers.rs`
+    // holds the two in step. So this is the last link in a chain that starts at
+    // the `match`, not a list written out here that could rot on its own.
+    let description = document()["paths"]["/v1/jobs/{id}/events"]["get"]["description"]
+        .as_str()
+        .expect("the events operation describes itself");
+
+    for name in lepatch::serve::EVENT_NAMES {
+        assert!(
+            description.contains(&format!("`{name}`")),
+            "the events description does not name `{name}`, so a client cannot switch on it: \
+             {description}"
+        );
+    }
+
+    // And it must not still be counting them. "Three event names" beside four of
+    // them is a description that tells a client the list is closed and is not.
+    let wrong = ["Two", "Three", "Five", "Six"]
+        .iter()
+        .map(|count| format!("{count} event names"))
+        .find(|phrase| description.contains(phrase.as_str()));
+
+    assert!(
+        wrong.is_none(),
+        "the events description says {wrong:?} and the renderer has {}: {description}",
+        lepatch::serve::EVENT_NAMES.len()
+    );
+}
+
+#[test]
+fn the_pack_get_documents_the_whole_pack_limit() {
+    // `GET /v1/packs/{id}` answers `413` for an un-ranged fetch of a pack above
+    // the server's whole-pack bound, and the document said nothing about it. A
+    // client generating from the spec has two reachable shapes for this endpoint
+    // — bytes, or a failure it was never told the server can produce — and only
+    // one of them is the truth.
+    //
+    // The other responses are the ones a fetch plan tells a client to expect, so
+    // the assertion is on the code rather than on the prose.
+    let responses = document()["paths"]["/v1/packs/{id}"]["get"]["responses"]
+        .as_object()
+        .expect("the pack GET declares responses");
+
+    assert!(
+        responses.contains_key("413"),
+        "an un-ranged GET of a pack above the whole-pack limit is refused, and the document does \
+         not say so: {:?}",
+        responses.keys().collect::<Vec<_>>()
+    );
+
+    // And it must be a documented problem, not an empty status: the client needs
+    // the `Error` schema to read the reason off it.
+    assert_eq!(
+        responses["413"]["content"]["application/problem+json"]["schema"]["$ref"],
+        "#/components/schemas/Error",
+        "a 413 must carry the error document every other failure does"
+    );
+}
+
+#[test]
 fn the_pack_media_type_is_the_one_the_server_sends() {
     // `application/octet-stream` would say nothing. A client that uploads a pack
     // and a client that uploads a photograph are the same request without it.

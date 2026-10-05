@@ -65,23 +65,39 @@ dist = true
 # `actix-rt`'s `parking_lot` and `time`. The features unify, so there is no
 # second runtime.
 #
-# **On serde.** `actix-web` pulls `serde` and `serde_json` in transitively. That
-# is not the first serde, because the comment below forbids it *here*. Read that
-# comment before concluding the position was abandoned.
-#
-# The no-serde rule is about the **on-disk format**: so that no upstream's release
-# cadence or security policy can decide whether a backup set is still readable.
-# That argument does not reach the API boundary. A JSON body has no bearing on
-# whether a set opens, and the HTTP contract is versioned by its own spec. So
-# serde is not added as a direct dependency, and the API's JSON is encoded by
-# hand in `src/serve/json.rs`, in the same style as everything else on disk.
-# `serde_json` appears once, as a **dev-dependency**, so `tests/openapi.rs` can
-# parse the spec and prove it has not drifted.
+# **On serde, read the `serde_json` entry below before drawing a conclusion.**
+# This crate has a no-serde rule for its ON-DISK format. That rule is intact and
+# `bincode` is still gone because of it. It does not reach the API boundary, and
+# `serde_json` below is now a direct dependency — for parsing request bodies, not
+# for writing this crate's types.
 #
 # `macros` is the only feature kept: the handlers are `#[get]` and `#[post]`.
 actix-web = { version = "4.15", default-features = false, features = ["macros"] }
 blake3 = { version = "1.8.2", features = ["traits-preview"] }
 clap = { version = "4.5.53", features = ["derive"] }
+# **This one is a parser, and it is here because the alternative was worse.**
+#
+# `serde_json` is ALREADY a transitive runtime dependency of `actix-web` — it is in
+# `Cargo.lock` under it, unconditionally, with the feature set this crate already
+# uses. So naming it here adds **zero** crates to the graph. An earlier version of
+# this comment claimed a hand-written parser was worth ~250 lines to avoid "a
+# dependency plus a CVE feed"; that was wrong, because the dependency and its
+# advisories were already being shipped in the binary. The graph argument did not
+# hold and has been deleted rather than softened.
+#
+# What remains true, and what still governs the API boundary:
+#
+# * **No serde on this crate's own types.** `Job`, `Requested`, a set name and a
+#   version are the library's contract, and a `#[derive(Serialize)]` on any of
+#   them would put a JSON concern into the type other callers reason about.
+#   So `src/serve/json.rs` still writes every response byte by hand.
+# * **The on-disk format stays hand-encoded**, which is the rule the crate still
+#   holds, and the one `bincode` was removed over.
+#
+# So: hand-written out, `serde_json` in. That is the honest split — the crate
+# chooses its response bytes, and does not hand-roll a JSON grammar to avoid a
+# crate it already links.
+serde_json = "1.0"
 fastcdc = "5.0.0"
 filetime = "0.2.29"
 # The streaming half of the server: the body of a ranged pack response, and the
@@ -101,7 +117,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # the job registry retires them on an age.
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+# `registry` is on for one reason: `lepatch serve` installs a second layer on the
+# subscriber so a running job's progress reaches a client even when `RUST_LOG`
+# keeps it off the terminal. Composing two layers is what `registry` is.
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "registry"] }
 walkdir = "2.5.0"
 # Record payloads are zstd frames, compressed on write and decompressed on read.
 # The measured trade-off, on a 4 MB executable: 2.7x smaller at level 1 and
@@ -128,10 +147,6 @@ experimental = []
 # it in parallel would only measure the sampler. Add the features back if the
 # plots are ever wanted.
 criterion = { version = "0.7", default-features = false }
-# For `tests/openapi.rs` only, which parses `openapi/lepatch.json` and fails if
-# the checked-in spec and the server's route table disagree. It is a dev-dependency
-# because the server does not use it: see the note on `actix-web` above.
-serde_json = "1.0"
 tempfile = "3.27.0"
 
 # Criterion is not a libtest harness, so each bench target opts out of it.

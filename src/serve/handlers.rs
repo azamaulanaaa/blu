@@ -35,6 +35,27 @@ use super::{
 /// The media type of every non-error response that is JSON.
 const JSON: &str = "application/json";
 
+/// The largest pack this server will send in a single un-ranged response.
+///
+/// **Why there is a bound at all.** `GET /v1/packs/{id}` with no `Range` header is
+/// the one response this service builds in memory: the pack's length is known
+/// from its geometry, so `content-length` is right, but the body itself is a
+/// `Vec` the size of the file (see [`read_range`]). This server has no
+/// authentication and its bind address is chosen by whoever starts it, so "the
+/// client asked for a big file" is not a limit anything can rely on — a handful
+/// of concurrent whole-pack `GET`s against a large version is enough to take the
+/// process out, and nothing in the request is the server's to refuse.
+///
+/// **Why this number.** It is a line an operator can reason about rather than a
+/// property of anything: comfortably above every pack this crate's own suite
+/// builds, and below the point where a `Vec` per in-flight request matters next
+/// to the set itself. A version bigger than this is not served whole by design —
+/// `POST /v1/packs/{id}/plan` is the documented way to pull one, it hands the
+/// client the exact ranges it lacks, and it allocates nothing like this. So the
+/// refusal is not a limitation the client works around; it is the supported flow
+/// being pointed at.
+const WHOLE_PACK_LIMIT: u64 = 64 * 1024 * 1024;
+
 /// A `200` carrying a JSON document.
 fn ok(document: &Json) -> HttpResponse {
     HttpResponse::Ok()
@@ -415,20 +436,19 @@ async fn request_pack(
         base: request.base,
     };
 
-    let id = jobs.spawn("pack", move |handle| async move {
+    // The job's span is entered by `Jobs::spawn`, which is where the id exists.
+    // See `spawn`.
+    let id = jobs.spawn("pack", move |_handle| async move {
         // `version: null` means "the newest one that resolves", which is what
         // the CLI does with no `--version`.
         let resolved = super::pack::resolve(&sets_for_job, &requested).await;
 
         let resolved = match resolved {
             Ok(resolved) => resolved,
-            Err(e) => {
-                handle.fail(e.to_string());
-                return Json::object(vec![("error", Json::string(e.to_string()))]);
-            }
+            Err(e) => return Err(e.to_string()),
         };
 
-        Json::object(vec![
+        Ok(Json::object(vec![
             ("set", Json::string(requested.set)),
             ("version", Json::int(u64::from(resolved.version))),
             ("length", Json::int(resolved.pack.file_len())),
@@ -439,7 +459,7 @@ async fn request_pack(
                 "snapshot",
                 Json::string(resolved.snapshot.to_hex().to_string()),
             ),
-        ])
+        ]))
     });
 
     accepted(id)
@@ -556,13 +576,18 @@ async fn begin_upload(uploads: web::Data<Uploads>) -> HttpResponse {
 /// what it sent is not a pack, rather than one request later at commit. That
 /// check reads the trailer and the index and no payload, so it costs nothing
 /// beside the transfer.
+///
+/// **The body is streamed, not collected.** It used to be taken as `web::Bytes`,
+/// which actix buffers subject to a default payload limit of 256 KiB — so a pack
+/// larger than that was refused with a bare `413`. A backup tool that cannot
+/// accept a 300 KiB pack cannot back anything up. See [`Uploads::put`].
 #[actix_web::put("/v1/uploads/{id}")]
 async fn fill_upload(
     uploads: web::Data<Uploads>,
     path: web::Path<String>,
-    body: web::Bytes,
+    payload: web::Payload,
 ) -> HttpResponse {
-    match uploads.put(&path.into_inner(), &body).await {
+    match uploads.put(&path.into_inner(), payload).await {
         Ok(_) => no_content(),
         Err(e) => error(&ApiError::from(e)),
     }
@@ -654,16 +679,8 @@ async fn merge_pack(
         return error(&ApiError::from(e));
     }
 
-    let id = jobs.spawn("merge", move |handle| async move {
-        let outcome = merge_into(&sets, &uploads, &name, &upload, policy).await;
-
-        match outcome {
-            Ok(merged) => merged,
-            Err(e) => {
-                handle.fail(e.to_string());
-                Json::object(vec![("error", Json::string(e.to_string()))])
-            }
-        }
+    let id = jobs.spawn("merge", move |_handle| async move {
+        merge_into(&sets, &uploads, &name, &upload, policy).await
     });
 
     accepted(id)
@@ -689,18 +706,31 @@ async fn merge_into(
     name: &str,
     upload: &str,
     policy: crate::command::MergeCompression,
-) -> Result<Json, std::io::Error> {
-    let guard = sets.writing(name).await?;
+) -> Result<Json, String> {
+    // Every `?` here is an `io::Error`; the job wants a sentence. One
+    // conversion at the boundary rather than a `map_err` on each call.
+    let attempt = sets
+        .writing(name, |store| async move {
+            let reason = |e: std::io::Error| e.to_string();
 
-    let base_path = sets.base(name)?;
-    let set = crate::layout::IndexSet::new(&base_path);
-    let _claim = set.lock()?;
+            let base_path = sets.base(name).map_err(reason)?;
+            let set = crate::layout::IndexSet::new(&base_path);
+            let _claim = set.lock().map_err(reason)?;
 
-    let pack = uploads.open(upload)?;
-    let merged = crate::command::merge(guard.store(), &pack, policy).await?;
+            let pack = uploads.open(upload).map_err(reason)?;
+            crate::command::merge(&store, &pack, policy)
+                .await
+                .map_err(reason)
+        })
+        .await
+        .map_err(|e: std::io::Error| e.to_string())?;
 
-    // After the merge, and only after it. A merge that failed leaves no version,
-    // and the handle is still accurate.
+    // The closure carries the conversion, so there is exactly one place an
+    // `io::Error` becomes the sentence a job reports.
+    let merged = attempt?;
+
+    // The cache is evicted here, outside the write lock and after the merge has
+    // returned, so the eviction cannot race a merge that is still appending.
     sets.evict(name);
 
     Ok(match merged {
@@ -823,8 +853,11 @@ async fn job_events(jobs: web::Data<super::Jobs>, path: web::Path<String>) -> Ht
 
 /// One event as an SSE frame.
 ///
-/// Three event names rather than one undifferentiated `data:` line, so a client
+/// Four event names rather than one undifferentiated `data:` line, so a client
 /// can tell a state change from a counter tick without parsing JSON to find out.
+/// `error` is the counterpart to `result`: a job that failed tells the stream why,
+/// so a client that only reads events does not have to fall back to polling to
+/// find out.
 ///
 /// By reference, because the two halves of the stream — the replay and the live
 /// receiver — hold the event between them and there is no reason to move it out.
@@ -842,10 +875,29 @@ fn render_event(event: &JobEvent) -> actix_web::web::Bytes {
             .to_string(),
         ),
         JobEvent::Result(result) => ("result", result.to_string()),
+        JobEvent::Error(reason) => ("error", Json::string(reason).to_string()),
     };
 
     actix_web::web::Bytes::from(format!("event: {name}\ndata: {payload}\n\n"))
 }
+
+/// Every event name the SSE renderer can put on the wire, as `JobEvent`'s
+/// variants are matched.
+///
+/// **Next to the `match`, because the `match` is the thing that can fall out of
+/// step with it.** An event variant added above renders a name this list does not
+/// name, and nothing else here would notice. So the list is the renderer's own
+/// vocabulary, published for `tests/openapi.rs` to check the `OpenAPI` document
+/// against — the description of `GET /v1/jobs/{id}/events` promises a client a
+/// closed set of names to switch on, and a promise that is one name short is
+/// worse than no promise.
+///
+/// Public for the same reason [`ROUTES`](super::ROUTES) and
+/// [`SCHEMAS`](super::SCHEMAS) are: the document is written by hand, so a test
+/// has to be able to compare it against the code without reaching into a private
+/// module. The renderer's own `match` is checked against this list by
+/// `every_rendered_event_is_a_named_one` below.
+pub const EVENT_NAMES: &[&str] = &["state", "progress", "result", "error"];
 
 /// The word a state is reported under, matching the JSON in a job document.
 fn state_name(state: State) -> &'static str {
@@ -860,17 +912,24 @@ fn state_name(state: State) -> &'static str {
 
 /// Answer a `Range` request against a resolved pack, or the whole pack.
 ///
-/// **The three responses a range can produce**, and each says what happened:
+/// **The four responses**, and each says what happened:
 ///
 /// * `206` with `Content-Range` — the bytes asked for.
-/// * `200` with the whole pack — no `Range` header, which is the ordinary fetch.
+/// * `200` with the whole pack — no `Range` header, which is the ordinary fetch,
+///   for a pack up to [`WHOLE_PACK_LIMIT`].
 /// * `416` with `Content-Range: bytes */length` — the offset is past the end, so
-///   the client's idea of the file is wrong and it should hear about it rather
+///   the client's idea of the file is wrong and it should hear about that rather
 ///   than receive an empty body it would write as a hole.
+/// * `413` — a whole-pack `GET` above [`WHOLE_PACK_LIMIT`], naming the plan
+///   endpoint and ranges as the way to fetch a pack that size.
 fn serve_range(resolved: &Resolved, asked: Option<ByteRange>) -> HttpResponse {
     let length = resolved.pack.file_len();
 
     let Some(parsed) = asked else {
+        if let Some(refusal) = whole_pack_refusal(length) {
+            return error(&refusal);
+        }
+
         let whole = ByteRange {
             start: 0,
             end: u64::MAX,
@@ -945,6 +1004,32 @@ fn serve_range(resolved: &Resolved, asked: Option<ByteRange>) -> HttpResponse {
     }
 }
 
+/// The `413` for a whole-pack `GET` above [`WHOLE_PACK_LIMIT`], or `None`.
+///
+/// **Refused rather than streamed, and the length is why this is enough.** The
+/// pack's length is already known before a byte is read, so there is no reason to
+/// start building a body the server has already decided it cannot afford. Nothing
+/// is read and nothing is allocated to produce this.
+///
+/// Its own function so the bound can be checked at its own edges without a
+/// resolved pack behind it — the boundary is a property of the constant, and the
+/// property is what a change to the constant has to break.
+fn whole_pack_refusal(length: u64) -> Option<ApiError> {
+    if length <= WHOLE_PACK_LIMIT {
+        return None;
+    }
+
+    Some(ApiError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "refusing to send a {length}-byte pack in one response: an un-ranged pack fetch is \
+             held in memory, and this server sends at most {WHOLE_PACK_LIMIT} bytes that way. \
+             Fetch a pack this size with `POST /v1/packs/{{id}}/plan`, which returns the byte \
+             ranges you lack, and request those ranges one at a time with a `Range` header"
+        ),
+    ))
+}
+
 /// Read `range` out of a resolved pack.
 ///
 /// **Read into memory rather than streaming, and the bound is why.** A range is
@@ -954,9 +1039,10 @@ fn serve_range(resolved: &Resolved, asked: Option<ByteRange>) -> HttpResponse {
 /// region — not an arbitrary slice of a multi-gigabyte payload.
 ///
 /// A whole-pack `GET` is the exception, and it is buffered because the alternative
-/// is a body whose length is not known until it has been computed. That is the one
-/// case where a very large allocation is possible, and it is a client asking for
-/// the whole file.
+/// is a body whose length is not known until it has been computed. **That case is
+/// bounded now**, at [`WHOLE_PACK_LIMIT`] and by a `413` rather than by the
+/// allocator, so the one allocation this endpoint can make is one whose size an
+/// operator chose. See [`whole_pack_refusal`].
 fn read_range(resolved: &Resolved, range: crate::pack::Range) -> std::io::Result<Vec<u8>> {
     let sources = resolved.source(range)?;
 
@@ -1043,19 +1129,21 @@ pub(super) fn id_for(request: &Requested) -> Option<String> {
 
 /// Split a JSON object body into its fields.
 ///
-/// A body is read whole and parsed here. **This is not a JSON parser and does not
-/// pretend to be.** It handles exactly what these endpoints accept — a flat
-/// object of strings, integers, arrays of strings and `null` — and anything else
-/// is a `400` naming what it found. A general parser is a dependency and a
-/// maintenance obligation, for three request shapes.
+/// A body is read whole and handed to [`Json::checked`], which parses it with
+/// `serde_json` and then validates the shape: a flat object of strings, whole
+/// numbers, booleans, `null` and arrays of strings. Anything else is a `400`
+/// naming the field and what it was, because a client that sent the wrong shape
+/// needs to be told the shape rather than told it failed.
 ///
 /// # Errors
 ///
-/// Returns an error if `body` is not an object, or if it holds a value this does
-/// not read.
+/// Returns an error if `body` is not JSON, is not an object, or holds a value
+/// this does not read.
 fn parse_fields(body: &str) -> Result<Vec<(String, Json)>, ApiError> {
-    match Json::parse_object(body).map_err(ApiError::bad_request)? {
+    match Json::checked(body).map_err(ApiError::bad_request)? {
         Json::Object(fields) => Ok(fields),
+        // Unreachable: `checked` yields `Ok` only for an object. Stated rather
+        // than `unreachable!()`, which this crate denies.
         _ => Err(ApiError::bad_request(
             "a request body must be a JSON object",
         )),
@@ -1072,3 +1160,101 @@ type StatusCode = actix_web::http::StatusCode;
 /// is wrapped. `Infallible` because rendering an event cannot fail: every field of
 /// one is either a string this module wrote or a number it already holds.
 type Frame = Result<actix_web::web::Bytes, std::convert::Infallible>;
+
+#[cfg(test)]
+mod tests {
+    use actix_web::http::StatusCode;
+
+    use super::{EVENT_NAMES, WHOLE_PACK_LIMIT, render_event, whole_pack_refusal};
+    use crate::serve::{JobEvent, Json, State};
+
+    #[test]
+    fn the_whole_pack_bound_is_inclusive_at_its_top() {
+        // **The boundary, both sides of it.** `<=`, so the limit itself is
+        // served and one byte more is not. A pack exactly at the line that was
+        // refused would make the number a claim rather than a bound.
+        assert!(
+            whole_pack_refusal(WHOLE_PACK_LIMIT).is_none(),
+            "a pack of exactly the limit must still be served whole"
+        );
+        assert!(whole_pack_refusal(WHOLE_PACK_LIMIT + 1).is_some());
+    }
+
+    #[test]
+    fn an_ordinary_small_pack_is_served_whole() {
+        // What a pull of a normal version does, and what must keep working: no
+        // `Range` header, `200`, the whole file. The size here is far below the
+        // bound and is the shape every other test in the suite fetches.
+        assert!(whole_pack_refusal(0).is_none());
+        assert!(whole_pack_refusal(2_073_438).is_none());
+    }
+
+    #[test]
+    fn a_refused_whole_pack_get_says_what_to_do_instead() {
+        // A `413` with no advice is a dead end. The client has two supported ways
+        // to fetch a pack this size and neither is a guess.
+        let refusal = whole_pack_refusal(WHOLE_PACK_LIMIT + 1).unwrap();
+
+        assert_eq!(refusal.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let document = refusal.problem().to_string();
+        assert!(
+            document.contains("/v1/packs/{id}/plan"),
+            "the refusal must name the plan endpoint: {document}"
+        );
+        assert!(
+            document.contains("Range"),
+            "the refusal must name ranged fetches: {document}"
+        );
+        assert!(
+            document.contains(&WHOLE_PACK_LIMIT.to_string()),
+            "the refusal must state the bound it refused against: {document}"
+        );
+    }
+
+    /// One of each [`JobEvent`], so the renderer's whole vocabulary is covered.
+    fn every_event() -> Vec<JobEvent> {
+        vec![
+            JobEvent::State(State::Running),
+            JobEvent::Progress(vec![("chunks".to_string(), 3)]),
+            JobEvent::Result(Json::Null),
+            JobEvent::Error("a reason".to_string()),
+        ]
+    }
+
+    #[test]
+    fn every_rendered_event_is_a_named_one() {
+        // **The chain that makes `EVENT_NAMES` worth exporting.** The renderer
+        // matches on `JobEvent`, so a variant added there renders a name that no
+        // other list knows about. This compares the two directions: every name the
+        // renderer can produce is in the list, and every name in the list is
+        // produced. `tests/openapi.rs` then holds the document's description to
+        // that list, which is the last link.
+        let rendered: Vec<String> = every_event()
+            .iter()
+            .map(|event| {
+                let frame = String::from_utf8(render_event(event).to_vec())
+                    .expect("a rendered frame is text");
+                frame
+                    .strip_prefix("event: ")
+                    .and_then(|rest| rest.split_once('\n').map(|(name, _)| name))
+                    .unwrap_or_else(|| panic!("a frame must lead with its name: {frame}"))
+                    .to_string()
+            })
+            .collect();
+
+        for name in &rendered {
+            assert!(
+                EVENT_NAMES.contains(&name.as_str()),
+                "the renderer emits {name:?}, which EVENT_NAMES does not list"
+            );
+        }
+
+        assert_eq!(
+            rendered.len(),
+            EVENT_NAMES.len(),
+            "EVENT_NAMES lists {} names and the renderer produces {rendered:?}",
+            EVENT_NAMES.len()
+        );
+    }
+}

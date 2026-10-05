@@ -212,6 +212,7 @@ use tracing::instrument;
 use crate::{
     metadata::Snapshot,
     pack::{Pack, StorageStored},
+    progress::{Counter, Phase, Progress},
     storage::{self, BlobId, Codec, Placement, StorageGet, StoragePut},
 };
 
@@ -413,6 +414,33 @@ pub async fn merge<C: storage::Compressor>(
         bytes: 0,
     };
 
+    // **Reported the way `verify` reports, and for the same reason.** The plan is
+    // resolved by now, so the chunk count is known before a byte is written and
+    // can be stated outright rather than counted up to a total nobody knows.
+    //
+    // The two counters are the two halves of [`MergePlan`], and the pairing is
+    // deliberate:
+    //
+    // * `chunks` is every distinct chunk the merged version reads, which is
+    //   [`MergePlan::chunks`].
+    // * `distinct` is the ones this run actually stored, which is
+    //   [`MergePlan::fresh`]. The set already holding the rest is exactly
+    //   `chunks - distinct`, so nothing is lost by not giving [`MergePlan::held`]
+    //   a counter of its own: a client can do the subtraction.
+    //
+    // `Written` is deliberately **not** reported. Its doc says "bytes written to
+    // the destination", and the only byte total a merge has is
+    // [`MergePlan::bytes`], which this module's docs are explicit is *content*
+    // before compression rather than what lands in a segment. The rate on that
+    // counter would then be a content rate wearing the name of a disk rate, which
+    // is the exact kind of quiet lie the counter split exists to prevent.
+    let mut progress = Progress::new(Phase::Merge);
+    progress.set(
+        Counter::Chunks,
+        u64::try_from(plan.as_ref().len()).unwrap_or(0),
+    );
+    progress.report();
+
     for chunk in &plan {
         merged.chunks = merged.chunks.saturating_add(1);
 
@@ -487,6 +515,17 @@ pub async fn merge<C: storage::Compressor>(
 
         merged.fresh = merged.fresh.saturating_add(1);
         merged.bytes = merged.bytes.saturating_add(located.content_len);
+
+        // **Inside the loop, not after it.** A merge of a large pack is the one
+        // run whose interesting part is the writing, so the counter has to move
+        // while it is happening rather than land in one line at the end. The
+        // rate limiting is [`Progress::report`]'s own; nothing here throttles.
+        //
+        // The `held` arm above does not report, and that is honest rather than
+        // an oversight: a chunk the set already holds is a hash lookup, so a run
+        // spending its time on those is a run with nothing to say.
+        progress.add(Counter::Distinct, 1);
+        progress.report();
     }
 
     // The snapshot is a blob like any other, addressed by the hash of its own

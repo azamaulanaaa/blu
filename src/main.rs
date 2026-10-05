@@ -14,7 +14,11 @@ use lepatch::{
     reader, storage,
 };
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{
+    EnvFilter, fmt,
+    layer::{Layer as _, SubscriberExt as _},
+    util::SubscriberInitExt as _,
+};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "lepatch", version, about, long_about = None)]
@@ -26,7 +30,11 @@ struct Args {
     #[arg(long, short)]
     verbose: bool,
 
-    /// Only report warnings and errors.
+    /// Only report warnings and errors, on the terminal.
+    ///
+    /// "On the terminal" is the whole of the scope. A client watching a job over
+    /// HTTP still sees its progress, because `--quiet` and `RUST_LOG` are asked
+    /// what goes to stderr and nothing is asked them about the wire.
     #[arg(long, short, conflicts_with = "verbose")]
     quiet: bool,
 }
@@ -396,9 +404,19 @@ enum Command {
 async fn main() -> ExitCode {
     let args = Args::parse();
 
-    init_tracing(args.verbose, args.quiet);
+    // The registry the progress layer forwards into. It has to exist before
+    // `init_tracing`, because the layer is installed on the subscriber there.
+    //
+    // Built unconditionally: it is a broadcast channel and two mutexes, and a
+    // conditional build made every command carry an `Option` that one arm of a
+    // match could not use. Which commands install the layer is `init_tracing`'s
+    // business, and it still installs it only for `serve`.
+    let jobs = lepatch::serve::Jobs::new();
+    let serving = matches!(args.command, Command::Serve { .. });
 
-    match run(args.command).await {
+    init_tracing(args.verbose, args.quiet, serving.then_some(&jobs));
+
+    match run(args.command, jobs).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // The message, not the `Debug` form.
@@ -441,7 +459,39 @@ async fn main() -> ExitCode {
     }
 }
 
-fn init_tracing(verbose: bool, quiet: bool) {
+/// Build the subscriber, with the job-progress layer installed when serving.
+///
+/// **The layer is only installed for `serve`.** It reads `lepatch::progress`
+/// events out of the span a job runs in and forwards the counters into the job
+/// registry, which only `serve` has. Installing it elsewhere would cost every
+/// event a hash lookup for a registry nothing reads.
+///
+/// # What the filter is attached to, and why that is the whole fix
+///
+/// **`--verbose`, `--quiet` and `RUST_LOG` govern the terminal. They are attached
+/// to the `fmt` layer, and to nothing else.**
+///
+/// They used to be attached to the subscriber, which is a global filter: a
+/// callsite it answers `never` to is not emitted at all, so a decision made for
+/// stderr was also a decision made for everything stacked above it. A
+/// `lepatch::progress` event is an `INFO` event, so `lepatch --quiet serve`
+/// answered `never` to it, the event was never emitted, the progress layer above
+/// was never offered it, and a client polling `GET /v1/jobs/{id}` was told the
+/// merge had reported nothing. Adding `RUST_LOG=info` restored it, which is what
+/// made this look like a filter bug rather than an architectural one.
+///
+/// A filter attached to the writer layer answers only the writer's question. The
+/// progress layer carries its own — [`lepatch::serve::progress_filter`] — so a
+/// client's view of a running job does not move when the operator turns the
+/// terminal down. The two are asked the same question and are allowed to answer
+/// it differently, which is the point.
+///
+/// The other commands are unaffected because for them there is no second layer:
+/// the `None` arm below installs one filtered layer over the registry, and a
+/// filter on the only layer is indistinguishable from a filter on the subscriber.
+/// `tests/cli.rs::quiet_suppresses_progress_and_verbose_adds_detail` is what
+/// holds that still true.
+fn init_tracing(verbose: bool, quiet: bool, jobs: Option<&lepatch::serve::Jobs>) {
     let default = if verbose {
         LevelFilter::TRACE
     } else if quiet {
@@ -456,10 +506,30 @@ fn init_tracing(verbose: bool, quiet: bool) {
 
     // Data on stdout, diagnostics on stderr. So every command is pipeable
     // without `--quiet`.
-    let _ = fmt()
-        .with_env_filter(filter)
+    let writer = fmt::layer()
         .with_writer(std::io::stderr)
-        .try_init();
+        .with_filter(filter);
+
+    match jobs {
+        None => {
+            // No second layer, so this is the plain case and it is spelled the
+            // plain way.
+            let _ = tracing_subscriber::registry().with(writer).try_init();
+        }
+        Some(jobs) => {
+            // Each layer is asked separately, and each answers for itself. The
+            // `fmt` layer's filter says what the terminal prints; the progress
+            // layer's says which callsites carry a client's counters, and
+            // refuses the rest of the process.
+            let layer = lepatch::serve::progress_layer(jobs.clone())
+                .with_filter(lepatch::serve::progress_filter());
+
+            let _ = tracing_subscriber::registry()
+                .with(writer)
+                .with(layer)
+                .try_init();
+        }
+    }
 }
 
 /// Number of the signal that asked us to stop, or 0 if none did. `main` reads it
@@ -500,9 +570,9 @@ macro_rules! say {
 ///
 /// The claims a run holds are released by `Drop`, so stopping is a matter of
 /// letting the work future drop rather than resuming it.
-async fn run(command: Command) -> std::io::Result<()> {
+async fn run(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Result<()> {
     tokio::select! {
-        result = dispatch(command) => result,
+        result = dispatch(command, jobs) => result,
         signal = stop_signal() => Err(signal),
     }
 }
@@ -557,9 +627,9 @@ async fn run_serve(
     root: &std::path::Path,
     bind: Option<&str>,
     scratch: Option<&std::path::Path>,
+    jobs: &lepatch::serve::Jobs,
 ) -> std::io::Result<()> {
     let config = lepatch::serve::Config::new(root, bind.unwrap_or(DEFAULT_BIND), scratch);
-    let jobs = lepatch::serve::Jobs::new();
 
     // Reported before the listener is up, and to stdout, so a caller reading one
     // line knows the port. The address is resolved by actix, which is what makes
@@ -571,7 +641,7 @@ async fn run_serve(
         "serving"
     );
 
-    let running = lepatch::serve::bind(&config, &jobs)?;
+    let running = lepatch::serve::bind(&config, jobs)?;
     say!("http://{}", running.addr())?;
 
     running.run().await
@@ -585,7 +655,7 @@ async fn run_serve(
 const DEFAULT_BIND: &str = "127.0.0.1:8480";
 
 /// The work itself, without the interruption handling.
-async fn dispatch(command: Command) -> std::io::Result<()> {
+async fn dispatch(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Result<()> {
     match command {
         Command::Backup {
             source,
@@ -645,7 +715,7 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
             root,
             bind,
             scratch,
-        } => run_serve(&root, bind.as_deref(), scratch.as_deref()).await,
+        } => run_serve(&root, bind.as_deref(), scratch.as_deref(), &jobs).await,
     }
 }
 

@@ -78,9 +78,10 @@ impl Uploads {
     pub async fn begin(&self, id: &str) -> io::Result<PathBuf> {
         let path = self.scratch.join(format!("{id}.pack"));
 
-        // Created empty, so a `PUT` opens with `create` rather than `truncate`
-        // and a second `PUT` cannot silently replace an upload a client believes
-        // it sent. `PUT` checks for itself and refuses.
+        // Created empty, so the file exists before a `PUT` arrives and a `PUT`
+        // against an id nobody began cannot invent one. `PUT` then opens it with
+        // `create`, which truncates — see the note on `put` for why that is the
+        // right answer to a second `PUT`.
         if !path.exists() {
             tokio::fs::File::create(&path).await?;
         }
@@ -99,23 +100,88 @@ impl Uploads {
         self.locked()?.get(id).cloned().ok_or_else(|| no_upload(id))
     }
 
-    /// Write an upload's bytes.
+    /// Write an upload's bytes, streaming them to the scratch file.
+    ///
+    /// **A second `PUT` truncates and replaces; it does not refuse.** An earlier
+    /// version of this comment claimed the opposite — that `begin` created the
+    /// file precisely so that a second `PUT` could not silently replace an upload
+    /// a client believed it had sent — and it was never implemented. It described
+    /// a resumable upload that does not exist, so a reader checking the code
+    /// against the comment would find they had the contract backwards.
+    ///
+    /// **Truncation is the right answer for the case that actually happens.** A
+    /// backup client whose transfer was cut off re-sends the whole pack under the
+    /// same upload id, and those bytes have to land. Refusing would leave it with
+    /// no way forward at all: the only alternative this API offers is to abandon
+    /// the upload and begin a new one, throwing away a scratch file the server has
+    /// already accepted bytes into, which is exactly the cost a retry exists to
+    /// avoid. And the case that *would* argue for a refusal — a second `PUT` over
+    /// an upload something has already read — is not one this crate guards today
+    /// in either direction, so refusing every second `PUT` would break the real
+    /// case to defend against one that is already undefended.
+    ///
+    /// A short or interrupted body cannot be mistaken for a good one: `Pack::open`
+    /// at the end of this function refuses it, and that check happens on every
+    /// `PUT` rather than only at commit.
+    ///
+    /// **Streamed, not buffered, and the reason is that there is no ceiling on a
+    /// pack's size.** This used to take `&[u8]`, which meant actix collected the
+    /// whole body first — and actix's default payload limit is 256 KiB, so a pack
+    /// over that was refused with a bare `413` and a backup tool that could not
+    /// accept a 300 KiB pack was not a backup tool. Every test in the suite used
+    /// a pack of about 20 KB, so nothing caught it.
+    ///
+    /// Streaming also fixes the other end of the same problem: a pack is derived
+    /// output and can be larger than memory, so buffering one to write it out is
+    /// a ceiling by another name.
     ///
     /// # Errors
     ///
-    /// Returns an error if the upload is not held, if the write fails, or if the
-    /// bytes do not make a file that `Pack::open` accepts. **The check is
-    /// `Pack::open` itself**, run before the upload is recorded as complete, so
-    /// `commit` is not the first place a client hears that what it sent was not
-    /// a pack.
-    pub async fn put(&self, id: &str, bytes: &[u8]) -> io::Result<Pack> {
-        let path = self.path(id)?;
+    /// Returns an error if the upload is not held, if the client disconnects
+    /// mid-transfer, or if the bytes do not make a file that `Pack::open`
+    /// accepts. **The check is `Pack::open` itself**, run before the upload is
+    /// recorded as complete, so `commit` is not the first place a client hears
+    /// that what it sent was not a pack.
+    pub async fn put<S, E>(&self, id: &str, payload: S) -> io::Result<Pack>
+    where
+        S: futures_util::Stream<Item = Result<actix_web::web::Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        use futures_util::StreamExt as _;
 
+        let path = self.path(id)?;
         let mut file = tokio::fs::File::create(&path).await?;
-        file.write_all(bytes).await?;
+        let mut written = 0u64;
+
+        let mut payload = std::pin::pin!(payload);
+        while let Some(chunk) = payload.next().await {
+            // A client that goes away mid-transfer leaves a partial file. It is not
+            // a pack, so `Pack::open` below refuses it and nothing downstream can
+            // mistake it for one. **A payload error is mapped, not lost**: a bare
+            // `413` from a body limit and a bare disconnect are the two failures a
+            // client cannot tell apart otherwise.
+            let chunk = chunk.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the upload was cut short: {e}"),
+                )
+            })?;
+            file.write_all(&chunk).await?;
+            written = written.saturating_add(u64::try_from(chunk.len()).unwrap_or(0));
+        }
+
         file.flush().await?;
         file.sync_all().await?;
         drop(file);
+
+        // An empty body is not a pack, and saying so by name is more use than the
+        // length error `Pack::open` would produce on its own.
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the upload arrived empty; a pack has a header and an index at minimum",
+            ));
+        }
 
         // Now, and not at commit. `Pack::open` reads a trailer and an index, so
         // this costs nothing near what the transfer did — and it means the two
@@ -187,6 +253,9 @@ fn no_upload(id: &str) -> io::Error {
 mod tests {
     use std::io;
 
+    use actix_web::web::Bytes;
+    use futures_util::Stream;
+
     use super::Uploads;
 
     fn scratch_dir() -> (tempfile::TempDir, Uploads) {
@@ -196,6 +265,20 @@ mod tests {
         (dir, uploads)
     }
 
+    /// A body arriving as the single chunk it was written as.
+    ///
+    /// `Uploads::put` takes the payload as a `Stream` because the real one is a
+    /// socket read in pieces, and a test hands it over whole. One item over
+    /// `stream::iter` is what "one chunk, then end of body" looks like as a
+    /// stream, so a test that only cares about the bytes still reads as a `put`
+    /// with a body.
+    ///
+    /// `stream::iter` rather than `stream::once` over an `async` block, because
+    /// `put` pins its payload and an `async` block is not `Unpin`.
+    fn one_chunk(body: &'static [u8]) -> impl Stream<Item = Result<Bytes, io::Error>> {
+        futures_util::stream::iter([Ok(Bytes::from_static(body))])
+    }
+
     #[tokio::test]
     async fn an_upload_that_was_never_filled_is_not_a_pack() {
         // Checked at `put`, not only at commit, so a client hears about it at the
@@ -203,9 +286,40 @@ mod tests {
         let (_dir, uploads) = scratch_dir();
         uploads.begin("abc").await.unwrap();
 
-        let error = uploads.put("abc", b"not a pack at all").await.unwrap_err();
+        let error = uploads
+            .put("abc", one_chunk(b"not a pack at all"))
+            .await
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_second_put_replaces_what_the_first_wrote() {
+        // **The documented behaviour, and the one a retry needs.** A client whose
+        // transfer was cut off re-sends the whole pack under the same id; the
+        // bytes on disk afterwards have to be the ones it sent *last*, or the
+        // retry silently produced a pack spliced out of two transfers.
+        //
+        // Both bodies here are refused by `Pack::open` — the assertion is about
+        // which bytes survived, not about validity.
+        let (_dir, uploads) = scratch_dir();
+        let path = uploads.begin("abc").await.unwrap();
+
+        uploads
+            .put("abc", one_chunk(b"the first attempt, cut short"))
+            .await
+            .unwrap_err();
+        uploads
+            .put("abc", one_chunk(b"the whole pack, sent again"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the whole pack, sent again",
+            "a second PUT must truncate, not append and not refuse"
+        );
     }
 
     #[tokio::test]

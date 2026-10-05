@@ -31,9 +31,9 @@
 //! status is for.
 //!
 //! So the boundary is exempt. The rule is kept anyway — the JSON is hand-encoded
-//! in [`Json`](super::Json), for the reasons above — and `serde_json` appears once
-//! as a **dev-dependency**, so `tests/openapi.rs` can parse this document and
-//! fail when it stops being true.
+//! in [`Json`](super::Json), for the reasons above. `serde_json` is a direct
+//! dependency for *parsing request bodies*; it is also what `tests/openapi.rs`
+//! uses to parse this document and fail when it stops being true.
 
 /// The document, served verbatim.
 ///

@@ -207,6 +207,17 @@ pub enum JobEvent {
     Progress(Vec<(String, u64)>),
     /// The job finished, and this is its result.
     Result(Json),
+    /// The job finished, and this is why it did not.
+    ///
+    /// **The counterpart to [`JobEvent::Result`], and it exists because a
+    /// watcher otherwise cannot learn anything.** `Result` was broadcast on
+    /// success only, so a client on `/events` was sent `state: failed` and then
+    /// nothing: the `Err` was stored on the job and was reachable only by polling
+    /// `GET /v1/jobs/{id}`, which is the endpoint a client falls back to precisely
+    /// when the stream has not told it what happened. The sentence is the same one
+    /// the poll reports — the `Err` the work returned, verbatim, not a rewording —
+    /// so the two cannot disagree.
+    Error(String),
 }
 
 /// A job, as a client sees it.
@@ -279,6 +290,11 @@ struct Inner {
     handles: Mutex<HashMap<JobId, JoinHandle<()>>>,
     events: broadcast::Sender<JobEvent>,
     /// Recent events per job, so a late subscriber is not told nothing.
+    ///
+    /// **This lock also covers the `send` in `broadcast`.** The history and the
+    /// live stream are two views of one event, and they can only be taken
+    /// consistently if both the sending and the reading happen under one lock.
+    /// See [`Jobs::subscribe`].
     replay: Mutex<HashMap<JobId, Vec<JobEvent>>>,
 }
 
@@ -302,13 +318,45 @@ impl Jobs {
     /// `work` is handed the job so it can report progress. The task is spawned
     /// immediately, so a job is `Queued` only for as long as the scheduler takes.
     ///
-    /// The result is recorded when `work` returns, and the job's terminal state
-    /// is set from whether it returned `Ok`. **There is no cleanup path to get
-    /// wrong**: dropping the future on a cancel runs the destructors inside it.
+    /// **`work` returns a `Result`, and the `Err` is what makes the job fail.**
+    ///
+    /// This used to return the `Json` outright, with a failure carried as an
+    /// `{"error": ...}` object inside it, and `spawn` set `Succeeded` either way.
+    /// So a pack that could not be resolved produced
+    ///
+    /// ```text
+    /// { "state": "succeeded",
+    ///   "error": "no usable version in /srv/docs",
+    ///   "result": { "error": "no usable version in /srv/docs" } }
+    /// ```
+    ///
+    /// which is worse than a plain wrong answer, because `state` and `error`
+    /// disagree and the field a client checks first is the false one. A second
+    /// escape hatch — `JobHandle::fail`, which set `error` without touching
+    /// `state` — existed for the same reason and is gone with this.
+    ///
+    /// **There is no cleanup path to get wrong**: dropping the future on a cancel
+    /// runs the destructors inside it.
+    ///
+    /// ## What a panic in the work does
+    ///
+    /// Nothing observes the [`JoinHandle`], so a panic inside `work` unwinds the
+    /// task and the job is left `running` for ever with its handle still in
+    /// `handles`. **That is left as it is deliberately**, and the reason is that
+    /// the alternative is a watchdog task per job — a second task per job, and a
+    /// second state machine for the abort race — bought for a failure this
+    /// codebase does not produce. `unwrap` and `expect` are denied crate-wide, so
+    /// a job future's ways of going wrong are the `Err` values it returns, and a
+    /// panic here is a bug that belongs in a log rather than one the server
+    /// papers over with a sentence it invented.
+    ///
+    /// It is not stranded either. `handles` is left holding the handle, so
+    /// `DELETE /v1/jobs/{id}` finds it, aborts it (a no-op on a task that has
+    /// already finished) and marks the job `cancelled`.
     pub fn spawn<F, Fut>(&self, kind: &'static str, work: F) -> JobId
     where
         F: FnOnce(JobHandle) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Json> + Send + 'static,
+        Fut: std::future::Future<Output = Result<Json, String>> + Send + 'static,
     {
         let id = JobId::new();
         let started = nanos();
@@ -338,10 +386,54 @@ impl Jobs {
             },
         );
 
+        // `Running` is **announced** here and **written** at the top of the task,
+        // once it has actually been scheduled. So `Queued` lasts as long as the
+        // scheduler takes, which is what `State::Queued` claims, and a poller
+        // stops reading `queued` for the whole length of the work — which is the
+        // lie this fixes: the write used not to happen at all.
         self.broadcast(id, JobEvent::State(State::Running));
 
         let this = self.clone();
         let handle = tokio::spawn(async move {
+            // **The span the progress layer matches on.** It lives here rather
+            // than in the handler because the id does not exist until `spawn` has
+            // run, and because putting it here makes it impossible for a new kind
+            // of job to forget it: a job with no span reports no progress and
+            // nothing fails.
+            //
+            // `lepatch::progress` events emitted inside this span belong to this
+            // job. The same events from another process, or from a `lepatch
+            // restore` running in this one, are in no job span and are dropped.
+            let job_span = tracing::info_span!(
+                super::observe::SPAN,
+                job = %id,
+                kind = kind,
+            );
+            let _entered = job_span.enter();
+
+            // **The state is written, not only broadcast.** It used to be
+            // announced from `spawn` and never stored, so the only write that ever
+            // set `job.state` set a terminal one: a client that polls — the
+            // endpoint that has to keep working when a stream has been dropped —
+            // read `"state": "queued"` for the entire length of a merge measured
+            // in minutes.
+            //
+            // Written here rather than beside the broadcast in `spawn`, so
+            // `Queued` is a state a client can actually observe: it lasts until
+            // the task is first polled, which is what `State::Queued` promises.
+            //
+            // **Conditional, for the same reason `cancel`'s write is.** A
+            // `DELETE` that arrived before the task was first polled has already
+            // earned the job a terminal state, and a cancelled job turning
+            // running afterwards would be the same class of lie this whole change
+            // is about.
+            if let Ok(mut jobs) = this.inner.jobs.lock()
+                && let Some(job) = jobs.get_mut(&id)
+                && !job.state.is_terminal()
+            {
+                job.state = State::Running;
+            }
+
             let handle = JobHandle {
                 id,
                 jobs: this.clone(),
@@ -350,18 +442,35 @@ impl Jobs {
             let outcome = work(handle).await;
 
             let finished = nanos();
+
+            // One lock, one decision. `state`, `error` and `result` are set
+            // together so no reader can observe a combination that never happened.
+            let (state, result) = match &outcome {
+                Ok(value) => (State::Succeeded, Some(value.clone())),
+                Err(_) => (State::Failed, None),
+            };
+
             if let Ok(mut jobs) = this.inner.jobs.lock()
                 && let Some(job) = jobs.get_mut(&id)
             {
-                job.state = State::Succeeded;
+                job.state = state;
                 job.finished = Some(finished);
-                job.result = Some(outcome.clone());
+                job.error = outcome.as_ref().err().cloned();
+                job.result = result;
             }
+
             if let Ok(mut handles) = this.inner.handles.lock() {
                 handles.remove(&id);
             }
-            this.broadcast(id, JobEvent::Result(outcome));
-            this.broadcast(id, JobEvent::State(State::Succeeded));
+
+            this.broadcast(id, JobEvent::State(state));
+            match outcome {
+                Ok(value) => this.broadcast(id, JobEvent::Result(value)),
+                // **The reason, on the stream.** The state write above already
+                // carries it for a poller; without this a watcher was told
+                // `failed` and nothing else.
+                Err(reason) => this.broadcast(id, JobEvent::Error(reason)),
+            }
         });
 
         if let Ok(mut handles) = self.inner.handles.lock() {
@@ -427,31 +536,85 @@ impl Jobs {
             })?
             .remove(&id);
 
-        if let Some(handle) = handle {
-            handle.abort();
+        let Some(handle) = handle else {
+            return Ok(());
+        };
 
-            if let Ok(mut jobs) = self.inner.jobs.lock()
-                && let Some(job) = jobs.get_mut(&id)
-            {
-                job.state = State::Cancelled;
-                job.finished = Some(nanos());
-            }
+        handle.abort();
+
+        // **Re-checked under the same lock that writes.** The check above and this
+        // write are not one atomic step, so a job that finished in between would
+        // otherwise be relabelled `cancelled` after it had succeeded — the same
+        // class of lie as the one this whole change is about, one race along.
+        // A job already in a terminal state keeps the state it earned.
+        let mut marked = false;
+        if let Ok(mut jobs) = self.inner.jobs.lock()
+            && let Some(job) = jobs.get_mut(&id)
+            && !job.state.is_terminal()
+        {
+            job.state = State::Cancelled;
+            job.finished = Some(nanos());
+            marked = true;
+        }
+
+        if marked {
             self.broadcast(id, JobEvent::State(State::Cancelled));
         }
 
         Ok(())
     }
 
+    /// Record that a job's counters moved, from outside.
+    ///
+    /// This is the seam [`observe`](super::observe) uses, and it is one line
+    /// rather than a second event type: the layer has a job id and a bag of
+    /// counters, which is exactly what a job document shows, so it updates both
+    /// the stored figures and the broadcast through here. That is what makes a
+    /// client that polls and a client that watches agree.
+    pub(crate) fn emit_progress(&self, id: JobId, counters: Vec<(String, u64)>) {
+        if let Ok(mut jobs) = self.inner.jobs.lock()
+            && let Some(job) = jobs.get_mut(&id)
+        {
+            for (name, value) in &counters {
+                match job
+                    .progress
+                    .iter_mut()
+                    .find(|(existing, _)| existing == name)
+                {
+                    Some(slot) => slot.1 = *value,
+                    None => job.progress.push((name.clone(), *value)),
+                }
+            }
+        }
+
+        self.broadcast(id, JobEvent::Progress(counters));
+    }
+
     /// A receiver for this job's events, plus what a late subscriber missed.
     ///
-    /// **Both, from one call, and that is the point.** Taking the receiver before
-    /// the history snapshot leaves a window in which an event reaches both, and a
-    /// client receives it twice. Separating them also made the caller check
-    /// existence separately, which is two locks and two clones for one answer.
+    /// **Both, from one call, and that is the point.** Separating them made the
+    /// caller check existence separately, which is two locks and two clones for
+    /// one answer.
     ///
-    /// The replay is a snapshot, so an event arriving after this returns is on the
-    /// receiver and not in the history — which is what makes the pair correct
-    /// rather than merely complete.
+    /// ## Each event exactly once, which took one lock
+    ///
+    /// The receiver and the history are both taken **under the same lock that
+    /// records and sends**. So an event either lands entirely before this
+    /// returns — in which case it is in
+    /// the history and was sent before the receiver existed, and it is replayed
+    /// once — or entirely after, and it is on the receiver and not in the
+    /// history. The two cannot disagree.
+    ///
+    /// Taking the receiver first and snapshotting the history second left a
+    /// window between them with two ways to be wrong at once: an event broadcast
+    /// inside it arrived on **both** and a client was told it twice, and an event
+    /// sent just before the `subscribe` but pushed to the history just after the
+    /// snapshot was on **neither** and reached nobody at all.
+    ///
+    /// What is still bounded, and is not claimed here to be more: the history is
+    /// the last `REPLAY` events, and the receiver has the broadcast's own finite
+    /// capacity. A subscriber that falls further behind than that is told the
+    /// stream lagged and can poll `GET /v1/jobs/{id}` for what it missed.
     ///
     /// # Errors
     ///
@@ -473,19 +636,35 @@ impl Jobs {
             ));
         }
 
+        // **The pair, under one lock, in this order.** The receiver is created
+        // first and the history read second, but nothing can run between the two
+        // while this guard is held — which is the whole of the guarantee above.
+        let Ok(replay) = self.inner.replay.lock() else {
+            // A poisoned history is still worth a live receiver: a subscriber
+            // gets the events from here on and loses only the replay.
+            return Ok((self.inner.events.subscribe(), Vec::new()));
+        };
+
         let receiver = self.inner.events.subscribe();
-        let history = self
-            .inner
-            .replay
-            .lock()
-            .map(|all| all.get(&id).cloned().unwrap_or_default())
-            .unwrap_or_default();
+        let history = replay.get(&id).cloned().unwrap_or_default();
 
         Ok((receiver, history))
     }
 
     /// Record an event, and remember the last few for a late subscriber.
+    ///
+    /// **One lock across the send and the record**, and that is what makes
+    /// [`subscribe`](Self::subscribe) able to promise each event exactly once.
+    /// The two operations are only atomic with respect to each other while the
+    /// same guard covers both.
     fn broadcast(&self, id: JobId, event: JobEvent) {
+        let Ok(mut replay) = self.inner.replay.lock() else {
+            // A poisoned history must not also silence the live stream, so the
+            // send still happens — it is only the replay that is lost.
+            let _ = self.inner.events.send(event);
+            return;
+        };
+
         // A send with nobody listening is not a failure. Every event here may
         // have no subscriber at all, which is the normal case for a job whose
         // client polls.
@@ -495,13 +674,11 @@ impl Jobs {
         // `None` for a job that has not recorded an event yet, so the **first**
         // event of every job was dropped and the history began at the second — and
         // a late subscriber was never told a job had started.
-        if let Ok(mut replay) = self.inner.replay.lock() {
-            let history = replay.entry(id).or_default();
-            history.push(event);
-            if history.len() > REPLAY {
-                let excess = history.len() - REPLAY;
-                history.drain(..excess);
-            }
+        let history = replay.entry(id).or_default();
+        history.push(event);
+        if history.len() > REPLAY {
+            let excess = history.len() - REPLAY;
+            history.drain(..excess);
         }
     }
 
@@ -601,16 +778,6 @@ impl JobHandle {
             ),
         );
     }
-
-    /// Record a failure, so a poller sees the reason before the task's own
-    /// return value arrives.
-    pub fn fail(&self, error: impl Into<String>) {
-        if let Ok(mut jobs) = self.jobs.inner.jobs.lock()
-            && let Some(job) = jobs.get_mut(&self.id)
-        {
-            job.error = Some(error.into());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -620,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_starts_queued_and_ends_succeeded() {
         let jobs = Jobs::new();
-        let id = jobs.spawn("pack", |_| async { super::Json::string("done") });
+        let id = jobs.spawn("pack", |_| async { Ok(super::Json::string("done")) });
 
         // Wait for it, without polling in a loop the test could hang on.
         let mut seen = None;
@@ -648,7 +815,7 @@ mod tests {
         let jobs = Jobs::new();
         let id = jobs.spawn("merge", |handle| async move {
             handle.progress(&[("chunks", 12), ("bytes", 4096)]);
-            super::Json::Null
+            Ok(super::Json::Null)
         });
 
         let mut job = None;
@@ -672,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn a_job_json_carries_every_field_a_client_reads() {
         let jobs = Jobs::new();
-        let id = jobs.spawn("pack", |_| async { super::Json::string("ok") });
+        let id = jobs.spawn("pack", |_| async { Ok(super::Json::string("ok")) });
 
         for _ in 0..200 {
             if jobs.get(id).is_some_and(|job| job.state.is_terminal()) {
@@ -706,7 +873,7 @@ mod tests {
         // definite answer, and "it already succeeded" is more use than a `202`
         // for something that will not happen.
         let jobs = Jobs::new();
-        let id = jobs.spawn("pack", |_| async { super::Json::Null });
+        let id = jobs.spawn("pack", |_| async { Ok(super::Json::Null) });
 
         for _ in 0..200 {
             if jobs.get(id).is_some_and(|job| job.state.is_terminal()) {
@@ -792,7 +959,7 @@ mod tests {
         // Otherwise a client that connects after a job has been running is told
         // a job that has made no progress.
         let jobs = Jobs::new();
-        let id = jobs.spawn("pack", |_| async { super::Json::Null });
+        let id = jobs.spawn("pack", |_| async { Ok(super::Json::Null) });
 
         for _ in 0..200 {
             if jobs.get(id).is_some_and(|job| job.state.is_terminal()) {
@@ -818,6 +985,287 @@ mod tests {
             jobs.subscribe(JobId::new()).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_that_fails_reports_failed_and_not_succeeded() {
+        // **The lie this test exists for.** `spawn` used to set `Succeeded`
+        // unconditionally and carry the failure as an `{"error": ...}` object in
+        // the result, so a failed job read `{state: "succeeded", error: "..."}` —
+        // two fields disagreeing, with the one a client checks first being the
+        // false one.
+        let jobs = Jobs::new();
+        let id = jobs.spawn("pack", |_| async {
+            Err("no usable version in /srv/docs".to_string())
+        });
+
+        let mut job = None;
+        for _ in 0..200 {
+            if let Some(current) = jobs.get(id)
+                && current.state.is_terminal()
+            {
+                job = Some(current);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let job = job.expect("the job should have finished");
+        assert_eq!(job.state, State::Failed);
+        assert_eq!(job.error.as_deref(), Some("no usable version in /srv/docs"));
+        assert_eq!(
+            job.result, None,
+            "a failed job must not also carry a result"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_document_never_says_succeeded() {
+        // The same property as the bytes a client reads, because the fields are
+        // the contract and a disagreement between them is the failure mode.
+        let jobs = Jobs::new();
+        let id = jobs.spawn("merge", |_| async {
+            Err("refusing: already locked".to_string())
+        });
+
+        for _ in 0..200 {
+            if jobs.get(id).is_some_and(|job| job.state.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let document = jobs.get(id).unwrap().to_json().to_string();
+
+        assert!(document.contains(r#""state":"failed""#), "{document}");
+        assert!(
+            !document.contains(r#""state":"succeeded""#),
+            "a failed job must not read as succeeded: {document}"
+        );
+        assert!(!document.contains(r#""result":{ "#), "{document}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_does_not_relabel_a_job_that_already_finished() {
+        // **The same lie, one race along.** `cancel` checks the state, then
+        // aborts, then writes `Cancelled` — three steps, and a job that finished
+        // between the check and the write was being marked `cancelled` after it
+        // had succeeded. The write is now conditional, so a job already in a
+        // terminal state keeps the state it earned.
+        let jobs = Jobs::new();
+        let id = jobs.spawn("pack", |_| async { Ok(super::Json::Null) });
+
+        for _ in 0..200 {
+            if jobs.get(id).is_some_and(|job| job.state.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Already finished, so the handle is gone and the state must survive.
+        let _ = jobs.cancel(id);
+
+        assert_eq!(jobs.get(id).unwrap().state, State::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn a_watcher_is_told_why_a_job_failed() {
+        // **The gap this test is for.** `Result` was broadcast only on `Ok`, so a
+        // client on the event stream was sent `state: failed` and then silence,
+        // and had to poll `GET /v1/jobs/{id}` to learn the reason — which is the
+        // endpoint it falls back to precisely when the stream has not told it
+        // anything.
+        let jobs = Jobs::new();
+        let id = jobs.spawn("pack", |_| async {
+            Err("no usable version in /srv/docs".to_string())
+        });
+
+        let (mut receiver, history) = jobs.subscribe(id).unwrap();
+
+        // Wait for the failure, draining the stream until it arrives.
+        let mut seen = history;
+        for _ in 0..200 {
+            if seen
+                .iter()
+                .any(|event| matches!(event, JobEvent::Error(reason) if reason.contains("no usable version")))
+            {
+                break;
+            }
+            match receiver.recv().await {
+                Ok(event) => seen.push(event),
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                JobEvent::Error(reason) if reason == "no usable version in /srv/docs"
+            )),
+            "a watcher must be told the reason, got {seen:?}"
+        );
+
+        // And it is the same sentence the poll reports, so the two cannot differ.
+        let job = jobs.get(id).unwrap();
+        assert_eq!(job.error.as_deref(), Some("no usable version in /srv/docs"));
+    }
+
+    #[tokio::test]
+    async fn a_job_is_written_running_not_only_announced_running() {
+        // **The lie this test is for.** `spawn` broadcast `running` and never
+        // stored it, so the only writes to `job.state` were terminal ones and a
+        // poller read `"state": "queued"` for the whole length of the work.
+        let jobs = Jobs::new();
+
+        // A job that is still going, so its state can be read while it is not
+        // terminal — reading it after the fact only proves it finished.
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let id = jobs.spawn("merge", move |_| async move {
+            let _ = finished.await;
+            Ok(super::Json::Null)
+        });
+
+        let mut seen = None;
+        for _ in 0..200 {
+            if let Some(job) = jobs.get(id)
+                && job.state == State::Running
+            {
+                seen = Some(job);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let _ = finish.send(());
+
+        let job = seen.expect("a job that has started must be stored as running");
+        assert_eq!(job.state, State::Running);
+        assert!(!job.state.is_terminal());
+    }
+
+    #[test]
+    fn subscribe_neither_loses_an_event_nor_repeats_one() {
+        // **The guarantee `subscribe` makes, against real threads.** The two
+        // calls it has to make consistent contain no `await` between them, so a
+        // current-thread runtime cannot put a publisher and a subscriber inside
+        // that window at once — an async version of this test passes against the
+        // broken implementation, which is the reason it is written with
+        // `std::thread` instead.
+        //
+        // Taking the receiver first and snapshotting the history second allowed
+        // both ways to be wrong, and each shows up as a different tally:
+        //
+        // * **twice** — the event was sent before the receiver existed and
+        //   recorded before the snapshot, so it is in the replay *and* delivered
+        //   live.
+        // * **never** — the event was sent before the receiver existed and
+        //   recorded after the snapshot, so it is in neither.
+        const PUBLISHED: u64 = 20_000;
+        const WATCHERS: usize = 4;
+        const SUBSCRIBES: usize = 2_000;
+
+        /// What a subscriber has held, as `(lowest, highest)`.
+        type Held = Option<(u64, u64)>;
+
+        let jobs = std::sync::Arc::new(Jobs::new());
+
+        // A job to subscribe to. The task never has to run: `subscribe` only
+        // needs the entry to be there, and a runtime is needed only because
+        // `spawn` hands the work to one.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        let id = runtime.block_on(async {
+            jobs.spawn("pack", |_| async {
+                std::future::pending::<()>().await;
+                Ok(super::Json::Null)
+            })
+        });
+        drop(runtime);
+
+        let publisher = {
+            let jobs = std::sync::Arc::clone(&jobs);
+            std::thread::spawn(move || {
+                for value in 1..=PUBLISHED {
+                    jobs.emit_progress(id, vec![("chunks".to_string(), value)]);
+                }
+            })
+        };
+
+        let watchers: Vec<_> = (0..WATCHERS)
+            .map(|_| {
+                let jobs = std::sync::Arc::clone(&jobs);
+                std::thread::spawn(move || {
+                    let mut held: Held = None;
+
+                    for _ in 0..SUBSCRIBES {
+                        let (mut receiver, history) = jobs
+                            .subscribe(id)
+                            .expect("the job was spawned, so it is there");
+
+                        // The `chunks` value out of a progress event, if it is one.
+                        let chunks = |event: &JobEvent| match event {
+                            JobEvent::Progress(counters) => counters
+                                .iter()
+                                .find(|(name, _)| name == "chunks")
+                                .map(|(_, value)| *value),
+                            _ => None,
+                        };
+
+                        let replayed: Vec<u64> = history.iter().filter_map(chunks).collect();
+                        let highest_replayed = replayed.iter().copied().max().unwrap_or(0);
+                        let mut seen = replayed.clone();
+
+                        while let Ok(event) = receiver.try_recv() {
+                            if let Some(value) = chunks(&event) {
+                                assert!(
+                                    replayed.is_empty() || value > highest_replayed,
+                                    "event {value} reached a subscriber twice: it is in the \
+                                     replay and it was delivered live"
+                                );
+                                seen.push(value);
+                            }
+                        }
+
+                        seen.sort_unstable();
+                        seen.dedup();
+                        if let (Some(lowest), Some(highest)) =
+                            (seen.first().copied(), seen.last().copied())
+                        {
+                            assert_eq!(
+                                highest - lowest + 1,
+                                seen.len() as u64,
+                                "events {lowest} to {highest} arrived, which is a hole: a \
+                                 subscriber lost one"
+                            );
+
+                            held = Some(match held {
+                                None => (lowest, highest),
+                                Some(previous) => (previous.0.min(lowest), previous.1.max(highest)),
+                            });
+                        }
+                    }
+
+                    held.expect("a watcher must have caught events, not none")
+                })
+            })
+            .collect();
+
+        publisher
+            .join()
+            .expect("the publisher thread should not panic");
+
+        let mut caught = 0usize;
+        for watcher in watchers {
+            let (_, highest) = watcher.join().expect("a watcher should not panic");
+            assert!(
+                highest > 1,
+                "a watcher must have seen more than the first event"
+            );
+            caught += usize::try_from(highest).unwrap_or(0);
+        }
+        assert!(caught > 1, "the watchers must actually have caught events");
     }
 
     #[test]

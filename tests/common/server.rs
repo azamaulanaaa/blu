@@ -37,12 +37,54 @@ pub(crate) struct Server {
 impl Server {
     /// Start `lepatch serve` on `root`, and wait for it to report its address.
     ///
+    /// Runs under `--quiet`, so **the terminal prints nothing**. A test that
+    /// asserts on what a *client* received under this constructor is asserting on
+    /// the filter as well as on the server, which is the right thing for most of
+    /// them and the wrong thing for a test about progress — see
+    /// [`Server::start_with_progress`].
+    ///
     /// # Panics
     ///
     /// Panics if the process will not start or does not report an address. A
     /// server that never came up leaves nothing to assert about.
     pub(crate) fn start(root: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        Self::spawn(root, &[])
+    }
+
+    /// Start `lepatch serve` with the terminal turned all the way down, **and the
+    /// progress layer left working anyway**.
+    ///
+    /// **`--quiet` and `RUST_LOG=warn` together.** Both say the terminal prints
+    /// nothing at all, so nothing a client sees can be coming from there. Naming
+    /// both rather than `--quiet` alone because `--quiet` only sets the
+    /// *default* directive, which `RUST_LOG` replaces — so `--quiet` on its own
+    /// would still honour a `RUST_LOG` inherited from whatever is running the
+    /// test, and a test about verbosity should not have that question open.
+    ///
+    /// **This is what makes it a test of progress rather than of the merge.**
+    /// A progress event is an `INFO` event and the terminal's filter is at `WARN`,
+    /// so if that filter were attached to the subscriber rather than to the writer
+    /// layer it would refuse the callsite outright: the event would never be
+    /// emitted, the progress layer would never be offered it, and a client polling
+    /// the job would be told the merge reported nothing. That was the defect, it
+    /// looked like a bug in the progress layer, and it was invisible to every
+    /// other test in the file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process will not start or does not report an address.
+    pub(crate) fn start_with_progress(root: &Path) -> Self {
+        Self::spawn(root, &[("RUST_LOG", "warn")])
+    }
+
+    /// The server both constructors above are, given the environment to add.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the process will not start or does not report an address.
+    fn spawn(root: &Path, env: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lepatch"));
+        command
             // Before the subcommand, because `--quiet` is a global flag on `Args`
             // rather than one of `serve`'s own. `lepatch serve <root> --quiet` is
             // a parse error, and a parse error prints nothing to stdout — which
@@ -50,7 +92,13 @@ impl Server {
             .arg("--quiet")
             .arg("serve")
             .arg(root)
-            .args(["--bind", "127.0.0.1:0"])
+            .args(["--bind", "127.0.0.1:0"]);
+
+        for (name, value) in env {
+            command.env(name, value);
+        }
+
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

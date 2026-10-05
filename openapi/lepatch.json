@@ -395,6 +395,16 @@
               }
             }
           },
+          "413": {
+            "description": "The pack is larger than this server will send in one un-ranged response, so a `GET` with no `Range` header is refused. This applies only to the whole pack: any ranged fetch of the same pack is served, however large it is, because a range is one entry from a fetch plan and is written at an offset rather than built whole. The error names the two supported ways to fetch a pack this size \u2014 `POST /v1/packs/{id}/plan`, and ranged `GET`s \u2014 so the client is not left to guess.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "default": {
             "description": "A failure.",
             "content": {
@@ -851,7 +861,7 @@
         ],
         "operationId": "streamJob",
         "summary": "The same events, as a stream.",
-        "description": "Server-Sent Events rather than WebSockets: this is one-directional, it is text, and it reconnects on its own. A client that does not want a stream polls `GET /v1/jobs/{id}` instead, and both read the same events, so the two agree.\n\nThree event names: `state` on every transition, `progress` on each counter tick, and `result` once.",
+        "description": "Server-Sent Events rather than WebSockets: this is one-directional, it is text, and it reconnects on its own. A client that does not want a stream polls `GET /v1/jobs/{id}` instead, and both read the same events, so the two agree.\n\nFour event names: `state` on every transition, `progress` on each counter tick, `result` once, and `error` when the job fails. `error` is the counterpart to `result`: a failed job carries the reason on the stream, so a client that reads only events does not have to fall back to polling to find out what went wrong.",
         "responses": {
           "200": {
             "description": "The stream. It is closed when the job finishes.",

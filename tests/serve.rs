@@ -27,8 +27,11 @@ mod common;
 
 use std::{
     fs,
+    future::Future,
     io::{Seek, SeekFrom, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use common::{http::Request, server::Server};
@@ -36,9 +39,57 @@ use lepatch::{
     pack::Pack,
     storage::{BlobStore, Compression, Plan, StorageGet},
 };
-use tokio::io::AsyncReadExt;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 const PACK_MEDIA_TYPE: &str = "application/x-lepatch-pack";
+
+/// A pack big enough that merging it outlasts the reporting interval.
+///
+/// ## Why this fixture is not `tree`
+///
+/// `a_job_can_be_watched_over_sse` sets the rule a test about progress has to
+/// keep: a fixture small enough that the merge finishes before a socket connect
+/// completes tests the wiring and not the timing. **Its own 32 MB tree is not big
+/// enough for that**, and it is worth saying why rather than just growing the
+/// number, because what a merge spends its time on is what *survives
+/// deduplication*, not what is on disk. `tree` hands out `common::noisy`, a pure
+/// function of position, so file `i` is a *prefix* of file `i + 1` and the store
+/// keeps only the longest: its 32 MB tree deduplicates to 8 MB of chunks, and a
+/// merge of that measures 128 ms against a 300 ms reporting interval — so exactly
+/// one line, whatever the machine.
+///
+/// So the bytes here are four **windows of one long stream**, cut at disjoint
+/// offsets: no window is a prefix of another, none of them repeats, and
+/// deduplication has nothing to collapse. 48 MB of distinct content, which
+/// measures several reporting intervals to merge. `common::untagged_stream`
+/// looks like the right tool and is not — it splices one 64-byte block over the
+/// second half, so past those 64 bytes every file is the same bytes again, and a
+/// 128 MB tree made of them merges 17 MB.
+///
+/// The first tick is why none of this has to be lucky: `Progress::due` returns
+/// true until a line has been emitted, so a merge of *any* size reports once, the
+/// moment the chunk loop opens. The size is what makes the rest of it — a second
+/// tick, and a run still going when a stream's live half is read — real rather
+/// than asserted about.
+async fn slow_pack(dir: &Path) -> PathBuf {
+    const FILE_BYTES: usize = 12 << 20;
+
+    let source = common::source(dir);
+    for (i, window) in common::noisy(FILE_BYTES * 4).chunks(FILE_BYTES).enumerate() {
+        fs::write(source.join(format!("f{i}.bin")), window).unwrap();
+    }
+
+    let blob = dir.join("local");
+    backup(&source, &blob).await;
+
+    let pack_path = dir.join("local.pack");
+    pack(&blob, &pack_path).await;
+
+    pack_path
+}
 
 /// A source tree of `files` noisy files.
 fn tree(dir: &Path, files: usize, size: usize) -> PathBuf {
@@ -179,6 +230,122 @@ async fn push(server: &Server, set: &str, pack_path: &Path) -> serde_json::Value
     await_job(server, &job).await
 }
 
+/// How long the replay read waits for bytes before calling the stream quiet.
+///
+/// The replay is written when the response starts, so the stream goes quiet
+/// immediately and this only has to outlast a loopback round trip. It is short
+/// because it is *added* to the time a job has left to run: the longer the read
+/// waits, the longer the merge must be for the live half to prove anything.
+const REPLAY_QUIET: Duration = Duration::from_millis(25);
+
+/// How long one read of the live half waits for bytes, and how long the live
+/// half is read for in total.
+const LIVE_STEP: Duration = Duration::from_millis(250);
+const LIVE_FOR: Duration = Duration::from_secs(10);
+
+/// One SSE stream, read in the two halves a live event is told apart by.
+struct EventStream {
+    /// The status line's number.
+    status: u16,
+    /// Everything the server had sent by the time the stream went quiet.
+    replay: String,
+    /// Everything that arrived after `finished` resolved.
+    live: String,
+}
+
+/// Read `GET /v1/jobs/{job}/events`, split around `finished`.
+///
+/// **Why not [`Request::stream_until`].** It reads a stream in one pass, stopping
+/// at a terminator it finds in the body. On a job that has already finished the
+/// REPLAY history alone carries every frame a test could assert on, so the live
+/// half — the part chained after the replay — is never distinguished from it, and
+/// a server that replayed and then sent nothing would pass.
+///
+/// So the read is split at a moment the caller knows the job had not finished:
+/// `replay` is what had arrived by then and `live` is what arrived after
+/// `finished` resolved. **A frame in `live` cannot have been in the replay**, and
+/// the caller checks that `replay` does not already hold the frame it looks for
+/// in `live`.
+///
+/// # Panics
+///
+/// Panics if the connection fails or the response carries no status line. A
+/// stream that cannot be opened has nothing to assert about.
+async fn read_events<F>(address: SocketAddr, job: &str, finished: F) -> EventStream
+where
+    F: Future<Output = ()>,
+{
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("the server should accept a connection");
+
+    // No `connection: close`: this body is closed by the server when the job is
+    // over, and closing the request would take the stream with it.
+    let head = format!("GET /v1/jobs/{job}/events HTTP/1.1\r\nhost: {address}\r\n\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut raw = Vec::new();
+    let mut chunk = vec![0u8; 1024];
+
+    while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut chunk).await.unwrap();
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return EventStream {
+            status: 0,
+            replay: String::new(),
+            live: String::new(),
+        };
+    };
+
+    let status = String::from_utf8_lossy(&raw[..split])
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+
+    // The first half: everything the server had already sent. A job that is
+    // still running has nothing live to say, so this read ends when the stream
+    // goes quiet.
+    let mut opened = raw[split + 4..].to_vec();
+    while let Ok(Ok(read)) = tokio::time::timeout(REPLAY_QUIET, stream.read(&mut chunk)).await {
+        if read == 0 {
+            break;
+        }
+        opened.extend_from_slice(&chunk[..read]);
+    }
+
+    let replay = String::from_utf8_lossy(&opened).into_owned();
+
+    // The second half: from here on, whatever arrives is live by construction.
+    finished.await;
+
+    let mut live = Vec::new();
+    let until = Instant::now() + LIVE_FOR;
+    while !String::from_utf8_lossy(&live).contains("event: result") && Instant::now() < until {
+        let Ok(Ok(read)) = tokio::time::timeout(LIVE_STEP, stream.read(&mut chunk)).await else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        live.extend_from_slice(&chunk[..read]);
+    }
+
+    EventStream {
+        status,
+        replay,
+        live: String::from_utf8_lossy(&live).into_owned(),
+    }
+}
+
 #[tokio::test]
 async fn the_server_reports_its_version_and_formats() {
     // A client cannot work this out from a pack fetch, which is why it is an
@@ -195,10 +362,43 @@ async fn the_server_reports_its_version_and_formats() {
 
     let document: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(document["version"], env!("CARGO_PKG_VERSION"));
+
+    // **All three format numbers**, against the constants themselves.
+    //
+    // Only `pack_format` was checked before. The other two are three constants in
+    // three modules with nothing tying any of them to the API — so a format bump
+    // could ship a client that believed it could read a set it could not, and the
+    // check that would have caught it was on the one field nobody bumped.
+    assert_eq!(
+        document["snapshot_format"],
+        serde_json::json!(lepatch::metadata::FORMAT_VERSION),
+        "a client asks this to decide whether it can read a snapshot"
+    );
+    assert_eq!(
+        document["record_format"],
+        serde_json::json!(lepatch::storage::FORMAT_VERSION),
+        "a client asks this to decide whether it can read a store"
+    );
     assert_eq!(
         document["pack_format"],
-        serde_json::json!(lepatch::pack::FORMAT_VERSION)
+        serde_json::json!(lepatch::pack::FORMAT_VERSION),
+        "a client asks this to decide whether it can read a pack"
     );
+
+    // And they must be in the document the server serves, so a client reading
+    // the spec sees the same numbers the endpoint reports.
+    let spec = Request::new("GET", "/openapi.json")
+        .send(server.address())
+        .await;
+    assert_eq!(spec.status, 200);
+    let parsed: serde_json::Value = serde_json::from_slice(&spec.body).unwrap();
+    for field in ["snapshot_format", "record_format", "pack_format"] {
+        let properties = &parsed["components"]["schemas"]["ServerInfo"]["properties"];
+        assert!(
+            properties.get(field).is_some(),
+            "the document describes no {field}, so a client reading the spec is not told it"
+        );
+    }
 }
 
 #[tokio::test]
@@ -517,25 +717,54 @@ async fn the_plan_covers_the_fixed_regions_a_client_needs() {
 async fn a_held_chunk_hash_that_is_not_one_is_refused() {
     // A typo would become a chunk the client does not have, and it would fetch
     // it — with the response covering bytes that were never asked for.
+    //
+    // **Against a set that exists.** This used to ask `nosuch@1`, so the set was
+    // resolved first and answered `404` before a hash was ever looked at: the
+    // test passed on the refusal of something else, and deleting have-hash
+    // validation outright left it green.
     let dir = tempfile::tempdir().unwrap();
+    let source = tree(dir.path(), 3, 20_000);
+    let blob = dir.path().join("local");
+    backup(&source, &blob).await;
+    let pack_path = dir.path().join("local.pack");
+    pack(&blob, &pack_path).await;
+
     let root = dir.path().join("served");
     fs::create_dir_all(&root).unwrap();
     let server = Server::start(&root);
+    push(&server, "docs", &pack_path).await;
 
     let planned = Request::json(
         "POST",
-        "/v1/packs/nosuch@1/plan",
+        "/v1/packs/docs@1/plan",
         &serde_json::json!({ "have": ["not-a-hash"] }),
     )
     .send(server.address())
     .await;
 
-    // The set is resolved before the plan, so this is a 404 rather than a 400.
-    // Both are refusals; the set is the first thing that can fail.
+    assert_eq!(planned.status, 400, "body: {}", planned.text());
     assert!(
-        planned.status == 400 || planned.status == 404,
-        "got {}",
-        planned.status
+        planned.text().contains("64 hexadecimal"),
+        "the refusal must say what a chunk hash looks like: {}",
+        planned.text()
+    );
+
+    // And a well-formed hash the set does not hold is **not** refused. It is a
+    // chunk the client claims to hold and does not, so the plan has to cover the
+    // whole file — which is what refusing everything would break.
+    let claimed = Request::json(
+        "POST",
+        "/v1/packs/docs@1/plan",
+        &serde_json::json!({ "have": ["00".repeat(32)] }),
+    )
+    .send(server.address())
+    .await;
+
+    assert_eq!(claimed.status, 200, "body: {}", claimed.text());
+    let plan: serde_json::Value = serde_json::from_slice(&claimed.body).unwrap();
+    assert_eq!(
+        plan["bytes"], plan["length"],
+        "a chunk the client holds that is not in the set cannot shorten the plan"
     );
 }
 
@@ -725,6 +954,46 @@ async fn bytes_that_are_not_a_pack_are_refused_at_the_upload() {
 }
 
 #[tokio::test]
+async fn a_pack_larger_than_the_payload_limit_uploads_and_merges() {
+    // **A pack that is big on the wire.** `Uploads::put` used to take `web::Bytes`,
+    // so actix collected the whole body before the handler ran and refused
+    // anything past its default `PayloadConfig` limit of 256 KiB with a bare
+    // `413`. Every other test in this file uploads about 20 KB, so the whole suite
+    // agreed with the bug.
+    //
+    // `tree` hands out `noisy` bytes, which are a function of position: file `i` is
+    // a prefix of file `i + 1`, so the store deduplicates all but the last of them
+    // and a pack is a good deal smaller than the tree that made it. Sixty-four
+    // files of 250 KB is 18 MB on disk and about 2 MB on the wire, and the
+    // assertion below says so rather than leaving it to be worked out from the
+    // numbers.
+    let dir = tempfile::tempdir().unwrap();
+    let source = tree(dir.path(), 64, 250_000);
+    let blob = dir.path().join("local");
+    backup(&source, &blob).await;
+    let pack_path = dir.path().join("local.pack");
+    pack(&blob, &pack_path).await;
+
+    let on_the_wire = fs::metadata(&pack_path).unwrap().len();
+    assert!(
+        on_the_wire > 4 * 256 * 1024,
+        "this test is about a body over the payload limit, so it must not quietly \
+         pack into something small: the pack is {on_the_wire} bytes"
+    );
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    // `push` asserts `204` on the `PUT`, which is the assertion that matters: a
+    // `413` here is the bug, and it is not something a client can work around.
+    let merged = push(&server, "big", &pack_path).await;
+
+    assert_eq!(merged["already"], serde_json::json!(false));
+    assert_eq!(merged["version"], serde_json::json!(1));
+}
+
+#[tokio::test]
 async fn a_commit_reports_what_arrived() {
     let dir = tempfile::tempdir().unwrap();
     let source = tree(dir.path(), 3, 20_000);
@@ -824,15 +1093,20 @@ async fn a_name_that_is_not_a_set_is_a_four_oh_four_not_an_empty_list() {
 
 #[tokio::test]
 async fn a_job_can_be_watched_over_sse() {
-    // **The stream, end to end.** `Request::send` reads to end-of-stream, which
-    // for an SSE body means "until the job is over" — so it would hand back the
-    // frames in a lump and prove nothing about the stream. This uses the bounded
-    // streaming read, which stops as soon as it has enough.
+    // **The stream, end to end, and a live event proved rather than assumed.**
     //
-    // The three event names are part of the contract, not a detail: a client
-    // switches on them rather than parsing the payload to find out what it is.
+    // `Request::send` reads to end-of-stream, which for an SSE body means "until
+    // the job is over" — so it would hand back the frames in a lump and prove
+    // nothing about the stream. This reads it in two halves with [`read_events`],
+    // around a moment the test knows the job was still running.
+    //
+    // The fixture is large for that reason. A merge of a few hundred kilobytes is
+    // over before a socket connect completes, and a stream opened after the job
+    // has finished replays everything: the replay alone then satisfies any
+    // assertion about the body, and the live half of `handlers.rs` — the part
+    // chained after the replay — is never exercised.
     let dir = tempfile::tempdir().unwrap();
-    let source = tree(dir.path(), 4, 20_000);
+    let source = tree(dir.path(), 4, 8_000_000);
     let blob = dir.path().join("local");
     backup(&source, &blob).await;
     let pack_path = dir.path().join("local.pack");
@@ -842,7 +1116,7 @@ async fn a_job_can_be_watched_over_sse() {
     fs::create_dir_all(&root).unwrap();
     let server = Server::start(&root);
 
-    // Accept the merge, then read the stream.
+    // Accept the merge, then read the stream while it is still running.
     let begin = Request::new("POST", "/v1/uploads")
         .send(server.address())
         .await;
@@ -866,13 +1140,53 @@ async fn a_job_can_be_watched_over_sse() {
     assert_eq!(accepted.status, 202, "body: {}", accepted.text());
     let job = accepted.field("job").unwrap().as_str().unwrap().to_string();
 
-    let stream = Request::new("GET", &format!("/v1/jobs/{job}/events"))
+    let stream = read_events(server.address(), &job, async {
+        await_job(&server, &job).await;
+    })
+    .await;
+
+    assert_eq!(stream.status, 200);
+
+    // The replay: what the server had already sent, which for a running job is
+    // the one state transition that has happened.
+    assert!(
+        stream.replay.contains("event: state"),
+        "the stream must replay the state transitions: {}",
+        stream.replay
+    );
+    assert!(
+        !stream.replay.contains("event: result"),
+        "the job had already finished when the stream opened, so nothing here proves a live \
+         event is delivered — make the fixture larger: {}",
+        stream.replay
+    );
+
+    // The live half. `result` is broadcast when the job finishes, which the split
+    // above establishes had not happened when this stream was opened — so these
+    // bytes crossed the wire after the response started, rather than out of the
+    // replay. **Deleting the live half of `job_events` empties this.**
+    assert!(
+        stream.live.contains("event: result"),
+        "a live event must arrive on the stream: {}",
+        stream.live
+    );
+    assert!(
+        stream.live.contains("event: state") && stream.live.contains("succeeded"),
+        "the terminal state must be delivered live: {}",
+        stream.live
+    );
+
+    // And a client that connects after the job is over is told the whole of it in
+    // one pass, which is what the replay is for.
+    let late = Request::new("GET", &format!("/v1/jobs/{job}/events"))
         .stream_until(server.address(), 8192, "succeeded")
         .await;
 
-    assert_eq!(stream.status, 200);
-    let text = String::from_utf8_lossy(&stream.body).into_owned();
+    assert_eq!(late.status, 200);
+    let text = String::from_utf8_lossy(&late.body).into_owned();
 
+    // The three event names are part of the contract, not a detail: a client
+    // switches on them rather than parsing the payload to find out what it is.
     assert!(
         text.contains("event: state"),
         "the stream must name state transitions: {text}"
@@ -890,6 +1204,264 @@ async fn a_job_can_be_watched_over_sse() {
     // two worth having.
     await_job(&server, &job).await;
 }
+
+#[tokio::test]
+async fn a_merge_reports_progress_to_a_client() {
+    // **The producer side of the whole mechanism.** `progress_events_carry_the
+    // counters_that_moved` proves the plumbing — that counters handed to a
+    // `JobHandle` reach both a poller and a watcher. Nothing proved that any
+    // *command* ever produces them, which is why a merge over HTTP could report
+    // nothing at all and every other test would still pass. This drives a real
+    // merge through the real server, which only means anything because
+    // `src/command/merge.rs` builds a `Progress` of its own and lets the
+    // `tracing` layer forward it. **The counters here are not put there by the
+    // server.**
+    let dir = tempfile::tempdir().unwrap();
+    let pack_path = slow_pack(dir.path()).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    // **Not** `Server::start`, and the difference is now deliberate rather than
+    // a workaround: `start_with_progress` pins the terminal all the way down
+    // (`--quiet` *and* `RUST_LOG=warn`), so a client seeing progress here is
+    // seeing it in spite of the verbosity rather than because of it.
+    let server = Server::start_with_progress(&root);
+
+    let begin = Request::new("POST", "/v1/uploads")
+        .send(server.address())
+        .await;
+    let upload = begin.field("upload").unwrap().as_str().unwrap().to_string();
+    Request::bytes(
+        "PUT",
+        &format!("/v1/uploads/{upload}"),
+        PACK_MEDIA_TYPE,
+        fs::read(&pack_path).unwrap(),
+    )
+    .send(server.address())
+    .await;
+
+    let accepted = Request::json(
+        "POST",
+        "/v1/sets/docs/merges",
+        &serde_json::json!({ "upload": upload }),
+    )
+    .send(server.address())
+    .await;
+    assert_eq!(accepted.status, 202, "body: {}", accepted.text());
+    let job = accepted.field("job").unwrap().as_str().unwrap().to_string();
+
+    // Time the merge itself: from the `202` to the job's terminal state.
+    let started = Instant::now();
+    let result = read_events(server.address(), &job, async {
+        await_job(&server, &job).await;
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.status, 200);
+    let carried = format!("{}{}", result.replay, result.live);
+
+    assert!(
+        carried.contains("event: progress"),
+        "a merge must put a progress frame on the stream, and nothing fabricated one \
+         server-side: {carried}"
+    );
+
+    // The two halves, so a failure says which one was empty. A slow merge that
+    // outlasted the connect puts its first frame in the replay; the rest are live.
+    eprintln!(
+        "merge of a ~48 MB pack took {elapsed:?}, against a {REPORTING_INTERVAL:?} reporting \
+         interval: progress frames replayed = {}, live = {}",
+        result.replay.matches("event: progress").count(),
+        result.live.matches("event: progress").count()
+    );
+
+    // Whether the *live* half carried one depends on the merge outlasting the
+    // read above it, and that is the fixture's job rather than an assertion that
+    // can be made honestly on every machine. So it is checked when the run was
+    // long enough for it to mean anything, and the measurement is printed either
+    // way.
+    if elapsed > REPORTING_INTERVAL {
+        assert!(
+            result.live.contains("event: progress"),
+            "the merge of a ~48 MB pack took {elapsed:?}, so it must still have been running \
+             when the stream's live half was read: {carried}"
+        );
+    }
+
+    // And the poller's view, which is the one a client that never opens a stream
+    // reads. The job is over now; its figures are still its own.
+    let document = Request::new("GET", &format!("/v1/jobs/{job}"))
+        .send(server.address())
+        .await;
+    assert_eq!(document.status, 200, "body: {}", document.text());
+
+    let progress = document
+        .field("progress")
+        .expect("a merge reports progress, so the job document carries it");
+    let counters = progress
+        .as_object()
+        .expect("progress is an object of counters");
+    assert!(
+        !counters.is_empty(),
+        "a merge that stored chunks must not report an empty progress object: {}",
+        document.text()
+    );
+
+    // Every key is a counter this crate knows the name of. Anything else would be
+    // a counter no `Counter` can produce, which is exactly the silent gap the
+    // layer's own test guards against — checked here from the client side as
+    // well, because this is the document a client is written against.
+    let names = lepatch::progress::counter_names();
+    for key in counters.keys() {
+        assert!(
+            names.contains(&key.as_str()),
+            "the job document reports {key:?}, which is not a counter name: {names:?}"
+        );
+    }
+
+    // **And the figures are the merge's own.** `chunks` is set from the resolved
+    // plan before the first chunk is written, so it is exactly the number of
+    // chunks the version reads — and the job's `result` carries the same figure,
+    // counted independently at the end of the run. Two counts that agree because
+    // they are the same count of the same thing; two that disagree are a wiring
+    // bug.
+    let merged = await_job(&server, &job).await;
+    assert_eq!(
+        counters.get("chunks").and_then(serde_json::Value::as_u64),
+        merged["chunks"].as_u64(),
+        "the reported chunk total must be the one the merge committed: {merged}"
+    );
+
+    // `distinct` counts up as chunks are stored, and the last tick is rate limited
+    // like any other, so it is bounded by the figure rather than equal to it.
+    let distinct = counters
+        .get("distinct")
+        .and_then(serde_json::Value::as_u64)
+        .expect("a merge stores chunks, so it reports distinct ones");
+    let fresh = merged["fresh"]
+        .as_u64()
+        .expect("a commit reports what it stored");
+
+    assert!(
+        distinct <= fresh,
+        "the number of chunks stored must not pass the figure the run ended on: {distinct} \
+         against {fresh}"
+    );
+
+    // **Conditional on the only thing it depends on.** A merge that outlasted one
+    // reporting interval has ticked at least twice, and the second tick carries a
+    // stored-chunk count. A merge that finished inside the interval legitimately
+    // reports one line and leaves `distinct` at zero, so asserting `> 0` there
+    // would be asserting that the fixture is slow enough — which is what the
+    // measurement above reports and what this check defers to.
+    if elapsed > REPORTING_INTERVAL {
+        assert!(
+            distinct > 0,
+            "a merge that took {elapsed:?} outlasted the {REPORTING_INTERVAL:?} reporting \
+             interval and so must have moved a counter while it ran: {}",
+            document.text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_quiet_server_still_reports_progress_to_a_client() {
+    // **The defect, end to end through a real process.** `lepatch --quiet serve`
+    // used to reach every client with an empty `progress` object: the terminal's
+    // `EnvFilter` was attached to the subscriber rather than to the writer layer,
+    // so it refused the `lepatch::progress` *callsite* outright and the progress
+    // layer above it was never offered the event. `RUST_LOG=info` restored it,
+    // which is what made this look like a filter bug rather than one of
+    // architecture.
+    //
+    // **`Server::start_with_progress` sets `RUST_LOG=warn`**, so both verbosity
+    // knobs are turned down as far as they go and the operator decision is
+    // tested rather than assumed: what a client sees over HTTP does not move when
+    // the terminal does.
+    //
+    // **This is a real merge through a real socket**, not a fixture of counters.
+    // A test that handed the job registry its own numbers would pass with the
+    // whole filter arrangement wrong, since the broken part is precisely the
+    // path a *command's* events take to reach the registry.
+    let dir = tempfile::tempdir().unwrap();
+    let pack_path = slow_pack(dir.path()).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start_with_progress(&root);
+
+    let merged = push(&server, "docs", &pack_path).await;
+    assert!(
+        merged
+            .get("chunks")
+            .and_then(serde_json::Value::as_u64)
+            .is_some(),
+        "the merge itself must have done something, or this test is asserting \\
+         about an empty run: {merged}"
+    );
+
+    // The job id, from the listing: `push` waits for the merge and hands back the
+    // result, and the counters live on the *job* rather than in the result.
+    let listed = Request::new("GET", "/v1/jobs").send(server.address()).await;
+    assert_eq!(listed.status, 200, "body: {}", listed.text());
+    let job = listed
+        .field("jobs")
+        .and_then(|jobs| jobs.as_array().and_then(|jobs| jobs.first().cloned()))
+        .and_then(|job| {
+            job.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("the merge must have left a job: {}", listed.text()));
+
+    let document = Request::new("GET", &format!("/v1/jobs/{job}"))
+        .send(server.address())
+        .await;
+    assert_eq!(document.status, 200, "body: {}", document.text());
+
+    // **Non-empty, and made of real counter names.** The empty object is exactly
+    // what the defect produced, so `!counters.is_empty()` is the assertion that
+    // fails when the filter is put back on the subscriber. The name check is what
+    // makes it a test of progress rather than of any old object: a server that
+    // invented a key to look busy would pass an emptiness check.
+    let progress = document
+        .field("progress")
+        .expect("a merge reports progress, so the job document carries it");
+    let counters = progress
+        .as_object()
+        .expect("progress is an object of counters");
+    assert!(
+        !counters.is_empty(),
+        "a merge that stored chunks must report progress even with the terminal \\
+         silent, or every client is told the job reported nothing: {}",
+        document.text()
+    );
+
+    let names = lepatch::progress::counter_names();
+    for key in counters.keys() {
+        assert!(
+            names.contains(&key.as_str()),
+            "the job document reports {key:?}, which is not a counter name: {names:?}"
+        );
+    }
+
+    // **And the figures are the merge's own**, checked against the count the run
+    // committed to independently. Two counts of the same thing that disagree are a
+    // wiring bug; two that agree are the wiring working.
+    assert_eq!(
+        counters.get("chunks").and_then(serde_json::Value::as_u64),
+        merged["chunks"].as_u64(),
+        "the reported chunk total must be the one the merge committed: {merged}"
+    );
+}
+
+/// How often a run is expected to say something.
+///
+/// `progress::INTERVAL`, restated rather than imported: it is private, and a test
+/// that cannot see it can only guess what "long enough to tick" means. The two
+/// have to agree, so this is the number the crate documents its own cadence with.
+const REPORTING_INTERVAL: Duration = Duration::from_millis(300);
 
 #[tokio::test]
 async fn a_running_job_can_be_cancelled() {
@@ -1541,5 +2113,49 @@ async fn a_delta_whose_base_is_not_in_the_set_is_refused() {
         "a base that does not resolve must be refused, got {}: {}",
         response.status,
         response.text()
+    );
+}
+
+#[tokio::test]
+async fn progress_events_carry_the_counters_that_moved() {
+    // The same mechanism, driven through the registry rather than through a job,
+    // so it does not depend on a merge happening to be slow enough to tick.
+    //
+    // This is the assertion that would have failed before: a `JobHandle` given
+    // counters must have them in the job document a poller reads AND on the event
+    // stream a watcher reads, because those two are the same registry.
+    let jobs = lepatch::serve::Jobs::new();
+    let id = jobs.spawn("pack", |handle| async move {
+        handle.progress(&[("files", 3), ("written", 4096)]);
+        Ok(lepatch::serve::Json::object(vec![]))
+    });
+
+    for _ in 0..200 {
+        if jobs
+            .get(id)
+            .is_some_and(|job| job.state == lepatch::serve::State::Succeeded)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let job = jobs.get(id).unwrap();
+    assert_eq!(
+        job.progress,
+        vec![("files".to_string(), 3), ("written".to_string(), 4096)],
+        "a poller must see the counters"
+    );
+
+    // And the stream carried them, so a watcher and a poller agree.
+    let replay = jobs
+        .subscribe(id)
+        .map(|(_, history)| history)
+        .unwrap_or_default();
+    assert!(
+        replay
+            .iter()
+            .any(|event| matches!(event, lepatch::serve::JobEvent::Progress(_))),
+        "a watcher must see the counters too"
     );
 }
