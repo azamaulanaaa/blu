@@ -206,28 +206,44 @@ fn every_operation_says_what_it_can_return() {
 }
 
 #[test]
-fn every_parameter_a_handler_reads_is_declared() {
-    // A path parameter the handler extracts with `web::Path` must be in
-    // `components/parameters` or declared inline, or actix will not route to it
-    // at all — the failure looks like a 404 for a documented resource.
-    let declared: BTreeSet<String> = declared()
-        .into_iter()
-        .map(|(_, path)| {
+fn every_path_parameter_the_router_uses_is_declared() {
+    // The parameter names come from **`ROUTES`, the router's own table**, not
+    // from the document. The previous version of this test built its set from the
+    // document and then asserted two hardcoded names appeared in it — so renaming
+    // `{id}` to `{packId}` in one path left the test passing while the handler's
+    // `web::Path` extraction and the documented parameter disagreed.
+    let used: BTreeSet<&str> = lepatch::serve::ROUTES
+        .iter()
+        .filter_map(|(_, path)| {
             path.split('/')
                 .find(|part| part.starts_with('{') && part.ends_with('}'))
-                .map(|name| name.trim_matches(|c| c == '{' || c == '}').to_string())
-                .unwrap_or_default()
+                .map(|name| name.trim_matches(|c| c == '{' || c == '}'))
+        })
+        .collect();
+
+    let declared: BTreeSet<&str> = document()["paths"]
+        .as_object()
+        .expect("paths must be an object")
+        .keys()
+        .flat_map(|path| {
+            path.split('/')
+                .filter(|part| part.starts_with('{') && part.ends_with('}'))
+                .map(|name| name.trim_matches(|c| c == '{' || c == '}'))
+                .collect::<Vec<_>>()
         })
         .collect();
 
     assert!(
-        declared.contains("set"),
-        "the document declares no {{set}} path parameter"
+        !used.is_empty(),
+        "no path parameters were found in ROUTES, so this test would pass vacuously"
     );
-    assert!(
-        declared.contains("id"),
-        "no {{id}} path parameter is declared"
-    );
+
+    for name in &used {
+        assert!(
+            declared.contains(name),
+            "the router reads `{{{name}}}` and the document declares no such parameter"
+        );
+    }
 }
 
 #[test]

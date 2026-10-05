@@ -69,10 +69,14 @@ async fn backup(source: &Path, blob: &Path) -> lepatch::storage::BlobId {
         .snapshot
 }
 
-/// Pack a set's latest version, into `at`.
+/// Pack a set's latest version, into `at`, recorded as the pack's own version.
+///
+/// The number is the pack's `version` header, which is the version it came *from*
+/// in the set that made it. It matters for the delta tests, where a pack of
+/// version 2 against a base of version 1 has to be nameable on the server.
 async fn pack(blob: &Path, at: &Path) -> Pack {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
-    let (_, snapshot_id) = store.latest().unwrap();
+    let (version, snapshot_id) = store.latest().unwrap();
 
     let mut reader = store.get(&snapshot_id).await.unwrap();
     let mut buffer = Vec::new();
@@ -81,7 +85,9 @@ async fn pack(blob: &Path, at: &Path) -> Pack {
 
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap();
 
-    Pack::write(&store, &plan, &snapshot, 1, at).await.unwrap()
+    Pack::write(&store, &plan, &snapshot, version, at)
+        .await
+        .unwrap()
 }
 
 /// Ask for a pack and wait for its job, returning the job's `result`.
@@ -817,9 +823,14 @@ async fn a_name_that_is_not_a_set_is_a_four_oh_four_not_an_empty_list() {
 }
 
 #[tokio::test]
-async fn a_job_can_be_watched_and_cancelled() {
-    // Both halves of the job resource. The state event names are what a client
-    // switches on, so they are part of the contract rather than a detail.
+async fn a_job_can_be_watched_over_sse() {
+    // **The stream, end to end.** `Request::send` reads to end-of-stream, which
+    // for an SSE body means "until the job is over" — so it would hand back the
+    // frames in a lump and prove nothing about the stream. This uses the bounded
+    // streaming read, which stops as soon as it has enough.
+    //
+    // The three event names are part of the contract, not a detail: a client
+    // switches on them rather than parsing the payload to find out what it is.
     let dir = tempfile::tempdir().unwrap();
     let source = tree(dir.path(), 4, 20_000);
     let blob = dir.path().join("local");
@@ -831,26 +842,144 @@ async fn a_job_can_be_watched_and_cancelled() {
     fs::create_dir_all(&root).unwrap();
     let server = Server::start(&root);
 
-    let accepted = Request::json(
-        "POST",
-        "/v1/sets/docs/merges",
-        &serde_json::json!({ "upload": "nosuchupload" }),
+    // Accept the merge, then read the stream.
+    let begin = Request::new("POST", "/v1/uploads")
+        .send(server.address())
+        .await;
+    let upload = begin.field("upload").unwrap().as_str().unwrap().to_string();
+    Request::bytes(
+        "PUT",
+        &format!("/v1/uploads/{upload}"),
+        PACK_MEDIA_TYPE,
+        fs::read(&pack_path).unwrap(),
     )
     .send(server.address())
     .await;
-    assert_eq!(accepted.status, 404, "body: {}", accepted.text());
 
-    // A job list, and a job that is not there.
-    let jobs = Request::new("GET", "/v1/jobs").send(server.address()).await;
-    assert_eq!(jobs.status, 200);
-    assert!(jobs.text().starts_with(r#"{"jobs":"#));
+    let accepted = Request::json(
+        "POST",
+        "/v1/sets/docs/merges",
+        &serde_json::json!({ "upload": upload }),
+    )
+    .send(server.address())
+    .await;
+    assert_eq!(accepted.status, 202, "body: {}", accepted.text());
+    let job = accepted.field("job").unwrap().as_str().unwrap().to_string();
 
-    let missing = Request::new("GET", &format!("/v1/jobs/{}", "a".repeat(64)))
+    let stream = Request::new("GET", &format!("/v1/jobs/{job}/events"))
+        .stream_until(server.address(), 8192, "succeeded")
+        .await;
+
+    assert_eq!(stream.status, 200);
+    let text = String::from_utf8_lossy(&stream.body).into_owned();
+
+    assert!(
+        text.contains("event: state"),
+        "the stream must name state transitions: {text}"
+    );
+    assert!(
+        text.contains("event: result"),
+        "the stream must carry the result: {text}"
+    );
+    assert!(
+        text.contains("succeeded"),
+        "the terminal state must be on the stream: {text}"
+    );
+
+    // And it agrees with what polling says, which is the property that makes the
+    // two worth having.
+    await_job(&server, &job).await;
+}
+
+#[tokio::test]
+async fn a_running_job_can_be_cancelled() {
+    // `DELETE /v1/jobs/{id}` was documented and implemented and untested. The
+    // `202` carries a `Location`, which is unusual for a `DELETE` and so is
+    // exactly the kind of thing that should be pinned.
+    let dir = tempfile::tempdir().unwrap();
+    let source = tree(dir.path(), 2, 20_000);
+    let blob = dir.path().join("local");
+    backup(&source, &blob).await;
+    let pack_path = dir.path().join("local.pack");
+    pack(&blob, &pack_path).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    let begin = Request::new("POST", "/v1/uploads")
         .send(server.address())
         .await;
-    assert_eq!(missing.status, 404);
+    let upload = begin.field("upload").unwrap().as_str().unwrap().to_string();
+    Request::bytes(
+        "PUT",
+        &format!("/v1/uploads/{upload}"),
+        PACK_MEDIA_TYPE,
+        fs::read(&pack_path).unwrap(),
+    )
+    .send(server.address())
+    .await;
 
-    let bad = Request::new("GET", "/v1/jobs/not-a-job")
+    let accepted = Request::json(
+        "POST",
+        "/v1/sets/docs/merges",
+        &serde_json::json!({ "upload": upload }),
+    )
+    .send(server.address())
+    .await;
+    let job = accepted.field("job").unwrap().as_str().unwrap().to_string();
+
+    // Either it is still running, or it finished first. Both are legitimate
+    // outcomes over a real socket, so the test accepts either and asserts the
+    // mapping either way — a cancel of a *finished* job is a `409`, and that is
+    // worth pinning too.
+    let cancelled = Request::new("DELETE", &format!("/v1/jobs/{job}"))
+        .send(server.address())
+        .await;
+
+    match cancelled.status {
+        202 => {
+            assert_eq!(
+                cancelled.header("location"),
+                Some(format!("/v1/jobs/{job}").as_str()),
+                "an accepted cancel must say where the job is"
+            );
+
+            // And it reaches a terminal state a client can see.
+            let mut state = String::new();
+            for _ in 0..400 {
+                let response = Request::new("GET", &format!("/v1/jobs/{job}"))
+                    .send(server.address())
+                    .await;
+                state = response
+                    .field("state")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+
+                if state == "cancelled" || state == "succeeded" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            assert!(
+                state == "cancelled" || state == "succeeded",
+                "a cancelled job must reach a terminal state, got {state:?}"
+            );
+
+            // A second cancel of a finished job is a definite answer, not a 202
+            // for something that will not happen.
+            let again = Request::new("DELETE", &format!("/v1/jobs/{job}"))
+                .send(server.address())
+                .await;
+            assert_eq!(again.status, 409, "body: {}", again.text());
+        }
+        409 => { /* it finished before we got there; the 409 is the contract */ }
+        other => panic!("a cancel returned {other}: {}", cancelled.text()),
+    }
+
+    // A job id that is not one is a `400`, not a `404`.
+    let bad = Request::new("DELETE", "/v1/jobs/not-a-job")
         .send(server.address())
         .await;
     assert_eq!(bad.status, 400);
@@ -1293,5 +1422,124 @@ async fn holding_more_chunks_means_fetching_fewer_bytes() {
     assert!(
         all > 0,
         "the fixed regions are always fetched, so this is never zero"
+    );
+}
+
+#[tokio::test]
+async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
+    // **The end-to-end consequence of the id grammar.** `docs@2-1` used to be
+    // accepted and answered with a full pack, because `resolve` parsed `base` off
+    // the wire and then hardcoded `None` into `VirtualPack::new`. Nothing caught
+    // it: the id parsed, the route matched, and the response was a perfectly good
+    // pack that was the wrong one.
+    //
+    // So the assertion is the property the grammar promises — a delta is smaller,
+    // its header carries the base, and it still opens.
+    let dir = tempfile::tempdir().unwrap();
+    let source = tree(dir.path(), 6, 20_000);
+    let blob = dir.path().join("local");
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    // **Version 1 first**, so the server's set really holds two versions and a
+    // delta has something to be a delta against.
+    backup(&source, &blob).await;
+    let first_pack = dir.path().join("v1.pack");
+    pack(&blob, &first_pack).await;
+    push(&server, "docs", &first_pack).await;
+
+    // Version 2: change one file, back up again, and push it too.
+    fs::write(source.join("f0.bin"), common::noisy(60_000)).unwrap();
+    let storage = BlobStore::open_for_writing(
+        &blob,
+        lepatch::storage::SegmentLimit::default(),
+        Compression::default(),
+    )
+    .await
+    .unwrap();
+    lepatch::command::backup(&source, lepatch::command::Options::default(), storage)
+        .await
+        .unwrap();
+
+    let pack_path = dir.path().join("v2.pack");
+    pack(&blob, &pack_path).await;
+    push(&server, "docs", &pack_path).await;
+
+    // The full pack, kept on disk so the delta's index can be compared with it.
+    let full_at = dir.path().join("full.pack");
+    let full = Request::new("GET", "/v1/packs/docs@2")
+        .send(server.address())
+        .await;
+    assert_eq!(full.status, 200, "body: {}", full.text());
+    fs::write(&full_at, &full.body).unwrap();
+
+    // The delta, whose reader is assumed to already hold version 1.
+    let delta = Request::new("GET", "/v1/packs/docs@2-1")
+        .send(server.address())
+        .await;
+    assert_eq!(delta.status, 200, "body: {}", delta.text());
+
+    assert!(
+        delta.body.len() < full.body.len(),
+        "a delta must be smaller than the full pack: {} vs {}",
+        delta.body.len(),
+        full.body.len()
+    );
+
+    // And it is a real delta: the header records the base, and `Pack::open`
+    // reports it. A full pack served under a `-base` id would have neither.
+    let at = dir.path().join("delta.pack");
+    fs::write(&at, &delta.body).unwrap();
+
+    let opened = Pack::open(&at).unwrap();
+    let base = opened
+        .base()
+        .expect("the delta's header must name its base");
+
+    let store = BlobStore::open_for_reading(root.join("docs"))
+        .await
+        .unwrap();
+    assert_eq!(
+        base,
+        store.snapshot_via_index(1).unwrap(),
+        "the base must be version 1 of THIS set"
+    );
+
+    // The chunk count is the real check. A delta's index is shorter, so it names
+    // fewer chunks than the full pack of the same version.
+    assert!(
+        opened.len() < Pack::open(&full_at).unwrap().len(),
+        "a delta's index must name fewer chunks"
+    );
+}
+
+#[tokio::test]
+async fn a_delta_whose_base_is_not_in_the_set_is_refused() {
+    // The base is a promise about what the reader holds. Nothing in a pack can
+    // check it, so a base that does not resolve must be refused rather than
+    // quietly answered with a full pack.
+    let dir = tempfile::tempdir().unwrap();
+    let source = tree(dir.path(), 3, 20_000);
+    let blob = dir.path().join("local");
+    backup(&source, &blob).await;
+    let pack_path = dir.path().join("local.pack");
+    pack(&blob, &pack_path).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+    push(&server, "docs", &pack_path).await;
+
+    let response = Request::new("GET", "/v1/packs/docs@1-99")
+        .send(server.address())
+        .await;
+
+    assert!(
+        response.status == 404 || response.status == 422,
+        "a base that does not resolve must be refused, got {}: {}",
+        response.status,
+        response.text()
     );
 }

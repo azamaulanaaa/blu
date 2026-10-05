@@ -298,13 +298,13 @@
         ],
         "operationId": "getPack",
         "summary": "The bytes of a pack, or a range of them.",
-        "description": "**Nothing is stored for the pack.** The id names `(set, version, base)` and the bytes are computed out of the set's segments on every request, which is what keeps a server's disk from being a function of how many versions clients have been curious about.\n\nOne range at a time. A client that wants several issues several requests: a multipart/byteranges body would be bytes a client must parse before it can use, where a second response can be written straight at an offset into a sparse file. And a fetch plan already merges touching ranges, so a client following one never asks for two that touch.",
+        "description": "**Nothing is stored for the pack.** The id names `(set, version, base)` and the bytes are computed out of the set's segments on every request, which is what keeps a server's disk from being a function of how many versions clients have been curious about.\n\nOne range at a time. A client that wants several issues several requests: a multipart/byteranges body would be bytes a client must parse before it can use, where a second response can be written straight at an offset into a sparse file. And a fetch plan already merges touching ranges, so a client following one never asks for two that touch.\n\n**A delta is a real delta.** `set@version-base` is a smaller file than `set@version`, because the plan is `Plan::since`: it keeps only the chunks the base does not have. The base hash is recorded in the pack's header, and a reader that cannot account for the base must refuse the pack rather than apply what it can \u2014 the bytes that would prove the reader holds those chunks are exactly the bytes the delta left out.",
         "parameters": [
           {
             "name": "Range",
             "in": "header",
             "required": false,
-            "description": "A single byte range, `bytes=first-last` or `bytes=first-`. A range past the end is clamped to what exists; one that *starts* past the end is a 416, because a client whose idea of the file is wrong should hear about it rather than receive an empty body it would write as a hole. A suffix range (`bytes=-N`) is refused.",
+            "description": "`set@version` or `set@version-base`. An id is a name, not a handle: resolving one needs nothing stored, because the bytes are computed from the set. With a base, the pack is a **delta** \u2014 it carries only the chunks the base version does not already hold, and its index is correspondingly shorter. The base must resolve in the same set; the two version numbers mean the same set's numbering.",
             "schema": {
               "type": "string"
             }
@@ -915,7 +915,7 @@
         "name": "id",
         "in": "path",
         "required": true,
-        "description": "`set@version` or `set@version-base`. An id is a name, not a handle: resolving one needs nothing stored, because the bytes are computed from the set.",
+        "description": "`set@version` or `set@version-base`. An id is a name, not a handle: resolving one needs nothing stored, because the bytes are computed from the set. A `-base` suffix names a delta.",
         "schema": {
           "type": "string"
         },
@@ -1115,7 +1115,7 @@
       },
       "PackRequest": {
         "type": "object",
-        "description": "Which version to pack, and from what base.",
+        "description": "Which version to pack, and from what base. Omit `version` for the newest that resolves.",
         "properties": {
           "version": {
             "type": "integer",
@@ -1127,7 +1127,7 @@
             "type": "integer",
             "format": "int32",
             "nullable": true,
-            "description": "The version the pack assumes its reader already holds, for a delta."
+            "description": "The version the pack assumes its reader already holds. Produces a delta: only the chunks this base does not have are carried, and the base hash is written into the pack's header. Must resolve in the same set."
           },
           "compression": {
             "type": "string",

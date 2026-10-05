@@ -43,9 +43,6 @@ pub enum Json {
     /// A signed value would mean writing a cast, and a cast on a byte length is
     /// how a figure goes negative in a report.
     Int(u64),
-    /// A negative integer, for the fields that genuinely have one. There is
-    /// none today; it is here so that adding one is not a sign error.
-    NegInt(i64),
     /// A literal `true` or `false`.
     Bool(bool),
     /// The literal `null`.
@@ -150,9 +147,6 @@ impl Json {
             Self::Int(value) => {
                 out.push_str(&value.to_string());
             }
-            Self::NegInt(value) => {
-                out.push_str(&value.to_string());
-            }
             Self::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
             Self::Null => out.push_str("null"),
             Self::Array(items) => {
@@ -187,7 +181,7 @@ fn describe(value: &Json) -> &'static str {
         Json::Object(_) => "an object",
         Json::Array(_) => "an array",
         Json::Str(_) => "a string",
-        Json::Int(_) | Json::NegInt(_) => "a number",
+        Json::Int(_) => "a number",
         Json::Bool(_) => "a boolean",
         Json::Null => "null",
     }
@@ -474,14 +468,18 @@ fn parse_number(bytes: &[u8], at: &mut usize) -> Result<Json, String> {
         ));
     }
 
-    text.parse::<i64>()
-        .map(|value| {
-            if value < 0 {
-                Json::NegInt(value)
-            } else {
-                Json::int(value.unsigned_abs())
-            }
-        })
+    // A leading `-` is refused outright rather than parsed and then rejected at
+    // the consumer. Every number in a request body is a version or a chunk count,
+    // and this is the place that knows that; the alternative is a variant plus a
+    // match arm at each of the three places that read a number.
+    if text.starts_with('-') {
+        return Err(format!(
+            "{text:?} is negative; this reads whole numbers only"
+        ));
+    }
+
+    text.parse::<u64>()
+        .map(Json::int)
         .map_err(|_| format!("{text:?} is not a number this reads"))
 }
 
@@ -593,7 +591,9 @@ mod tests {
         assert_eq!(rendered(&Json::int(0)), "0");
         assert_eq!(rendered(&Json::int(1000)), "1000");
         assert_eq!(rendered(&Json::int(u64::from(u32::MAX))), "4294967295");
-        assert_eq!(rendered(&Json::NegInt(-1)), "-1");
+        // A negative number is refused at the parser, so there is no variant to
+        // render. See `parse_number`.
+        assert!(Json::parse_object(r#"{"v":-1}"#).is_err());
     }
 
     #[test]

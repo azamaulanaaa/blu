@@ -123,12 +123,6 @@ impl JobId {
     }
 }
 
-impl Default for JobId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl fmt::Display for JobId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.hex())
@@ -144,6 +138,19 @@ fn nanos() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The id an unset handle would carry.
+///
+/// Not read anywhere, and required: `clippy::new_without_default` is in the `all`
+/// group this crate denies, so a `new()` without a `Default` is a build failure.
+/// That is the same constraint that removed `assert_eq!(x, [])` from four tests
+/// when `serde_json` arrived — a lint the author does not control deciding the
+/// shape of the tree.
+impl Default for JobId {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Where a job is in its life.
@@ -255,6 +262,15 @@ impl Job {
 #[derive(Debug, Clone)]
 pub struct Jobs {
     inner: Arc<Inner>,
+}
+
+/// An empty registry.
+///
+/// Also `clippy::new_without_default`. See [`JobId::default`].
+impl Default for Jobs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug)]
@@ -426,35 +442,46 @@ impl Jobs {
         Ok(())
     }
 
-    /// A stream of this job's events, plus what a late subscriber missed.
+    /// A receiver for this job's events, plus what a late subscriber missed.
+    ///
+    /// **Both, from one call, and that is the point.** Taking the receiver before
+    /// the history snapshot leaves a window in which an event reaches both, and a
+    /// client receives it twice. Separating them also made the caller check
+    /// existence separately, which is two locks and two clones for one answer.
+    ///
+    /// The replay is a snapshot, so an event arriving after this returns is on the
+    /// receiver and not in the history — which is what makes the pair correct
+    /// rather than merely complete.
     ///
     /// # Errors
     ///
     /// Returns an error if no job has this id.
-    pub fn subscribe(&self, id: JobId) -> std::io::Result<Vec<JobEvent>> {
-        if self.get(id).is_none() {
+    pub fn subscribe(
+        &self,
+        id: JobId,
+    ) -> std::io::Result<(broadcast::Receiver<JobEvent>, Vec<JobEvent>)> {
+        let known = self
+            .inner
+            .jobs
+            .lock()
+            .is_ok_and(|jobs| jobs.contains_key(&id));
+
+        if !known {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("no job {id}"),
             ));
         }
 
-        // The replay comes first, because a client that connects late must not
-        // be told a job has made no progress when it has.
-        let replay = self
+        let receiver = self.inner.events.subscribe();
+        let history = self
             .inner
             .replay
             .lock()
             .map(|all| all.get(&id).cloned().unwrap_or_default())
             .unwrap_or_default();
 
-        Ok(replay)
-    }
-
-    /// A receiver for this job's events from now on.
-    #[must_use]
-    pub fn receiver(&self) -> broadcast::Receiver<JobEvent> {
-        self.inner.events.subscribe()
+        Ok((receiver, history))
     }
 
     /// Record an event, and remember the last few for a late subscriber.
@@ -485,7 +512,6 @@ impl Jobs {
             return;
         };
 
-        let before = jobs.len();
         // Kept: anything still running, whatever its age. A job that started an
         // hour ago and has not finished is not garbage — a merge of a very large
         // pack is still a merge that is going.
@@ -508,24 +534,26 @@ impl Jobs {
 
         if by_age.len() > RETAINED {
             by_age.sort_by_key(|id| jobs[id].started);
+
+            // **The ids being removed, collected as they go.** An earlier version
+            // swept `jobs.keys()` *after* the removals, which is the set of jobs
+            // that SURVIVED — so retiring one job destroyed the replay history of
+            // every other job and leaked the retired one. It read as cleanup and
+            // was the opposite.
+            let mut retired = Vec::new();
             for id in &by_age[..by_age.len() - RETAINED] {
+                retired.push(*id);
                 jobs.remove(id);
             }
-        }
 
-        if jobs.len() != before
-            && let Ok(mut replay) = self.inner.replay.lock()
-        {
-            for id in jobs.keys() {
-                replay.remove(id);
+            if !retired.is_empty()
+                && let Ok(mut replay) = self.inner.replay.lock()
+            {
+                for id in retired {
+                    replay.remove(&id);
+                }
             }
         }
-    }
-}
-
-impl Default for Jobs {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -773,7 +801,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        let replay = jobs.subscribe(id).unwrap();
+        let (_receiver, replay) = jobs.subscribe(id).unwrap();
         assert!(
             replay
                 .iter()

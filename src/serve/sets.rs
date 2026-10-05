@@ -72,12 +72,6 @@ impl Sets {
         }
     }
 
-    /// The directory this server keeps sets in.
-    #[must_use]
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// The set's base path, from a name off the wire.
     ///
     /// # Errors

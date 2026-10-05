@@ -2050,7 +2050,7 @@ pub struct VirtualPack {
 /// are where the *payload* is in the segment file, which is what a read is made
 /// from. A record's header is in neither: it is computed and written to the pack,
 /// never copied out of the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct VirtualRecord {
     /// The chunk's content hash, and the identity it is addressed by.
     id: BlobId,
@@ -2065,9 +2065,15 @@ struct VirtualRecord {
     raw_len: u64,
     /// How the payload is stored.
     codec: crate::storage::Codec,
-    /// Which segment the payload sits in.
-    segment: u32,
-    /// Byte offset of the payload within that segment.
+    /// The file the payload is in.
+    ///
+    /// Resolved once, at construction, rather than by a second mechanism at serve
+    /// time. A caller used to hand `VirtualPack::new` a `resolve` closure whose
+    /// result this loop threw away, and carry a separate `Vec<PathBuf>` of
+    /// segments alongside — which meant a directory scan on every pack fetch, and
+    /// two answers to "which file is segment 3 in" that could disagree.
+    path: std::path::PathBuf,
+    /// Byte offset of the payload within that file.
     payload_offset: u64,
 }
 
@@ -2158,7 +2164,7 @@ impl VirtualPack {
                 stored_len,
                 raw_len: planned.placement.raw_len,
                 codec: planned.placement.codec,
-                segment: planned.placement.segment,
+                path: resolve(planned.placement.segment),
                 payload_offset: planned.placement.offset,
             });
 
@@ -2185,14 +2191,6 @@ impl VirtualPack {
             .saturating_add(u64::try_from(snapshot_bytes.len()).unwrap_or(0))
             .saturating_add(u64::try_from(index.len()).unwrap_or(0))
             .saturating_add(trailer_len);
-
-        // Resolved now rather than at serve time, so a pack that could not be
-        // served at all is refused while it is being made rather than by a
-        // request that would have been answered with a hole in the file. Nothing
-        // is opened; this only names each segment the plan needs.
-        for record in &records {
-            resolve(record.segment);
-        }
 
         Ok(Self {
             header,
@@ -2351,18 +2349,11 @@ impl VirtualPack {
         merged
     }
 
-    /// Bytes a client holding `have` still has to fetch.
-    #[must_use]
-    pub fn needed_bytes(&self, have: &HashSet<BlobId>) -> u64 {
-        self.fetch_plan(have)
-            .iter()
-            .fold(0u64, |total, range| total.saturating_add(range.len()))
-    }
-
     /// The bytes of `range`, and where each part of them comes from.
     ///
     /// Nothing is read here: the returned [`Source::Segment`]s name files and
-    /// offsets and the caller reads them. So a segment truncated since this pack
+    /// offsets and the caller reads them. Each file was resolved when this pack
+    /// was made, so answering a range needs no directory scan. So a segment truncated since this pack
     /// was computed fails at the read, which is the same place a real transfer
     /// would fail and with the same error.
     ///
@@ -2372,10 +2363,7 @@ impl VirtualPack {
     /// pack. An inverted range is refused rather than answered as empty, because
     /// an empty answer to a range a client believed it had would leave a file
     /// with a hole in it and nothing saying so.
-    pub fn source<F>(&self, range: Range, resolve: F) -> io::Result<Vec<Source>>
-    where
-        F: Fn(u32) -> std::path::PathBuf,
-    {
+    pub fn source(&self, range: Range) -> io::Result<Vec<Source>> {
         if range.start >= range.end || range.end > self.length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2444,7 +2432,7 @@ impl VirtualPack {
             } else if payload_from >= header_bytes {
                 // Entirely in the payload, which is read out of the segment.
                 out.push(Source::Segment {
-                    path: resolve(record.segment),
+                    path: record.path.clone(),
                     offset: record
                         .payload_offset
                         .saturating_add(payload_from.saturating_sub(header_bytes)),
@@ -2455,7 +2443,7 @@ impl VirtualPack {
                 let header = record_header(record);
                 push(&mut out, &header, payload_from, header_bytes);
                 out.push(Source::Segment {
-                    path: resolve(record.segment),
+                    path: record.path.clone(),
                     offset: record.payload_offset,
                     len: payload_to.saturating_sub(header_bytes),
                 });

@@ -30,15 +30,9 @@
 //!
 //! [`Pack::open`]: crate::pack::Pack::open
 
-use std::{
-    collections::HashSet,
-    io,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashSet, io, path::Path, sync::Arc};
 
 use crate::{
-    layout::IndexSet,
     pack::{Range, VirtualPack},
     storage::{BlobId, BlobStore, Compression, Read},
 };
@@ -63,6 +57,22 @@ pub struct Requested {
     /// cannot detect.
     pub version: Option<u32>,
     /// The version the pack assumes its reader already holds, for a delta.
+    ///
+    /// **Honoured, and it changes what is served.** A delta's plan is
+    /// [`Plan::since`](crate::storage::Plan::since), which keeps only the chunks
+    /// the base does not have, and its index is correspondingly shorter. So
+    /// `docs@5-4` is a genuinely smaller file than `docs@5`, and the base hash is
+    /// written into its header.
+    ///
+    /// The reader is asserting it already holds those chunks. Nothing in the pack
+    /// can check it, because the bytes that would prove it are exactly the bytes
+    /// that were left out — so a reader that cannot account for the base must
+    /// refuse the pack, which is what [`Pack::base`](crate::pack::Pack::base)
+    /// reporting the hash is for.
+    ///
+    /// The base must resolve in **this** set. `since` compares against a
+    /// snapshot, and the set that holds it is the one whose numbering the two
+    /// versions mean.
     pub base: Option<u32>,
 }
 
@@ -74,10 +84,8 @@ pub struct Requested {
 /// making ten requests pays for ten walks rather than ten packs.
 #[derive(Debug)]
 pub struct Resolved {
-    /// The geometry.
+    /// The geometry, and the files each of its records is in.
     pub pack: VirtualPack,
-    /// The set's segments, for resolving a segment number to a file.
-    pub segments: Vec<PathBuf>,
     /// The version the pack records, which is what a client checks it fetched
     /// the version it asked for.
     pub version: u32,
@@ -92,20 +100,7 @@ impl Resolved {
     ///
     /// Returns an error if the range is inverted or past the end of the pack.
     pub fn source(&self, range: Range) -> io::Result<Vec<crate::pack::Source>> {
-        self.pack.source(range, |segment| self.segment(segment))
-    }
-
-    /// The file a segment number is in.
-    ///
-    /// An unknown segment number is a pack that cannot be served, so it is an
-    /// error naming the number rather than a path that does not exist. A client
-    /// would otherwise get a `500` from a read deep inside a range response,
-    /// with nothing in the message about the pack it asked for.
-    fn segment(&self, number: u32) -> PathBuf {
-        self.segments
-            .get(usize::try_from(number).unwrap_or(usize::MAX))
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from(format!("segment-{number}")))
+        self.pack.source(range)
     }
 }
 
@@ -131,15 +126,34 @@ pub(super) async fn resolve(sets: &Sets, request: &Requested) -> io::Result<Reso
     let store = &*cached;
     let snapshot = crate::command::load_snapshot(store, snapshot_id).await?;
 
-    let plan = crate::storage::Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
+    // **The delta, when one was asked for.** `Plan::since` drops every chunk the
+    // base already holds, so both the payload and the index shrink. That is the
+    // whole of the point, and it is why a delta is not merely a full pack with
+    // some records left out: the index would still name them.
+    //
+    // The base is resolved through the **store**, not off the version number, so
+    // a stale index falls back to a scan and a version the set cannot serve is a
+    // `404` rather than a delta whose omitted chunks nobody checked against.
+    let (plan, base_id) = match request.base {
+        None => (
+            crate::storage::Plan::from_snapshot(&snapshot, |id| store.locate(id))?,
+            None,
+        ),
+        Some(base_version) => {
+            let base_id = store.snapshot_via_index(base_version)?;
+            let base_snapshot = crate::command::load_snapshot(store, base_id).await?;
+            let full = crate::storage::Plan::from_snapshot(&snapshot, |id| store.locate(id))?;
 
-    let virtual_pack = VirtualPack::new(&plan, &snapshot, version, None, |segment| {
+            (full.since(&snapshot, &base_snapshot), Some(base_id))
+        }
+    };
+
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, version, base_id, |segment| {
         store.segment_path(segment)
     })?;
 
     Ok(Resolved {
         pack: virtual_pack,
-        segments: IndexSet::new(&base_path).segments()?,
         version,
         snapshot: snapshot_id,
     })

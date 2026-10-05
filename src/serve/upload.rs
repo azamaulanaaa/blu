@@ -147,21 +147,6 @@ impl Uploads {
         }
     }
 
-    /// Remove every upload this registry is holding.
-    ///
-    /// Called on shutdown, so a run that did not commit everything does not
-    /// leave a scratch directory full of packs the next run would have to sort
-    /// out.
-    pub fn discard_all(&self) {
-        let Ok(mut held) = self.locked() else {
-            return;
-        };
-
-        for path in held.drain().map(|(_, path)| path).collect::<Vec<PathBuf>>() {
-            let _ = remove(&path);
-        }
-    }
-
     /// Lock the map, recovering from a poison.
     ///
     /// The map holds paths and nothing that a panic could leave inconsistent, so
@@ -258,19 +243,5 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         uploads.discard("abc").unwrap();
-    }
-
-    #[tokio::test]
-    async fn discarding_everything_leaves_no_scratch_behind() {
-        // Called on shutdown, so a run that did not commit everything does not
-        // leave a directory the next run has to sort out.
-        let (dir, uploads) = scratch_dir();
-        uploads.begin("one").await.unwrap();
-        uploads.begin("two").await.unwrap();
-
-        uploads.discard_all();
-
-        let left = std::fs::read_dir(dir.path()).unwrap().count();
-        assert_eq!(left, 0, "scratch held {left} file(s) after discard_all");
     }
 }

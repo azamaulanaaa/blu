@@ -25,6 +25,26 @@ use tokio::{
     net::TcpStream,
 };
 
+/// Read a response body that never ends, up to a bound.
+///
+/// **For Server-Sent Events, and nothing else.** An SSE stream is closed by the
+/// server when a job finishes, not by a `Content-Length`, so [`Request::send`]
+/// cannot be used on one — it reads to end-of-stream, which for a live job means
+/// it blocks until the job is done and then hands back everything at once, losing
+/// the ordering the stream exists to convey.
+///
+/// So this reads **until it has seen enough**, then stops, leaving the socket to
+/// be dropped. It is not a general streaming client and does not pretend to be:
+/// `limit` is a cap on how much is read, not a promise that the body is that
+/// long.
+#[derive(Debug, Clone)]
+pub(crate) struct Stream {
+    /// The status line's number.
+    pub status: u16,
+    /// Everything received after the headers.
+    pub body: Vec<u8>,
+}
+
 /// A response, read whole.
 #[derive(Debug, Clone)]
 pub(crate) struct Response {
@@ -120,7 +140,98 @@ impl<'a> Request<'a> {
         self
     }
 
-    /// Send it to `address` and read the response.
+    /// Send it to `address`, and read until `limit` bytes, `until` appears, or
+    /// the peer goes quiet.
+    ///
+    /// For a response that does not end. See [`Stream`].
+    ///
+    /// **The quiet deadline is not optional.** A Server-Sent Events body stays
+    /// open for the life of the job, so a read that waits for `limit` bytes
+    /// blocks forever if fewer arrive — which it did, and hung the suite. The
+    /// three stopping conditions are all needed: `limit` for a big burst,
+    /// `until` for a small terminator, and the deadline for neither.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection fails or the response has no status line.
+    pub(crate) async fn stream_until(
+        self,
+        address: std::net::SocketAddr,
+        limit: usize,
+        until: &str,
+    ) -> Stream {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .expect("the server should accept a connection");
+
+        let mut head = format!(
+            "{} {} HTTP/1.1\r\nhost: {}\r\ncontent-length: {}\r\n",
+            self.method.to_ascii_uppercase(),
+            self.path,
+            address,
+            self.body.len()
+        );
+        for (name, value) in &self.headers {
+            let _ = writeln!(head, "{name}: {value}");
+        }
+        head.push_str("\r\n");
+
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&self.body).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the head first, so the cap applies to the body alone.
+        let mut raw = Vec::new();
+        let mut chunk = vec![0u8; 1024];
+
+        while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+        }
+
+        let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return Stream {
+                status: 0,
+                body: Vec::new(),
+            };
+        };
+
+        let status: u16 = String::from_utf8_lossy(&raw[..split])
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+
+        let mut body = raw[split + 4..].to_vec();
+
+        while body.len() < limit && !String::from_utf8_lossy(&body).contains(until) {
+            // A short deadline, retried each round, so a job that takes a while to
+            // report is still followed — but a stream that never terminates does
+            // not hang the suite.
+            let Ok(Ok(read)) = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                stream.read(&mut chunk),
+            )
+            .await
+            else {
+                break;
+            };
+
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(limit);
+
+        Stream { status, body }
+    }
+
+    /// Send it to `address` and read the response whole.
     ///
     /// # Panics
     ///

@@ -965,9 +965,24 @@ why the answer is `needed` *unioned with the fixed regions* rather than `needed`
 `needed` alone would be a payload with no trailer, and `Pack::open` reads the
 trailer first.
 
-The server does not write a pack file to answer that. A pack is derived output —
-re-running `lepatch pack` regenerates one — so its bytes are computed from the set
-on each request. That is why a large version costs nothing to be addressable.
+**A client that already holds an earlier version asks for a delta.** The pack id
+carries the base, and the answer is a smaller file:
+
+```console
+$ curl -sS -H 'range: bytes=0-' localhost:8480/v1/packs/docs@3-2 > delta.pack
+```
+
+A delta's plan is `Plan::since`, so it carries only the chunks its base does not
+have and its index is correspondingly shorter. The base hash goes into the pack's
+header, and that is the whole of the checking: a reader that cannot account for
+the base must refuse the pack rather than apply what it can, because the bytes
+that would prove it holds those chunks are exactly the bytes the delta left out.
+So a base that does not resolve in the set is a `404`, not a full pack.
+
+The server does not write a pack file to answer any of this. A pack is derived
+output — re-running `lepatch pack` regenerates one — so its bytes are computed
+from the set on each request. That is why a large version costs nothing to be
+addressable.
 
 ### API
 

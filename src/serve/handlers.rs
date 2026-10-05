@@ -777,14 +777,16 @@ async fn job_events(jobs: web::Data<super::Jobs>, path: web::Path<String>) -> Ht
         Err(e) => return error(&ApiError::from(e)),
     };
 
-    // A late subscriber is given what it missed rather than an empty stream that
-    // looks like a job with no progress.
-    if let Err(e) = jobs.subscribe(id) {
-        return error(&ApiError::from(e));
-    }
-
-    let receiver = jobs.receiver();
-    let history = jobs.subscribe(id).unwrap_or_default();
+    // **One call, one lock.** This used to be three: `subscribe(id)` as an
+    // existence check whose value was discarded, then `receiver()`, then
+    // `subscribe(id)` again for the history. Two locks and two clones for one
+    // answer, and the receiver was taken *before* the history snapshot — so an
+    // event broadcast in that window landed in both and a late subscriber
+    // received it twice.
+    let (receiver, history) = match jobs.subscribe(id) {
+        Ok(pair) => pair,
+        Err(e) => return error(&ApiError::from(e)),
+    };
 
     // The replay first, then the live stream, chained. A client that connects late
     // is therefore told what it missed before it is told what is happening now,
