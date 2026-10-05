@@ -45,6 +45,11 @@ pub use hash::BlobId;
 pub use locate::{Resolved, resolve, resolve_with};
 pub use plan::{Plan, PlannedChunk};
 pub use record::Codec;
+/// The layout version of the store's records, served at `GET /v1/version`.
+///
+/// Public so a client can ask what a server can read before it sends it
+/// anything. See [`record::FORMAT_VERSION`].
+pub use record::FORMAT_VERSION;
 pub use segment::SegmentLimit;
 pub use version_index::VersionIndex;
 

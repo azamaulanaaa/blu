@@ -1,0 +1,1508 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "lepatch",
+    "version": "0.5.1",
+    "description": "Serve a backup set over HTTP.\n\nThe server moves packs and nothing else. It never takes a path on its own disk: there is no endpoint that snapshots a server-local tree and none that restores into one. The client runs `lepatch backup` and `lepatch pack` locally, uploads the pack, and the server merges it. For a restore the server packs a version and the client fetches the chunks it lacks and merges or applies it locally.\n\n**There is no authentication.** Anyone who can reach the port can read every set this server keeps and can append versions to them. That is a decision, not an oversight. The bind address defaults to 127.0.0.1.\n\nA pack's bytes are a pack, verbatim: `GET /v1/packs/{id}` serves them under `application/x-lepatch-pack`, and a client can hand what it fetched straight to `Pack::open` and then to `lepatch merge` or `lepatch apply`.",
+    "license": {
+      "name": "GPL-2.0-or-later",
+      "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.html"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8480",
+      "description": "The default bind."
+    }
+  ],
+  "tags": [
+    {
+      "name": "meta",
+      "description": "What this build is, and its own specification."
+    },
+    {
+      "name": "sets",
+      "description": "The sets under the root, and what they hold."
+    },
+    {
+      "name": "pull",
+      "description": "Packing a version out and serving its bytes."
+    },
+    {
+      "name": "push",
+      "description": "Uploading a pack and merging it into a set."
+    },
+    {
+      "name": "jobs",
+      "description": "Long work, and how to watch or stop it."
+    }
+  ],
+  "paths": {
+    "/openapi.json": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "getOpenapi",
+        "summary": "This document.",
+        "description": "The source of truth for this API. `tests/openapi.rs` fails if it stops describing the routes this server actually answers.",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.0 document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/version": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "getServerInfo",
+        "summary": "What this build is, and what it can read.",
+        "description": "A client cannot work any of this out from a pack fetch: a pack this build cannot read is refused with a message naming the version it wanted, and the version a client wants is not in the pack. So a client asks, compares, and knows before it uploads anything.",
+        "responses": {
+          "200": {
+            "description": "This build's version and the layout versions it reads.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sets": {
+      "get": {
+        "tags": [
+          "sets"
+        ],
+        "operationId": "listSets",
+        "summary": "The sets under the root.",
+        "description": "A name that is not a set is not listed, so a stray file beside the sets is simply not there rather than becoming a 404 later.",
+        "responses": {
+          "200": {
+            "description": "Every set found, sorted by name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetList"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sets/{set}/versions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Set"
+        }
+      ],
+      "get": {
+        "tags": [
+          "sets"
+        ],
+        "operationId": "listVersions",
+        "summary": "The versions a set's index files name.",
+        "description": "**A lower bound, and that is the answer.** The index files are a cache derived from the store's commit records; a version whose index was never written still exists and still restores. This may report fewer versions than the set holds, and never more. A client that needs the newest version should ask for a pack, which resolves through the store and falls back to a scan when an index is stale.",
+        "responses": {
+          "200": {
+            "description": "The indexed versions, oldest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionList"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No set at that name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sets/{set}/versions/{version}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Set"
+        },
+        {
+          "$ref": "#/components/parameters/Version"
+        }
+      ],
+      "get": {
+        "tags": [
+          "sets"
+        ],
+        "operationId": "showVersion",
+        "summary": "One version's figures, and its pack id.",
+        "description": "Resolved through the store rather than off an index file, so a stale, foreign or edited index is a reason to fall back to a scan and never a reason to name a version the store cannot serve.",
+        "responses": {
+          "200": {
+            "description": "The version's figures.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No set at that name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "That version does not resolve.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sets/{set}/packs": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Set"
+        }
+      ],
+      "post": {
+        "tags": [
+          "pull"
+        ],
+        "operationId": "requestPack",
+        "summary": "Ask for a pack of a version.",
+        "description": "Returns a job, because answering this is work: even the `keep` case walks the version and resolves every chunk against the store.\n\n**`compression` must be `keep`, or be absent.** A re-encode cannot be served from the set's bytes \u2014 they are not in the set \u2014 so a request for one is refused rather than quietly answered with `keep` bytes.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted. The job carries the pack's geometry and the snapshot hash that names it.",
+            "headers": {
+              "Location": {
+                "description": "The job to poll or watch.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A compression policy that cannot be served from a set.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/packs/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/PackId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "pull"
+        ],
+        "operationId": "getPack",
+        "summary": "The bytes of a pack, or a range of them.",
+        "description": "**Nothing is stored for the pack.** The id names `(set, version, base)` and the bytes are computed out of the set's segments on every request, which is what keeps a server's disk from being a function of how many versions clients have been curious about.\n\nOne range at a time. A client that wants several issues several requests: a multipart/byteranges body would be bytes a client must parse before it can use, where a second response can be written straight at an offset into a sparse file. And a fetch plan already merges touching ranges, so a client following one never asks for two that touch.",
+        "parameters": [
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "description": "A single byte range, `bytes=first-last` or `bytes=first-`. A range past the end is clamped to what exists; one that *starts* past the end is a 416, because a client whose idea of the file is wrong should hear about it rather than receive an empty body it would write as a hole. A suffix range (`bytes=-N`) is refused.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The whole pack. Sent when no Range header was given.",
+            "headers": {
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "bytes"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/x-lepatch-pack": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The bytes asked for.",
+            "headers": {
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "bytes"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/x-lepatch-pack": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A Range this server does not serve.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No set at that name, or no usable version in it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "The range starts past the end of the pack. `Content-Range: bytes */length` says how long it is.",
+            "headers": {
+              "Content-Range": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/packs/{id}/plan": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/PackId"
+        }
+      ],
+      "post": {
+        "tags": [
+          "pull"
+        ],
+        "operationId": "planPack",
+        "summary": "What a client holding some chunks still needs.",
+        "description": "The byte ranges of the chunks `have` does not contain, **unioned with the header, snapshot, index and trailer**. The union matters: the ranges of the missing chunks alone would be a payload with no trailer, and `Pack::open` reads the trailer first, so a client that fetched only those would be refused on a file it had already paid for.\n\nA client writes each range at its offset into a sparse file of `length` bytes, fetches each with `GET /v1/packs/{id}` and a `Range` header, and calls `Pack::open` on the result.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestorePlan"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The ranges to fetch, and their total length.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackPlan"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A `have` entry that is not a chunk hash.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No set at that name, or no usable version in it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/uploads": {
+      "post": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "beginUpload",
+        "summary": "Begin an upload, and get a slot to put a pack in.",
+        "description": "An upload is its own resource rather than a fused `PUT /v1/sets/{set}/packs`, for two reasons. A merge reads the pack **twice** \u2014 once to verify the file table and once per chunk \u2014 so it needs a seekable file and the bytes must land on disk whatever the route is called. And one pack can go to more than one set: a client backing the same tree up to two servers has one pack and two merges.",
+        "responses": {
+          "201": {
+            "description": "The upload slot.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Upload"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/uploads/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/UploadId"
+        }
+      ],
+      "put": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "fillUpload",
+        "summary": "The pack's bytes.",
+        "description": "Checked with `Pack::open` before the 204, so a client finds out here that what it sent is not a pack rather than one request later at commit. That check reads the trailer and the index and no payload, so it costs nothing beside the transfer.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-lepatch-pack": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "The pack arrived and is a pack."
+          },
+          "404": {
+            "description": "No upload at that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The bytes are not a pack this build reads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "dropUpload",
+        "summary": "Drop the upload and remove its file.",
+        "responses": {
+          "204": {
+            "description": "Dropped. An upload that was never there is also dropped."
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/uploads/{id}/commit": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/UploadId"
+        }
+      ],
+      "post": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "commitUpload",
+        "summary": "What arrived, and where it is.",
+        "description": "Does **not** hash the chunks. `Pack::open` cannot, by design. A pack whose payload is damaged is caught by the merge that would have stored it, chunk by chunk, at the store's own check \u2014 so a corrupt pack is refused by the merge rather than by a check that would have cost a full read and proved the same thing twice.",
+        "responses": {
+          "200": {
+            "description": "The pack's header figures.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadCommit"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No upload at that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The upload is not a pack this build reads.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sets/{set}/merges": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Set"
+        }
+      ],
+      "post": {
+        "tags": [
+          "push"
+        ],
+        "operationId": "mergePack",
+        "summary": "Merge an uploaded pack into a set, as a new version.",
+        "description": "The receiving half of `lepatch pack`, and the one a remote push uses.\n\nA full pack suits any set and creates one if there is none. A delta names a version its reader already holds and is refused unless some committed version of the set is that version.\n\n**Merging the same pack twice is not an error.** The second run reports which version of the set already holds it and writes nothing, so a retried transfer is answerable.\n\nConcurrent merges into one set are serialised: the store takes its append reservation when it opens, so two handles onto one set would each believe they own the next offset. This endpoint takes a per-set lock before opening, and the set's own file lock inside it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Accepted. The job's result is a MergedCommitted or a MergedAlready.",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A compression value that is neither `keep` nor a level from 0 to 9.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No upload at that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "listJobs",
+        "summary": "Every job this server is running or has run.",
+        "description": "Finished jobs are kept for an hour, or 256 of them, whichever comes first.",
+        "responses": {
+          "200": {
+            "description": "The jobs, oldest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobList"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "showJob",
+        "summary": "One job.",
+        "responses": {
+          "200": {
+            "description": "The job's state, progress and result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a job id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No job at that id. It may have been retired.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "cancelJob",
+        "summary": "Stop a job.",
+        "description": "Aborts the task, which drops its future, which runs the destructors inside it \u2014 so an upload's file is removed and a set's claim is dropped.\n\n**No rollback is needed**, and that is what makes it safe. A store is append-only with one commit record at the end of a run, so an aborted merge published no version and left a torn tail the next open reclaims.\n\nA `409` against a finished job, which is a definite answer rather than a 202 for something that will not happen.",
+        "responses": {
+          "202": {
+            "description": "Stopping."
+          },
+          "400": {
+            "description": "Not a job id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No job at that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The job has already finished.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/events": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "streamJob",
+        "summary": "The same events, as a stream.",
+        "description": "Server-Sent Events rather than WebSockets: this is one-directional, it is text, and it reconnects on its own. A client that does not want a stream polls `GET /v1/jobs/{id}` instead, and both read the same events, so the two agree.\n\nThree event names: `state` on every transition, `progress` on each counter tick, and `result` once.",
+        "responses": {
+          "200": {
+            "description": "The stream. It is closed when the job finishes.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a job id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No job at that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "Set": {
+        "name": "set",
+        "in": "path",
+        "required": true,
+        "description": "The set's name: one path component. Anything with a separator, a `..`, or an absolute form is refused with a 400, because a set name becomes the prefix its segments are named from.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "docs"
+      },
+      "Version": {
+        "name": "version",
+        "in": "path",
+        "required": true,
+        "description": "The set's own number for a version. Omit it from a pack request to mean the newest one that resolves.",
+        "schema": {
+          "type": "integer",
+          "format": "int32",
+          "minimum": 1
+        },
+        "example": 3
+      },
+      "PackId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "`set@version` or `set@version-base`. An id is a name, not a handle: resolving one needs nothing stored, because the bytes are computed from the set.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "docs@3"
+      },
+      "UploadId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "An upload slot, from `POST /v1/uploads`.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "JobId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "64 hexadecimal characters, from the `Location` header of the request that created the job.",
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "RFC 9457 problem details. Every non-2xx response is this shape, so a client parses one thing whatever went wrong.\n\n`title` and `detail` are the same sentence: this crate's errors are deliberately flat and complete, and the server does not translate them into a second vocabulary. A client shows `detail` and the user reads the error the command line would have printed.",
+        "required": [
+          "type",
+          "title",
+          "status"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "A URI reference that gives more detail, or `about:blank` when there is none.",
+            "default": "about:blank"
+          },
+          "title": {
+            "type": "string",
+            "description": "A short summary of the problem type."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The same status code as the response line."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Why this request failed, in this crate's own words."
+          }
+        }
+      },
+      "ServerInfo": {
+        "type": "object",
+        "description": "What this build is, and what it can read.",
+        "required": [
+          "version",
+          "snapshot_format",
+          "record_format",
+          "pack_format"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "description": "This build's version.",
+            "example": "0.5.1"
+          },
+          "snapshot_format": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The snapshot layout version this build reads."
+          },
+          "record_format": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The store record layout version this build reads."
+          },
+          "pack_format": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The pack layout version this build reads."
+          }
+        }
+      },
+      "SetSummary": {
+        "type": "object",
+        "description": "One set, and roughly what it holds.",
+        "required": [
+          "name",
+          "versions",
+          "segments"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The set's name under the root."
+          },
+          "versions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many versions are indexed. A lower bound."
+          },
+          "segments": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many segment files it has."
+          }
+        }
+      },
+      "SetList": {
+        "type": "object",
+        "required": [
+          "sets"
+        ],
+        "properties": {
+          "sets": {
+            "type": "array",
+            "description": "Empty, not absent, when the root holds no sets.",
+            "items": {
+              "$ref": "#/components/schemas/SetSummary"
+            }
+          }
+        }
+      },
+      "Version": {
+        "type": "object",
+        "required": [
+          "version",
+          "snapshot"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The set's own number for it."
+          },
+          "snapshot": {
+            "type": "string",
+            "description": "Its snapshot's hash, which is what the version is known by. 64 hexadecimal characters.",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "VersionList": {
+        "type": "object",
+        "required": [
+          "versions"
+        ],
+        "properties": {
+          "versions": {
+            "type": "array",
+            "description": "Oldest first. A lower bound: a version whose index file was never written is omitted, and it still restores.",
+            "items": {
+              "$ref": "#/components/schemas/Version"
+            }
+          }
+        }
+      },
+      "VersionInfo": {
+        "type": "object",
+        "description": "One version's figures, resolved through the store.",
+        "required": [
+          "version",
+          "snapshot",
+          "chunks",
+          "content_bytes"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "snapshot": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "chunks": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many distinct chunks it needs."
+          },
+          "content_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes of chunk content those chunks hold."
+          },
+          "pack": {
+            "type": "string",
+            "nullable": true,
+            "description": "The id that serves a pack of it, so a client need not build one from the URL rules.",
+            "example": "docs@3"
+          }
+        }
+      },
+      "PackRequest": {
+        "type": "object",
+        "description": "Which version to pack, and from what base.",
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "description": "Absent or null for the newest version that resolves."
+          },
+          "base": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "description": "The version the pack assumes its reader already holds, for a delta."
+          },
+          "compression": {
+            "type": "string",
+            "nullable": true,
+            "description": "Must be `keep`. A re-encode cannot be served from the set's bytes, so any other value is refused with a 422.",
+            "enum": [
+              "keep"
+            ],
+            "default": "keep"
+          }
+        }
+      },
+      "RestorePlan": {
+        "type": "object",
+        "description": "What the client already holds, so the server can say what it still needs.",
+        "properties": {
+          "have": {
+            "type": "array",
+            "description": "Content hashes of chunks the client has. Each must be 64 hexadecimal characters; anything else is a 400 naming which one, because a typo would become a chunk the client does not have and would fetch anyway.",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      },
+      "Range": {
+        "type": "object",
+        "description": "A half-open byte range within the pack. A record's own header is inside its range, so a range that covers a chunk covers it whole.",
+        "required": [
+          "start",
+          "end"
+        ],
+        "properties": {
+          "start": {
+            "type": "integer",
+            "format": "int64",
+            "description": "First byte, inclusive."
+          },
+          "end": {
+            "type": "integer",
+            "format": "int64",
+            "description": "One past the last byte, so `end - start` is the length."
+          }
+        }
+      },
+      "PackPlan": {
+        "type": "object",
+        "description": "What to fetch, and how long the whole pack is.",
+        "description_note": "A plan that omits the fixed regions is not a plan.",
+        "required": [
+          "length",
+          "bytes",
+          "ranges"
+        ],
+        "properties": {
+          "length": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The length of the whole pack, which is the size of the sparse file to create."
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many bytes these ranges total, which is what this transfer costs."
+          },
+          "ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Range"
+            }
+          }
+        }
+      },
+      "PackSummary": {
+        "type": "object",
+        "description": "A pack's geometry and the snapshot hash that names it.",
+        "required": [
+          "set",
+          "version",
+          "length",
+          "payload_start",
+          "payload_bytes",
+          "chunks",
+          "snapshot"
+        ],
+        "properties": {
+          "set": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "length": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes the whole pack occupies."
+          },
+          "payload_start": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Where the chunk records begin, just after the header."
+          },
+          "payload_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes the chunk records occupy."
+          },
+          "chunks": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "snapshot": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "Upload": {
+        "type": "object",
+        "required": [
+          "upload"
+        ],
+        "properties": {
+          "upload": {
+            "type": "string",
+            "description": "The slot's id. Send it to `PUT /v1/uploads/{id}`."
+          }
+        }
+      },
+      "UploadCommit": {
+        "type": "object",
+        "description": "What arrived: the header figures, read from the trailer and index without touching a payload.",
+        "required": [
+          "upload",
+          "length",
+          "payload_bytes",
+          "chunks",
+          "version",
+          "snapshot"
+        ],
+        "properties": {
+          "upload": {
+            "type": "string"
+          },
+          "length": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes the file occupies."
+          },
+          "payload_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "chunks": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The version this pack was packed from, in the packing set's numbering."
+          },
+          "snapshot": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "base": {
+            "type": "string",
+            "nullable": true,
+            "description": "The snapshot a delta assumes its reader holds, or null for a full pack.",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "MergeRequest": {
+        "type": "object",
+        "required": [
+          "upload"
+        ],
+        "properties": {
+          "upload": {
+            "type": "string",
+            "description": "The upload to merge, from `POST /v1/uploads`."
+          },
+          "compression": {
+            "type": "string",
+            "nullable": true,
+            "description": "`keep` stores what the pack carries, frame and all, which is what makes a merge of a compressed pack cheap. A level from 0 to 9 decodes and re-encodes every chunk, which is what a set with a compression policy of its own wants: `keep` would write the sender's frames into it.",
+            "default": "keep"
+          }
+        }
+      },
+      "MergedCommitted": {
+        "type": "object",
+        "description": "The merge published a new version.",
+        "required": [
+          "set",
+          "version",
+          "already",
+          "snapshot",
+          "chunks",
+          "fresh",
+          "held",
+          "bytes"
+        ],
+        "properties": {
+          "set": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The set's own number, allocated at commit time."
+          },
+          "already": {
+            "type": "boolean",
+            "enum": [
+              false
+            ]
+          },
+          "snapshot": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "base": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true,
+            "description": "The version of this set holding the pack's base."
+          },
+          "chunks": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "fresh": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Chunks that had to be written."
+          },
+          "held": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Chunks the set already held."
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes of chunk content stored, before compression."
+          }
+        }
+      },
+      "MergedAlready": {
+        "type": "object",
+        "description": "The set already held this pack, so nothing was written. Success, so a retried transfer is answerable.",
+        "required": [
+          "set",
+          "version",
+          "already"
+        ],
+        "properties": {
+          "set": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The version of the set that already holds this snapshot."
+          },
+          "already": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        }
+      },
+      "JobState": {
+        "type": "string",
+        "description": "Where a job is in its life.",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "JobKind": {
+        "type": "string",
+        "description": "What a job is doing.",
+        "enum": [
+          "pack",
+          "merge"
+        ]
+      },
+      "Job": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "started",
+          "finished",
+          "error",
+          "result",
+          "progress"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/JobKind"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "started": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Nanoseconds since the epoch."
+          },
+          "finished": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true,
+            "description": "Nanoseconds since the epoch, or null while the job has not finished."
+          },
+          "error": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why it failed, or null."
+          },
+          "result": {
+            "nullable": true,
+            "description": "What it produced. Which shape depends on `kind`: a pack job produces a PackSummary, and a merge produces either a MergedCommitted or a MergedAlready.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PackSummary"
+              },
+              {
+                "$ref": "#/components/schemas/MergedCommitted"
+              },
+              {
+                "$ref": "#/components/schemas/MergedAlready"
+              }
+            ]
+          },
+          "progress": {
+            "type": "object",
+            "description": "Running totals by the name the tool prints them under: files, chunks, distinct, checked, done, read, written. Empty until the job reports any.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        }
+      },
+      "JobList": {
+        "type": "object",
+        "required": [
+          "jobs"
+        ],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Job"
+            }
+          }
+        }
+      }
+    }
+  }
+}

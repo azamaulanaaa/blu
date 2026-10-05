@@ -108,7 +108,13 @@ async fn an_empty_blob_round_trips() {
         .unwrap();
 
     let store = BlobStore::open_for_reading(&blob).await.unwrap();
-    assert_eq!(read_all(&store, &common::id_of(&[])).await.unwrap(), []);
+    // `assert_eq!(..., [])` no longer type-checks: `serde_json` is a
+    // dev-dependency, so it is linked into this binary, and its `Value` has a
+    // `PartialEq<u8>` impl that makes the empty array's element type ambiguous.
+    assert_eq!(
+        read_all(&store, &common::id_of(&[])).await.unwrap().len(),
+        0
+    );
 }
 
 #[tokio::test]

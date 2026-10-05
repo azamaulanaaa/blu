@@ -150,16 +150,19 @@ impl ApiError {
 /// here, and inventing a status for it would be a guess about what a client
 /// ought to do about a failure nobody has seen.
 #[must_use]
-pub fn status_for(kind: io::ErrorKind) -> StatusCode {
+pub(super) fn status_for(kind: io::ErrorKind) -> StatusCode {
     match kind {
         io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
         io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
-        io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        // `InvalidFilename` alongside `InvalidInput` rather than on its own line
+        // below: this crate uses it for an identifier that is not one, and both
+        // are a request this server can name and change. The table above says
+        // which is which.
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidFilename => StatusCode::BAD_REQUEST,
         io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        io::ErrorKind::InvalidFilename => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -186,8 +189,8 @@ impl std::fmt::Display for ApiError {
 
 /// So a handler can answer `Err(e)` with `?` and get a problem document.
 ///
-/// `ResponseError` is actix's hook for this: an `Err` returned out of a handler
-/// is rendered by calling [`error_response`]. Implementing it once here means no
+/// `ResponseError` is actix's hook for this: an `Err` returned out of a handler is
+/// rendered by calling the method below. Implementing it once here means no
 /// handler writes an error response by hand, which is what would otherwise make
 /// the shape a per-handler decision.
 impl ResponseError for ApiError {
@@ -249,6 +252,10 @@ mod tests {
         assert_eq!(
             status_for(io::ErrorKind::InvalidFilename),
             StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_for(io::ErrorKind::InvalidData),
+            StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 

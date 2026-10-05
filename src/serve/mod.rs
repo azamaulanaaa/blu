@@ -50,16 +50,16 @@
 //!
 //! ## Where the state lives
 //!
-//! A job in [`jobs`] and a handle in [`sets`]. The rest is derived per request.
-//! In particular a generated pack is **not** kept: [`pack`] ids encode what
-//! they name, and the bytes are computed from the set on each request. A pack
-//! can be larger than the set it came from once deduplication is undone, and
-//! holding a copy of every one of them would make the server's disk a function
-//! of how many versions have been asked for.
+//! A job in [`Jobs`] and a handle in [`Sets`]. The rest is derived per request.
+//! In particular a generated pack is **not** kept: a pack id encodes what it
+//! names, and the bytes are computed from the set on each request. A pack can be
+//! larger than the set it came from once deduplication is undone, and holding a
+//! copy of every one of them would make the server's disk a function of how many
+//! versions have been asked for.
 //!
 //! ## Wire format
 //!
-//! JSON, encoded by hand in [`json`], and described by the checked-in
+//! JSON, encoded by hand in [`Json`], and described by the checked-in
 //! `openapi/lepatch.json`. Pack *bytes* are not JSON at all — they are a pack,
 //! verbatim, which is what makes a client able to `Pack::open` what it fetched
 //! and hand it straight to the local merge.
@@ -73,6 +73,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 mod error;
+mod handlers;
 mod jobs;
 mod json;
 mod openapi;
@@ -82,14 +83,18 @@ mod upload;
 mod versions;
 
 pub use error::ApiError;
-pub use jobs::{Job, JobId, Jobs, State};
+pub use jobs::{Job, JobEvent, JobHandle, JobId, Jobs, State};
 pub use json::Json;
-pub use sets::Sets;
+/// The `OpenAPI` document, served at `GET /openapi.json`.
+pub use openapi::DOCUMENT;
+/// The schema names `DOCUMENT` must define.
+///
+/// Public so `tests/openapi.rs` can check the checked-in document against the
+/// server's own idea of what it serves, without reaching into a private module.
+pub use openapi::SCHEMAS;
+pub use pack::{ByteRange, Requested, Resolved};
+pub use sets::{Sets, WriteGuard};
 pub use upload::Uploads;
-
-pub(crate) use error::status_for;
-pub(crate) use openapi::{DOCUMENT, SCHEMAS};
-pub(crate) use pack::Packs;
 
 /// Where the server keeps sets, where it binds, and where it puts scratch files.
 ///
@@ -117,10 +122,7 @@ impl Config {
     #[must_use]
     pub fn new(root: &Path, bind: impl Into<String>, scratch: Option<&Path>) -> Self {
         let root = absolute(root);
-        let scratch = scratch.map_or_else(
-            || root.join(SCRATCH_NAME),
-            |path| absolute(path),
-        );
+        let scratch = scratch.map_or_else(|| root.join(SCRATCH_NAME), absolute);
 
         Self {
             root,
@@ -136,7 +138,7 @@ const SCRATCH_NAME: &str = ".lepatch-serve";
 /// Every route this server answers, as `(method, path)`.
 ///
 /// **The router is built from this, so the table and the routes cannot drift.**
-/// `tests/openapi.rs` checks it against the checked-in OpenAPI document in both
+/// `tests/openapi.rs` checks it against the checked-in `OpenAPI` document in both
 /// directions: a route with no entry in `paths`, and an entry in `paths` with no
 /// route, are both failures. A hand-written specification is only a liability if
 /// nothing says whether it is true, so something says.
@@ -160,30 +162,106 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/v1/jobs/{id}"),
 ];
 
-/// Run the server until it is stopped.
+/// A listening server, before it starts serving.
+///
+/// Separated from [`serve`] so that a caller can learn the address **before**
+/// anything is accepted. `--bind 127.0.0.1:0` asks the operating system for a free
+/// port, and the only way to learn which one is to bind first and then ask.
+///
+/// Dropping this stops the server and removes the scratch directory's contents.
+///
+/// `Debug` by hand rather than by derive, because actix's `Server` is not `Debug`
+/// and this crate denies `missing_debug_implementations` on a public type. The
+/// address is the whole of what is interesting before the server runs.
+impl std::fmt::Debug for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bound")
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The address and the server that serves it. Private fields, because both are
+/// reached through [`Bound::addr`] and [`Bound::run`].
+pub struct Bound {
+    address: std::net::SocketAddr,
+    server: actix_web::dev::Server,
+    _scratch: Scratch,
+}
+
+impl Bound {
+    /// The address actually bound.
+    ///
+    /// Resolved, so under `:0` this is the port the operating system chose rather
+    /// than the zero that was asked for.
+    #[must_use]
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    /// Serve until the process is asked to stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server fails while running. It does not return an
+    /// error because a set is damaged: sets are opened per request, and a request
+    /// against a damaged set fails with `422` rather than taking the server down.
+    pub async fn run(self) -> io::Result<()> {
+        self.server.await
+    }
+}
+
+/// Bind, and return the server ready to run.
 ///
 /// # Errors
 ///
 /// Returns an error if the scratch directory cannot be created, if the address
-/// cannot be parsed, or if the listener cannot be bound. It does **not** return
-/// an error because a set is damaged: a set is opened per request, and a
-/// request against a damaged set fails with `422` rather than taking the server
-/// down with it.
-pub async fn serve(config: Config, jobs: &Jobs) -> io::Result<()> {
-    let config = config;
-
+/// cannot be parsed, or if the listener cannot be bound.
+pub fn bind(config: &Config, jobs: &Jobs) -> io::Result<Bound> {
     std::fs::create_dir_all(&config.scratch)?;
 
-    let sets = Sets::new(config.root.clone());
-    let uploads = Uploads::new(config.scratch.clone());
+    let (server, address) = handlers::configure(config, jobs)?;
 
-    let app = actix_web::App::new()
-        .app_data(actix_web::web::Data::new(sets))
-        .app_data(actix_web::web::Data::new(uploads))
-        .app_data(actix_web::web::Data::new(Packs::new()))
-        .app_data(actix_web::web::Data::new(jobs.clone()));
+    Ok(Bound {
+        address,
+        server,
+        _scratch: Scratch::new(config.scratch.clone()),
+    })
+}
 
-    crate::serve::handlers::configure(app, &config.bind).await
+/// Serve until stopped, for a caller that does not need the address first.
+///
+/// # Errors
+///
+/// As [`bind`] and [`Bound::run`].
+pub async fn serve(config: Config, jobs: &Jobs) -> io::Result<()> {
+    bind(&config, jobs)?.run().await
+}
+
+/// Removes a scratch directory's contents when the server stops.
+///
+/// A `Drop` guard rather than a call at the end of `run`, because the end is not
+/// the only way out: a `?` on the bind and a Ctrl-C both leave. A pack that was
+/// uploaded and never merged is a file with no meaning, and one left by a killed
+/// run is the same file — so the next run would otherwise start by sorting out
+/// the last one's leftovers.
+///
+/// `pub` because it is named in [`Bound`], which is public.
+#[derive(Debug)]
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // Best effort, and deliberately not a report. The server is going away,
+        // and there is nobody left to read an error about a temporary directory.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Resolve a path to an absolute one, creating nothing.
@@ -211,7 +289,10 @@ mod tests {
         // sized for, and the sets are what the scratch files exist to move.
         let config = Config::new(std::path::Path::new("/srv/sets"), "127.0.0.1:8480", None);
 
-        assert_eq!(config.scratch, std::path::Path::new("/srv/sets").join(SCRATCH_NAME));
+        assert_eq!(
+            config.scratch,
+            std::path::Path::new("/srv/sets").join(SCRATCH_NAME)
+        );
     }
 
     #[test]

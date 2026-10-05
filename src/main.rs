@@ -174,6 +174,52 @@ enum Command {
         #[arg(long)]
         numbers_only: bool,
     },
+    /// Serve the backup sets under a directory over HTTP.
+    ///
+    /// **The server moves packs and nothing else.** It never takes a path on its
+    /// own disk: there is no endpoint that snapshots a server-local tree and none
+    /// that restores into one. A remote backup is a client running `lepatch
+    /// backup` and `lepatch pack` locally, uploading the pack, and this server
+    /// merging it. A remote restore is this server packing a version and the
+    /// client fetching the chunks it lacks.
+    ///
+    /// That boundary is what keeps the server small. A server that snapshotted
+    /// its own filesystem would need every rule the local commands have about
+    /// claims, about `..` in recorded paths, and about refusing a destination
+    /// that holds the set being restored from — all of it, at the one place where
+    /// it is least wanted. None of it is needed here, because no tree is ever
+    /// named.
+    ///
+    /// **There is no authentication, and there is no TLS.** Anyone who can reach
+    /// the port can read every set under the root and can append versions to them.
+    /// That is a decision, not an oversight. The bind address defaults to
+    /// `127.0.0.1`, so the common case is a service on the same machine; `--bind`
+    /// says otherwise out loud and the server does not check. Put it behind
+    /// something that does, if it needs it.
+    ///
+    /// The API is described by `openapi/lepatch.json`, served at
+    /// `/openapi.json`. `lepatch serve` is a `pack` on one end and a `merge` on
+    /// the other, so anything that can run those can be a client.
+    Serve {
+        /// Directory holding the backup sets to serve.
+        root: std::path::PathBuf,
+        /// Address to bind, e.g. `127.0.0.1:8480`.
+        ///
+        /// Defaults to `127.0.0.1:8480`. There is no refusal for a non-loopback
+        /// address, because there is no authentication to protect and a warning
+        /// that cannot be acted on is noise.
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<String>,
+        /// Where uploaded packs are written.
+        ///
+        /// A merge reads a pack **twice** — once to check the file table and once
+        /// per chunk — so an upload has to land on a seekable file rather than be
+        /// streamed. Defaults to `.lepatch-serve` under the root, rather than a
+        /// system temporary directory: a pack can be larger than one is sized for,
+        /// and these files exist to move data the sets hold.
+        #[arg(long, value_name = "DIR")]
+        scratch: Option<std::path::PathBuf>,
+    },
     /// Rebuild a directory from a backup set.
     Restore {
         /// Directory to restore into.
@@ -495,6 +541,49 @@ fn parse_size(raw: &str) -> std::result::Result<u64, String> {
         .ok_or_else(|| format!("`{raw}` is larger than can be addressed"))
 }
 
+/// Serve the sets under `root` until the process is asked to stop.
+///
+/// **The bound address goes to stdout**, and that is the same rule `pack` follows
+/// when it prints a content hash. stdout is data; diagnostics are stderr. The
+/// address is data a script needs — it wants to connect, and under `--bind
+/// 127.0.0.1:0` it is the only way to learn the port. Diagnostics stay on
+/// stderr, so `lepatch serve --bind 127.0.0.1:0 | head -1` is a working way to
+/// get the address.
+///
+/// The server shuts down on the same [`stop_signal`] every other command uses, so
+/// Ctrl-C and a container stop both stop it cleanly — and the `Drop` guard on the
+/// scratch directory removes whatever uploads were still held.
+async fn run_serve(
+    root: &std::path::Path,
+    bind: Option<&str>,
+    scratch: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    let config = lepatch::serve::Config::new(root, bind.unwrap_or(DEFAULT_BIND), scratch);
+    let jobs = lepatch::serve::Jobs::new();
+
+    // Reported before the listener is up, and to stdout, so a caller reading one
+    // line knows the port. The address is resolved by actix, which is what makes
+    // `--bind 127.0.0.1:0` mean "pick one".
+    tracing::info!(
+        root = %config.root.display(),
+        bind = %config.bind,
+        scratch = %config.scratch.display(),
+        "serving"
+    );
+
+    let running = lepatch::serve::bind(&config, &jobs)?;
+    say!("http://{}", running.addr())?;
+
+    running.run().await
+}
+
+/// The address a server binds when `--bind` is not given.
+///
+/// Loopback, because there is no authentication and the two go together: a
+/// service that grants every set on the machine to the network is a mistake, and
+/// loopback is the default that prevents it by omission.
+const DEFAULT_BIND: &str = "127.0.0.1:8480";
+
 /// The work itself, without the interruption handling.
 async fn dispatch(command: Command) -> std::io::Result<()> {
     match command {
@@ -552,6 +641,11 @@ async fn dispatch(command: Command) -> std::io::Result<()> {
         } => run_merge(&pack, &name, compression, dry_run).await,
         Command::Reindex { name, dry_run } => run_reindex(&name, dry_run).await,
         Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
+        Command::Serve {
+            root,
+            bind,
+            scratch,
+        } => run_serve(&root, bind.as_deref(), scratch.as_deref()).await,
     }
 }
 

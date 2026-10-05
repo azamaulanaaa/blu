@@ -60,7 +60,11 @@ async fn plan_of(store: &BlobStore<lepatch::storage::Read, Compression>) -> Plan
 async fn built(dir: &Path, files: usize, size: usize) -> (PathBuf, PathBuf) {
     let source = common::source(dir);
     for i in 0..files {
-        fs::write(source.join(format!("f{i}.bin")), common::noisy(size + i * 1_000)).unwrap();
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            common::noisy(size + i * 1_000),
+        )
+        .unwrap();
     }
 
     let blob = dir.join("store");
@@ -89,7 +93,7 @@ async fn serve_whole(virtual_pack: &VirtualPack, base: &Path, out: &Path) -> Vec
         .source(
             Range {
                 start: 0,
-                end: virtual_pack.len(),
+                end: virtual_pack.file_len(),
             },
             resolve,
         )
@@ -108,10 +112,7 @@ async fn serve_whole(virtual_pack: &VirtualPack, base: &Path, out: &Path) -> Vec
             }
             Source::Segment { path, offset, len } => {
                 let mut handle = tokio::fs::File::open(&path).await.unwrap();
-                handle
-                    .seek(std::io::SeekFrom::Start(offset))
-                    .await
-                    .unwrap();
+                handle.seek(std::io::SeekFrom::Start(offset)).await.unwrap();
                 let mut buffer = vec![0u8; usize::try_from(len).unwrap_or(0)];
                 tokio::io::AsyncReadExt::read_exact(&mut handle, &mut buffer)
                     .await
@@ -139,12 +140,15 @@ async fn a_full_virtual_pack_is_the_written_pack_byte_for_byte() {
     let snapshot = snapshot_of(&store).await;
 
     let written = dir.path().join("written.pack");
-    Pack::write(&store, &plan, &snapshot, 1, &written).await.unwrap();
+    Pack::write(&store, &plan, &snapshot, 1, &written)
+        .await
+        .unwrap();
 
     let segments = segments(&blob);
-    let virtual_pack =
-        VirtualPack::new(&plan, &snapshot, 1, None, |segment| segments[segment as usize].clone())
-            .unwrap();
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
 
     let served = serve_whole(&virtual_pack, &blob, &dir.path().join("served.pack")).await;
 
@@ -176,9 +180,10 @@ async fn a_served_pack_opens() {
 
     let served_path = dir.path().join("served.pack");
     let segments = segments(&blob);
-    let virtual_pack =
-        VirtualPack::new(&plan, &snapshot, 1, None, |segment| segments[segment as usize].clone())
-            .unwrap();
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
     serve_whole(&virtual_pack, &blob, &served_path).await;
 
     let opened = Pack::open(&served_path).unwrap();
@@ -197,13 +202,10 @@ async fn a_delta_virtual_pack_is_the_written_delta() {
 
     // Change one file, and back up again.
     fs::write(source.join("f0.bin"), common::noisy(45_000)).unwrap();
-    let storage = BlobStore::open_for_writing(
-        &blob,
-        SegmentLimit::default(),
-        Compression::default(),
-    )
-    .await
-    .unwrap();
+    let storage =
+        BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
+            .await
+            .unwrap();
     lepatch::command::backup(&source, Options::default(), storage)
         .await
         .unwrap();
@@ -222,16 +224,14 @@ async fn a_delta_virtual_pack_is_the_written_delta() {
     let delta_plan = full.clone();
 
     let written = dir.path().join("written.pack");
-    Pack::write(&store, &delta_plan, &snapshot, 2, &written).await.unwrap();
+    Pack::write(&store, &delta_plan, &snapshot, 2, &written)
+        .await
+        .unwrap();
 
     let segments = segments(&blob);
-    let virtual_pack = VirtualPack::new(
-        &delta_plan,
-        &snapshot,
-        2,
-        None,
-        |segment| segments[segment as usize].clone(),
-    )
+    let virtual_pack = VirtualPack::new(&delta_plan, &snapshot, 2, None, |segment| {
+        segments[segment as usize].clone()
+    })
     .unwrap();
 
     let served = serve_whole(&virtual_pack, &blob, &dir.path().join("served.pack")).await;
@@ -258,12 +258,15 @@ async fn a_compressed_set_produces_the_same_bytes() {
     let snapshot = snapshot_of(&store).await;
 
     let written = dir.path().join("written.pack");
-    Pack::write(&store, &plan, &snapshot, 1, &written).await.unwrap();
+    Pack::write(&store, &plan, &snapshot, 1, &written)
+        .await
+        .unwrap();
 
     let segments = segments(&blob);
-    let virtual_pack =
-        VirtualPack::new(&plan, &snapshot, 1, None, |segment| segments[segment as usize].clone())
-            .unwrap();
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
 
     let served = serve_whole(&virtual_pack, &blob, &dir.path().join("served.pack")).await;
     assert_eq!(served, fs::read(&written).unwrap());
@@ -277,13 +280,18 @@ async fn a_set_that_rolled_over_a_segment_produces_the_same_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     for i in 0..6 {
-        fs::write(source.join(format!("f{i}.bin")), common::noisy(40_000 + i * 1_000)).unwrap();
+        fs::write(
+            source.join(format!("f{i}.bin")),
+            common::noisy(40_000 + i * 1_000),
+        )
+        .unwrap();
     }
 
     let blob = dir.path().join("store");
-    let storage = BlobStore::open_for_writing(&blob, SegmentLimit::new(50_000), Compression::default())
-        .await
-        .unwrap();
+    let storage =
+        BlobStore::open_for_writing(&blob, SegmentLimit::new(50_000), Compression::default())
+            .await
+            .unwrap();
     lepatch::command::backup(&source, Options::default(), storage)
         .await
         .unwrap();
@@ -298,16 +306,14 @@ async fn a_set_that_rolled_over_a_segment_produces_the_same_bytes() {
     let snapshot = snapshot_of(&store).await;
 
     let written = dir.path().join("written.pack");
-    Pack::write(&store, &plan, &snapshot, 1, &written).await.unwrap();
+    Pack::write(&store, &plan, &snapshot, 1, &written)
+        .await
+        .unwrap();
 
     let segments = segments(&blob);
-    let virtual_pack = VirtualPack::new(
-        &plan,
-        &snapshot,
-        1,
-        None,
-        |segment| segments[segment as usize].clone(),
-    )
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
     .unwrap();
 
     let served = serve_whole(&virtual_pack, &blob, &dir.path().join("served.pack")).await;
@@ -327,12 +333,15 @@ async fn needed_agrees_with_the_written_packs_needed() {
     let snapshot = snapshot_of(&store).await;
 
     let written = dir.path().join("written.pack");
-    let pack = Pack::write(&store, &plan, &snapshot, 1, &written).await.unwrap();
+    let pack = Pack::write(&store, &plan, &snapshot, 1, &written)
+        .await
+        .unwrap();
 
     let segments = segments(&blob);
-    let virtual_pack =
-        VirtualPack::new(&plan, &snapshot, 1, None, |segment| segments[segment as usize].clone())
-            .unwrap();
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
 
     // Every subset worth testing: nothing held, everything held, and the two
     // halves.
@@ -365,9 +374,10 @@ async fn a_fetch_plan_always_covers_what_opens_the_file() {
     let snapshot = snapshot_of(&store).await;
 
     let segments = segments(&blob);
-    let virtual_pack =
-        VirtualPack::new(&plan, &snapshot, 1, None, |segment| segments[segment as usize].clone())
-            .unwrap();
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
 
     let every: HashSet<_> = plan.iter().map(|c| c.id).collect();
     let plan_ranges = virtual_pack.fetch_plan(&every);
@@ -412,23 +422,24 @@ async fn a_client_can_fetch_only_the_chunks_it_is_missing() {
     let snapshot = snapshot_of(&store).await;
 
     let segments = segments(&blob);
-    let virtual_pack =
-        VirtualPack::new(&plan, &snapshot, 1, None, |segment| segments[segment as usize].clone())
-            .unwrap();
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
 
     let all: Vec<_> = plan.iter().map(|c| c.id).collect();
     let have: HashSet<_> = all.iter().step_by(2).copied().collect();
 
     let ranges = virtual_pack.fetch_plan(&have);
     assert!(
-        virtual_pack.needed_bytes(&have) < virtual_pack.len(),
+        virtual_pack.needed_bytes(&have) < virtual_pack.file_len(),
         "a client holding half the chunks must fetch less than the whole pack"
     );
 
     // Assemble, writing each range at its offset into a sparse file.
     let assembled = dir.path().join("partial.pack");
     let file = tokio::fs::File::create(&assembled).await.unwrap();
-    file.set_len(virtual_pack.len()).await.unwrap();
+    file.set_len(virtual_pack.file_len()).await.unwrap();
     let mut writer = file;
 
     for range in ranges {
@@ -450,12 +461,9 @@ async fn a_client_can_fetch_only_the_chunks_it_is_missing() {
                 }
             };
 
-            tokio::io::AsyncSeekExt::seek(
-                &mut writer,
-                std::io::SeekFrom::Start(at),
-            )
-            .await
-            .unwrap();
+            tokio::io::AsyncSeekExt::seek(&mut writer, std::io::SeekFrom::Start(at))
+                .await
+                .unwrap();
             tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes)
                 .await
                 .unwrap();

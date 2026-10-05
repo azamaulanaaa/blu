@@ -230,7 +230,10 @@ async fn seeking_to_the_end_is_allowed() {
     reader.seek(SeekFrom::Start(1_000)).await.unwrap();
     let mut out = Vec::new();
     reader.read_to_end(&mut out).await.unwrap();
-    assert_eq!(out, []);
+    // `assert_eq!(out, [])` no longer type-checks: `serde_json` is a
+    // dev-dependency, so it is linked into this binary, and its `Value` has a
+    // `PartialEq<u8>` impl that makes the empty array's element type ambiguous.
+    assert_eq!(out.len(), 0);
 }
 
 /// An empty payload is empty, not an error.
@@ -243,7 +246,7 @@ async fn an_empty_payload_reads_as_empty() {
     let mut reader = DecompressReader::new(frame_of(&[]), 0).await.unwrap();
     let mut out = Vec::new();
     reader.read_to_end(&mut out).await.unwrap();
-    assert_eq!(out, []);
+    assert_eq!(out.len(), 0);
 }
 
 /// A record claiming an absurd length is refused, and does not allocate.

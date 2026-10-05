@@ -65,6 +65,7 @@ pub mod metadata;
 pub mod pack;
 pub mod progress;
 pub mod reader;
+pub mod serve;
 pub mod slice;
 pub mod storage;
 pub mod varint;

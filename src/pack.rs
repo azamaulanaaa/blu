@@ -180,6 +180,12 @@ const MAGIC: [u8; 4] = *b"LPK1";
 /// where these have twenty. Those two cannot be told apart by their contents, and
 /// they would take their index length from the wrong place.
 ///
+/// Public because a client has to be able to ask what a server can read before it
+/// uploads anything. A pack this build cannot read is refused with a message
+/// naming the version it wanted, and the version a client wants is not in the
+/// pack — so the answer has to come from somewhere else. `lepatch serve` serves it
+/// at `GET /v1/version`.
+///
 /// **Every earlier version is refused rather than guessed at**, and the error names
 /// both numbers, this build's and the pack's. A client holding a pack this build
 /// cannot read is otherwise left guessing which command produces one. That is
@@ -191,7 +197,7 @@ const MAGIC: [u8; 4] = *b"LPK1";
 /// first chunk's bytes would be read as a record header and refused for a magic
 /// that is not there, so the damage is loud. It is refused by name anyway, because
 /// the alternative is a reader that works out what a file is by trying.
-const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Set in the header when a base snapshot hash follows it, making this a delta.
 const BASE_FLAG: u8 = 0x01;
@@ -1985,8 +1991,8 @@ pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
 /// derived output is the one thing this format does not need.
 ///
 /// Every byte of a pack is already determined by two things: the [`Plan`], which
-/// says which chunks and in what order, and the [`Placement`]s that plan
-/// resolved, which say how each one is stored. Given those, the header, every
+/// says which chunks and in what order, and the [`crate::storage::Placement`]s
+/// that plan resolved, which say how each one is stored. Given those, the header, every
 /// record header, the snapshot section, the index and the trailer are all
 /// computable without reading a chunk. So this type computes them, and answers
 /// "give me bytes *a* to *b*" from the set's own segment files.
@@ -2011,8 +2017,8 @@ pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
 ///
 /// # What is in memory
 ///
-/// The header, the snapshot section, the index, and one small [`VirtualRecord`]
-/// per chunk. **Not** the payload, and not a chunk. The index is proportional to
+/// The header, the snapshot section, the index, and one small record per chunk.
+/// **Not** the payload, and not a chunk. The index is proportional to
 /// the chunk count and nothing else, which is the same cost [`Pack::open`] pays
 /// and is what makes a pack's index-at-the-end layout worth its trailer.
 #[derive(Debug, Clone)]
@@ -2200,8 +2206,14 @@ impl VirtualPack {
     }
 
     /// Length of the file this describes.
+    ///
+    /// Named for the file rather than left as a bare `len`, for the reason
+    /// [`Pack::file_len`] is: it is the length of a thing on disk, and `len` on a
+    /// value that has a `chunks()` beside it reads as "how many chunks". There is
+    /// no `is_empty`, because a pack is never empty — a version with no chunks is
+    /// still a header, a snapshot and an index.
     #[must_use]
-    pub fn len(&self) -> u64 {
+    pub fn file_len(&self) -> u64 {
         self.length
     }
 
@@ -2378,9 +2390,19 @@ impl VirtualPack {
         let mut at = range.start;
         let end = range.end;
 
+        // Sliced through `usize`, and the offsets came from this type's own
+        // arithmetic over lengths it already holds, so a value past `usize` on a
+        // 32-bit target cannot occur. It is *checked* rather than cast, because the
+        // crate denies `cast_possible_truncation` and a truncating slice index is
+        // a panic with an unhelpful message.
         let push = |out: &mut Vec<Source>, bytes: &[u8], from: u64, to: u64| {
-            if from < to {
-                out.push(Source::Bytes(bytes[from as usize..to as usize].to_vec()));
+            let (Some(from), Some(to)) = (usize::try_from(from).ok(), usize::try_from(to).ok())
+            else {
+                return;
+            };
+
+            if from < to && to <= bytes.len() {
+                out.push(Source::Bytes(bytes[from..to].to_vec()));
             }
         };
 

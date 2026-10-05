@@ -41,7 +41,11 @@ async fn a_zero_limit_yields_nothing() {
     let mut out = Vec::new();
     reader.read_to_end(&mut out).await.unwrap();
 
-    assert_eq!(out, []);
+    // `assert_eq!(out, [])` no longer type-checks: `serde_json` is a
+    // dev-dependency, so it is linked into this binary, and its `Value` has a
+    // `PartialEq<u8>` impl that makes the empty array's element type ambiguous.
+    // The assertion is unchanged in what it says.
+    assert_eq!(out.len(), 0);
 }
 
 #[tokio::test]
@@ -128,7 +132,7 @@ async fn a_zero_limit_writer_writes_nothing() {
         assert_eq!(written, 0);
     }
 
-    assert_eq!(sink, []);
+    assert_eq!(sink.len(), 0);
 }
 
 #[tokio::test]

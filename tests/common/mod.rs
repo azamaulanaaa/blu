@@ -14,6 +14,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The hand-rolled HTTP/1.1 client, for the `serve` tests.
+///
+/// A submodule rather than more of this file, because it is only used by
+/// `tests/serve.rs` and it pulls `serde_json` into any test binary that declares
+/// `common`. See the module's own docs for why this is not `awc`.
+pub(crate) mod http;
+
+/// A `lepatch serve` running as a real process.
+#[cfg(any(test, doc))]
+pub(crate) mod server;
+
 use lepatch::{
     command::{Committed, Options, backup, restore},
     layout::IndexSet,

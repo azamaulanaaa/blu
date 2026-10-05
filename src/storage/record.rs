@@ -64,7 +64,11 @@ pub(super) const RECORD_MAGIC: [u8; 4] = *b"LPB1";
 /// **2** added a codec byte and a second length to every record header. A store
 /// written by version 1 is *refused*, not converted. Its headers have a different
 /// shape. Only this number tells the two shapes apart.
-pub(super) const FORMAT_VERSION: u32 = 2;
+///
+/// Public for the same reason [`crate::pack::FORMAT_VERSION`] is: a client cannot
+/// work the version out of a set it has not been sent, and a refusal to read one
+/// arrives after the upload. `lepatch serve` serves it at `GET /v1/version`.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Bytes of store header: magic, version, and this segment's own number.
 pub(super) const STORE_HEADER: usize = 12;

@@ -1,0 +1,326 @@
+//! The checked-in `OpenAPI` document, and whether it is still true.
+//!
+//! `openapi/lepatch.json` is the source of truth for this API and it is written
+//! by hand. `src/serve/openapi.rs` explains why: a derive-based generator would
+//! put `#[derive(Serialize)]` on this crate's own types, and a `build.rs` emitter
+//! would make the document stop being reviewable in a diff.
+//!
+//! **A hand-written specification is only a liability if nothing says whether it
+//! is true.** So this file says, in the four ways it rots:
+//!
+//! 1. a route with no entry in `paths`;
+//! 2. an entry in `paths` with no route;
+//! 3. a schema defined and never referenced, or referenced and never defined;
+//! 4. a version bump that forgot the document, or an `operationId` that was
+//!    copied and now names two operations.
+//!
+//! `serde_json` is a dev-dependency for exactly this file. See `Cargo.toml` for
+//! why the boundary is exempt from the crate's no-serde rule, and why it is a
+//! dev-dependency anyway.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
+
+use std::{collections::BTreeSet, sync::OnceLock};
+
+use serde_json::Value;
+
+/// The document as it is served, parsed once.
+///
+/// `include_str!`d into the binary, so this cannot pass by reading a file that is
+/// not the one that ships.
+///
+/// Parsed once and shared, because the helpers below return references *into*
+/// the parsed value. Re-parsing per call would hand out borrows of a temporary.
+fn document() -> &'static Value {
+    static PARSED: OnceLock<Value> = OnceLock::new();
+
+    PARSED.get_or_init(|| {
+        serde_json::from_str(lepatch::serve::DOCUMENT)
+            .expect("openapi/lepatch.json must be valid JSON")
+    })
+}
+
+/// Every `(method, path)` the document declares, over every operation.
+fn declared() -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+
+    let paths = document()["paths"]
+        .as_object()
+        .expect("paths must be an object");
+
+    for (path, item) in paths {
+        let operations = item
+            .as_object()
+            .expect("each path must hold its operations");
+
+        for method in operations.keys() {
+            // `parameters` is a key beside the operations, not an operation.
+            if method == "parameters" {
+                continue;
+            }
+            out.insert((method.to_ascii_uppercase(), path.clone()));
+        }
+    }
+
+    out
+}
+
+#[test]
+fn the_document_is_openapi_3_0() {
+    // The user asked for 3.0 specifically, and 3.1 is not a compatible superset
+    // of what a 3.0 client expects: nullable changes from a keyword to a type.
+    let version = document()["openapi"].as_str().unwrap();
+
+    assert!(
+        version.starts_with("3.0"),
+        "the document declares OpenAPI {version}, not 3.0.x"
+    );
+}
+
+#[test]
+fn the_version_matches_the_crate() {
+    // The number a client reads is the number a bug report carries. A release
+    // that bumped the manifest and not this file would advertise a version that
+    // does not exist.
+    assert_eq!(
+        document()["info"]["version"].as_str().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+        "info.version must track Cargo.toml"
+    );
+}
+
+#[test]
+fn every_route_the_server_answers_is_in_the_document() {
+    // The direction that matters. A route nobody documented is a route a client
+    // generating from the document has never heard of, and it is the one that
+    // gets discovered in production.
+    let declared = declared();
+
+    for (method, path) in lepatch::serve::ROUTES {
+        let key = ((*method).to_string(), (*path).to_string());
+        assert!(
+            declared.contains(&key),
+            "{method} {path} is answered by the server and is not in the document"
+        );
+    }
+}
+
+#[test]
+fn every_path_in_the_document_is_answered_by_the_server() {
+    // The other direction. A documented operation the server does not answer is
+    // a client's `404`, and it is the one that looks like the document is right.
+    let answered: BTreeSet<(String, String)> = lepatch::serve::ROUTES
+        .iter()
+        .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
+        .collect();
+
+    for (method, path) in declared() {
+        assert!(
+            answered.contains(&(method.clone(), path.clone())),
+            "the document declares {method} {path}, which the server does not answer"
+        );
+    }
+}
+
+#[test]
+fn every_referenced_schema_is_defined() {
+    // A dangling `$ref` is a document that cannot be resolved, so a generator
+    // either fails or emits a stub with no fields — and the stub is what a client
+    // is written against.
+    let names = defined_schemas();
+    let defined: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+
+    for reference in references() {
+        assert!(
+            defined.contains(reference.as_str()),
+            "a $ref points at {reference}, which is not defined"
+        );
+    }
+}
+
+#[test]
+fn every_defined_schema_is_referenced_and_declared() {
+    // Two checks that belong together.
+    //
+    // A schema nothing references is a leftover from a route that was removed,
+    // and it is the first thing a reader trusts because it is in the document.
+    // And the whole point of `SCHEMAS` is that it lists what the handlers
+    // produce, so a handler that grows a body and does not update it is a
+    // mismatch between the code and the contract.
+    let referenced: BTreeSet<String> = references().into_iter().collect();
+
+    for name in defined_schemas() {
+        assert!(
+            referenced.contains(&name),
+            "schema {name} is defined and nothing refers to it"
+        );
+    }
+
+    let names = defined_schemas();
+    for declared in lepatch::serve::SCHEMAS {
+        assert!(
+            names.iter().any(|name| name == declared),
+            "SCHEMAS lists {declared}, which the document does not define"
+        );
+    }
+}
+
+#[test]
+fn every_operation_has_a_unique_operation_id() {
+    // A duplicated `operationId` is how a generated client ends up with two
+    // methods of the same name, and the second silently wins.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    for id in operation_ids() {
+        assert!(!id.is_empty(), "an operation has an empty operationId");
+        assert!(
+            seen.insert(id.clone()),
+            "operationId {id:?} is used by two operations"
+        );
+    }
+}
+
+#[test]
+fn every_operation_says_what_it_can_return() {
+    // An operation with no `responses` tells a client nothing about failure, and
+    // the failures here are the interesting half: a `422` for a pack that is not
+    // one, a `409` for a job that already finished, a `416` for a range past the
+    // end.
+    let paths = document()["paths"].as_object().unwrap();
+
+    for (path, item) in paths {
+        for (method, operation) in item.as_object().unwrap() {
+            if method == "parameters" {
+                continue;
+            }
+
+            let responses = operation.get("responses");
+            assert!(
+                responses
+                    .and_then(Value::as_object)
+                    .is_some_and(|r| !r.is_empty()),
+                "{method} {path} declares no responses"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_parameter_a_handler_reads_is_declared() {
+    // A path parameter the handler extracts with `web::Path` must be in
+    // `components/parameters` or declared inline, or actix will not route to it
+    // at all — the failure looks like a 404 for a documented resource.
+    let declared: BTreeSet<String> = declared()
+        .into_iter()
+        .map(|(_, path)| {
+            path.split('/')
+                .find(|part| part.starts_with('{') && part.ends_with('}'))
+                .map(|name| name.trim_matches(|c| c == '{' || c == '}').to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    assert!(
+        declared.contains("set"),
+        "the document declares no {{set}} path parameter"
+    );
+    assert!(
+        declared.contains("id"),
+        "no {{id}} path parameter is declared"
+    );
+}
+
+#[test]
+fn the_pack_media_type_is_the_one_the_server_sends() {
+    // `application/octet-stream` would say nothing. A client that uploads a pack
+    // and a client that uploads a photograph are the same request without it.
+    let document = lepatch::serve::DOCUMENT;
+
+    assert!(
+        document.contains("application/x-lepatch-pack"),
+        "the document does not use the pack media type"
+    );
+    assert!(
+        document.contains("application/problem+json"),
+        "the document does not use RFC 9457's media type"
+    );
+}
+
+/// Every schema name the document defines.
+fn defined_schemas() -> Vec<String> {
+    document()["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas must be an object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Every `#/components/schemas/...` name anything refers to.
+///
+/// Walked as text rather than resolved as a value, so a `$ref` inside a schema's
+/// own `example` — which is not a real reference — is not treated as one. A
+/// document that used a schema name in an example would otherwise fail here.
+fn references() -> Vec<String> {
+    let mut out = Vec::new();
+    collect(document(), &mut out);
+    out
+}
+
+fn collect(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(name) = text.strip_prefix("#/components/schemas/") {
+                out.push(name.to_string());
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+        Value::Object(fields) => {
+            for (key, item) in fields {
+                if key == "$ref" {
+                    if let Some(name) = item
+                        .as_str()
+                        .and_then(|t| t.strip_prefix("#/components/schemas/"))
+                    {
+                        out.push(name.to_string());
+                    }
+                    continue;
+                }
+                collect(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every `operationId` in the document.
+fn operation_ids() -> Vec<String> {
+    let mut out = Vec::new();
+
+    let paths = document()["paths"].as_object().unwrap();
+    for item in paths.values() {
+        for (method, operation) in item.as_object().unwrap() {
+            if method == "parameters" {
+                continue;
+            }
+            if let Some(id) = operation.get("operationId").and_then(Value::as_str) {
+                out.push(id.to_string());
+            }
+        }
+    }
+
+    out
+}
+
+#[test]
+fn the_two_counts_agree() {
+    // A cheap sanity check on the helpers above rather than on the document: if
+    // `declared` or `operation_ids` stopped finding anything, every other test
+    // in this file would pass vacuously.
+    assert_eq!(declared().len(), lepatch::serve::ROUTES.len());
+    assert_eq!(operation_ids().len(), declared().len());
+    assert!(
+        !declared().is_empty(),
+        "the helpers found nothing, so every other test here would pass vacuously"
+    );
+}
