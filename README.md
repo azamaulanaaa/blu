@@ -20,6 +20,7 @@ $ lepatch restore /tmp/docs-restored docs
 $ lepatch reindex docs                 # rebuild the per-version index files
 $ lepatch pack docs game.pack          # one version as a single distributable file
 $ lepatch merge game.pack other        # and one version into another set
+$ lepatch serve ./backups              # and put a set over HTTP — see "Serving"
 ```
 
 `--version N` selects a specific version; without it, restore, verify and pack use
@@ -906,6 +907,89 @@ Stated rather than discovered:
   hand-written in `src/metadata/codec.rs` rather than delegated, so there is no
   upstream whose policy can decide whether your backup set can still be read —
   which is how `bincode` came to be on an advisory list in the first place.
+
+## Serving
+
+`lepatch serve` puts a set over HTTP, so a backup can cross a machine:
+
+```console
+$ lepatch serve ~/backups                    # 127.0.0.1:8480
+$ lepatch serve ~/backups --bind 0.0.0.0:8480
+```
+
+**It moves packs and nothing else.** There is no endpoint that snapshots a
+server-local tree and none that restores into one, because a remote backup is a
+`pack` at one end and a `merge` at the other, and those two commands already
+exist:
+
+```console
+# on the client — the push
+$ lepatch backup ~/Documents docs
+$ lepatch pack docs docs.pack
+$ curl -sS -X POST localhost:8480/v1/uploads
+{"upload":"5f2c…"}
+$ curl -sS -X PUT --data-binary @docs.pack \
+    -H 'content-type: application/x-lepatch-pack' \
+    localhost:8480/v1/uploads/5f2c…
+$ curl -sS -X POST localhost:8480/v1/uploads/5f2c…/commit
+$ curl -sS -X POST -d '{"upload":"5f2c…"}' \
+    localhost:8480/v1/sets/docs/merges
+{"job":"9a41…"}
+```
+
+The server merges it, so `localhost:8480/v1/sets/docs/versions` now lists it. And
+the other direction:
+
+```console
+# on the client — the pull
+$ curl -sS -X POST -d '{}' localhost:8480/v1/sets/docs/packs   # a job
+$ curl -sS -H 'range: bytes=0-' localhost:8480/v1/packs/docs@3 > docs.pack
+$ lepatch merge docs.pack mirror
+```
+
+**A client that already holds some of the chunks fetches only the rest.** It asks
+what it needs, gets byte ranges rather than a whole file, writes each at its
+offset into a sparse file, and opens the result with `Pack::open` exactly as it
+would open a pack from disk:
+
+```console
+$ curl -sS -X POST -d '{"have":["1a2b…","3c4d…"]}' \
+    localhost:8480/v1/packs/docs@3/plan
+{"length":7340032,"bytes":811520,"ranges":[{"start":0,"end":49},{"start":63104,"end":63737}]}
+```
+
+Those two ranges are the whole fetch. The first is the header; the second is the
+snapshot, the index and the trailer. The payload is not in the plan at all,
+because this client already holds every chunk in it — which is the point, and is
+why the answer is `needed` *unioned with the fixed regions* rather than `needed`.
+`needed` alone would be a payload with no trailer, and `Pack::open` reads the
+trailer first.
+
+The server does not write a pack file to answer that. A pack is derived output —
+re-running `lepatch pack` regenerates one — so its bytes are computed from the set
+on each request. That is why a large version costs nothing to be addressable.
+
+### API
+
+`GET /openapi.json` is the specification, served from `openapi/lepatch.json` in
+this repository. It is written by hand and `tests/openapi.rs` fails if it stops
+describing the server: a route with no entry, an entry with no route, a dangling
+`$ref`, a version bump that forgot the document.
+
+Two things about it are worth knowing before reading it. Errors are
+[RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) `application/problem+json`
+everywhere, and `title` is the same sentence the command line would have printed
+— this crate's errors are flat and complete by design, so the server does not
+translate them into a second vocabulary. And long work returns `202` with a job:
+`GET /v1/jobs/{id}` to poll, `GET /v1/jobs/{id}/events` to watch over SSE,
+`DELETE /v1/jobs/{id}` to stop it. Stopping needs no rollback, because a store is
+append-only with one commit record at the end of a run.
+
+**There is no authentication, and there is no TLS.** Anyone who can reach the port
+can read every set under the root and can append versions to them. That is a
+decision rather than an oversight, and the bind address defaults to `127.0.0.1` so
+the common case is a service on the same machine. Put it behind something that
+does the authentication, if it needs it.
 
 ## Library
 
