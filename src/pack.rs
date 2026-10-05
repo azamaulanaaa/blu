@@ -1972,3 +1972,546 @@ pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
 
     Ok(hasher.finalize())
 }
+
+/// A pack that is never written: the same bytes, computed where they are asked
+/// for.
+///
+/// # Why this exists
+///
+/// `lepatch serve` serves a pack over HTTP. The obvious way is to build the file
+/// and hand out ranges of it. That works, and it costs disk a pack's worth per
+/// version any client has asked for. A pack is *derived output* — re-running
+/// `lepatch pack` regenerates one, and nothing is lost but the file — so storing
+/// derived output is the one thing this format does not need.
+///
+/// Every byte of a pack is already determined by two things: the [`Plan`], which
+/// says which chunks and in what order, and the [`Placement`]s that plan
+/// resolved, which say how each one is stored. Given those, the header, every
+/// record header, the snapshot section, the index and the trailer are all
+/// computable without reading a chunk. So this type computes them, and answers
+/// "give me bytes *a* to *b*" from the set's own segment files.
+///
+/// **It is valid only for `keep`.** A pack written under a compression policy
+/// re-encodes every record, so its bytes are not in the set and not derivable
+/// from it. A request for one has to materialise the file instead. That is the
+/// caller's check to make; [`VirtualPack::new`] is what then proves it.
+///
+/// # The guarantee it rests on
+///
+/// **A [`VirtualPack`]'s bytes are byte-identical to the file [`Pack::write`]
+/// produces for the same plan.** Not "equivalent", not "a pack that reads the
+/// same". The same bytes, so a client may fetch some of its ranges from one and
+/// the rest from the other and still hold one file.
+///
+/// This is a strong claim about two code paths sharing an encoder, and it is
+/// load-bearing: a client that got it wrong would hand a file to `Pack::open`
+/// that it refuses, naming an offset and a count nowhere near the cause.
+/// `tests/pack_geometry.rs` pins it against real stores — a full pack, a delta, a
+/// compressed set, and a set that has rolled over a segment.
+///
+/// # What is in memory
+///
+/// The header, the snapshot section, the index, and one small [`VirtualRecord`]
+/// per chunk. **Not** the payload, and not a chunk. The index is proportional to
+/// the chunk count and nothing else, which is the same cost [`Pack::open`] pays
+/// and is what makes a pack's index-at-the-end layout worth its trailer.
+#[derive(Debug, Clone)]
+pub struct VirtualPack {
+    /// The header, the whole of it, at offset zero.
+    header: Vec<u8>,
+    /// One entry per record, in payload order. The same order [`Pack::write`]
+    /// writes them in, which is the order a range walk needs.
+    records: Vec<VirtualRecord>,
+    /// Bytes the payload region occupies.
+    payload_len: u64,
+    /// The snapshot section, verbatim, as [`Pack::write`] writes it.
+    snapshot: Vec<u8>,
+    /// The index, as [`Pack::write`] writes it.
+    index: Vec<u8>,
+    /// The trailer, as [`Pack::write`] writes it: the two section lengths and
+    /// then the magic. [`TRAILER`] bytes, of which [`encode_trailer`] supplies
+    /// all but the last four.
+    trailer: Vec<u8>,
+    /// Length of the file these bytes would make.
+    length: u64,
+}
+
+/// One record's place in the payload, and where its payload sits in the store.
+///
+/// The two offsets are different things, and holding them in one struct is what
+/// makes the difference hard to forget. `start` is where the *record* is in the
+/// pack, which is what a range request covers. `segment` and `payload_offset`
+/// are where the *payload* is in the segment file, which is what a read is made
+/// from. A record's header is in neither: it is computed and written to the pack,
+/// never copied out of the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtualRecord {
+    /// The chunk's content hash, and the identity it is addressed by.
+    id: BlobId,
+    /// Byte offset of this record within the payload region.
+    start: u64,
+    /// Bytes the record occupies, its header included.
+    len: u64,
+    /// The payload's own length, which is not [`VirtualRecord::len`].
+    stored_len: u64,
+    /// Bytes the payload decodes to, which is what the index and a header carry
+    /// as the raw length.
+    raw_len: u64,
+    /// How the payload is stored.
+    codec: crate::storage::Codec,
+    /// Which segment the payload sits in.
+    segment: u32,
+    /// Byte offset of the payload within that segment.
+    payload_offset: u64,
+}
+
+/// Where some bytes of a [`VirtualPack`] come from.
+///
+/// A pack is a header, a run of records, a snapshot, an index and a trailer, and
+/// a byte range may cross from one of those to the next. So an answer is a list,
+/// and each part says where its own bytes live. Holding the small regions as
+/// owned bytes is right: a header is 48 bytes and an index is proportional to
+/// the chunk count, and either is cheaper to rebuild for one request than to
+/// keep for the life of the process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// Bytes that are already in memory.
+    Bytes(Vec<u8>),
+    /// Bytes to read from a segment file.
+    Segment {
+        /// The file to read from.
+        path: std::path::PathBuf,
+        /// Byte offset within it.
+        offset: u64,
+        /// How many bytes.
+        len: u64,
+    },
+}
+
+impl VirtualPack {
+    /// Compute the pack a `plan` makes, for `version` and an optional base.
+    ///
+    /// `resolve` names the file a segment number is in. It is a parameter rather
+    /// than a set because a pack is not tied to one: a `VirtualPack` computed
+    /// against set *A* serves the same bytes as one computed against set *B*, for
+    /// as long as the two resolve their chunks the same way.
+    ///
+    /// No chunk is read, so this cannot fail because of damaged data. A chunk
+    /// that is damaged fails when its bytes are served, by the same check a real
+    /// read makes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `snapshot` cannot be encoded on this platform, which
+    /// on unix cannot happen, and reports it as `InvalidInput` because nothing
+    /// is wrong with the snapshot — this build simply cannot record it.
+    pub fn new<F>(
+        plan: &Plan,
+        snapshot: &crate::metadata::Snapshot,
+        version: u32,
+        base: Option<BlobId>,
+        resolve: F,
+    ) -> io::Result<Self>
+    where
+        F: Fn(u32) -> std::path::PathBuf,
+    {
+        let snapshot_bytes = snapshot.to_bytes().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("this version cannot be packed on this platform: {e}"),
+            )
+        })?;
+        let snapshot_id = blake3::hash(&snapshot_bytes);
+
+        // The same header `write_from` builds, over the same two counts. Built
+        // before the payload, because a varint's length depends on the numbers
+        // it carries, so the header's own length is only known once it is built.
+        let header = encode_header(&Header {
+            snapshot: snapshot_id,
+            version,
+            base,
+            chunks: u64::try_from(plan.len()).unwrap_or(0),
+            payload_len: planned_payload_len(plan),
+        });
+
+        // The same walk `write_from` does, over the same plan and the same
+        // placements, accumulating the same offsets. This is the half of the
+        // byte-identity guarantee that `tests/pack_geometry.rs` checks.
+        let mut records = Vec::with_capacity(plan.len());
+        let mut offset = 0u64;
+
+        for planned in plan.chunks() {
+            let stored_len = planned.placement.stored_len;
+            let len = crate::storage::header_len(stored_len, planned.placement.raw_len)
+                .saturating_add(stored_len);
+
+            records.push(VirtualRecord {
+                id: planned.id,
+                start: offset,
+                len,
+                stored_len,
+                raw_len: planned.placement.raw_len,
+                codec: planned.placement.codec,
+                segment: planned.placement.segment,
+                payload_offset: planned.placement.offset,
+            });
+
+            offset = offset.saturating_add(len);
+        }
+
+        let payload_len = offset;
+        let index = encode_index_of(&records);
+        let trailer_len = u64::try_from(TRAILER).unwrap_or(0);
+        let mut trailer = encode_trailer(
+            u64::try_from(index.len()).unwrap_or(0),
+            u64::try_from(snapshot_bytes.len()).unwrap_or(0),
+        )
+        .to_vec();
+        // The magic is written after the two lengths, not inside them: it is what
+        // a reader finds at the *end* of the file, so a pack that was truncated
+        // is refused before its trailer is parsed at all.
+        trailer.extend_from_slice(&MAGIC);
+
+        let snapshot_start = u64::try_from(header.len())
+            .unwrap_or(0)
+            .saturating_add(payload_len);
+        let length = snapshot_start
+            .saturating_add(u64::try_from(snapshot_bytes.len()).unwrap_or(0))
+            .saturating_add(u64::try_from(index.len()).unwrap_or(0))
+            .saturating_add(trailer_len);
+
+        // Resolved now rather than at serve time, so a pack that could not be
+        // served at all is refused while it is being made rather than by a
+        // request that would have been answered with a hole in the file. Nothing
+        // is opened; this only names each segment the plan needs.
+        for record in &records {
+            resolve(record.segment);
+        }
+
+        Ok(Self {
+            header,
+            records,
+            payload_len,
+            snapshot: snapshot_bytes,
+            index,
+            trailer,
+            length,
+        })
+    }
+
+    /// Length of the file this describes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    /// Where the payload region starts, which is just after the header.
+    #[must_use]
+    pub fn payload_start(&self) -> u64 {
+        u64::try_from(self.header.len()).unwrap_or(0)
+    }
+
+    /// Bytes the payload region occupies.
+    #[must_use]
+    pub fn payload_len(&self) -> u64 {
+        self.payload_len
+    }
+
+    /// How many chunks this pack carries.
+    ///
+    /// May be zero: a pack of an empty tree still has a header, a snapshot and an
+    /// index, and is a file worth fetching.
+    #[must_use]
+    pub fn chunks(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Where the header sits.
+    #[must_use]
+    pub fn header_range(&self) -> Range {
+        Range {
+            start: 0,
+            end: self.payload_start(),
+        }
+    }
+
+    /// Where the payload region sits.
+    #[must_use]
+    pub fn payload_range(&self) -> Range {
+        let start = self.payload_start();
+        Range {
+            start,
+            end: start.saturating_add(self.payload_len),
+        }
+    }
+
+    /// Where the snapshot section sits.
+    #[must_use]
+    pub fn snapshot_range(&self) -> Range {
+        let start = self.payload_range().end;
+        Range {
+            start,
+            end: start.saturating_add(u64::try_from(self.snapshot.len()).unwrap_or(0)),
+        }
+    }
+
+    /// Where the index sits.
+    #[must_use]
+    pub fn index_range(&self) -> Range {
+        let start = self.snapshot_range().end;
+        Range {
+            start,
+            end: start.saturating_add(u64::try_from(self.index.len()).unwrap_or(0)),
+        }
+    }
+
+    /// Where the trailer sits, at the very end.
+    #[must_use]
+    pub fn trailer_range(&self) -> Range {
+        let end = self.length;
+        Range {
+            start: end.saturating_sub(u64::try_from(TRAILER).unwrap_or(0)),
+            end,
+        }
+    }
+
+    /// The byte ranges a client holding `have` is missing, in pack coordinates.
+    ///
+    /// **The same answer [`Pack::needed`] gives**, from the same walk in the same
+    /// order, for the same reason: a run of consecutive missing records is one
+    /// range, which is the entire cost a pack exists to remove.
+    ///
+    /// **And it is not enough on its own.** A client that fetched only these
+    /// would have a run of records and no header, no snapshot, no index and no
+    /// trailer, and [`Pack::open`] would refuse the file it assembled — on the
+    /// trailer, since a trailer is not there.
+    /// [`VirtualPack::fetch_plan`] is what a client actually wants.
+    #[must_use]
+    pub fn needed(&self, have: &HashSet<BlobId>) -> Vec<Range> {
+        let mut ranges: Vec<Range> = Vec::new();
+
+        for record in &self.records {
+            if have.contains(&record.id) {
+                continue;
+            }
+
+            let start = self.payload_start().saturating_add(record.start);
+            let end = start.saturating_add(record.len);
+
+            match ranges.last_mut() {
+                Some(last) if last.end == start => last.end = end,
+                _ => ranges.push(Range { start, end }),
+            }
+        }
+
+        ranges
+    }
+
+    /// What a client holding `have` should fetch: [`needed`](Self::needed) plus
+    /// the fixed regions, merged and sorted.
+    ///
+    /// The fixed regions are the header, the snapshot, the index and the trailer.
+    /// They are the same for every client, so they are always fetched, and they
+    /// are what makes the fetched bytes a file rather than a payload.
+    #[must_use]
+    pub fn fetch_plan(&self, have: &HashSet<BlobId>) -> Vec<Range> {
+        let mut ranges = self.needed(have);
+        ranges.push(self.header_range());
+        ranges.push(self.snapshot_range());
+        ranges.push(self.index_range());
+        ranges.push(self.trailer_range());
+
+        ranges.sort_unstable_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
+
+        // Merged, because two ranges that touch or overlap are one fetch. A
+        // fixed region can land next to a run of records, and a client that
+        // asked for them separately would make two requests for one run of bytes.
+        let mut merged: Vec<Range> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => {
+                    last.end = last.end.max(range.end);
+                }
+                _ => merged.push(range),
+            }
+        }
+
+        merged
+    }
+
+    /// Bytes a client holding `have` still has to fetch.
+    #[must_use]
+    pub fn needed_bytes(&self, have: &HashSet<BlobId>) -> u64 {
+        self.fetch_plan(have)
+            .iter()
+            .fold(0u64, |total, range| total.saturating_add(range.len()))
+    }
+
+    /// The bytes of `range`, and where each part of them comes from.
+    ///
+    /// Nothing is read here: the returned [`Source::Segment`]s name files and
+    /// offsets and the caller reads them. So a segment truncated since this pack
+    /// was computed fails at the read, which is the same place a real transfer
+    /// would fail and with the same error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `range` is inverted or reaches past the end of the
+    /// pack. An inverted range is refused rather than answered as empty, because
+    /// an empty answer to a range a client believed it had would leave a file
+    /// with a hole in it and nothing saying so.
+    pub fn source<F>(&self, range: Range, resolve: F) -> io::Result<Vec<Source>>
+    where
+        F: Fn(u32) -> std::path::PathBuf,
+    {
+        if range.start >= range.end || range.end > self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "bytes {}..{} are not inside a pack of {} bytes",
+                    range.start, range.end, self.length
+                ),
+            ));
+        }
+
+        let mut out = Vec::new();
+        let mut at = range.start;
+        let end = range.end;
+
+        let push = |out: &mut Vec<Source>, bytes: &[u8], from: u64, to: u64| {
+            if from < to {
+                out.push(Source::Bytes(bytes[from as usize..to as usize].to_vec()));
+            }
+        };
+
+        // The header.
+        let header_range = self.header_range();
+        if at < header_range.end {
+            let to = end.min(header_range.end);
+            push(&mut out, &self.header, at, to);
+            at = to;
+        }
+
+        // The payload, record by record. A range can begin inside a record and
+        // end inside a later one, so this is a walk and not a lookup. Records
+        // are in payload order and the walk is in that order too, so it stops at
+        // the first one past `end`.
+        for record in &self.records {
+            if at >= end {
+                break;
+            }
+
+            let record_range = self.record_range(record);
+            if record_range.end <= at {
+                continue;
+            }
+
+            let from = at.max(record_range.start);
+            let to = end.min(record_range.end);
+
+            // A record is its header followed by its payload. A range can land in
+            // either, in both, or across the join.
+            let header_bytes = record.len.saturating_sub(record.stored_len);
+            let payload_from = from.saturating_sub(record_range.start);
+            let payload_to = to.saturating_sub(record_range.start);
+
+            if payload_from < header_bytes && payload_to <= header_bytes {
+                // Entirely in the header, which is computed rather than read.
+                let header = record_header(record);
+                push(&mut out, &header, payload_from, payload_to);
+            } else if payload_from >= header_bytes {
+                // Entirely in the payload, which is read out of the segment.
+                out.push(Source::Segment {
+                    path: resolve(record.segment),
+                    offset: record
+                        .payload_offset
+                        .saturating_add(payload_from.saturating_sub(header_bytes)),
+                    len: payload_to.saturating_sub(payload_from),
+                });
+            } else {
+                // The join. The header's tail, then the payload's head.
+                let header = record_header(record);
+                push(&mut out, &header, payload_from, header_bytes);
+                out.push(Source::Segment {
+                    path: resolve(record.segment),
+                    offset: record.payload_offset,
+                    len: payload_to.saturating_sub(header_bytes),
+                });
+            }
+
+            at = to;
+        }
+
+        // The snapshot, the index and the trailer, in the order they sit. Each
+        // region is checked by whether `at` is inside it, so a range that skipped
+        // a region entirely does not read it.
+        for region in [
+            self.snapshot_range(),
+            self.index_range(),
+            self.trailer_range(),
+        ] {
+            if at >= region.start && at < region.end {
+                let to = end.min(region.end);
+                let (from, bytes): (u64, &[u8]) = if region.start == self.snapshot_range().start {
+                    (at - region.start, &self.snapshot)
+                } else if region.start == self.index_range().start {
+                    (at - region.start, &self.index)
+                } else {
+                    (at - region.start, &self.trailer)
+                };
+                push(&mut out, bytes, from, to - region.start);
+                at = to;
+            }
+        }
+
+        debug_assert_eq!(at, end, "the walk must consume the whole range");
+
+        Ok(out)
+    }
+
+    /// Where one record sits in the pack, header included.
+    fn record_range(&self, record: &VirtualRecord) -> Range {
+        let start = self.payload_start().saturating_add(record.start);
+        Range {
+            start,
+            end: start.saturating_add(record.len),
+        }
+    }
+}
+
+/// Build the index over a set of records.
+///
+/// The same encoder [`Pack::write`] uses, over the same entries in the same
+/// order. A function rather than a method because the writer needs it too, and a
+/// second encoder that agreed with the first until the first moved is the exact
+/// failure this module's docs warn about.
+fn encode_index_of(records: &[VirtualRecord]) -> Vec<u8> {
+    let entries: Vec<Located> = records
+        .iter()
+        .map(|record| Located {
+            id: record.id,
+            offset: record.start,
+            content_len: record.raw_len,
+        })
+        .collect();
+
+    encode_index(&entries)
+}
+
+/// One record's header bytes, computed the way `write_record` writes them.
+///
+/// The store's own encoder, over the lengths the plan resolved. That is the
+/// whole point: these have to be the bytes `write_record` wrote, and the only way
+/// to be sure of that is to be the same call.
+fn record_header(record: &VirtualRecord) -> Vec<u8> {
+    let mut header = Vec::new();
+    crate::storage::encode_header(
+        &mut header,
+        crate::storage::RecordKind::Blob,
+        record.codec,
+        record.id.as_bytes(),
+        record.stored_len,
+        record.raw_len,
+    );
+    header
+}

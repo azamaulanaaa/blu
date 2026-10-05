@@ -51,10 +51,44 @@ publish = false
 dist = true
 
 [dependencies]
+# The server behind `lepatch serve`.
+#
+# `default-features = false` is deliberate and each omission has a reason.
+#
+# `compress-brotli`, `compress-gzip` and `compress-zstd` are dropped. This crate
+# already depends on `zstd 0.13`, so leaving actix's on would put a *second*
+# zstd in the graph and let two copies answer "what is the compression
+# algorithm". Dropping all three also drops `brotli` and `flate2`, which nothing
+# here uses. `cookies` is dropped because the API sets none.
+#
+# What actix adds to our own tokio requirement is `net`, and to the graph
+# `actix-rt`'s `parking_lot` and `time`. The features unify, so there is no
+# second runtime.
+#
+# **On serde.** `actix-web` pulls `serde` and `serde_json` in transitively. That
+# is not the first serde, because the comment below forbids it *here*. Read that
+# comment before concluding the position was abandoned.
+#
+# The no-serde rule is about the **on-disk format**: so that no upstream's release
+# cadence or security policy can decide whether a backup set is still readable.
+# That argument does not reach the API boundary. A JSON body has no bearing on
+# whether a set opens, and the HTTP contract is versioned by its own spec. So
+# serde is not added as a direct dependency, and the API's JSON is encoded by
+# hand in `src/serve/json.rs`, in the same style as everything else on disk.
+# `serde_json` appears once, as a **dev-dependency**, so `tests/openapi.rs` can
+# parse the spec and prove it has not drifted.
+#
+# `macros` is the only feature kept: the handlers are `#[get]` and `#[post]`.
+actix-web = { version = "4.15", default-features = false, features = ["macros"] }
 blake3 = { version = "1.8.2", features = ["traits-preview"] }
 clap = { version = "4.5.53", features = ["derive"] }
 fastcdc = "5.0.0"
 filetime = "0.2.29"
+# The streaming half of the server: the body of a ranged pack response, and the
+# SSE stream behind `GET /v1/jobs/{id}/events`. `default-features = false`
+# drops `async-await`, which nothing here needs because the handlers are
+# `async fn` rather than manual `Future` chains.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # No serialisation crate, deliberately. The snapshot encoding is hand-written in
 # `src/metadata/codec.rs`, and the record and pack encodings are hand-written
 # beside it, so that no upstream's release cadence or security policy can decide
@@ -63,7 +97,9 @@ filetime = "0.2.29"
 # and the note on `tests/paths.rs` for the abort `PathBuf`'s `Serialize` impl
 # caused. `deny.toml` enables `unused-crate-dependencies`, so a crate that creeps
 # back in is a failing check rather than a comment nobody reads.
-tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "signal", "sync"] }
+# `time` is for `lepatch serve`: a job records when it started and finished, and
+# the job registry retires them on an age.
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 walkdir = "2.5.0"
@@ -92,6 +128,10 @@ experimental = []
 # it in parallel would only measure the sampler. Add the features back if the
 # plots are ever wanted.
 criterion = { version = "0.7", default-features = false }
+# For `tests/openapi.rs` only, which parses `openapi/lepatch.json` and fails if
+# the checked-in spec and the server's route table disagree. It is a dev-dependency
+# because the server does not use it: see the note on `actix-web` above.
+serde_json = "1.0"
 tempfile = "3.27.0"
 
 # Criterion is not a libtest harness, so each bench target opts out of it.

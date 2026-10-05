@@ -31,6 +31,11 @@ allow = [
     # memchr, walkdir, same-file, winapi-util
     "Unlicense",
     "CC0-1.0",
+    # foldhash, reached through `actix-http` when `lepatch serve` is built.
+    # Zlib is OSI approved and FSF Free/Libre, so it is compatible with
+    # GPL-2.0-or-later. It is listed by the crate that pulls it, so the next
+    # person to read this knows where the obligation came from.
+    "Zlib",
 ]
 # Some crates ship licence text without an SPDX expression. 0.9 rather than the
 # usual 0.8: a file this tool writes has to stay readable, so an unrecognised
