@@ -638,6 +638,18 @@ fn init_tracing(
     };
     let telemetry_is_on = otel.is_some();
 
+    // Beside the layer above, under the same config, and built only if it was
+    // asked for. Nothing here is constructed on a run that did not ask: the
+    // function returns before the exporter, the reader or any instrument exists.
+    //
+    // **A failure is a warning and not a refusal**, exactly as it is for the span
+    // exporter. A collector that cannot take metrics has not made the backup
+    // wrong, and refusing to take the backup because of it would make this
+    // feature into a way to lose backups.
+    if let Err(e) = lepatch::telemetry::metrics::install(telemetry) {
+        eprintln!("warning: {e}");
+    }
+
     match jobs {
         None => {
             // No second layer, so this is the plain case and it is spelled the
@@ -798,8 +810,44 @@ async fn run_serve(
 /// loopback is the default that prevents it by omission.
 const DEFAULT_BIND: &str = "127.0.0.1:8480";
 
+/// The word a command is reported and measured under.
+///
+/// **The name `lepatch --help` already prints**, so `lepatch.command.duration`
+/// carries the same word the user typed. A second spelling would be a dashboard
+/// split in two by nothing at all.
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Backup { .. } => "backup",
+        Command::Restore { .. } => "restore",
+        Command::Verify { .. } => "verify",
+        Command::Pack { .. } => "pack",
+        Command::Apply { .. } => "apply",
+        Command::Merge { .. } => "merge",
+        Command::Reindex { .. } => "reindex",
+        Command::Versions { .. } => "versions",
+        Command::Serve { .. } => "serve",
+    }
+}
+
 /// The work itself, without the interruption handling.
+///
+/// **Time the command and report it on both arms.** The measurement is around
+/// [`dispatch_inner`] rather than inside it, so it covers the whole of the work
+/// and *not* the `select!` — an interrupted run is not timed, because there is
+/// no code after the `select!` in `run` that still knows which command it was.
+/// `serve` is timed too: a server that runs for a day and is then told to stop
+/// has a duration, and a histogram of one very large sample is a true answer
+/// rather than a wrong one.
 async fn dispatch(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Result<()> {
+    let name = command_name(&command);
+    let started = std::time::Instant::now();
+    let outcome = dispatch_inner(command, jobs).await;
+    lepatch::telemetry::metrics::record_command_duration(name, started.elapsed());
+    outcome
+}
+
+/// The commands themselves.
+async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Result<()> {
     match command {
         Command::Backup {
             source,

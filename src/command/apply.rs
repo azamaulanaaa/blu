@@ -723,6 +723,8 @@ async fn write_files(
         }
     }
 
+    crate::telemetry::metrics::record_run(&progress);
+
     Ok(written)
 }
 

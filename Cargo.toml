@@ -194,7 +194,17 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 # async client inside an async process, and the alternative — the blocking
 # client this dependency used to name — is a second runtime's worth of
 # machinery whose threads exist only to be blocked on a socket.
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
+#
+# `experimental_metrics_periodicreader_with_async_runtime` is the **metrics half
+# of the same argument**, and without it this crate's metric reader panics on
+# every run that exports. The default `metrics::PeriodicReader` collects on its
+# own `std` thread and calls `futures_executor::block_on` around the async OTLP
+# client, which is a `reqwest` client underneath and needs a tokio reactor. That
+# thread has no reactor, so the export panics with "there is no reactor running"
+# and **the numbers are lost with no error anywhere and an exit code of 0** —
+# the same silent loss the span exporter has, in the same place. The
+# runtime-aware reader spawns its worker on the runtime `main` already runs.
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
 # Only the stable, non-experimental attribute constants, and only the three this
 # crate actually writes: `service.name`, `service.version` and
 # `process.executable.name`. `semconv_experimental` is off, so a naming change

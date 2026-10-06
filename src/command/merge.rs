@@ -528,6 +528,14 @@ pub async fn merge<C: storage::Compressor>(
         progress.report();
     }
 
+    // The loop is the last thing that moved a counter, so this is where the run
+    // is reported. A merge that fails inside the loop reports nothing, which is
+    // the right answer: there was no version.
+    //
+    // `Distinct` here means the chunks **this run stored**, which is not what
+    // the same counter means in a backup. See `lepatch::telemetry::metrics`.
+    crate::telemetry::metrics::record_run(&progress);
+
     // The snapshot is a blob like any other, addressed by the hash of its own
     // bytes. The commit record names that hash.
     // The snapshot is therefore stored before the commit rather than carried by

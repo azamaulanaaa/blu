@@ -175,7 +175,12 @@ pub enum State {
 
 impl State {
     /// The word this service reports, in lower case.
-    const fn name(self) -> &'static str {
+    ///
+    /// `pub(crate)` rather than private because
+    /// [`crate::telemetry::metrics::record_job`] reports the same word as an
+    /// attribute. Two spellings of one state is a dashboard that splits a
+    /// failure count in two, so both are this.
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
@@ -457,6 +462,12 @@ impl Jobs {
                 job.finished = Some(finished);
                 job.error = outcome.as_ref().err().cloned();
                 job.result = result;
+
+                // **Beside the write, not after it.** This is the only place a
+                // job earns `succeeded` or `failed`, so a count taken from the
+                // branch rather than from the write would be counting a terminal
+                // state the job never had.
+                crate::telemetry::metrics::record_job(kind, state.name());
             }
 
             if let Ok(mut handles) = this.inner.handles.lock() {
@@ -547,18 +558,22 @@ impl Jobs {
         // otherwise be relabelled `cancelled` after it had succeeded — the same
         // class of lie as the one this whole change is about, one race along.
         // A job already in a terminal state keeps the state it earned.
-        let mut marked = false;
+        let mut cancelled_kind = None;
         if let Ok(mut jobs) = self.inner.jobs.lock()
             && let Some(job) = jobs.get_mut(&id)
             && !job.state.is_terminal()
         {
             job.state = State::Cancelled;
             job.finished = Some(nanos());
-            marked = true;
+            cancelled_kind = Some(job.kind);
         }
 
-        if marked {
+        if let Some(kind) = cancelled_kind {
             self.broadcast(id, JobEvent::State(State::Cancelled));
+            // Beside the broadcast, and inside the same branch: a cancel that
+            // lost the race against a job that had already finished marked
+            // nothing above, and must count nothing here either.
+            crate::telemetry::metrics::record_job(kind, State::Cancelled.name());
         }
 
         Ok(())

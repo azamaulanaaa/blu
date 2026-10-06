@@ -37,6 +37,10 @@
 //! `main` computes an exit code and then returns it — see
 //! `flush_telemetry` there.
 //!
+//! It flushes the **meter** provider as well as the tracer's, and for exactly
+//! the same reason: a metric is batched too, so a run that exits without it
+//! loses every number it measured with the same silence.
+//!
 //! Two tests hold it down, and they are the ones that matter: a span is
 //! **received** after the exporter is shut down, and the same span emitted with
 //! no shutdown **is not**, which is the defect this section is about.
@@ -48,9 +52,8 @@
 //!   propagator that is merely *registered* is worth nothing to a caller that
 //!   never extracts, and the registration is one line that is easy to leave out
 //!   and impossible to notice.
-//! * **No metrics instruments and no HTTP middleware.** They are separate
-//!   concerns with their own tests; nothing in this file writes an instrument or
-//!   wraps a handler.
+//! * **No HTTP middleware.** It is a separate concern with its own tests;
+//!   nothing here wraps a handler.
 //! * **No sampling.** Nothing here configures a sampler, so the SDK's default
 //!   applies: every span is recorded. A sampled-out span is a span nobody can
 //!   debug, and this is a tool an operator turns on to look at one run.
@@ -76,6 +79,8 @@ use opentelemetry_sdk::{
 };
 use tracing::Subscriber;
 use tracing_subscriber::{EnvFilter, layer::Layer as _, registry::LookupSpan};
+
+pub mod metrics;
 
 /// The environment variable that turns telemetry on by itself.
 ///
@@ -403,6 +408,10 @@ pub fn filter() -> EnvFilter {
 ///   closes the HTTP client. Without it the exporter's thread is a live
 ///   thread being killed by a process that is exiting.
 ///
+/// The meter provider is flushed alongside it, and it is the same argument a
+/// second time: the metric reader batches too, and its measurements are lost in
+/// the same silence.
+///
 /// Calling it twice is harmless: the provider is taken out of its slot on the
 /// first call, so the second returns `Ok(())` without touching anything. A
 /// process that never asked for telemetry takes the same path and costs one
@@ -415,14 +424,19 @@ pub fn filter() -> EnvFilter {
 /// telemetry backend about itself has still done — or has still failed to do —
 /// the work the user asked for, and the exit code is that fact.
 pub fn shutdown() -> io::Result<()> {
+    // The meters first: a metric reader collects on its own thread, and
+    // stopping the tracer's processor can already be several seconds of waiting.
+    // The order is the reverse of the argument's order for that reason.
+    let metrics = metrics::shutdown();
+
     let Some(provider) = installed() else {
-        return Ok(());
+        return metrics;
     };
 
     let flushed = provider.force_flush().map_err(|e| otel_error("flush", &e));
     let stopped = provider.shutdown().map_err(|e| otel_error("shutdown", &e));
 
-    flushed.and(stopped)
+    flushed.and(stopped).and(metrics)
 }
 
 /// Name an SDK failure as an `io::Error`, which is this crate's only error type.

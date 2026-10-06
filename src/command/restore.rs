@@ -665,6 +665,8 @@ async fn restore_files<S: storage::StorageGet + 'static>(
         }
     }
 
+    crate::telemetry::metrics::record_run(&progress);
+
     Ok(written)
 }
 

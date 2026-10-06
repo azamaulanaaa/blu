@@ -177,6 +177,32 @@ impl Progress {
         }
     }
 
+    /// Which phase these totals belong to.
+    ///
+    /// A reader of the final totals needs it: the counters below do not mean
+    /// one thing across phases, so a total is only a number once the phase is
+    /// attached to it. See [`crate::telemetry::metrics`].
+    pub(crate) const fn phase(&self) -> Phase {
+        self.what
+    }
+
+    /// The totals, in the order they were first reported.
+    ///
+    /// **A copy of the running state, for the end of a run.** It is what
+    /// [`crate::telemetry::metrics::record_run`] reads, and it is the same
+    /// rendering path the lines use — a caller cannot get a total that was not
+    /// reported.
+    ///
+    /// Ordered by when each counter was first reported rather than by the enum's
+    /// own declaration, so the order matches what a client would have seen.
+    #[must_use]
+    pub fn totals(&self) -> Vec<(Counter, u64)> {
+        self.seen
+            .iter()
+            .map(|counter| (*counter, self.counters[counter.slot()]))
+            .collect()
+    }
+
     /// Add to a running total, which is only read when a line is emitted.
     ///
     /// Saturating, so a total that would wrap reports a large wrong number
@@ -370,15 +396,23 @@ mod tests {
 
     /// The counters and their totals as pairs, for asserting on.
     ///
-    /// The rendering path takes the two arrays directly, not a `Vec` of pairs. So
-    /// this helper is for tests only. Nothing in the crate needs the pairs.
+    /// A thin alias for [`Progress::totals`], kept so the assertions below read
+    /// as `totals(&progress)` rather than `progress.totals()`.
     fn totals(progress: &Progress) -> Vec<(Counter, u64)> {
-        progress
-            .seen
-            .iter()
-            .map(|c| (*c, progress.counters[c.slot()]))
-            .collect()
+        progress.totals()
     }
+
+    /// The phase is part of what a total means, so it is readable.
+    ///
+    /// A caller that cannot tell a backup's `distinct` from a merge's has two
+    /// numbers and one meaning, which is the confusion this crate's metrics are
+    /// named to prevent.
+    #[test]
+    fn a_progress_knows_its_phase() {
+        assert_eq!(Progress::new(Phase::Backup).phase(), Phase::Backup);
+        assert_eq!(Progress::new(Phase::Merge).phase(), Phase::Merge);
+    }
+
     #[test]
     fn the_counters_accumulate_into_one_total() {
         let mut progress = Progress::new(Phase::Backup);
