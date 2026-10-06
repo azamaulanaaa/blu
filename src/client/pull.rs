@@ -340,9 +340,7 @@ impl<'a> Pull<'a> {
     /// Returns an error if the file cannot be removed or created, or cannot be
     /// given its length.
     pub async fn begin(&self, length: u64, path: &Path) -> io::Result<()> {
-        tokio::task::LocalSet::new()
-            .run_until(begin_file(length, path))
-            .await
+        begin_file(length, path).await
     }
 
     /// Fetch `ranges` into the file at `path`, and report what moved.
