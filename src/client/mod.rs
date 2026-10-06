@@ -16,6 +16,11 @@
 //!   waits for the job that runs it. [`Remote::merge_pack`] is those four in the
 //!   order they have to happen, with the cleanup a failed push owes the server
 //!   wired in.
+//! * **How does a tree come back?** [`Remote::plan_pack`] asks a server what it
+//!   should still fetch, [`Remote::fetch_range`] gets one of those ranges, and
+//!   [`Pull::fetch`] assembles them into a pack file at their offsets. A pack on a
+//!   server is computed rather than stored, so this is a download and nothing
+//!   else.
 //!
 //! ## Why the output is the same as a local run's
 //!
@@ -57,6 +62,7 @@
 
 mod error;
 mod jobs;
+mod pull;
 mod uploads;
 mod versions;
 
@@ -68,6 +74,7 @@ pub use jobs::{
     Job, Kind, MergeCompression, Merged, MergedAlready, MergedCommitted, Outcome, PackSummary,
     State,
 };
+pub use pull::{Fetched, PackPlan, Pull};
 pub use uploads::{PACK_MEDIA_TYPE, Upload, UploadCommit};
 pub use versions::Version;
 

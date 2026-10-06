@@ -348,6 +348,11 @@ enum Command {
         /// Directory to restore into.
         destination: std::path::PathBuf,
         /// Base path of the backup set to restore from.
+        ///
+        /// With `--remote` this is **the name of the set on that server** rather
+        /// than a path here — `--set docs` and `docs` mean the same thing, and the
+        /// same as what `versions --remote` takes. Nothing on this machine is
+        /// opened, because nothing on this machine holds the version.
         name: std::path::PathBuf,
         /// Version to restore, defaulting to the most recent usable one.
         #[arg(long, short)]
@@ -370,6 +375,39 @@ enum Command {
         /// a destination another restore is using.
         #[arg(long)]
         dry_run: bool,
+        /// Pull the version from a `lepatch serve` at this address, instead of
+        /// from a set on this machine.
+        ///
+        /// **The whole restore happens over the socket.** No set is opened here:
+        /// `NAME` is the set's name on that server. The server packs the version,
+        /// this run fetches the ranges it is missing into a sparse file, and the
+        /// pack is applied to the destination through exactly the code
+        /// `lepatch apply` uses — so a destination holding a version is brought
+        /// up to this one by writing only what it lacks, and one holding nothing
+        /// is given the lot.
+        ///
+        /// **Only the chunks this destination already holds are left out of the
+        /// fetch.** A record of a previous apply beside the destination says which
+        /// version that tree is, and a tree still where that record left it holds
+        /// every chunk of it. So a second pull of the same version transfers the
+        /// pack's header, snapshot, index and trailer and nothing else, and a pull
+        /// into a fresh directory transfers the whole pack. Anything less certain
+        /// — no record, a record for another version, a file that has moved since —
+        /// falls back to the whole pack, which is always right and never wrong.
+        ///
+        /// The pack is assembled in a temporary file and removed when the run
+        /// ends, however it ends. A pull that fails half-way leaves the
+        /// destination as it was rather than a tree of zeroes.
+        ///
+        /// `--clean` removes entries this version does not record, which is what
+        /// it says for a local restore: the destination ends up holding the
+        /// version and nothing else. It is a prune rather than an emptying,
+        /// because there is no local set to protect the destination from.
+        ///
+        /// `--dry-run` still fetches the pack. The report has to come from the
+        /// same probe an apply would take, and that probe reads the pack.
+        #[arg(long, value_name = "URL")]
+        remote: Option<String>,
     },
     /// Check a snapshot's stored chunks against their recorded hashes.
     Verify {
@@ -985,7 +1023,13 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
             version,
             clean,
             dry_run,
-        } => run_restore(&destination, &name, version, clean, dry_run).await,
+            remote,
+        } => match remote {
+            Some(address) => {
+                run_restore_remote(&destination, &name, version, clean, dry_run, &address).await
+            }
+            None => run_restore(&destination, &name, version, clean, dry_run).await,
+        },
         Command::Verify { name, version } => run_verify(&name, version).await,
         Command::Pack {
             name,
@@ -1602,6 +1646,346 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
     }
 
     Ok(())
+}
+
+/// Rebuild a tree from a set on a `lepatch serve`, into `destination`.
+///
+/// **The local path's work, unchanged, behind a download.** A local restore
+/// reads a version out of a set and writes every chunk of it. This one asks the
+/// server to pack the version, fetches the ranges it does not already have into
+/// a sparse file, and hands that file to [`apply`] — which is the same call
+/// `lepatch apply` makes, with the same options, and reports through the same
+/// [`report_applied`]. There is no second applier here and no second report.
+///
+/// ## Where `have` comes from
+///
+/// **From the destination, and only from the destination.** A chunk in `have`
+/// is a region this run will not fetch, so it has to be a chunk this machine can
+/// read. The one place a pulled tree keeps the chunks of a version is the tree
+/// itself, and the one record that says which version a tree is — and that its
+/// files are still where that record left them — is the apply manifest beside
+/// [`Manifest::path_for`]. So [`have_for`] is the whole of it: every chunk of the
+/// version when the destination already is that version, and none of them
+/// otherwise.
+///
+/// Anything less than certainty is the empty set, deliberately. An empty `have`
+/// costs the whole payload and is always correct; a `have` naming a chunk the
+/// destination cannot produce is a hole in the assembled pack, and the applier
+/// would write zeroes for it.
+///
+/// ## Why the fixed regions are fetched before the plan is asked for
+///
+/// **`have` is a list of chunk hashes, and the hashes are in the version's file
+/// table.** The table is inside the pack, so the first thing to know is which
+/// chunks there are. Only the header, the snapshot, the index and the trailer are
+/// needed for that, and a pack assembled out of those four opens — that is what
+/// [`Pack::open`] reads — so the cost is a couple of small range requests in the
+/// one case where it can pay for itself, and nothing at all in the case where
+/// `have` was going to be empty regardless.
+///
+/// ## Why the assembled pack is a temporary file
+///
+/// **It is derived output, and a pack that failed to assemble is worse than no
+/// pack.** It is named by this process and this version, it is removed whether
+/// the run succeeded or failed, and nothing outside this run ever looks at it.
+/// A pull that fails part-way leaves the destination as it was rather than a
+/// tree of zeroes: the bytes are written into the file first and applied after,
+/// and [`Pull::open`] refuses a file whose missing records are not the ones
+/// [`have_for`] named.
+async fn run_restore_remote(
+    destination: &std::path::Path,
+    name: &std::path::Path,
+    version: Option<u32>,
+    clean: bool,
+    dry_run: bool,
+    address: &str,
+) -> std::io::Result<()> {
+    use lepatch::client::Outcome;
+
+    let Some(set) = name.to_str() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a name this client can send: a set on a server is named by text",
+                name.display()
+            ),
+        ));
+    };
+
+    let remote = lepatch::client::Remote::new(address)?;
+    lepatch::client::check_set(set)?;
+
+    // The manifest, once. It is what `have` is built from, and reading it twice
+    // would be two chances to answer differently.
+    let manifest = lepatch::command::Manifest::load(destination)?;
+
+    let started = remote.start_pack(set, version, None).await?;
+
+    let packed = remote
+        .await_job_with(&started, |counters| {
+            let shown = counters
+                .iter()
+                .map(|(name, value)| format!("{name} {value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("packing on {}: {shown}", remote.address());
+        })
+        .await?;
+
+    let Some(Outcome::Packed(summary)) = &packed.result else {
+        return Err(std::io::Error::other(format!(
+            "job {} finished without saying what it packed",
+            packed.id
+        )));
+    };
+
+    tracing::info!(
+        server = %remote.address(),
+        set,
+        version = summary.version,
+        snapshot = %summary.snapshot,
+        chunks = summary.chunks,
+        length = summary.length,
+        destination = %destination.display(),
+        clean,
+        dry_run,
+        "packing a version to restore from"
+    );
+
+    let pack_path = std::env::temp_dir().join(format!(
+        "lepatch-pull-{}-{}.pack",
+        std::process::id(),
+        &summary.snapshot.to_hex().to_string()[..16]
+    ));
+
+    // Everything from here on owns that file. Whether the run succeeded or
+    // failed, it goes: a pack nobody named is not something to leave in a user's
+    // directory, and a run that failed half-way has already said so.
+    let restored = pull_and_apply(
+        &remote,
+        set,
+        destination,
+        manifest.as_ref(),
+        summary,
+        &pack_path,
+        clean,
+        dry_run,
+    )
+    .await;
+
+    if let Err(e) = std::fs::remove_file(&pack_path) {
+        tracing::debug!(
+            pack = %pack_path.display(),
+            error = %e,
+            "could not remove the pack this pull assembled"
+        );
+    }
+
+    restored
+}
+
+/// Fetch the pack a remote restore needs, apply it, and report.
+///
+/// Split out of [`run_restore_remote`] because that one is about the temporary
+/// file and this one is about the work: what to ask for, what to leave out, and
+/// what to do with the answer.
+///
+/// # Errors
+///
+/// Returns an error if the pack cannot be planned, fetched or opened, or if the
+/// apply refuses the destination.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a restore's own arguments, plus the pack"
+)]
+async fn pull_and_apply(
+    remote: &lepatch::client::Remote,
+    set: &str,
+    destination: &std::path::Path,
+    manifest: Option<&lepatch::command::Manifest>,
+    summary: &lepatch::client::PackSummary,
+    pack_path: &std::path::Path,
+    clean: bool,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    let fixed = fixed_regions(summary);
+    let scratch = lepatch::client::Pull::new(
+        remote,
+        set,
+        summary.version,
+        std::collections::HashSet::new(),
+    );
+
+    scratch.begin(summary.length, pack_path).await?;
+
+    // The file table, and with it the chunk hashes `have` is built from — but
+    // only where the destination's own record says there is something to save.
+    let reads = manifest.filter(|m| m.version == summary.snapshot);
+    let mut fetched = lepatch::client::Fetched {
+        ranges: 0,
+        bytes: 0,
+        total: 0,
+    };
+    let mut prefetched = Vec::new();
+
+    let have = match reads {
+        None => std::collections::HashSet::new(),
+        Some(manifest) => {
+            let table = scratch.write(&fixed, pack_path, |_| {}).await?;
+            fetched.bytes = table.bytes;
+            fetched.ranges = table.ranges;
+            prefetched = fixed;
+
+            have_for(destination, manifest, &Pack::open(pack_path)?.snapshot()?)
+        }
+    };
+
+    let listed: Vec<lepatch::storage::BlobId> = have.iter().copied().collect();
+    tracing::info!(
+        held = listed.len(),
+        of = summary.chunks,
+        "the destination already holds these chunks, so they are not fetched"
+    );
+
+    // Only the ranges actually written count as already there. Where the
+    // destination gave no reason to read the file table first, nothing was
+    // fetched and the plan has to bring all of it.
+    let pull =
+        lepatch::client::Pull::new(remote, set, summary.version, have).already_fetched(prefetched);
+    let plan = remote.plan_pack(set, summary.version, &listed).await?;
+
+    if plan.length != summary.length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} planned a {}-byte pack and then described a {}-byte one; the file this run \
+                 assembles would not be the file it fetched",
+                remote.address(),
+                summary.length,
+                plan.length
+            ),
+        ));
+    }
+
+    let moved = pull
+        .write(&plan.ranges, pack_path, |moved| {
+            tracing::info!(
+                server = %remote.address(),
+                ranges = fetched.ranges + moved.ranges,
+                bytes = fetched.bytes + moved.bytes,
+                total = moved.total,
+                "fetched"
+            );
+        })
+        .await?;
+
+    fetched.bytes = fetched.bytes.saturating_add(moved.bytes);
+    fetched.ranges = fetched.ranges.saturating_add(moved.ranges);
+
+    let pack = pull.open(&plan, pack_path)?;
+
+    // Held for the whole run, as `lepatch apply` holds it, so two pulls into one
+    // destination cannot interleave writes into the same tree.
+    let _claim = if dry_run {
+        None
+    } else {
+        Some(lock_destination(destination)?)
+    };
+
+    let applied = apply(
+        destination,
+        &pack,
+        ApplyOptions {
+            prune: clean,
+            recheck: false,
+            dry_run,
+        },
+    )
+    .await?;
+
+    tracing::info!(
+        held = applied.held,
+        files = applied.files,
+        written = applied.written,
+        bytes = applied.bytes,
+        removed = applied.removed,
+        fetched = fetched.bytes,
+        ranges = fetched.ranges,
+        dry_run,
+        "applied the pack this pull fetched"
+    );
+
+    // What moved, and where it came from. The line after it is the applier's own,
+    // unchanged, so a script reading an apply report reads this one the same way.
+    say!(
+        "version {} of {} on {}: fetched {} of {} bytes in {} range(s)",
+        summary.version,
+        set,
+        remote.address(),
+        fetched.bytes,
+        summary.length,
+        fetched.ranges,
+    )?;
+
+    report_applied(&applied, &pack, destination, dry_run)
+}
+
+/// The chunks a destination holds of `snapshot`, or none of them.
+///
+/// **The apply manifest is a record of what a tree was, and this is the only
+/// question it can answer.** It names one version, and `Manifest::untrusted` says
+/// whether every file that version recorded is still where the record left it. A
+/// tree that passes both *is* that version, which means it holds every chunk of
+/// it — that is what a version is — and the server can be told not to send any of
+/// them.
+///
+/// One file that has moved, one recorded with no modification time to compare,
+/// and no manifest at all all give the empty set. So does a manifest for a
+/// different version: that tree's chunks are a real thing the server could
+/// leave out, but which of them *this* version also needs cannot be worked out
+/// without reading the pack, and a wrong `have` is the one failure this protocol
+/// cannot survive.
+fn have_for(
+    destination: &std::path::Path,
+    manifest: &lepatch::command::Manifest,
+    snapshot: &lepatch::metadata::Snapshot,
+) -> std::collections::HashSet<lepatch::storage::BlobId> {
+    let moved = manifest.untrusted(destination, snapshot);
+
+    if !moved.is_empty() {
+        tracing::debug!(
+            moved = moved.len(),
+            "the destination has moved since its last apply, so the whole pack is fetched"
+        );
+        return std::collections::HashSet::new();
+    }
+
+    snapshot.chunks.iter().copied().collect()
+}
+
+/// The regions of a pack every client has to fetch.
+///
+/// **The header and the snapshot before the payload, the index and the trailer
+/// after it.** A plan is these four plus the records a client lacks, so they are
+/// what a client fetching nothing at all is sent — and they are enough on their
+/// own to open the file, which is what a client that only wants the version's
+/// file table needs.
+fn fixed_regions(summary: &lepatch::client::PackSummary) -> Vec<lepatch::pack::Range> {
+    use lepatch::pack::Range;
+
+    let head = Range {
+        start: 0,
+        end: summary.payload_start,
+    };
+    let tail = Range {
+        start: summary.payload_start.saturating_add(summary.payload_bytes),
+        end: summary.length,
+    };
+
+    [head, tail]
+        .into_iter()
+        .filter(|range| range.end > range.start)
+        .collect()
 }
 
 /// Rebuild a tree from the set at `name` into `destination`.
