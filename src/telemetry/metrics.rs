@@ -4,9 +4,11 @@
 //!
 //! [`install`] returns before it constructs anything when [`Config`] is off: no
 //! exporter, no reader, no thread, no socket, and no instrument handle of any
-//! kind. Every recording function below asks [`installed`] first, and answers a
-//! run of a default `lepatch` in a single atomic load. This is the same
-//! default-off promise [`super::layer`] makes for spans, and it is held by
+//! kind. Every instrument recording below asks [`installed`] first, and answers a
+//! run of a default `lepatch` in a single atomic load; the one function that also
+//! writes span attributes reaches `tracing` instead, and a subscriber with no
+//! OpenTelemetry layer on it drops them. This is the same default-off promise
+//! [`super::layer`] makes for spans, and it is held by
 //! `nothing_is_built_and_nothing_is_recorded_when_telemetry_is_off`.
 //!
 //! # The phase goes in the name, and here is why that is not tidiness
@@ -53,6 +55,34 @@
 //! copies of one fact that could drift, and a reader would have no way to tell
 //! which to believe.
 //!
+//! ## The whole list, in one table
+//!
+//! **Every number this crate reports, and which kind it is.** A reader should be
+//! able to build a panel from this table and no other evidence — the constants
+//! below it agree with it, and `every_instrument_exists_with_the_documented_name_and_unit`
+//! holds the counters and the histogram to the same list.
+//!
+//! | phase | span attributes (a `set` total) | counters (an `add` total) |
+//! |---|---|---|
+//! | `backup` | `lepatch.backup.files_walked` `{file}`, `lepatch.backup.distinct_chunks_in_version` `{chunk}` | `lepatch.backup.chunks_produced` `{chunk}`, `lepatch.backup.bytes_read` `By` |
+//! | `merge` | `lepatch.merge.chunks_in_plan` `{chunk}` | `lepatch.merge.distinct_chunks_stored` `{chunk}` |
+//! | `verify` | `lepatch.verify.chunks_in_version` `{chunk}` | `lepatch.verify.chunks_checked` `{chunk}`, `lepatch.verify.bytes_read` `By` |
+//! | `restore` | `lepatch.restore.files_in_version` `{file}` | `lepatch.restore.files_written` `{file}`, `lepatch.restore.bytes_written` `By` |
+//! | `apply` | `lepatch.apply.files_in_pack` `{file}` | `lepatch.apply.files_written` `{file}`, `lepatch.apply.bytes_written` `By` |
+//!
+//! Two instruments are not a phase's total and so are not in that table:
+//! `lepatch.command.duration` (a histogram in `s`, carrying `lepatch.command`)
+//! and `lepatch.job.count` (`{job}`, carrying `lepatch.job.kind` and
+//! `lepatch.job.state`). Both are recorded through their own entry points — see
+//! [`record_command_duration`] and [`record_job`].
+//!
+//! **The attributes are recorded on whatever span is current when the run
+//! finishes**, which is the innermost span the run is inside: a command run on
+//! the command line reports onto that command's own span, and a merge the
+//! server started as a job reports onto its `lepatch::command::merge` span
+//! inside the job's `lepatch_job` span — the job span is entered first and so is
+//! the parent, never the one the attributes land on.
+//!
 //! # Semantic conventions
 //!
 //! Where they apply, they are followed: units are UCUM (`By` for bytes, `s` for
@@ -83,6 +113,13 @@
 //!   times a second; the instrument is added **once per run**, from the final
 //!   totals, by [`record_run`]. A counter that moved per chunk would report the
 //!   same information at a cost the hot loop should not pay.
+//! * **`probe`'s work.** It has no [`Progress`] of its own — the five commands
+//!   that do counted work are `backup`, `merge`, `verify`, `restore` and
+//!   `apply` — so the probe an apply takes internally reports nothing beyond
+//!   what that apply already reports.
+//! * **A job's duration.** `lepatch.job.count` counts terminal states and there
+//!   is no `lepatch.job.duration`. The span says how long the work took; a second
+//!   instrument carrying the same number would be two copies of one fact.
 //!
 //! # Attributes
 //!
@@ -355,7 +392,9 @@ static METER_PROVIDER: Mutex<Option<SdkMeterProvider>> = Mutex::new(None);
 ///   spawns the task that collects and exports, and it is the reason the
 ///   interval is left at the SDK's default: a `lepatch backup` is over in under
 ///   a minute and its one export is the [`super::shutdown`] flush, exactly as
-///   its spans are.
+///   its spans are. **"Left at the default" is not "fixed"**: the reader reads
+///   `OTEL_METRIC_EXPORT_INTERVAL`, so an operator exporting from a long-running
+///   `serve` can have the numbers leave on a schedule instead of at exit.
 ///
 ///   The reader is the **runtime-aware** one, and that is not a detail. The
 ///   default reader collects on its own `std` thread and drives an asynchronous
@@ -377,8 +416,10 @@ static METER_PROVIDER: Mutex<Option<SdkMeterProvider>> = Mutex::new(None);
 /// # Errors
 ///
 /// Returns an error if the exporter cannot be built — a malformed endpoint, or
-/// an HTTP client that could not be created. Reported the way `layer`'s is: a
-/// warning, and the command carries on.
+/// an HTTP client that could not be created — and an error if instruments have
+/// already been installed, which [`install`] is called once per process by
+/// `init_tracing` and a library caller could get wrong. Both are reported the
+/// way `layer`'s is: a warning, and the command carries on.
 pub fn install(config: &Config) -> io::Result<()> {
     if !config.enabled() {
         return Ok(());

@@ -80,6 +80,7 @@ pub(crate) mod observe;
 mod openapi;
 mod pack;
 mod sets;
+mod span;
 mod upload;
 mod versions;
 
@@ -248,6 +249,14 @@ impl Bound {
 
 /// Bind, and return the server ready to run.
 ///
+/// **Whether a request is traced is decided here, once, from whether a tracer
+/// provider is installed.** [`crate::telemetry::is_installed`] is the answer
+/// after startup — the provider a failed exporter build left behind is not
+/// installed, so a server whose telemetry was asked for and could not be built
+/// traces nothing, which is the honest outcome: there is nowhere for the spans
+/// to go. A library caller that installs its own provider *before* binding gets
+/// the middleware, and one that does not pays nothing for it.
+///
 /// # Errors
 ///
 /// Returns an error if the scratch directory cannot be created, if the address
@@ -255,7 +264,7 @@ impl Bound {
 pub fn bind(config: &Config, jobs: &Jobs) -> io::Result<Bound> {
     std::fs::create_dir_all(&config.scratch)?;
 
-    let (server, address) = handlers::configure(config, jobs)?;
+    let (server, address) = handlers::configure(config, jobs, crate::telemetry::is_installed())?;
 
     Ok(Bound {
         address,

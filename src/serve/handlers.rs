@@ -29,7 +29,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 
 use super::{
     ApiError, ByteRange, JobEvent, JobId, Json, Requested, Sets, Uploads, jobs::State, openapi,
-    pack::Resolved, versions,
+    pack::Resolved, span, versions,
 };
 
 /// The media type of every non-error response that is JSON.
@@ -223,49 +223,142 @@ mod serde_lite {
 /// checks them against the document in both directions. A new route is one line
 /// in three places, and forgetting any of them fails a test rather than
 /// producing a server that answers something the spec does not mention.
+///
+/// `spans` decides whether the request middleware is wrapped around the router
+/// at all, and the two arms are **two different apps rather than one app with a
+/// flag inside it**. `Option<MiddlewareFn>` is the type that would let a single
+/// `App` cover both, and it is rejected: a wrapped app is a different service
+/// type, so the two would have to be built separately anyway, and building only
+/// the one that is wanted is what makes a server with telemetry off pay nothing
+/// at all — no span, no header read, no allocation per request. See [`span`].
 pub(super) fn configure(
     config: &super::Config,
     jobs: &super::Jobs,
+    spans: bool,
 ) -> std::io::Result<(actix_web::dev::Server, std::net::SocketAddr)> {
     // The shared state is built **once** and cloned into each worker. The `App`
     // itself is built inside the factory, because actix needs a fresh one per
     // worker and `App` is deliberately not `Clone` — sharing it would share the
     // router's state too, which is exactly what it must not do.
+    //
+    // **Once, not once per worker**, and that is load-bearing: a `Sets` built
+    // per worker is as many sets as the machine has cores, an `Uploads` per
+    // worker is as many upload registries, and a `POST /v1/uploads` answered by
+    // one worker would be a `404` to the next request for it. `web::Data` is an
+    // `Arc`, so cloning one of these into an app shares the one behind it.
     let sets = web::Data::new(super::Sets::new(config.root.clone()));
     let uploads = web::Data::new(super::Uploads::new(config.scratch.clone()));
     let jobs = web::Data::new(jobs.clone());
 
-    let server = actix_web::HttpServer::new(move || {
-        actix_web::App::new()
-            .app_data(sets.clone())
-            .app_data(uploads.clone())
-            .app_data(jobs.clone())
-            .service(openapi_document)
-            .service(server_info)
-            .service(list_sets)
-            .service(list_versions)
-            .service(show_version)
-            .service(request_pack)
-            .service(get_pack)
-            .service(plan_pack)
-            .service(begin_upload)
-            .service(fill_upload)
-            .service(commit_upload)
-            .service(drop_upload)
-            .service(merge_pack)
-            .service(list_jobs)
-            .service(show_job)
-            .service(job_events)
-            .service(cancel_job)
-    })
-    .bind(&config.bind)?;
+    // `bind` is its own binding because the closures below capture `config`
+    // whole, and actix wants the address while a factory still owns it.
+    let bind = config.bind.clone();
 
-    // Read before `run`, because `run` consumes the server and blocks.
-    let address = server.addrs().first().copied().ok_or_else(|| {
-        std::io::Error::other(format!("bound to {} but reported no address", config.bind))
-    })?;
+    // `bind` is called in each arm rather than after the `if`, because
+    // `HttpServer` carries the app factory in its type: two factories are two
+    // types, so the arms have to agree on something else. `dev::Server` is what
+    // they do agree on — `run()` answers one for either — which is why each arm
+    // reads its address and runs on its own two lines.
+    let (server, address) = if spans {
+        let http = actix_web::HttpServer::new(move || {
+            traced_app(sets.clone(), uploads.clone(), jobs.clone())
+        })
+        .bind(&bind)?;
+        let address = reported_address(&http.addrs(), &bind);
+        (http.run(), address?)
+    } else {
+        let http =
+            actix_web::HttpServer::new(move || app(sets.clone(), uploads.clone(), jobs.clone()))
+                .bind(&bind)?;
+        let address = reported_address(&http.addrs(), &bind);
+        (http.run(), address?)
+    };
 
-    Ok((server.run(), address))
+    Ok((server, address))
+}
+
+/// The address a bound server reported, or a sentence saying it did not.
+///
+/// Takes the list rather than the `HttpServer`, because naming that type means
+/// naming all four of its parameters and the three bounds between them, for a
+/// function whose whole body is one line. Read before `run`, because `run`
+/// consumes the server and blocks.
+fn reported_address(
+    addrs: &[std::net::SocketAddr],
+    bind: &str,
+) -> std::io::Result<std::net::SocketAddr> {
+    addrs
+        .first()
+        .copied()
+        .ok_or_else(|| std::io::Error::other(format!("bound to {bind} but reported no address")))
+}
+
+/// The app every worker gets: the router, and nothing around it.
+///
+/// **The state is passed in rather than built here**, for the reason
+/// [`configure`] gives: it is built once and cloned per worker, and a `Sets` or
+/// an `Uploads` built inside this function would be a fresh one for every core.
+/// Taking them by value is also what makes the return type usable at all: a
+/// return-position `impl Trait` captures every lifetime in scope (edition 2024),
+/// so an app built from a borrow could not be `'static`, and an app factory that
+/// is not `'static` is not one actix can call.
+pub(super) fn app(
+    sets: web::Data<super::Sets>,
+    uploads: web::Data<super::Uploads>,
+    jobs: web::Data<super::Jobs>,
+) -> actix_web::App<
+    impl actix_web::dev::ServiceFactory<
+        actix_web::dev::ServiceRequest,
+        Config = (),
+        Response = actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+> {
+    actix_web::App::new()
+        .app_data(sets)
+        .app_data(uploads)
+        .app_data(jobs)
+        .service(openapi_document)
+        .service(server_info)
+        .service(list_sets)
+        .service(list_versions)
+        .service(show_version)
+        .service(request_pack)
+        .service(get_pack)
+        .service(plan_pack)
+        .service(begin_upload)
+        .service(fill_upload)
+        .service(commit_upload)
+        .service(drop_upload)
+        .service(merge_pack)
+        .service(list_jobs)
+        .service(show_job)
+        .service(job_events)
+        .service(cancel_job)
+}
+
+/// The same router, with one span around every request.
+///
+/// Built from [`app`] rather than beside it, so **there is exactly one list of
+/// services in this file** and the middleware cannot make it out of step with
+/// `ROUTES` or with the `OpenAPI` document. That is the whole reason this is a
+/// function of its own: a second copy of the route list is a second thing to
+/// forget.
+pub(super) fn traced_app(
+    sets: web::Data<super::Sets>,
+    uploads: web::Data<super::Uploads>,
+    jobs: web::Data<super::Jobs>,
+) -> actix_web::App<
+    impl actix_web::dev::ServiceFactory<
+        actix_web::dev::ServiceRequest,
+        Config = (),
+        Response = actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+> {
+    app(sets, uploads, jobs).wrap(actix_web::middleware::from_fn(span::trace))
 }
 
 /// `GET /openapi.json` — the document, verbatim.

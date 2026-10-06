@@ -233,12 +233,18 @@ tracing-opentelemetry = { version = "0.32", default-features = false }
 #   server it is describing.
 #
 # **To send to an `https://` collector**, build with `--features telemetry-tls`,
-# which turns on `reqwest-rustls-webpki-roots`. That is opt-in on purpose: it
-# puts `rustls`, `ring` and `rustls-webpki` in the graph — a licence and
-# build-toolchain decision, and not one a default `cargo build` should make for
-# the person who installs the binary. An `https://` endpoint in the default
-# build fails to connect rather than falling back to plaintext, which is the
-# same refusal `lepatch versions --remote` makes for an `https://` server.
+# which turns on `opentelemetry-otlp`'s `reqwest-rustls`. That is opt-in on
+# purpose: it puts `rustls`, `ring` and `rustls-native-certs` in the graph — a
+# licence and build-toolchain decision, and not one a default `cargo build`
+# should make for the person who installs the binary. It is the **native-roots**
+# variant: the feature resolves to `reqwest`'s `rustls-tls-native-roots`, so a
+# collector is verified against the operating system's certificate store. An
+# earlier version of this comment named `reqwest-rustls-webpki-roots` and claimed
+# `rustls-webpki`; the feature line below says `reqwest-rustls` and that is what
+# `lepatch --help` promises a build that can speak `https://`. An `https://`
+# endpoint in the default build fails to connect rather than falling back to
+# plaintext, which is the same refusal `lepatch versions --remote` makes for an
+# `https://` server.
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client"] }
 
 [features]
@@ -248,8 +254,8 @@ experimental = []
 #
 # Off by default, so the shipped binary has no TLS backend at all — see the
 # `opentelemetry-otlp` entry above for the whole argument, and `deny.toml` for
-# the licences the default graph is held to. This turns on `rustls` (with
-# `ring`, not `aws-lc-rs`, which needs `cmake`) and `rustls-webpki` for the
+# the licences the default graph is held to. This turns on `rustls` with `ring`
+# (not `aws-lc-rs`, which needs `cmake`) and `rustls-native-certs` for the
 # exporter's HTTP client, and it changes nothing else: no endpoint, no span and
 # no flag behaves differently, and the same env vars resolve the same way.
 #

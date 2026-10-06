@@ -41,27 +41,53 @@
 //! the same reason: a metric is batched too, so a run that exits without it
 //! loses every number it measured with the same silence.
 //!
-//! Two tests hold it down, and they are the ones that matter: a span is
+//! One test holds it down, and it is the one that matters: a span is
 //! **received** after the exporter is shut down, and the same span emitted with
-//! no shutdown **is not**, which is the defect this section is about.
+//! no shutdown **is not**, both asserted in `a_span_emitted_before_shutdown_is_received`
+//! — first half before the flush, second after it. That is the defect this
+//! section is about.
 //!
 //! # What is not here
 //!
-//! * **Nothing reads an inbound `traceparent` yet.** The W3C `TraceContext`
-//!   propagator *is* installed, explicitly, by [`layer`] — see below — because a
-//!   propagator that is merely *registered* is worth nothing to a caller that
-//!   never extracts, and the registration is one line that is easy to leave out
-//!   and impossible to notice.
-//! * **No HTTP middleware.** It is a separate concern with its own tests;
-//!   nothing here wraps a handler.
+//! * **This module does not read an inbound `traceparent`.** The W3C
+//!   `TraceContext` propagator *is* installed, explicitly, by [`layer`] — see
+//!   below — because a propagator that is merely *registered* is worth nothing to
+//!   a caller that never extracts, and the registration is one line that is easy
+//!   to leave out and impossible to notice. **The extraction that reads it is in
+//!   `serve::span`**, a private module beside the routes it wraps, because a
+//!   request is the only thing in this crate that arrives from outside with
+//!   headers attached to it.
+//! * **No middleware lives here.** The one request middleware this crate has is
+//!   `serve::span`, written beside the routes it wraps: it is actix's middleware
+//!   and needs actix's types, and putting it in this module would put a second
+//!   concern in a module whose whole claim is that it exports nothing until the
+//!   operator asks. It is installed by [`crate::serve::bind`], and only when a
+//!   provider is installed.
 //! * **No sampling.** Nothing here configures a sampler, so the SDK's default
 //!   applies: every span is recorded. A sampled-out span is a span nobody can
 //!   debug, and this is a tool an operator turns on to look at one run.
 //! * **No TLS in the default build.** `--features telemetry-tls` turns on
-//!   `rustls` for the exporter and changes nothing else; without it an
-//!   `https://` endpoint fails to connect rather than quietly downgrading,
-//!   which is the same refusal [`lepatch versions --remote`](crate::client)
-//!   makes. See the `opentelemetry-otlp` entry in `Cargo.toml`.
+//!   `rustls` — with the operating system's trust store, through
+//!   `opentelemetry-otlp`'s `reqwest-rustls` — for the exporter, and changes
+//!   nothing else: no endpoint, no span and no flag behaves differently. Without
+//!   it an `https://` endpoint fails to connect rather than quietly
+//!   downgrading, which is the same refusal
+//!   [`lepatch versions --remote`](crate::client) makes. See the
+//!   `opentelemetry-otlp` entry in `Cargo.toml`.
+//! * **No logs signal.** `opentelemetry`'s `logs` feature is off on every crate
+//!   in this graph and nothing bridges a `tracing` *event* into an OpenTelemetry
+//!   log record. Diagnostics stay on stderr, filtered by `RUST_LOG`, `--verbose`
+//!   and `--quiet`; only spans and metrics cross the wire.
+//! * **No instrumentation of anything but this crate's own targets.** The layer
+//!   is filtered with `lepatch=info` (see [`filter`]), so a span from actix,
+//!   tokio, `reqwest` or from a library caller embedding this crate is never
+//!   exported. An instrumented dependency is therefore invisible here rather
+//!   than reported twice.
+//! * **No metrics for the HTTP surface.** `http.server` is a span; there is no
+//!   request counter, no request-duration histogram and no uploaded-byte
+//!   counter. Job outcomes are counted (`lepatch.job.count`), and that is the
+//!   whole of the server's metric story. See `crate::telemetry::metrics` for
+//!   the full list, which is deliberately short.
 
 use std::{io, sync::Mutex, time::Duration};
 
@@ -88,16 +114,32 @@ pub mod metrics;
 /// exporter's business: [`layer`] does not read it, and the exporter resolves
 /// it the way every OTLP exporter does — `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
 /// first, then this one with `/v1/traces` appended, then
-/// `http://127.0.0.1:4318`.
+/// [`DEFAULT_ENDPOINT`].
+///
+/// **Only this one turns telemetry on.** The per-signal variables — traces,
+/// metrics, headers, timeouts — configure an exporter, and an exporter is only
+/// built when telemetry is on: `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` on its own
+/// is read by nothing, because [`Config::new`] is asked about this variable and
+/// no other. Setting the per-signal variable is how an operator points one signal
+/// somewhere other than the other, and it is *not* a second way to switch the
+/// whole thing on.
 pub const ENDPOINT_VARIABLE: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
 /// The endpoint the exporter falls back to, named here so `--telemetry` on its
 /// own can say something useful.
 ///
-/// The OTLP default, and a loopback address for the same reason
-/// [`crate::serve`]'s bind default is: a telemetry backend is not something a
-/// backup tool should discover across the network.
-pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:4318";
+/// **The OTLP exporter's own default, spelled the way it spells it.** The
+/// fallback lives in `opentelemetry-otlp` as `http://localhost:4318` — the name
+/// `localhost`, not the address `127.0.0.1` — and this constant says the same
+/// thing, so the line `lepatch --telemetry` prints is where the exporter will
+/// actually go rather than a loopback address that looks equivalent. A host
+/// whose `localhost` does not resolve is a host this fallback fails on, and
+/// saying so in advance is cheaper than discovering it from a missing export.
+///
+/// A loopback address at all, for the same reason [`crate::serve`]'s bind
+/// default is: a telemetry backend is not something a backup tool should
+/// discover across the network.
+pub const DEFAULT_ENDPOINT: &str = "http://localhost:4318";
 
 /// What the operator asked for, read once at startup.
 ///
@@ -207,9 +249,20 @@ static PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
 /// is the answer before it. The two can differ — a provider that failed to
 /// build leaves nothing installed — so the module offers both rather than
 /// making a caller guess which question it is asking.
+///
+/// **A question, and it leaves the provider where it found it.** It reads the
+/// slot rather than calling `installed`, which *takes* the handle out so that
+/// [`shutdown`] cannot be run twice. Sharing that call would make this the worst
+/// function in the module: a caller asking whether telemetry is on would consume
+/// the provider, and the export that follows would find nothing to flush — **every
+/// span the process recorded, silently discarded, on a run that asked for
+/// telemetry and reported no error**. `lepatch serve` asks this once, when it
+/// binds, to decide whether to wrap the router in request spans; that one call
+/// is enough to lose the whole run. See
+/// `asking_whether_a_provider_is_installed_leaves_it_where_it_was`.
 #[must_use]
 pub fn is_installed() -> bool {
-    installed().is_some()
+    PROVIDER.lock().is_ok_and(|slot| slot.is_some())
 }
 
 /// The installed provider, taken out of the slot so it cannot be shut down twice.
@@ -449,16 +502,24 @@ fn otel_error(what: &str, error: &OTelSdkError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, PoisonError};
 
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::{
         error::OTelSdkResult,
-        trace::{SpanData, SpanExporter},
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
     };
     use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
 
     use super::{Config, DEFAULT_ENDPOINT, DIRECTIVE, ENDPOINT_VARIABLE, EXPORT_TIMEOUT};
+
+    /// The two tests that look at the provider slot, kept apart from each other.
+    ///
+    /// `PROVIDER` is process-global and `cargo test` runs these on parallel
+    /// threads in one process, so a test that fills the slot and a test that
+    /// asserts it is empty would otherwise fail each other depending on which
+    /// thread the scheduler reached first.
+    static PROVIDER_SLOT: Mutex<()> = Mutex::new(());
 
     /// An exporter that keeps every span it is handed, in this process.
     ///
@@ -552,6 +613,11 @@ mod tests {
 
     #[test]
     fn no_exporter_is_built_when_telemetry_is_off() {
+        // The slot is shared with
+        // `asking_whether_a_provider_is_installed_leaves_it_where_it_was`, which
+        // fills it; see `PROVIDER_SLOT`.
+        let _slot = PROVIDER_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+
         // **The default build, asserted rather than assumed.** `layer` returns
         // `Ok(None)` before it constructs anything, so there is no exporter to
         // look for and no thread to join: the only evidence available is that
@@ -564,6 +630,54 @@ mod tests {
         // Nothing was installed globally either, so a later `shutdown` has
         // nothing to flush — which is the state every default run exits in.
         assert!(!super::is_installed());
+    }
+
+    /// **Asking whether a provider is installed must not consume it.**
+    ///
+    /// This was a real bug and it is the quietest one this module could hold:
+    /// `is_installed` was written as `installed().is_some()`, and `installed`
+    /// *takes* the handle out of the slot so that `shutdown` cannot run it
+    /// twice. So the first question anybody asked took the provider with it, and
+    /// `lepatch serve` asks exactly once — when it binds, to decide whether to
+    /// wrap the router in request spans. **The run then flushed an empty slot:**
+    /// every span it recorded, including the request spans the question was about
+    /// to switch on, discarded on exit, with no error and a clean exit code.
+    ///
+    /// Found by `tests/telemetry.rs::a_span_survives_a_stopped_server`, which
+    /// runs the real binary against a real socket and found nothing arriving.
+    ///
+    /// **A stand-in provider, built by hand**, rather than one from [`layer`]:
+    /// `layer` needs a tokio runtime and installs a global tracer and propagator
+    /// for the rest of the binary, and what is under test here is the slot
+    /// rather than the pipeline. A provider with no processor has nothing to
+    /// batch and shuts down cleanly, so every assertion below is about the
+    /// handle alone.
+    #[test]
+    fn asking_whether_a_provider_is_installed_leaves_it_where_it_was() {
+        let _slot = PROVIDER_SLOT.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let mut held = super::PROVIDER.lock().expect("the provider slot");
+        assert!(held.is_none(), "another test left a provider behind");
+        *held = Some(SdkTracerProvider::builder().build());
+        drop(held);
+
+        assert!(
+            super::is_installed(),
+            "a provider in the slot is an installed provider"
+        );
+        assert!(
+            super::is_installed(),
+            "**and asking again must still say so**: a question that consumes its \\
+             answer loses every span at exit, silently, on exactly the runs that \\
+             asked for telemetry"
+        );
+
+        // The exit path still has a provider to flush, which is the whole claim.
+        super::shutdown().expect("a provider with nothing queued shuts down");
+        assert!(
+            !super::is_installed(),
+            "shutdown takes it out, and it does so once"
+        );
     }
 
     /// Install a layer over a recorder and emit a span — the shape `main` uses,
@@ -718,10 +832,20 @@ mod tests {
 
     #[test]
     fn the_defaults_this_module_documents_are_the_ones_in_it() {
-        // The module docs name `http://127.0.0.1:4318` and the standard
-        // variable. If either is renamed in the exporter, this fails rather than
-        // leaving a README to be quietly wrong.
-        assert_eq!(DEFAULT_ENDPOINT, "http://127.0.0.1:4318");
+        // The module docs name `http://localhost:4318` and the standard
+        // variable. If either is renamed here, this fails rather than leaving a
+        // README to be quietly wrong.
+        //
+        // **And this cannot check that the exporter still agrees, and does not
+        // pretend to.** `opentelemetry-otlp` keeps `http://localhost:4318` in a
+        // private constant and reads no accessor back out of a built exporter, so
+        // there is nothing here at runtime that could compare the two: if the
+        // exporter's fallback moved, the constant above and every sentence that
+        // repeats it would be stale, and the mismatch would be found by a
+        // collector that received nothing. What is asserted is the half that is
+        // this crate's own — the constant, the variable name, and an export
+        // timeout shorter than the SDK's default.
+        assert_eq!(DEFAULT_ENDPOINT, "http://localhost:4318");
         assert_eq!(ENDPOINT_VARIABLE, "OTEL_EXPORTER_OTLP_ENDPOINT");
         assert!(
             EXPORT_TIMEOUT < std::time::Duration::from_secs(30),

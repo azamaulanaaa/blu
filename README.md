@@ -1057,11 +1057,247 @@ progress to `GET /v1/jobs/{id}`. They are separate questions asked of separate
 things, so turning the terminal down cannot silence a client that is watching a
 merge over the network.
 
+**Every request is traced when `--telemetry` is on, and nothing is traced when
+it is off** — not a span built and thrown away, but no middleware around the
+router at all, so a default server reads no header and allocates nothing per
+request. `traceparent` is honoured, so a client that is itself instrumented sees
+one trace across both ends. See "Telemetry" for the span attributes, the
+metrics, and the list of what is *not* instrumented.
+
 **There is no authentication, and there is no TLS.** Anyone who can reach the port
 can read every set under the root and can append versions to them. That is a
 decision rather than an oversight, and the bind address defaults to `127.0.0.1` so
 the common case is a service on the same machine. Put it behind something that
 does the authentication, if it needs it.
+
+## Telemetry
+
+`--telemetry` sends this run's spans and metrics to an OpenTelemetry collector:
+
+```console
+$ lepatch --telemetry backup ~/Documents docs
+$ OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318 lepatch backup ~/Documents docs
+```
+
+Either one turns the same thing on, and asking twice is asking once.
+
+**Nothing leaves the machine unless one of them does.** With neither, no exporter
+is built, no thread is started for one and no socket is opened — and `lepatch
+serve` does not wrap its router in a request span either, so a default server
+reads no header and allocates nothing per request. That is a tested property
+rather than an intention: `tests/telemetry.rs` runs the real binary with the
+endpoint variables removed, with a socket listening the whole time, and asserts
+that nothing arrives; and `no_span_is_created_when_the_middleware_is_not_installed`
+asserts that the span object itself is never built.
+
+**Only the base variable is a switch.** `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and the header and timeout variables point
+an exporter somewhere; they are read by nothing until something has already
+turned telemetry on. A deployment that exports to two different collectors sets
+the base variable *and* the per-signal ones.
+
+### The transport
+
+OTLP over HTTP with protobuf bodies — not gRPC, not JSON — through an
+asynchronous client, with the endpoint resolved the way every OTLP exporter
+resolves it:
+
+| signal | in this order | path |
+|---|---|---|
+| spans | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | used whole |
+| metrics | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | used whole |
+| either | `OTEL_EXPORTER_OTLP_ENDPOINT` | `/v1/traces`, `/v1/metrics` appended |
+| either | nothing set | `http://localhost:4318` + the same paths |
+
+**Everything is flushed on the way out of the process**, on every path out: the
+command succeeded, the command failed, and the process was asked to stop. An
+exporter is batched, so a command that finished and exited without that flush
+has its spans and its measurements sitting in a queue on a thread the process
+has already decided to end — no error, no warning, and an exit code that says
+the run succeeded.
+
+**A collector that cannot be built is a warning at startup and nothing more.**
+The command carries on: refusing to back up a directory because a telemetry
+backend is unreachable would make this feature into a way to lose backups. The
+same is true at the other end — an export that fails is one line on stderr at
+exit, and the exit code is still the command's own. **If the exporter could not
+be built at all, `lepatch serve` does not install its request span either**,
+because there is nowhere for the spans to go; the warning at startup is the only
+sign of that.
+
+**`https://` is a build flag.** The shipped binary carries no TLS backend at
+all; `cargo build --features telemetry-tls` turns on `rustls` for the
+exporter's HTTP client and changes nothing else — no endpoint, no span and no
+flag behaves differently. Without it an `https://` endpoint fails to connect
+rather than being downgraded to a connection in the clear, which is the same
+refusal `versions --remote` makes for an `https://` server. A build that does
+speak `https` trusts the operating system's certificate store.
+
+**Almost every exporter setting is still the operator's.** The standard
+`OTEL_BSP_*` variables move the span batch schedule, its queue and its batch
+size, and `OTEL_METRIC_EXPORT_INTERVAL` moves how often metrics are collected.
+The one that is not is the export timeout: this crate sets it to ten seconds,
+because the flush happens on the exit path with the command's result already
+decided, and a collector that accepts the connection and then says nothing must
+not hold a backup open behind it.
+
+### Spans
+
+Every span below is this crate's own, at `info`; **nothing from actix, tokio or
+any dependency is exported**, because the layer is filtered to this crate's
+targets. Each span carries only its own arguments, and the only unbounded one is
+the source directory on `backup`, called out at the end.
+
+| span | one per | what it holds |
+|---|---|---|
+| `http.server` | each request, **only** while `lepatch serve` runs | method, route template, status, and the kind of job it started |
+| `lepatch_job` | each job the server starts | the job's id and its kind |
+| `backup`, `run` | a backup, and its inner run | the source directory — see below |
+| `merge` | a merge | nothing |
+| `verify` | a verify | the snapshot id |
+| `restore` | a restore | the snapshot id |
+| `apply` | an apply | nothing |
+| `probe_skipping` | the probe an apply takes internally | nothing |
+| `open_for_reading`, `open_for_writing` | each store a run opens | nothing |
+| `get`, `put`, `put_stored` | each chunk read out of a store, and each record written into one | nothing |
+| `stored`, `get` | each chunk read out of a pack | nothing |
+
+**What nests under what** — this is the whole of the shape, and it is worth
+stating because two of the three things are not where a reader would guess:
+
+```text
+http.server                  one per request
+├── lepatch::storage::blob::*   the store it opened
+└── lepatch::pack::*            the chunks it read out of a pack
+
+lepatch_job                  one per job, and a root span of its own trace
+└── lepatch::command::merge      the merge it ran, or the store and pack
+                                 spans a pack job's own work opens
+```
+
+**No `lepatch::command::*` span is ever inside an `http.server` span.** The two
+commands this server can reach — a merge, and the pack work behind `POST
+/v1/sets/{set}/packs` — both run in a task handed to `tokio::spawn`, and a
+spawned task inherits no span. So a job is its own trace: the `http.server` span
+records which request started it and what it answered (`202`, with a job id), and
+the `lepatch_job` span records the work. **Nothing links the two spans**, and the
+request span carries no job id, because the id does not exist until the handler
+has already answered. `lepatch.job` (`pack` or `merge`) and the id in the `202`
+body are the join; a panel has to make it itself.
+**`http.server` joins a client's trace rather than starting its own.** An
+inbound `traceparent` or `tracestate` header is extracted and the span is
+parented to it, so a client that is itself instrumented sees one trace across
+both ends; a request with no such header starts its own trace, which is the
+correct answer for a client that is not instrumented — and the answer this
+crate's own `lepatch versions --remote` gets, since it sends no header.
+`http.route` is the **template** (`/v1/sets/{set}/versions`), never the path, so
+seventeen route templates and four methods are the whole of the cardinality; a
+request for a route that does not exist carries no `http.route` at all rather
+than the path it asked for. The span's status is `ERROR` for a `5xx` and unset
+otherwise, so a mistyped path does not put a floor under every error rate.
+
+**Three span arguments are not from a closed set, and two of them are paths.**
+`backup` and its inner `run` record `root`, the directory the backup read, and
+`verify` and `restore` record `snapshot_id`, which is one value per version.
+Everything else above is nothing at all, and nothing on `http.server` carries a
+path, a set name, a version, an upload id or a pack id. Group a panel by those
+three only as a way to *find* the run, never as a dimension to sum over.
+
+### Metrics
+
+Eleven instruments and six span attributes, every one of them named for the
+command that records it — the two exceptions carry the command or the job kind as
+an attribute instead. Each reports a unit. Counters are cumulative — take a rate
+over them — and deliberately carry no `.total` suffix, because the specification
+asks a backend to add that where it wants one.
+
+| name | unit | attributes |
+|---|---|---|
+| `lepatch.command.duration` (histogram) | `s` | `lepatch.command` |
+| `lepatch.job.count` | `{job}` | `lepatch.job.kind`, `lepatch.job.state` |
+| `lepatch.backup.chunks_produced` | `{chunk}` | none |
+| `lepatch.backup.bytes_read` | `By` | none |
+| `lepatch.backup.files_walked` | `{file}` | none — a span attribute, not a counter |
+| `lepatch.backup.distinct_chunks_in_version` | `{chunk}` | none — a span attribute |
+| `lepatch.merge.distinct_chunks_stored` | `{chunk}` | none |
+| `lepatch.merge.chunks_in_plan` | `{chunk}` | none — a span attribute |
+| `lepatch.verify.chunks_checked` | `{chunk}` | none |
+| `lepatch.verify.bytes_read` | `By` | none |
+| `lepatch.verify.chunks_in_version` | `{chunk}` | none — a span attribute |
+| `lepatch.restore.files_written` | `{file}` | none |
+| `lepatch.restore.bytes_written` | `By` | none |
+| `lepatch.restore.files_in_version` | `{file}` | none — a span attribute |
+| `lepatch.apply.files_written` | `{file}` | none |
+| `lepatch.apply.bytes_written` | `By` | none |
+| `lepatch.apply.files_in_pack` | `{file}` | none — a span attribute |
+
+**A number is reported once, in one of two places.** A total that accumulates
+during a run is a counter, added once from the run's final totals. A total that
+describes one version — a walk's file count, a plan's length, a version's chunk
+count — is a span attribute on the command's span, because summing it over time
+means nothing. No number is in both.
+
+**`distinct` means two different things and the names say which.**
+`lepatch.backup.distinct_chunks_in_version` is the whole version's distinct
+chunks, and is an attribute; `lepatch.merge.distinct_chunks_stored` is the
+chunks *that run* stored, and is a counter.
+
+**`lepatch.job.count` counts outcomes, once each**: `succeeded`, `failed` or
+`cancelled`, by `lepatch.job.kind` (`pack` or `merge`). A cancelled job that had
+already finished counts nothing, because it did not earn the state.
+
+**`lepatch.command.duration` is the whole command**, including `serve` — a
+server's is one very large sample recorded when it is told to stop. It is
+recorded on the success and the failure arm alike, so a failed backup is on the
+histogram too. An interrupted command is not: there is no code after the
+interrupt that still knows which command it was.
+
+### What is not instrumented
+
+Stated rather than discovered, and the list is the point:
+
+- **`lepatch pack`, `lepatch versions` and `lepatch reindex` have no span of
+  their own.** Only `backup`, `merge`, `verify`, `restore` and `apply` carry
+  `#[instrument]`, so those three produce only the store and pack spans beneath
+  them — an `open_for_reading`, a `stored` per chunk — and nothing that names
+  the command. Their duration is on `lepatch.command.duration` like every other
+  command's, which is the only thing that tells you which one ran.
+- **A pack job reports no progress and no totals.** `POST
+  /v1/sets/{set}/packs` is counted by `lepatch.job.count` and traced by a
+  `lepatch_job` span, but the work behind it builds no `Progress`, so nothing is
+  recorded from it: a merge job reports `lepatch.merge.chunks_in_plan` and
+  `lepatch.merge.distinct_chunks_stored`, and a pack job reports nothing at all.
+- **There is no metric for the HTTP surface.** No request counter, no request
+  duration histogram, no uploaded-byte counter, no upload or pack count.
+  `http.server` is a span; `lepatch.job.count` is the server's only metric.
+- **A job's duration is not a metric**, only a span. There is no queue depth
+  either: `queued` and `running` are states a job passes through, and counting
+  transitions would be a count of transitions rather than of jobs.
+- **No per-chunk or per-file measurement.** A backup adds a counter thousands of
+  times a second; each instrument is added once, from the run's totals, so a
+  panel cannot chart progress *within* a run from metrics. The span's duration,
+  the client polling `GET /v1/jobs/{id}` and the SSE stream are how progress is
+  watched.
+- **A merge reports no bytes.** Its only byte total is content *before*
+  compression, and a byte counter there would be a content rate wearing the name
+  of a disk rate. There is no `lepatch.merge.bytes_*` instrument.
+- **Nothing is instrumented inside a dependency.** Actix's own request handling,
+  tokio's task spans and `reqwest`'s HTTP calls are not exported, so a slow
+  third-party call appears only as time inside one of this crate's spans.
+- **No logs signal.** Nothing bridges a `tracing` event into an OpenTelemetry
+  log record; diagnostics stay on stderr under `RUST_LOG`, `--verbose` and
+  `--quiet`. Only spans and metrics cross the wire.
+- **No sampling.** Every span is recorded, so a long-running `lepatch serve`
+  under load produces a span per request and a span per chunk it reads, batched
+  and exported on the SDK's five-second schedule with a queue of 2,048 spans. A
+  queue that fills drops spans, and nothing says which ones.
+- **A request and the job it starts are in different traces** with no link
+  between them, as above. The join is `lepatch.job` and the id in the `202`.
+- **`http.server` exists only under `lepatch serve`.** No other command speaks
+  HTTP, and none of them produces one.
+- **`thread.name` is absent** on a span exported from a thread the runtime did
+  not name, and the per-span `busy_ns`/`idle_ns` timings arrive as span *events*
+  rather than attributes.
 
 ## Library
 

@@ -38,21 +38,28 @@ struct Args {
     #[arg(long, short, conflicts_with = "verbose")]
     quiet: bool,
 
-    /// Send this run's OpenTelemetry spans to a collector.
+    /// Send this run's spans and metrics to an OTLP collector. Off by default.
     ///
-    /// **Off unless you ask, and asking twice is the same as asking once:**
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` in the environment turns the same thing on
-    /// without the flag, which is what a systemd unit or a container image sets.
+    /// **Nothing leaves the machine unless one of the two asks.** Either this
+    /// flag or `OTEL_EXPORTER_OTLP_ENDPOINT` in the environment turns the same
+    /// thing on — asking twice is asking once — and the environment spelling is
+    /// what a systemd unit or a container image sets. Without either, no
+    /// exporter is built, no thread is started for one, no socket is opened, and
+    /// `lepatch serve` does not even wrap its router in a request span.
     ///
-    /// Off means *nothing leaves the machine*: no exporter is built, no thread
-    /// is started for one, and no socket is opened. The spans this crate would
-    /// send are the ones its `#[instrument]`ed commands already produce, so
-    /// turning this on adds a collector to the picture and nothing else.
+    /// What is sent is what the crate already records: one span per `#[instrument]`ed
+    /// command, one `http.server` span per request while `serve` is running, one
+    /// `lepatch_job` span per server-side job, the run's totals as attributes and
+    /// counters, and a duration per command. Turning this on adds a collector to
+    /// the picture and nothing else.
     ///
     /// Where it goes is the exporter's standard resolution:
-    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` with `/v1/traces` appended, then
-    /// `http://127.0.0.1:4318`.
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` first, then
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` with `/v1/traces` (or `/v1/metrics`)
+    /// appended, then `http://localhost:4318`. **Only the base
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` switches telemetry on**; the per-signal
+    /// variables point an exporter somewhere and are read by nothing until
+    /// something has already turned it on.
     ///
     /// **This build has no TLS backend unless it was compiled with
     /// `--features telemetry-tls`.** Without it, an `https://` endpoint fails to
@@ -2446,4 +2453,136 @@ fn report_applied(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The tests of `main` itself, and there is one worth having.
+    //!
+    //! Everything a command does is tested through the library. **What is tested
+    //! here is the only thing the library cannot see: the layer stack.** A `tracing`
+    //! subscriber is process-global and this binary owns the only one there is, so
+    //! `init_tracing` is the seam between what the crate records and what anything
+    //! can see — and a stack assembled here rather than in the library is a stack
+    //! nothing else exercises.
+    //!
+    //! # Why this regressed once already
+    //!
+    //! Commit `9ab42a7`. `--quiet` and `RUST_LOG` were attached to the *subscriber*
+    //! rather than to the `fmt` layer, so a `lepatch --quiet serve` answered
+    //! `never` to `lepatch::progress`, the event was never emitted, the progress
+    //! layer above was never offered it, and **a client polling
+    //! `GET /v1/jobs/{id}` was told a running merge had reported nothing.** No test
+    //! failed, because every other part of the layer worked perfectly on the events
+    //! that were not filtered out.
+    //!
+    //! A filter is not the only way to do it. Adding a layer to the stack changes
+    //! the stack's type, changes which callsites reach which layer, and can break
+    //! `observe` in exactly the same way with no error anywhere — which is why the
+    //! test below installs **`init_tracing`'s own stack**, by calling
+    //! `init_tracing`, rather than a copy of it that a later edit would not reach.
+    //!
+    //! # The other end of the same question
+    //!
+    //! **`tests/observe_stack.rs`** asks what happens when this stack is
+    //! *assembled* rather than called: it spells the same three layers and three
+    //! filters out (it has to — `init_tracing` is private to this binary), installs
+    //! them on the process-global subscriber, binds a real server with
+    //! `serve::span`'s request middleware wrapped around the router, and pushes a
+    //! real pack through `POST /v1/sets/{set}/merges`. So the two ends are held at
+    //! once: this test says the function builds what it claims to build, and that
+    //! one says the arrangement still carries a client's progress.
+
+    use std::collections::HashMap;
+
+    use super::*;
+
+    use lepatch::{
+        progress::{Counter, Phase, Progress},
+        serve::{JobId, Jobs},
+    };
+
+    /// Spawn a job, let it report one progress event, and wait for it to finish.
+    ///
+    /// `Jobs::spawn` puts the work on a tokio task with a `lepatch_job` span
+    /// around it, which is the span `observe` matches on; the `Progress::report`
+    /// below writes the real `lepatch::progress` event that layer reads. The
+    /// oneshot is how the test learns the work has run — `spawn` returns before
+    /// the task is first polled, so reading the registry immediately would be a
+    /// race the test would lose half the time.
+    fn report_progress(jobs: &Jobs) -> JobId {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+
+        let (done, finished) = tokio::sync::oneshot::channel();
+        runtime.block_on(async {
+            let id = jobs.spawn("merge", move |_handle| async move {
+                let mut progress = Progress::new(Phase::Merge);
+                progress.add(Counter::Chunks, 7);
+                progress.add(Counter::Read, 4096);
+                assert!(progress.report(), "a run's first report is always due");
+
+                let _ = done.send(());
+                Ok(lepatch::serve::Json::Null)
+            });
+
+            let _ = finished.await;
+            id
+        })
+    }
+
+    /// The counters a job recorded, as a map to assert on.
+    fn counters(jobs: &Jobs, id: JobId) -> HashMap<String, u64> {
+        jobs.get(id)
+            .expect("the job is in the registry")
+            .progress
+            .into_iter()
+            .collect()
+    }
+
+    /// **`init_tracing`'s full stack, for a quiet server, still carries a client's
+    /// progress into the registry.**
+    ///
+    /// `init_tracing` is called rather than reconstructed: this is the stack a
+    /// `lepatch serve` run installs, the three layers and three filters in the
+    /// order `init_tracing` puts them, read off the same code. `--quiet` is on
+    /// deliberately — the terminal's filter is at `warn`, so every event under it
+    /// is refused, and the only question is whether that refusal stops where the
+    /// terminal's own layer says it should.
+    ///
+    /// **The failure this test exists to catch** is `9ab42a7` again: move that
+    /// `EnvFilter` from the `fmt` layer onto the subscriber and the job's events
+    /// are never emitted, the progress layer is never offered them, and the
+    /// counters below are empty while every other test in this binary still
+    /// passes.
+    #[test]
+    fn the_stack_a_server_installs_still_carries_progress_to_a_client() {
+        let jobs = Jobs::new();
+
+        // Telemetry off, so nothing tries to build an exporter and the stack is
+        // exactly the one a `lepatch serve` run that never asked for spans has.
+        init_tracing(
+            false,
+            true,
+            Some(&jobs),
+            &lepatch::telemetry::Config::new(false, None),
+        );
+
+        let id = report_progress(&jobs);
+        let recorded = counters(&jobs, id);
+
+        assert_eq!(
+            recorded.get("chunks"),
+            Some(&7),
+            "a client's view of a running job must not move when the terminal is \
+             turned down: {recorded:?}"
+        );
+        assert_eq!(
+            recorded.get("read"),
+            Some(&4096),
+            "the byte counters must reach the job on the same terms: {recorded:?}"
+        );
+    }
 }
