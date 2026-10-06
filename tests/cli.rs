@@ -4907,3 +4907,119 @@ fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
         payload_of("keep")
     );
 }
+
+/// `--set` names a set on a `lepatch serve`. Without `--remote` there is no
+/// server to name one on, so the flag is refused rather than discarded.
+///
+/// **It used to be discarded.** `requested_push` returned early when `--remote`
+/// was absent, without looking at `--set` at all, so
+/// `lepatch backup SRC SNAP --set docs` backed up to `SNAP`, said nothing about
+/// `docs`, and exited 0. A user who typed the set they wanted was told by their
+/// exit code that they had got it -- which is the same class of silent lie as
+/// the progress events that reached nobody and the job that reported success
+/// having failed.
+///
+/// All three push commands share `requested_push`, so one test each: a fix that
+/// closed only `backup` would leave the other two discarding the flag.
+#[test]
+fn a_set_named_without_a_server_to_name_it_on_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    build_tree(dir);
+
+    // A destination that does not exist, so a run that got past the refusal
+    // would fail later for a different reason and the message would be wrong.
+    let missing = dir.join("no-such-store");
+
+    for (command, args) in [
+        ("backup", vec!["src", "snap", "--set", "docs"]),
+        ("pack", vec!["snap", "out.pack", "--set", "docs"]),
+        (
+            "merge",
+            vec!["out.pack", &missing.display().to_string(), "--set", "docs"],
+        ),
+    ] {
+        let mut all = vec![command];
+        all.extend(args.iter().copied());
+        let stderr = fails(dir, &all);
+
+        assert!(
+            stderr.contains("--set") && stderr.contains("--remote"),
+            "`lepatch {command} --set` without `--remote` must name both the flag it was given \
+             and the one it needed; stderr was: {stderr}"
+        );
+
+        // The refusal has to be about the flag, not about the path that follows
+        // it. A run that complained about `no-such-store` would have got past
+        // this check.
+        if command == "merge" {
+            assert!(
+                !stderr.contains("no-such-store"),
+                "`merge` refused for the wrong reason -- about the destination rather than about \
+                 `--set`: {stderr}"
+            );
+        }
+    }
+}
+
+/// The same refusal, on the two read commands, which resolve through
+/// `requested_set` rather than `requested_push`. Named here so the two
+/// spellings are one rule with one test each rather than one rule tested once.
+#[test]
+fn a_set_named_without_a_server_is_refused_by_the_read_commands_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    build_tree(dir);
+    let missing = dir.join("no-such-dest");
+    let _ = &missing;
+
+    // Only `--set`, and no NAME beside it: on both of these `name` is optional,
+    // so the flag can stand alone, and passing both is the `conflicts_with`
+    // refusal rather than the one this test is about.
+    for command in ["restore", "versions"] {
+        let args: Vec<&str> = if command == "restore" {
+            vec![command, "out", "--set", "docs"]
+        } else {
+            vec![command, "--set", "docs"]
+        };
+        let stderr = fails(dir, &args);
+        assert!(
+            stderr.contains("--set") && stderr.contains("--remote"),
+            "`lepatch {command} --set` without `--remote` must say what it wanted and what it \
+             needed; stderr was: {stderr}"
+        );
+    }
+}
+
+/// And the flag still works when there IS a server, so the refusal above cannot
+/// be satisfied by breaking `--set` outright.
+#[test]
+fn a_set_named_with_a_server_is_not_refused() {
+    // Clap is what decides this one, and it decides it before any filesystem is
+    // touched, so an address nothing is listening on is enough: the run must
+    // get as far as trying to connect, which is a different failure entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    build_tree(dir);
+
+    // `--set` alone, because naming the set twice is `conflicts_with` and would
+    // be a different refusal than the one guarded here.
+    let output = lepatch(
+        dir,
+        &[
+            "versions",
+            "--remote",
+            "http://127.0.0.1:1",
+            "--set",
+            "docs",
+        ],
+    );
+    let stderr = stderr(&output);
+
+    // `--set` with `NAME` is refused by `conflicts_with`, so the same spelling
+    // twice cannot be what we are testing here.
+    assert!(
+        !stderr.contains("cannot be used with"),
+        "naming the set twice should be the parser's conflict, not a connection failure: {stderr}"
+    );
+}

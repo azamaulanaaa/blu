@@ -2658,6 +2658,25 @@ fn requested_push(
     command: &str,
 ) -> std::io::Result<Option<Push>> {
     let Some(address) = remote else {
+        // `--set` names a set on a `lepatch serve`, and this run has no
+        // `--remote` to name that server on. It used to return here, which
+        // silently discarded the flag: `lepatch backup s snap --set docs` backed
+        // up to `snap`, said nothing, and exited 0. A user who typed the set they
+        // wanted was told by their exit code that they had got it.
+        //
+        // Refused for the same reason `requested_set` refuses it, and with the
+        // same words, so the two spellings are one rule rather than two.
+        if set.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run has \
+                     no `--remote` to name that server on. A set on this machine is a path, so pass \
+                     it as the destination path instead"
+                ),
+            ));
+        }
+
         return Ok(None);
     };
 
