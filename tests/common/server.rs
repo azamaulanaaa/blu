@@ -21,11 +21,19 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::io::Write as _;
+
 use std::{
     io::{BufRead, BufReader},
-    net::SocketAddr,
+    net::{SocketAddr, TcpListener},
     path::Path,
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 /// A running server, killed when this is dropped.
@@ -143,5 +151,112 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A socket that answers every request with one fixed response.
+///
+/// ## Why this exists
+///
+/// **A client has to be tested against a server that has changed, and this
+/// build cannot produce one.** The shape `lepatch versions --remote` reads is
+/// the shape `lepatch serve` writes, so every response the real server can send
+/// is a response the client understands — and a parser that read permissively
+/// would pass against it forever. The only way to ask what a client does with
+/// an answer it does not understand is to answer with one.
+///
+/// So this is not a `lepatch serve` and does not pretend to be: it reads a
+/// request head, ignores what it says, and writes back bytes the test wrote
+/// down. Enough HTTP/1.1 to satisfy `awc`, and nothing else — no `Server` above
+/// has a second path through this file because only the remote tests need it.
+pub(crate) struct Stub {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+}
+
+impl Stub {
+    /// Answer every request `200 OK` with `body`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a loopback port cannot be bound. Nothing is left to assert
+    /// about if it cannot be.
+    pub(crate) fn answering_200(body: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port for the stub");
+        let address = listener.local_addr().expect("the stub's own address");
+
+        // Non-blocking rather than a shutdown channel: the thread has one job and
+        // no state, so polling a flag is less machinery than a second socket
+        // whose only purpose is to unblock `accept`.
+        listener
+            .set_nonblocking(true)
+            .expect("the stub's accept to be non-blocking");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&stop);
+
+        // Built here rather than in the thread, so the body is owned by the
+        // closure and the spawn does not need it to be `&'static str`. A test's
+        // body is a literal, but saying so in the signature would be a promise
+        // about the caller rather than a fact about this type.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        thread::spawn(move || {
+            while !finished.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        read_head(&mut stream);
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        Self { address, stop }
+    }
+
+    /// Where it is listening.
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for Stub {
+    /// Stop answering.
+    ///
+    /// The port is released when the thread returns and drops the listener, and
+    /// the flag is what makes it return. Bounded by the poll interval rather
+    /// than joined, because nothing a test asserts on depends on the thread
+    /// having stopped by the time the next line runs.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Read a request head and throw it away.
+///
+/// Read rather than ignored, because a client writing a request into a socket
+/// nobody is reading gets `EPIPE` on some platforms and a short write on
+/// others — either of which would make this stub test the client's write
+/// rather than its parse.
+fn read_head(stream: &mut std::net::TcpStream) {
+    use std::io::Read as _;
+
+    let mut seen = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !seen.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => seen.push(byte[0]),
+        }
     }
 }

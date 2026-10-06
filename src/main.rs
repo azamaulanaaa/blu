@@ -175,12 +175,32 @@ enum Command {
     /// The count is a lower bound: a version whose index file was never written
     /// still exists and still restores, so this can under-report and never
     /// over-reports.
+    ///
+    /// **The same listing is printed whether the set is local or remote.** With
+    /// `--remote` the set lives on a `lepatch serve` and nothing is read from
+    /// disk, but the lines are the same lines: `{version}  {snapshot}`, or just
+    /// `{version}` under `--numbers-only`. A script written against a local set
+    /// works unchanged against a remote one.
     Versions {
         /// Base path of the backup set to inspect.
+        ///
+        /// With `--remote`, the *name* of the set on that server rather than a
+        /// path to one: `docs`, not `backups/docs`.
         name: std::path::PathBuf,
         /// Print just the version numbers, one per line, and nothing else.
         #[arg(long)]
         numbers_only: bool,
+        /// List a set held by a `lepatch serve`, at this address, over HTTP.
+        ///
+        /// The address is the one the server printed on its first line, which is
+        /// why that line goes to stdout. `http://` only: this client has no TLS
+        /// and `lepatch serve` offers none, so an `https://` address is refused
+        /// rather than quietly downgraded.
+        ///
+        /// A set the server does not hold is an error carrying the server's own
+        /// sentence, exactly as a mistyped local path is.
+        #[arg(long, value_name = "URL")]
+        remote: Option<String>,
     },
     /// Serve the backup sets under a directory over HTTP.
     ///
@@ -710,7 +730,14 @@ async fn dispatch(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Resu
             dry_run,
         } => run_merge(&pack, &name, compression, dry_run).await,
         Command::Reindex { name, dry_run } => run_reindex(&name, dry_run).await,
-        Command::Versions { name, numbers_only } => run_versions(&name, numbers_only).await,
+        Command::Versions {
+            name,
+            numbers_only,
+            remote,
+        } => match remote {
+            Some(address) => run_versions_remote(&name, numbers_only, &address).await,
+            None => run_versions(&name, numbers_only).await,
+        },
         Command::Serve {
             root,
             bind,
@@ -957,11 +984,57 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
             continue;
         };
 
-        if numbers_only {
-            say!("{version}")?;
-        } else {
-            say!("{version}  {}", &snapshot)?;
-        }
+        print_version(version, &snapshot, numbers_only)?;
+    }
+
+    Ok(())
+}
+
+/// One line of a version listing, on whichever side the set is.
+///
+/// **One function, so the two listings cannot drift.** `--remote` prints through
+/// this and prints nothing else, which is what makes a script that reads a local
+/// set work unchanged against a remote one: same fields in the same order, the
+/// same two-space separator, the same `say!` and so the same broken-pipe
+/// behaviour. A second formatting path would be a difference nothing tests until
+/// a script meets it.
+fn print_version(
+    version: u32,
+    snapshot: &storage::BlobId,
+    numbers_only: bool,
+) -> std::io::Result<()> {
+    if numbers_only {
+        say!("{version}")
+    } else {
+        say!("{version}  {snapshot}")
+    }
+}
+
+/// List a set held by a `lepatch serve`, printing exactly what a local listing
+/// of the same set would.
+///
+/// The fetch is [`lepatch::client::Remote`]'s. Everything here is deciding which
+/// text is a set name — the positional NAME is a name on the server, not a path
+/// on this machine — and printing what came back.
+async fn run_versions_remote(
+    name: &std::path::Path,
+    numbers_only: bool,
+    address: &str,
+) -> std::io::Result<()> {
+    let Some(set) = name.to_str() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a name this client can send: a set on a server is named by text",
+                name.display()
+            ),
+        ));
+    };
+
+    let remote = lepatch::client::Remote::new(address)?;
+
+    for listed in remote.versions(set).await? {
+        print_version(listed.version, &listed.snapshot, numbers_only)?;
     }
 
     Ok(())

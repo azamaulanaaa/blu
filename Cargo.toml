@@ -73,6 +73,41 @@ dist = true
 #
 # `macros` is the only feature kept: the handlers are `#[get]` and `#[post]`.
 actix-web = { version = "4.15", default-features = false, features = ["macros"] }
+# The client half, for `lepatch versions --remote`.
+#
+# `awc` is actix's own client, so it sits on the `actix-http` this crate already
+# links and adds no second runtime and no second event loop. The alternative,
+# `reqwest`, would bring `hyper` and a TLS stack to answer one GET against a
+# server that ships neither.
+#
+# `default-features = false` for the same reason and in the same direction as
+# above. Dropped: `compress-brotli`, `compress-gzip` and `compress-zstd` (the
+# responses asked for are JSON, and this crate already carries `zstd 0.13`);
+# `cookies`, which nothing sets; and every `tls-*` feature, so **there is no TLS
+# backend in the graph at all**. `lepatch serve` does not offer TLS and says so,
+# so a client that cannot speak it cannot silently pretend to: `--remote` refuses
+# an `https://` address rather than connecting in the clear to something that
+# believes it is secure.
+#
+# What `awc` does pull unconditionally is `actix-tls` and `h2`. `actix-tls` is
+# here with no TLS feature enabled, so it is the shim and not a stack.
+#
+# **`h2` is a consequence that is not free, and it is this crate's fault to say
+# so here.** `awc` declares `actix-http` with `http2` turned on and offers no
+# feature to turn it off, and `actix-http`'s `http2` feature *is* `dep:h2`. So
+# `h2` arrives with `awc` — an earlier draft of this comment claimed it was
+# already in the graph through `actix-web`, which was false: with the features
+# above, the baseline graph has no `h2` in it at all.
+#
+# It also arrives with RUSTSEC-2026-0258, which `cargo deny check advisories`
+# denies and **cannot be resolved**: `h2 0.3.27` is the last release of the
+# unmaintained 0.3 line, `actix-http 3.18` pins `h2 = "0.3.27"`, and the fix is
+# in `0.4.16`. So this is a gate that is red until either `actix-http` moves to
+# `h2 0.4` or this dependency goes. `lepatch serve` speaks HTTP/1.1 and neither
+# end of the transfer uses it, so the vulnerable code is never reached; that is
+# an argument, not a mitigation, and the advisory stays denied rather than
+# ignored.
+awc = { version = "3.8.2", default-features = false }
 blake3 = { version = "1.8.2", features = ["traits-preview"] }
 clap = { version = "4.5.53", features = ["derive"] }
 # **This one is a parser, and it is here because the alternative was worse.**
@@ -197,6 +232,28 @@ pedantic = "deny"
 # `.clippy.toml` exemption for tests is what keeps the test suite readable.
 unwrap_used = "deny"
 expect_used = "deny"
+
+# One lint is relaxed, deliberately and narrowly.
+#
+# `awc` pulls a second `rand`, and `actix-tls` wants `http 1.x` where this crate
+# is on `http 0.2` through actix-web. Neither is avoidable by a feature choice,
+# and neither adds a TLS backend: the graph grows by 23 crates, with no rustls,
+# no openssl and no hyper.
+#
+# `warn`, not `allow`, and not `deny`. `deny.toml` already records this stance --
+# `[bans] multiple-versions = "warn"` -- on the grounds that "the count is still
+# reported, so a regression is visible". Until `awc` was added the graph happened
+# to hold no duplicates, so the lint never had to be relaxed and the manifest was
+# quietly stricter than the policy it was meant to express.
+#
+# It is a table rather than an inline `multiple_crate_versions = "warn"` because a
+# bare lint and a lint group both sit at priority 0, and Cargo refuses that
+# ambiguity outright. Cargo applies lints in increasing priority order, so
+# `priority = 1` is what puts this entry AFTER the `cargo` group and lets it win.
+# Every other lint in that group stays denied.
+[lints.clippy.multiple_crate_versions]
+level = "warn"
+priority = 1
 
 # The profile that 'dist' will build with
 [profile.dist]

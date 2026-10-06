@@ -947,6 +947,56 @@ $ curl -sS -H 'range: bytes=0-' localhost:8480/v1/packs/docs@3 > docs.pack
 $ lepatch merge docs.pack mirror
 ```
 
+**`lepatch versions --remote` is the one thing here with no `curl` in it.**
+Both flows above are `curl` because they move packs, and this is the question
+you ask before either of them — *what does that server actually hold?* — so it
+is a subcommand rather than an example to paste:
+
+```console
+$ lepatch versions docs --remote http://127.0.0.1:8480
+1  1976fecc6c84aaa9053093fdd22c4289d45014439b13d3fb84b9248f20863f5e
+2  245b2b54d4d91a0a90a2a95ca9bf2e83ffc3b2cc5bcfa95f8ba7caaf60e51ec0
+```
+
+**It prints the same lines a local set prints, and that is the whole feature.**
+Not the same versions — the same *bytes*: same fields, same order, same
+two-space separator, `--numbers-only` and all. So a script written against a
+local set works unchanged against a remote one, and the only difference on the
+command line is the flag:
+
+```console
+$ lepatch versions ~/backups/docs
+$ lepatch versions docs --remote http://127.0.0.1:8480        # identical output
+```
+
+Two things follow from that, and both are refusals rather than behaviours. The
+argument is the set's **name** on that server, not a path to one, so it is
+`docs` and never `backups/docs`. And a set the server does not hold is an
+error carrying **the server's own sentence** — the same `no backup set at …` a
+mistyped local path produces, because the server does not translate its errors
+and this client does not paraphrase them:
+
+```console
+$ lepatch versions nosuch --remote http://127.0.0.1:8480
+error: no backup set at /srv/backups/nosuch (looked in /srv/backups)
+```
+
+**`--remote` refuses `https://`.** There is no TLS backend in the dependency
+graph — `awc` is built with every TLS feature off, and `lepatch serve` offers
+no TLS either — so an `https://` address is refused by name rather than
+downgraded to a connection in the clear to something that believes it is
+secure. A server you have put a terminator in front of is addressed through
+that terminator, over `http://`, exactly as it is for `curl`.
+
+**An answer this client cannot read is an error, never an empty listing.**
+A server that renamed `versions`, or an entry that lost its `snapshot`, would
+answer `200` with something this parser does not understand; read permissively
+that prints nothing and exits 0, and a script reading that believes the set is
+empty — which is a claim, and the wrong one. So every field is asked for by
+name and its type checked, and the failure names the address whose answer
+could not be read. `{"versions":[]}` is not that case: an empty list is a thing
+a server can say, and it is printed as one.
+
 **A client that already holds some of the chunks fetches only the rest.** It asks
 what it needs, gets byte ranges rather than a whole file, writes each at its
 offset into a sparse file, and opens the result with `Pack::open` exactly as it

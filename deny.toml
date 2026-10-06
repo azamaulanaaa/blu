@@ -72,8 +72,6 @@ version = 2
 # stricter than a warn default on purpose.
 yanked = "deny"
 
-# Nothing is ignored.
-#
 # RUSTSEC-2025-0141 used to be here: the bincode team ceased development
 # permanently after a doxxing incident, so 1.3.3 was unmaintained with no fix
 # coming. Moving to bincode 2 did not clear it — the advisory covers the whole
@@ -83,7 +81,25 @@ yanked = "deny"
 # tool that has to keep working, and it should not be at the mercy of somebody
 # else's policy. The snapshot layout is now at `FORMAT_VERSION` 3; the version
 # number lives in `src/metadata.rs`, not here.
-ignore = []
+#
+# RUSTSEC-2026-0258 (Low), an HPACK-header flood in `h2` 0.3.x. It is here because
+# `awc`, the client behind `lepatch versions --remote`, enables `actix-http`'s
+# `http2` feature and offers no feature to turn it off; `actix-http` 3.18 pins
+# `h2 = "0.3.27"`, and the fix exists only in 0.4.x. So this cannot be upgraded
+# away, only designed around.
+#
+# **The vulnerable code is not reachable, and that is the whole argument.**
+# `lepatch serve` speaks HTTP/1.1 and nothing else: it offers no TLS, so there is
+# no ALPN to negotiate over, and the client asks for HTTP/1.1. `h2` is compiled
+# into the binary and never spoken. That is an argument and not a guarantee,
+# which is why it is written down here instead of being left in a commit message
+# somebody will have to rediscover.
+#
+# This is the one entry in this file, so the ignore is scoped to this single id
+# and every other advisory still gates. Revisit when `actix-http` moves to `h2`
+# 0.4; at that point this entry should be deleted, and `cargo deny check
+# advisories` will say so if it is not.
+ignore = [{ id = "RUSTSEC-2026-0258" }]
 
 [sources]
 # Denied rather than warned. The lockfile is what makes a build reproducible, so
