@@ -472,6 +472,12 @@ pub fn installed() -> bool {
 /// exits without a flush discards everything it measured with no error and a
 /// successful exit code.
 ///
+/// **And that claim is tested against a socket, not against this function:**
+/// `a_metric_survives_a_successful_run` in `tests/telemetry.rs` runs the binary
+/// to completion with a collector listening and reads an instrument name out of
+/// the bytes that arrive on `/v1/metrics`. With this call removed from
+/// [`super::shutdown`], that test fails and nothing else in the crate notices.
+///
 /// # Errors
 ///
 /// Returns an error if the SDK could not flush or could not stop. **Reported

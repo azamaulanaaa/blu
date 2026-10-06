@@ -288,6 +288,42 @@ async fn push_with(
     await_job(server, &job).await
 }
 
+/// A pack of a fresh tree, in its own subdirectory of `dir`.
+///
+/// **Two calls give two versions.** A second push of the *same* pack merges as
+/// `already` and publishes nothing, and a test about what a listing omits needs
+/// a merge that really adds a version.
+async fn pack_of(dir: &Path, tag: &str, files: usize) -> PathBuf {
+    let source = tree(&dir.join(tag), files, 20_000);
+    let blob = dir.join(format!("{tag}-local"));
+    backup(&source, &blob).await;
+
+    let at = dir.join(format!("{tag}.pack"));
+    pack(&blob, &at).await;
+    at
+}
+
+/// The version numbers a listing returns, oldest first.
+///
+/// Parsed out of the wire shape rather than the body as a string, so a listing
+/// that drops a version fails as a missing number and not as a formatting
+/// difference nobody was looking for.
+async fn listed_versions(server: &Server, spelling: &str) -> Vec<u64> {
+    let listed = Request::new("GET", &format!("/v1/sets/{spelling}/versions"))
+        .send(server.address())
+        .await;
+
+    assert_eq!(listed.status, 200, "body: {}", listed.text());
+
+    let parsed: serde_json::Value = serde_json::from_slice(&listed.body).unwrap();
+    parsed["versions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no versions in {}", listed.text()))
+        .iter()
+        .map(|entry| entry["version"].as_u64().unwrap())
+        .collect()
+}
+
 /// How long the replay read waits for bytes before calling the stream quiet.
 ///
 /// The replay is written when the response starts, so the stream goes quiet
@@ -541,6 +577,131 @@ async fn a_push_lands_in_the_set_and_a_listing_sees_it_immediately() {
         .await;
     assert_eq!(info.status, 200, "body: {}", info.text());
     assert_eq!(info.field("pack").unwrap(), serde_json::json!("docs@1"));
+}
+
+#[tokio::test]
+async fn a_merge_into_a_base_is_visible_through_its_segment_name() {
+    // **One store, one key, and the harm is a missing version.**
+    //
+    // `docs.0000.bin` is a spelling of `docs` — `IndexSet` cuts the tail, and
+    // the store's files are named from the base either way. The registry keyed
+    // its read cache by the name as it arrived, so it held two entries for one
+    // store: a listing through the segment spelling cached a handle, the merge
+    // through the base evicted only the base's entry, and the next listing
+    // through the segment spelling answered from a `contents` map built before
+    // the commit. Its version *numbers* came fresh off the index files and the
+    // new one would not resolve against that stale map — so it was **skipped**,
+    // and the server reported a set that had just lost a version.
+    //
+    // The order matters and is the point: the segment spelling is read once
+    // before the merge, so the cache entry the merge fails to drop really is
+    // there.
+    let dir = tempfile::tempdir().unwrap();
+    let first = pack_of(dir.path(), "first", 4).await;
+    let second = pack_of(dir.path(), "second", 5).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    assert_eq!(
+        push(&server, "docs", &first).await["version"],
+        serde_json::json!(1)
+    );
+    assert_eq!(listed_versions(&server, "docs.0000.bin").await, vec![1]);
+
+    // The merge that publishes version 2, under the *base* while the cached
+    // handle is under the segment's spelling of it.
+    assert_eq!(
+        push(&server, "docs", &second).await["version"],
+        serde_json::json!(2)
+    );
+
+    assert_eq!(
+        listed_versions(&server, "docs.0000.bin").await,
+        vec![1, 2],
+        "the version this merge published must be listed under both spellings"
+    );
+    assert_eq!(listed_versions(&server, "docs").await, vec![1, 2]);
+
+    // And it resolves, which is the check the omission above hid behind: the
+    // figures come through the store, so a version that cannot be resolved is
+    // skipped rather than named.
+    let info = Request::new("GET", "/v1/sets/docs.0000.bin/versions/2")
+        .send(server.address())
+        .await;
+    assert_eq!(info.status, 200, "body: {}", info.text());
+}
+
+#[tokio::test]
+async fn a_merge_into_a_segment_name_is_visible_through_its_base() {
+    // The other direction, which fails for the same reason and would not be
+    // caught by the test above: the eviction looked up the name the merge used
+    // and the cache was keyed by the other spelling, so the entry the merge
+    // needed to drop is not the entry it dropped.
+    let dir = tempfile::tempdir().unwrap();
+    let first = pack_of(dir.path(), "first", 4).await;
+    let second = pack_of(dir.path(), "second", 5).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    assert_eq!(
+        push(&server, "notes.0000.bin", &first).await["version"],
+        serde_json::json!(1)
+    );
+    assert_eq!(listed_versions(&server, "notes").await, vec![1]);
+
+    assert_eq!(
+        push(&server, "notes.0000.bin", &second).await["version"],
+        serde_json::json!(2)
+    );
+
+    assert_eq!(
+        listed_versions(&server, "notes").await,
+        vec![1, 2],
+        "the version this merge published must be listed under both spellings"
+    );
+    assert_eq!(listed_versions(&server, "notes.0000.bin").await, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn the_set_listing_names_a_set_once_and_by_its_base() {
+    // The registry agreeing with itself. `Sets::list` already deduplicated the
+    // two spellings into one entry, and that entry is the *base* — so a name a
+    // request may use is not always the name the listing prints, and a client
+    // that took the listing's names as the only names that work would be right
+    // about `docs` and wrong about `docs.0000.bin` in the only way that shows
+    // up as a stale answer later.
+    let dir = tempfile::tempdir().unwrap();
+    let pack_path = pack_of(dir.path(), "first", 4).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    assert_eq!(
+        push(&server, "docs.0000.bin", &pack_path).await["version"],
+        serde_json::json!(1)
+    );
+
+    let listed = Request::new("GET", "/v1/sets").send(server.address()).await;
+    assert_eq!(listed.status, 200, "body: {}", listed.text());
+
+    let sets = serde_json::from_slice::<serde_json::Value>(&listed.body).unwrap();
+    let names: Vec<&str> = sets["sets"]
+        .as_array()
+        .expect("a sets array")
+        .iter()
+        .map(|set| set["name"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(
+        names,
+        vec!["docs"],
+        "one set, named by its base: {listed:?}"
+    );
 }
 
 #[tokio::test]

@@ -47,6 +47,14 @@
 //! — first half before the flush, second after it. That is the defect this
 //! section is about.
 //!
+//! **And both signals are held down at the level that decides it: a collector,
+//! in a real process, after that process has exited.** `tests/telemetry.rs` runs
+//! the binary to completion against a socket and reads the bytes that arrive —
+//! `a_span_survives_a_successful_run` for the tracer and
+//! `a_metric_survives_a_successful_run` for the meter. Deleting either
+//! `force_flush` below or the `metrics::shutdown()` beside it fails one of them,
+//! which is the only reason to believe either sentence of this section.
+//!
 //! # What is not here
 //!
 //! * **This module does not read an inbound `traceparent`.** The W3C

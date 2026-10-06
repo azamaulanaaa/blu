@@ -27,8 +27,24 @@
 //!
 //! [`Sets::evict`] is therefore called when a merge finishes. That is the one
 //! place in this file where a missing call is a wrong answer rather than a slow
-//! one, so `tests/serve_push.rs` pushes and then immediately lists on the same
+//! one, so `tests/serve.rs` pushes and then immediately lists on the same
 //! server.
+//!
+//! ## One store, one key
+//!
+//! **`docs` and `docs.0000.bin` are one set, and this registry keys them as
+//! one.** [`layout::IndexSet`] cuts a segment tail off a base before anything
+//! opens a store, so both spellings resolve to the same directory — and a
+//! registry that keyed its locks and its read cache by the *raw* name would hold
+//! two entries for one store. A merge through one spelling then evicted one
+//! cache entry and left the other holding a `BlobStore` whose `contents` map
+//! predated the commit, so a listing through that spelling read its version
+//! numbers fresh off disk, failed to resolve the newest one against the stale
+//! map, **skipped it**, and reported a set that had just lost a version.
+//!
+//! So [`Sets::base`] normalises, once, at the boundary, and every key this
+//! registry keeps is derived from what it returns. `tests/serve.rs` merges and
+//! then lists through both spellings, in both orders.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -73,6 +89,20 @@ impl Sets {
     }
 
     /// The set's base path, from a name off the wire.
+    ///
+    /// **The name is normalised here, once.** `docs.0000.bin` is a spelling of
+    /// `docs`, and it resolves to the same path — through
+    /// [`IndexSet::new`], which is what every other part of the crate does with
+    /// a set's name, and through [`Sets::list`], which already lists the base and
+    /// not the segment file beside it. Accepting the tail rather than refusing
+    /// it is the same trade [`IndexSet::new`] records: `photos.0000.bin` is the
+    /// name a directory listing shows and a person copies, so it has to work
+    /// wherever a set is named. The cost is that a set genuinely named
+    /// `report.2024.bin` cannot be addressed, which is the cost the CLI already
+    /// pays for the same name.
+    ///
+    /// Every key in this registry comes from what this returns, so both
+    /// spellings share one write lock and one cache entry. See the module docs.
     ///
     /// # Errors
     ///
@@ -121,7 +151,44 @@ impl Sets {
             ));
         }
 
-        Ok(base)
+        // The one normaliser, and the only place this crate asks for one. A name
+        // shaped like one of the set's own segments is unwrapped here, so what
+        // leaves this function is the set rather than a spelling of it.
+        Ok(IndexSet::new(base).base().to_path_buf())
+    }
+
+    /// The registry's key for `name`, and the base path it resolves to.
+    ///
+    /// **The key is the base's own file name, never the name as it arrived.**
+    /// `docs` and `docs.0000.bin` are one store on disk, so they have to be one
+    /// entry in the lock map and one entry in the read cache. Keyed by the raw
+    /// name they were two of each, and the second merge into one spelling
+    /// invalidated one cache entry and left the other serving a `contents` map
+    /// built before the commit — which is how a listing came to omit the version
+    /// that had just been published.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Sets::base`] returns, plus an error for a base whose
+    /// last component is not a UTF-8 name. A name off the wire is a `&str`, and
+    /// normalising only ever cuts a tail off the end of one, so that arm is a
+    /// shape this function cannot produce; it is here because this function
+    /// returns a `String` and the conversion has to be a checked one.
+    fn resolve(&self, name: &str) -> io::Result<(String, PathBuf)> {
+        let base = self.base(name)?;
+
+        let key = base
+            .file_name()
+            .and_then(|key| key.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidFilename,
+                    format!("{name:?} does not name a set this registry can key"),
+                )
+            })?;
+
+        Ok((key, base))
     }
 
     /// The sets under the root, with what each one holds.
@@ -205,13 +272,15 @@ impl Sets {
     /// be opened — which includes a name that names nothing, and a set that is
     /// damaged.
     pub async fn reader(&self, name: &str) -> io::Result<Arc<BlobStore<Read, Compression>>> {
-        let key = name.to_string();
+        // Resolved before the lookup, so a name the registry would refuse is
+        // refused rather than half-served, and so the key it caches under is the
+        // set rather than a spelling of it.
+        let (key, base) = self.resolve(name)?;
 
         if let Some(existing) = Self::locked(&self.reads, "reader")?.get(&key).cloned() {
             return Ok(existing);
         }
 
-        let base = self.base(name)?;
         let store = Arc::new(BlobStore::open_for_reading(base).await?);
 
         let mut map = Self::locked(&self.reads, "reader")?;
@@ -269,11 +338,11 @@ impl Sets {
         F: FnOnce(Arc<BlobStore<Write, Compression>>) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
-        let base = self.base(name)?;
+        let (key, base) = self.resolve(name)?;
 
         let entry = {
             let mut map = Self::locked(&self.writes, "writing")?;
-            map.entry(name.to_string())
+            map.entry(key)
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()
         };
@@ -296,9 +365,23 @@ impl Sets {
     /// served from the cache would answer from a `contents` map built before the
     /// push, and would omit the version the push created — a wrong answer, not a
     /// slow one.
+    ///
+    /// **The name is resolved the same way [`Sets::reader`] keys it**, so a merge
+    /// through `docs.0000.bin` drops the entry a listing through `docs` reads.
+    /// Evicting by the name as it arrived is what left a stale store behind the
+    /// first time: the entry existed under both spellings and only one of them
+    /// was dropped.
+    ///
+    /// A name that resolves to nothing is not an error here. This is called
+    /// after the merge has already succeeded, so there is nothing left to fail
+    /// and no set for the caller to be told about.
     pub fn evict(&self, name: &str) {
+        let Ok((key, _)) = self.resolve(name) else {
+            return;
+        };
+
         if let Ok(mut map) = self.reads.lock() {
-            map.remove(name);
+            map.remove(&key);
         }
     }
 
@@ -339,9 +422,43 @@ mod tests {
             sets.base("docs.tar").unwrap(),
             Path::new("/srv/sets/docs.tar")
         );
+        // A dot is ordinary; four digits and `.bin` after it is a segment file,
+        // and that is a spelling of a base rather than a base of its own.
         assert_eq!(
-            sets.base("v2.0000.bin").unwrap(),
-            Path::new("/srv/sets/v2.0000.bin")
+            sets.base("docs.0000.bin").unwrap(),
+            Path::new("/srv/sets/docs")
+        );
+        // Including one that names nothing on disk, because the tail is cut on
+        // shape. A set that does not exist yet resolves like one that does.
+        assert_eq!(sets.base("v2.0000.bin").unwrap(), Path::new("/srv/sets/v2"));
+    }
+
+    #[test]
+    fn both_spellings_of_a_set_are_one_store_and_one_key() {
+        // **The defect this file's second half is about.** `docs` and
+        // `docs.0000.bin` are one directory, so a registry that keyed by the name
+        // as it arrived held two write locks and two read handles onto it — and a
+        // merge through one evicted one of the two. The listing then answered
+        // from a `contents` map built before the commit and omitted the version
+        // the merge had just published.
+        let sets = registry();
+
+        assert_eq!(
+            sets.resolve("docs").unwrap(),
+            sets.resolve("docs.0000.bin").unwrap()
+        );
+
+        // And the segment's own number makes no difference to the identity,
+        // since no store has more than one segment zero.
+        assert_eq!(
+            sets.resolve("docs.0012.bin").unwrap(),
+            sets.resolve("docs").unwrap()
+        );
+
+        // A name that is not shaped like a segment keeps its own identity.
+        assert_ne!(
+            sets.resolve("docs.tar").unwrap().0,
+            sets.resolve("docs").unwrap().0
         );
     }
 
