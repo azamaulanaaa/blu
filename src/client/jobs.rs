@@ -89,6 +89,12 @@ pub enum MergeCompression {
     Keep,
     /// A zstd level from `0` to [`MAX_COMPRESSION_LEVEL`], and the server
     /// re-encodes every chunk under it.
+    ///
+    /// **The level reaches the server's set, not just its answer.** A server
+    /// merges by opening the receiving set under a write policy, so this is the
+    /// level those records are written at; `0` stores each payload as it is.
+    /// The levels a merge can actually use are the ones the server can open a
+    /// store at, which is what `checked` refuses outside.
     Reencode(u8),
 }
 

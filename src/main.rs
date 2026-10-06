@@ -233,7 +233,9 @@ enum Command {
         ///
         /// `--compression` is the server's, in the same vocabulary: `keep`
         /// stores each chunk as the pack carries it and a level asks the server to
-        /// re-encode it.
+        /// re-encode it. The server opens the set at that level, so the level is
+        /// what the re-encoded records are written at rather than the server's
+        /// default.
         ///
         /// A pack the set already holds is reported as already merged, naming the
         /// version that holds it, exactly as a local merge reports it. A job that

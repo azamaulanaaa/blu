@@ -104,6 +104,50 @@ fn tree(dir: &Path, files: usize, size: usize) -> PathBuf {
     source
 }
 
+/// A source tree a compressor can shrink, for a test about *which* level wrote it.
+///
+/// **`tree` is the wrong fixture here, and deliberately so.** `common::noisy` is
+/// BLAKE3 output, which has no structure for a compressor to find, so a frame at
+/// any level comes back larger than the input and the store's own fallback stores
+/// the bytes raw. Every level would then produce the same set, and a test built
+/// on it would pass against a server that ignored the level entirely — which is
+/// the bug.
+///
+/// So the content is text. Words from a small vocabulary, in a deterministic order
+/// that differs per file, so nothing deduplicates away and every level has
+/// something real to disagree about.
+fn compressible_tree(dir: &Path, files: usize, size: usize) -> PathBuf {
+    const WORDS: [&str; 12] = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima",
+    ];
+
+    let source = common::source(dir);
+
+    for file in 0..files {
+        // A splitmix64 finaliser, so the words are the same on every run without
+        // being the same file. Starting from the file's number is what keeps
+        // file `i` from being a prefix of file `i + 1`.
+        let mut state = u64::try_from(file).unwrap_or(0).wrapping_add(1);
+        let mut text = String::with_capacity(size * 2);
+
+        while text.len() < size {
+            state = state.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            state ^= state >> 30;
+            state = state.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            state ^= state >> 27;
+
+            let word = usize::try_from(state >> 33).unwrap_or(0) % WORDS.len();
+            text.push_str(WORDS[word]);
+            text.push(' ');
+        }
+
+        fs::write(source.join(format!("f{file}.txt")), text).unwrap();
+    }
+
+    source
+}
+
 /// Back a tree up into a set at `blob`, and return the set.
 async fn backup(source: &Path, blob: &Path) -> lepatch::storage::BlobId {
     let storage = BlobStore::open_for_writing(
@@ -194,6 +238,19 @@ async fn await_job(server: &Server, job: &str) -> serde_json::Value {
 
 /// Upload a pack and merge it into `set`, returning the merge's result.
 async fn push(server: &Server, set: &str, pack_path: &Path) -> serde_json::Value {
+    push_with(server, set, pack_path, None).await
+}
+
+/// Upload a pack and merge it into `set` under `compression`.
+///
+/// `None` leaves the field out, which is the server's own default rather than a
+/// spelling of it, so a test that is not about the flag does not pin one.
+async fn push_with(
+    server: &Server,
+    set: &str,
+    pack_path: &Path,
+    compression: Option<&str>,
+) -> serde_json::Value {
     let begin = Request::new("POST", "/v1/uploads")
         .send(server.address())
         .await;
@@ -217,13 +274,14 @@ async fn push(server: &Server, set: &str, pack_path: &Path) -> serde_json::Value
         .await;
     assert_eq!(commit.status, 200, "body: {}", commit.text());
 
-    let accepted = Request::json(
-        "POST",
-        &format!("/v1/sets/{set}/merges"),
-        &serde_json::json!({ "upload": upload }),
-    )
-    .send(server.address())
-    .await;
+    let mut body = serde_json::json!({ "upload": upload });
+    if let Some(compression) = compression {
+        body["compression"] = serde_json::json!(compression);
+    }
+
+    let accepted = Request::json("POST", &format!("/v1/sets/{set}/merges"), &body)
+        .send(server.address())
+        .await;
     assert_eq!(accepted.status, 202, "body: {}", accepted.text());
 
     let job = accepted.field("job").unwrap().as_str().unwrap().to_string();
@@ -1062,6 +1120,92 @@ async fn a_compression_policy_that_cannot_be_served_from_a_set_is_refused() {
 
     assert_eq!(response.status, 422, "body: {}", response.text());
     assert!(response.text().contains("keep"));
+}
+
+#[tokio::test]
+async fn the_level_a_client_names_is_the_level_the_records_are_written_at() {
+    // **This is the test that says the flag is a flag.**
+    //
+    // `POST /v1/sets/{set}/merges` took a `compression` of `"1"` or `"9"`,
+    // range-checked it against the range its own 400 named, and then opened the
+    // set under `Compression::default()`. The number reached nothing: `--compression
+    // 1` and `--compression 9` were the same run, and `lepatch merge` on this
+    // server said so without anybody noticing.
+    //
+    // Refusing the number was the other option, and it is not the right one
+    // here. `lepatch merge --compression N` opens the receiving set at `N`
+    // locally, the pack endpoint's refusal exists because a re-encode cannot be
+    // *served from* a set's bytes rather than because a level is meaningless,
+    // and this endpoint already has the set in hand. So the level is honoured:
+    // it is threaded into the policy the set is opened with.
+    //
+    // **Asserted on the bytes on disk, never on the absence of an error.** A
+    // server that ignored the level answers every one of these three requests
+    // with a `202`, a `succeeded` job and the same reported figures. Only the
+    // sets differ.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+
+    let source = compressible_tree(dir.path(), 32, 64_000);
+    let blob = dir.path().join("local");
+    backup(&source, &blob).await;
+    let pack_path = dir.path().join("local.pack");
+    pack(&blob, &pack_path).await;
+
+    let server = Server::start(&root);
+
+    // The same pack into three sets, one per level. `0` is the level that means
+    // "store these bytes as they are", so it is the level whose effect cannot be
+    // confused with anything else.
+    let mut merged = Vec::new();
+
+    for (level, set) in [("0", "raw"), ("1", "fast"), ("9", "small")] {
+        let result = push_with(&server, set, &pack_path, Some(level)).await;
+
+        assert_eq!(result["already"], serde_json::json!(false));
+        merged.push((level, result, common::set_size(&root.join(set))));
+    }
+
+    let size_of = |level: &str| {
+        merged
+            .iter()
+            .find_map(|(asked, _, bytes)| (*asked == level).then_some(*bytes))
+    };
+    let reported_of = |level: &str| {
+        merged.iter().find_map(|(asked, result, _)| {
+            (*asked == level).then(|| (result["chunks"].clone(), result["bytes"].clone()))
+        })
+    };
+
+    let (raw, fast, small) = (
+        size_of("0").expect("level 0 was merged"),
+        size_of("1").expect("level 1 was merged"),
+        size_of("9").expect("level 9 was merged"),
+    );
+
+    assert!(
+        raw > fast,
+        "`compression: 0` stores payloads as they are and must be the largest set. \
+         It came out at {raw} bytes against {fast} for `compression: 1`, so the level \
+         was not opened with."
+    );
+    assert!(
+        small < fast,
+        "`compression: 9` is zstd at its smallest, and must beat level 1 on the same \
+         pack. It came out at {small} bytes against {fast}, so the level was not opened \
+         with."
+    );
+
+    // The figures a merge reports are content bytes, and are the same under every
+    // level. A run that got smaller on disk by storing *less* would have moved
+    // these, so this is what says the two sets hold the same version.
+    assert_eq!(
+        reported_of("0"),
+        reported_of("1"),
+        "the level changes the encoding of a merge, not what the version holds"
+    );
+    assert_eq!(reported_of("1"), reported_of("9"));
 }
 
 #[tokio::test]

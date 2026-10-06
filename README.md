@@ -532,7 +532,9 @@ that level, for a receiving set with a compression policy of its own: under `kee
 would be holding the *sender's* frames. Neither rewrites anything already in the set,
 because every record names the codec it was written with, so this is a policy for
 what arrives from now on, exactly as `backup --compression-level` is one for what
-goes in.
+goes in. With `--remote` the server does the merging, and it opens the set at the
+same level, so a level sent over HTTP is the level those records are written at
+rather than the server's default.
 
 What it does **not** do is skip the check. This is the option that looks most like a
 promise to believe the pack, and it is not one: every chunk is still decoded and

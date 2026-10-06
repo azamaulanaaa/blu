@@ -747,22 +747,9 @@ async fn merge_pack(
         Err(e) => return error(&e),
     };
 
-    let policy = match request.compression.as_deref() {
-        None => crate::command::MergeCompression::Keep,
-        Some(policy) if policy.eq_ignore_ascii_case("keep") => {
-            crate::command::MergeCompression::Keep
-        }
-        Some(other) => match other.parse::<u8>() {
-            Ok(level) if u64::from(level) <= u64::from(crate::storage::MAX_COMPRESSION_LEVEL) => {
-                crate::command::MergeCompression::Reencode
-            }
-            _ => {
-                return error(&ApiError::bad_request(format!(
-                    "{other:?} is not `keep` or a compression level from 0 to {}",
-                    crate::storage::MAX_COMPRESSION_LEVEL
-                )));
-            }
-        },
+    let (route, compression) = match merge_compression(request.compression.as_deref()) {
+        Ok(answer) => answer,
+        Err(e) => return error(&e),
     };
 
     let upload = request.upload.clone();
@@ -773,10 +760,68 @@ async fn merge_pack(
     }
 
     let id = jobs.spawn("merge", move |_handle| async move {
-        merge_into(&sets, &uploads, &name, &upload, policy).await
+        merge_into(&sets, &uploads, &name, &upload, route, compression).await
     });
 
     accepted(id)
+}
+
+/// A merge's `compression`, as the **two** answers it is.
+///
+/// A level names which write path the merge takes per chunk
+/// ([`crate::command::MergeCompression`]) *and* the policy the receiving set is
+/// opened with ([`crate::storage::Compression`]), because the store is what
+/// encodes a re-encoded chunk.
+/// They come out of one parse of one number so that they cannot disagree: a
+/// merge taking the re-encode path with the set opened under some other level
+/// would write frames at a level no client asked for, which is the defect this
+/// function exists to make impossible.
+///
+/// `keep` names neither, so it answers the default policy.
+/// The verbatim path does not compress a chunk; the only record it writes through
+/// the store's own policy is the snapshot, and a set opened for writing has to be
+/// opened with something. The default is what every other command opens a set
+/// with, and it is what `lepatch merge` opens one at when the flag says `keep`.
+///
+/// # Errors
+///
+/// Returns a `400` for anything that is neither `keep` nor a level from 0 to
+/// [`crate::storage::MAX_COMPRESSION_LEVEL`], naming the value and the range.
+fn merge_compression(
+    value: Option<&str>,
+) -> Result<
+    (
+        crate::command::MergeCompression,
+        crate::storage::Compression,
+    ),
+    ApiError,
+> {
+    // Absent is `keep` too, and is the flag's default at both ends.
+    if let Some(other) = value
+        && !other.eq_ignore_ascii_case("keep")
+    {
+        return match other.parse::<u8>() {
+            Ok(level) if u64::from(level) <= u64::from(crate::storage::MAX_COMPRESSION_LEVEL) => {
+                Ok((
+                    crate::command::MergeCompression::Reencode,
+                    // The user's `0`, which means as-is. `Compression::zstd` would
+                    // clamp it to 1, which is not what a command line's 0 means.
+                    // This is the same function `lepatch merge --compression 0`
+                    // reaches through `KeepOrLevel::policy`.
+                    crate::storage::Compression::from_level(level),
+                ))
+            }
+            _ => Err(ApiError::bad_request(format!(
+                "{other:?} is not `keep` or a compression level from 0 to {}",
+                crate::storage::MAX_COMPRESSION_LEVEL
+            ))),
+        };
+    }
+
+    Ok((
+        crate::command::MergeCompression::Keep,
+        crate::storage::Compression::default(),
+    ))
 }
 
 /// The merge itself, as a job runs it.
@@ -793,17 +838,22 @@ async fn merge_pack(
 ///    cached reader's `contents` map was built before this merge, so without it
 ///    the next listing would omit the version this merge just published — a wrong
 ///    answer rather than a slow one.
+///
+/// `compression` is the write policy the set is opened with. It is a separate
+/// argument from `policy` only because the two are different types that happen to
+/// come out of the same number; see [`merge_compression`].
 async fn merge_into(
     sets: &Sets,
     uploads: &Uploads,
     name: &str,
     upload: &str,
     policy: crate::command::MergeCompression,
+    compression: crate::storage::Compression,
 ) -> Result<Json, String> {
     // Every `?` here is an `io::Error`; the job wants a sentence. One
     // conversion at the boundary rather than a `map_err` on each call.
     let attempt = sets
-        .writing(name, |store| async move {
+        .writing(name, compression, |store| async move {
             let reason = |e: std::io::Error| e.to_string();
 
             let base_path = sets.base(name).map_err(reason)?;
@@ -1258,8 +1308,77 @@ type Frame = Result<actix_web::web::Bytes, std::convert::Infallible>;
 mod tests {
     use actix_web::http::StatusCode;
 
-    use super::{EVENT_NAMES, WHOLE_PACK_LIMIT, render_event, whole_pack_refusal};
+    use super::{
+        EVENT_NAMES, WHOLE_PACK_LIMIT, merge_compression, render_event, whole_pack_refusal,
+    };
     use crate::serve::{JobEvent, Json, State};
+
+    #[test]
+    fn a_merge_compression_is_a_level_and_the_policy_it_opens_the_set_with() {
+        // **Both halves, or the endpoint has the defect this function is here to
+        // prevent.** The route alone is not a compression policy: the set is what
+        // encodes a re-encoded chunk, so `9` and the default are the same run if
+        // the second half is dropped.
+        //
+        // `0` is the one that has to be checked rather than inferred, because
+        // `Compression::zstd(0)` clamps to 1 and a command line's `0` means as-is.
+        // A store written at level 1 for a client that asked for `0` is a set
+        // holding a policy nobody chose.
+        for (wire, expected) in [
+            ("0", crate::storage::Compression::Off),
+            ("1", crate::storage::Compression::zstd(1)),
+            ("9", crate::storage::Compression::zstd(9)),
+        ] {
+            let (route, policy) = merge_compression(Some(wire)).unwrap();
+
+            assert_eq!(
+                route,
+                crate::command::MergeCompression::Reencode,
+                "{wire} is a level, so the merge must take the re-encode path"
+            );
+            assert_eq!(policy, expected, "{wire} must open the set at {expected:?}");
+        }
+    }
+
+    #[test]
+    fn a_merge_under_keep_stores_the_packs_own_records() {
+        // The other answer, and the default: no re-encode, and the default write
+        // policy — which is what `lepatch merge --compression keep` opens the
+        // local set with, so a push and a local merge agree.
+        for wire in [None, Some("keep"), Some("KEEP")] {
+            let (route, policy) = merge_compression(wire).unwrap();
+
+            assert_eq!(route, crate::command::MergeCompression::Keep);
+            assert_eq!(policy, crate::storage::Compression::default());
+        }
+    }
+
+    #[test]
+    fn a_merge_compression_that_is_neither_word_nor_level_is_refused_by_name() {
+        // The 400 the client sees before it packs a tree. It has to name both the
+        // value and the range, because a client that is told only that something
+        // is wrong cannot tell a typo from a policy it has not heard of.
+        for wire in ["10", "-1", "high", ""] {
+            let error = merge_compression(Some(wire)).unwrap_err();
+
+            assert_eq!(
+                error.status(),
+                StatusCode::BAD_REQUEST,
+                "{wire:?} is not `keep` and not a level"
+            );
+            let detail = error.to_string();
+            assert!(
+                detail.contains(&format!(
+                    "{wire:?} is not `keep` or a compression level from 0 to"
+                )),
+                "the refusal should name the value and the range, and says {detail:?}"
+            );
+            assert!(
+                detail.contains('9'),
+                "the refusal should name where the range ends, and says {detail:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_whole_pack_bound_is_inclusive_at_its_top() {

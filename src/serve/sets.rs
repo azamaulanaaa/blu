@@ -225,6 +225,15 @@ impl Sets {
 
     /// The write lock for a set, held for the length of a merge.
     ///
+    /// **`compression` is the caller's, and it is a parameter rather than a
+    /// default for that reason.** The store is what frames each record, so a
+    /// merge that re-encodes chunks and a set opened under the wrong policy
+    /// produce records at a level nobody asked for. The level a client sent is
+    /// the level the set has to be opened at, and the only place that open
+    /// happens is here. See [`crate::command::MergeCompression`], which says the
+    /// same thing from the other end: a caller asking for a level opens the set
+    /// with it.
+    ///
     /// # Errors
     ///
     /// Returns an error if `name` is not a usable set name, or if the set cannot
@@ -250,7 +259,12 @@ impl Sets {
     /// prevent, and both were possible. A closure makes the extent of the lock
     /// the closure's own body, so the only way to get the scope wrong is to move
     /// the call.
-    pub async fn writing<F, Fut, T>(&self, name: &str, work: F) -> io::Result<T>
+    pub async fn writing<F, Fut, T>(
+        &self,
+        name: &str,
+        compression: Compression,
+        work: F,
+    ) -> io::Result<T>
     where
         F: FnOnce(Arc<BlobStore<Write, Compression>>) -> Fut,
         Fut: std::future::Future<Output = T>,
@@ -269,12 +283,8 @@ impl Sets {
         let _held = Arc::clone(&entry).lock_owned().await;
 
         let store = Arc::new(
-            BlobStore::open_for_writing(
-                base,
-                crate::storage::SegmentLimit::default(),
-                Compression::default(),
-            )
-            .await?,
+            BlobStore::open_for_writing(base, crate::storage::SegmentLimit::default(), compression)
+                .await?,
         );
 
         Ok(work(store).await)
