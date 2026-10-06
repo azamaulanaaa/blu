@@ -37,6 +37,32 @@ struct Args {
     /// what goes to stderr and nothing is asked them about the wire.
     #[arg(long, short, conflicts_with = "verbose")]
     quiet: bool,
+
+    /// Send this run's OpenTelemetry spans to a collector.
+    ///
+    /// **Off unless you ask, and asking twice is the same as asking once:**
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` in the environment turns the same thing on
+    /// without the flag, which is what a systemd unit or a container image sets.
+    ///
+    /// Off means *nothing leaves the machine*: no exporter is built, no thread
+    /// is started for one, and no socket is opened. The spans this crate would
+    /// send are the ones its `#[instrument]`ed commands already produce, so
+    /// turning this on adds a collector to the picture and nothing else.
+    ///
+    /// Where it goes is the exporter's standard resolution:
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` with `/v1/traces` appended, then
+    /// `http://127.0.0.1:4318`.
+    ///
+    /// **This build has no TLS backend unless it was compiled with
+    /// `--features telemetry-tls`.** Without it, an `https://` endpoint fails to
+    /// connect rather than being downgraded — the same refusal
+    /// `versions --remote` makes. That matches `lepatch serve`, which offers no
+    /// TLS either: a telemetry backend is expected to sit on the same trust
+    /// boundary as the thing it is describing. A build that does speak `https`
+    /// reads the operating system's trust store, not one compiled in.
+    #[arg(long)]
+    telemetry: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -434,9 +460,32 @@ async fn main() -> ExitCode {
     let jobs = lepatch::serve::Jobs::new();
     let serving = matches!(args.command, Command::Serve { .. });
 
-    init_tracing(args.verbose, args.quiet, serving.then_some(&jobs));
+    // Telemetry is read once, here, and everything downstream asks this value
+    // rather than the environment. See `lepatch::telemetry`.
+    let telemetry = lepatch::telemetry::Config::from_environment(args.telemetry);
 
-    match run(args.command, jobs).await {
+    init_tracing(
+        args.verbose,
+        args.quiet,
+        serving.then_some(&jobs),
+        &telemetry,
+    );
+
+    // **Every way out of this process goes through this line.**
+    //
+    // `run` returns a result for all three endings — the command succeeded, the
+    // command failed, and `stop_signal` interrupted it — and the exit code is
+    // decided from that result, so flushing here covers every one of them
+    // rather than only the successful one. The stop path matters as much as the
+    // others: a container that is sent `SIGTERM` is the most common way a
+    // server-side run ends, and it is the one most likely to be the *only* span
+    // anybody wanted.
+    //
+    // An OTLP exporter is asynchronous, so without this the spans of a run that
+    // has already finished are still sitting in a queue on a thread the process
+    // is about to stop using. That is a silent loss: no error, no warning, and
+    // a run that looks exactly like a successful one.
+    let code = match run(args.command, jobs).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // The message, not the `Debug` form.
@@ -476,15 +525,58 @@ async fn main() -> ExitCode {
                 ExitCode::from(128 + signal)
             }
         }
+    };
+
+    flush_telemetry();
+
+    code
+}
+
+/// Flush the telemetry exporter, and stop it, on the way out of the process.
+///
+/// **A failure here is reported and does not change the exit code.** A run that
+/// could not tell its collector about itself has still done — or has still
+/// failed to do — the work the user asked for, and the exit code is that fact.
+/// Losing telemetry is worth a line on stderr and nothing more; a backup that
+/// reports failure because a collector was down would be worse than the bug
+/// this prevents.
+///
+/// Safe to call when telemetry was never turned on: the module holds no
+/// provider in that case and this is one uncontended lock.
+fn flush_telemetry() {
+    if let Err(e) = lepatch::telemetry::shutdown() {
+        tracing::warn!(error = %e, "telemetry could not be flushed at exit");
     }
 }
 
-/// Build the subscriber, with the job-progress layer installed when serving.
+/// Build the subscriber, with the job-progress layer installed when serving and
+/// the OpenTelemetry layer installed when telemetry was asked for.
 ///
-/// **The layer is only installed for `serve`.** It reads `lepatch::progress`
-/// events out of the span a job runs in and forwards the counters into the job
-/// registry, which only `serve` has. Installing it elsewhere would cost every
-/// event a hash lookup for a registry nothing reads.
+/// **The OpenTelemetry layer is built here and installed here, and the library
+/// builds it without installing it** (`lepatch::telemetry::layer`), because the
+/// subscriber is process-global and this binary owns the only one there is.
+///
+/// **When telemetry is off there is no layer at all**, not a layer that does
+/// nothing: `lepatch::telemetry::layer` returns `Ok(None)` before it constructs
+/// an exporter, so the default build has no exporter, no exporter thread and no
+/// socket. That is the whole of the cost of a build that carries the feature.
+///
+/// **A collector that cannot be reached is a warning, not a failure.** The
+/// exporter is built at startup and never asked to deliver anything, so a
+/// failure here is a malformed endpoint or an unusable client — a
+/// configuration mistake worth saying out loud — and the right answer is to say
+/// it and carry on. Refusing to back up a directory because telemetry is
+/// misconfigured would make this feature into a way to lose backups.
+///
+/// The layer is stacked **underneath** the writer so that its subscriber type
+/// is the registry: each layer above it can then be added without a single type
+/// parameter being written out, which is what lets the two arms below differ
+/// only in whether the progress layer is present.
+///
+/// **The progress layer is only installed for `serve`.** It reads
+/// `lepatch::progress` events out of the span a job runs in and forwards the
+/// counters into the job registry, which only `serve` has. Installing it
+/// elsewhere would cost every event a hash lookup for a registry nothing reads.
 ///
 /// # What the filter is attached to, and why that is the whole fix
 ///
@@ -511,7 +603,12 @@ async fn main() -> ExitCode {
 /// filter on the only layer is indistinguishable from a filter on the subscriber.
 /// `tests/cli.rs::quiet_suppresses_progress_and_verbose_adds_detail` is what
 /// holds that still true.
-fn init_tracing(verbose: bool, quiet: bool, jobs: Option<&lepatch::serve::Jobs>) {
+fn init_tracing(
+    verbose: bool,
+    quiet: bool,
+    jobs: Option<&lepatch::serve::Jobs>,
+    telemetry: &lepatch::telemetry::Config,
+) {
     let default = if verbose {
         LevelFilter::TRACE
     } else if quiet {
@@ -530,25 +627,52 @@ fn init_tracing(verbose: bool, quiet: bool, jobs: Option<&lepatch::serve::Jobs>)
         .with_writer(std::io::stderr)
         .with_filter(filter);
 
+    let otel = match lepatch::telemetry::layer(telemetry) {
+        Ok(layer) => layer,
+        Err(e) => {
+            // `eprintln!` and not `tracing::warn!`: the subscriber does not exist
+            // yet, so a tracing event would be said to nothing.
+            eprintln!("warning: {e}");
+            None
+        }
+    };
+    let telemetry_is_on = otel.is_some();
+
     match jobs {
         None => {
             // No second layer, so this is the plain case and it is spelled the
             // plain way.
-            let _ = tracing_subscriber::registry().with(writer).try_init();
+            let _ = tracing_subscriber::registry()
+                .with(otel)
+                .with(writer)
+                .try_init();
         }
         Some(jobs) => {
             // Each layer is asked separately, and each answers for itself. The
             // `fmt` layer's filter says what the terminal prints; the progress
             // layer's says which callsites carry a client's counters, and
-            // refuses the rest of the process.
+            // refuses the rest of the process. The OpenTelemetry layer's filter
+            // is a third such filter, and `RUST_LOG` does not reach it either.
             let layer = lepatch::serve::progress_layer(jobs.clone())
                 .with_filter(lepatch::serve::progress_filter());
 
             let _ = tracing_subscriber::registry()
+                .with(otel)
                 .with(writer)
                 .with(layer)
                 .try_init();
         }
+    }
+
+    // Said after the subscriber is installed, because said before it is said to
+    // nothing.
+    if telemetry_is_on {
+        tracing::info!(
+            endpoint = telemetry
+                .endpoint()
+                .unwrap_or(lepatch::telemetry::DEFAULT_ENDPOINT),
+            "telemetry is on"
+        );
     }
 }
 

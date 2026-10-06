@@ -69,6 +69,7 @@ pub mod reader;
 pub mod serve;
 pub mod slice;
 pub mod storage;
+pub mod telemetry;
 pub mod varint;
 
 /// The README's code blocks, compiled as doctests.

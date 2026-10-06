@@ -164,10 +164,89 @@ walkdir = "2.5.0"
 # payload that does not get smaller is stored raw rather than as a frame that is
 # a few bytes larger than the bytes it replaced.
 zstd = "0.13"
+# OpenTelemetry. **`src/telemetry` is off unless the operator asks for it** —
+# see that module's docs. What is in the graph is the SDK, not an exporter: no
+# exporter is built, no exporter thread is started and no socket is opened unless
+# `--telemetry` or `OTEL_EXPORTER_OTLP_ENDPOINT` says so.
+#
+# `metrics` is on for the instruments; `logs` is off on every crate, because
+# nothing in this one bridges `tracing` events into OTel logs and carrying the
+# signal API for a bridge that does not exist would be graph for nothing. Same
+# reason for `internal-logs`: this crate keeps its diagnostics on `tracing`.
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
+# `rt-tokio` is what makes an *asynchronous* OTLP client usable at all, and it
+# is not a detail. Without it the batch processor drives the exporter on its own
+# `std` thread with `futures_executor::block_on`, which has no tokio reactor:
+# `tokio::spawn` and `tokio::time::sleep` inside the async reqwest client then
+# panic on a thread nobody is watching, and the spans are lost with no error
+# anywhere. With `rt-tokio` the batching task is spawned on the runtime `main`
+# already runs, so the client's I/O is driven properly.
+#
+# `experimental_trace_batch_span_processor_with_async_runtime` is the other
+# half, and it is the one that actually swaps the processor:
+# `opentelemetry_sdk::trace::BatchSpanProcessor` is the thread-and-`block_on`
+# one and is what `with_batch_exporter` builds, while the async processor lives
+# in `span_processor_with_async_runtime` behind that feature. So this crate
+# builds the async processor by hand, with the runtime named, rather than asking
+# the builder for the batch one.
+#
+# Both are `experimental_*` features of the SDK. That is the honest cost of an
+# async client inside an async process, and the alternative — the blocking
+# client this dependency used to name — is a second runtime's worth of
+# machinery whose threads exist only to be blocked on a socket.
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
+# Only the stable, non-experimental attribute constants, and only the three this
+# crate actually writes: `service.name`, `service.version` and
+# `process.executable.name`. `semconv_experimental` is off, so a naming change
+# upstream cannot move an attribute out from under the resource.
+opentelemetry-semantic-conventions = { version = "0.31", default-features = false }
+# `default-features = false` drops `tracing-log` (this crate uses `tracing`
+# directly and has no `log` records to forward) and `metrics` (the layer's
+# metrics bridge, which would duplicate the instruments rather than feed them).
+tracing-opentelemetry = { version = "0.32", default-features = false }
+# **The exporter, and the whole of the feature argument.**
+#
+# * `http-proto` — OTLP over HTTP with protobuf bodies. The other HTTP encoding
+#   is `http-json`, which would put `serde` and `serde_json` on the wire for no
+#   benefit, and the third option is `grpc-tonic`, which is a whole gRPC stack.
+#   Protobuf over HTTP is what a collector accepts by default.
+# * `reqwest-client` — the **asynchronous** HTTP client. An earlier version of
+#   this line named `reqwest-blocking-client`, which was wrong twice: it brings
+#   `reqwest` in with a TLS backend, and a *blocking* client has no business
+#   being the transport of an exporter inside an actix process.
+# * **No TLS feature, so no TLS backend is in the graph.** `reqwest` is declared
+#   `default-features = false` upstream and nothing here turns a TLS feature on,
+#   so the shipped binary carries no rustls, no aws-lc-rs and no openssl — the
+#   same position `awc` takes for `lepatch versions --remote` (see the comment
+#   above it), and for the same reason: `lepatch serve` offers no TLS, so a
+#   telemetry endpoint is expected to be on the same trust boundary as the
+#   server it is describing.
+#
+# **To send to an `https://` collector**, build with `--features telemetry-tls`,
+# which turns on `reqwest-rustls-webpki-roots`. That is opt-in on purpose: it
+# puts `rustls`, `ring` and `rustls-webpki` in the graph — a licence and
+# build-toolchain decision, and not one a default `cargo build` should make for
+# the person who installs the binary. An `https://` endpoint in the default
+# build fails to connect rather than falling back to plaintext, which is the
+# same refusal `lepatch versions --remote` makes for an `https://` server.
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client"] }
 
 [features]
 # Windows file identity, needed to detect hard links there.
 experimental = []
+# **Telemetry over `https://`, and nothing else.**
+#
+# Off by default, so the shipped binary has no TLS backend at all — see the
+# `opentelemetry-otlp` entry above for the whole argument, and `deny.toml` for
+# the licences the default graph is held to. This turns on `rustls` (with
+# `ring`, not `aws-lc-rs`, which needs `cmake`) and `rustls-webpki` for the
+# exporter's HTTP client, and it changes nothing else: no endpoint, no span and
+# no flag behaves differently, and the same env vars resolve the same way.
+#
+# Without it an `https://` endpoint is refused by the connect rather than
+# downgraded, which is the same refusal `lepatch versions --remote` makes for
+# an `https://` server this tool cannot speak TLS to.
+telemetry-tls = ["opentelemetry-otlp/reqwest-rustls"]
 
 [dev-dependencies]
 # `default-features = false` drops criterion's `plotters`, `rayon` and
@@ -237,8 +316,16 @@ expect_used = "deny"
 #
 # `awc` pulls a second `rand`, and `actix-tls` wants `http 1.x` where this crate
 # is on `http 0.2` through actix-web. Neither is avoidable by a feature choice,
-# and neither adds a TLS backend: the graph grows by 23 crates, with no rustls,
-# no openssl and no hyper.
+# and neither adds a TLS backend: `awc` alone grows the graph by 23 crates, with
+# no rustls and no openssl.
+#
+# **The OpenTelemetry dependency adds six more duplicate pairs, and it does bring
+# `hyper` into the graph**, which the sentence above used to be able to claim it
+# did not. `http-proto` reuses tonic's generated message types, so `tonic`
+# arrives with its `tower` and `hyper` whether or not any gRPC is spoken; the
+# async OTLP client is `reqwest`, which is a `hyper` client underneath. It
+# still adds **no TLS backend** — see its entry above — and `h2` is still the
+# only unmaintained crate the advisory check has to ignore.
 #
 # `warn`, not `allow`, and not `deny`. `deny.toml` already records this stance --
 # `[bans] multiple-versions = "warn"` -- on the grounds that "the count is still

@@ -36,6 +36,27 @@ allow = [
     # GPL-2.0-or-later. It is listed by the crate that pulls it, so the next
     # person to read this knows where the obligation came from.
     "Zlib",
+    # ISC, reached only through the `telemetry-tls` feature: `rustls`,
+    # `rustls-webpki`, `untrusted` and `ring`, which is what an OTLP exporter
+    # needs to speak `https://`. None of them is in the *default* graph — an
+    # `https://` endpoint in a default build fails to connect rather than being
+    # downgraded — so this one line describes an opt-in binary and nothing else.
+    #
+    # ISC is permissive, it is on the FSF's own list of licences compatible with
+    # the GPL, and it is what the Rust project itself uses. One entry is enough
+    # for all four crates: `ring` is declared "Apache-2.0 AND ISC", and
+    # `Apache-2.0` is already allowed above.
+    #
+    # **`webpki-roots` is deliberately absent, and that is a decision rather than
+    # an omission.** `opentelemetry-otlp` offers the exporter TLS two ways:
+    # `reqwest-rustls` (the operating system's trust store) and
+    # `reqwest-rustls-webpki-roots` (Mozilla's, compiled in). The second pulls
+    # `webpki-roots`, which is `CDLA-Permissive-2.0` — a licence this project
+    # should not take a compatibility position on to save a manifest line. So
+    # `telemetry-tls` uses the system trust store, which is also the behaviour a
+    # command-line tool is expected to have on a machine whose trust store its
+    # operator already maintains.
+    "ISC",
 ]
 # Some crates ship licence text without an SPDX expression. 0.9 rather than the
 # usual 0.8: a file this tool writes has to stay readable, so an unrecognised
