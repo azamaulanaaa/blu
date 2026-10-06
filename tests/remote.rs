@@ -514,3 +514,79 @@ async fn a_listing_of_a_set_that_exists_holds_every_version_the_server_names() {
         "and should name nothing else:\n{listing}"
     );
 }
+
+/// `--set docs` and `docs` are the same set, and list the same versions.
+///
+/// **`versions --remote` grew `--set` for the reason `restore` did**: every
+/// other remote command spells the set that way, and a user who learned `--set`
+/// from `backup` should not be told it does not exist here. Bytes are compared,
+/// as everywhere in this file — "the same versions" is a weaker claim than "the
+/// same lines", and the claim is about stdout.
+#[tokio::test]
+async fn a_set_named_by_flag_lists_the_same_versions_as_the_one_named_positionally() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, set) = served_three_versions(dir.path()).await;
+    let server = Server::start(&root);
+    let address = remote_of(&server);
+
+    let positional = ok(&root, &["versions", "docs", "--remote", &address]);
+    let flagged = ok(&root, &["versions", "--remote", &address, "--set", "docs"]);
+
+    assert!(
+        !positional.is_empty(),
+        "the fixture should hold three versions, so this compares two non-empty listings"
+    );
+    assert_eq!(
+        flagged, positional,
+        "`--set docs` should list what `docs` lists, byte for byte"
+    );
+
+    // And what it lists is the local set's listing, which is the claim this
+    // whole file exists to hold. `versions NAME` with no `--remote` reads the
+    // filesystem, so this is the local command's own output.
+    assert_eq!(
+        positional,
+        ok(&root, &["versions", set.display().to_string().as_str()])
+    );
+}
+
+/// Two names for one set are a conflict on `versions` too.
+///
+/// **The same rule as `restore`, because it is the same rule.** A command line
+/// that says `docs` and `--set other` has no meaning this client may invent, so
+/// the run is refused before any request is made and the refusal names both
+/// spellings.
+#[tokio::test]
+async fn naming_the_set_both_ways_on_a_listing_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _set) = served_three_versions(dir.path()).await;
+    let server = Server::start(&root);
+
+    let output = lepatch(
+        &root,
+        &[
+            "versions",
+            "docs",
+            "--remote",
+            &remote_of(&server),
+            "--set",
+            "other",
+        ],
+    );
+    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(
+        !output.status.success(),
+        "naming the set twice should be refused\nstdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        said.contains("--set") && said.contains("NAME"),
+        "the refusal should name both spellings of the set: {said}"
+    );
+    assert_eq!(
+        output.stdout,
+        Vec::<u8>::new(),
+        "a refused listing prints nothing on stdout, as any other refusal does"
+    );
+}

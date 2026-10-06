@@ -280,8 +280,9 @@ enum Command {
         /// Base path of the backup set to inspect.
         ///
         /// With `--remote`, the *name* of the set on that server rather than a
-        /// path to one: `docs`, not `backups/docs`.
-        name: std::path::PathBuf,
+        /// path to one: `docs`, not `backups/docs` — and `--set docs` says the
+        /// same thing.
+        name: Option<std::path::PathBuf>,
         /// Print just the version numbers, one per line, and nothing else.
         #[arg(long)]
         numbers_only: bool,
@@ -296,6 +297,18 @@ enum Command {
         /// sentence, exactly as a mistyped local path is.
         #[arg(long, value_name = "URL")]
         remote: Option<String>,
+        /// The name of the set on that server to list.
+        ///
+        /// The same set `NAME` names under `--remote`, spelled as a flag:
+        /// `--set docs` and `docs` mean the same thing, and giving both is
+        /// refused rather than resolved. With no `--remote` there is no server
+        /// to name a set on, so it is refused there too — a set on this machine
+        /// is a path, and that is `NAME`.
+        ///
+        /// With `--remote`, one of this or `NAME` is required: a server holds
+        /// many sets and this command will not guess which one was meant.
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
+        set: Option<String>,
     },
     /// Serve the backup sets under a directory over HTTP.
     ///
@@ -353,7 +366,7 @@ enum Command {
         /// than a path here — `--set docs` and `docs` mean the same thing, and the
         /// same as what `versions --remote` takes. Nothing on this machine is
         /// opened, because nothing on this machine holds the version.
-        name: std::path::PathBuf,
+        name: Option<std::path::PathBuf>,
         /// Version to restore, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
@@ -379,7 +392,8 @@ enum Command {
         /// from a set on this machine.
         ///
         /// **The whole restore happens over the socket.** No set is opened here:
-        /// `NAME` is the set's name on that server. The server packs the version,
+        /// `NAME` — or `--set`, which is the same set — is the set's name on that
+        /// server. The server packs the version,
         /// this run fetches the ranges it is missing into a sparse file, and the
         /// pack is applied to the destination through exactly the code
         /// `lepatch apply` uses — so a destination holding a version is brought
@@ -408,6 +422,18 @@ enum Command {
         /// same probe an apply would take, and that probe reads the pack.
         #[arg(long, value_name = "URL")]
         remote: Option<String>,
+        /// The name of the set on that server to restore from.
+        ///
+        /// The same set `NAME` names under `--remote`, spelled as a flag:
+        /// `--set docs` and `docs` mean the same thing, and giving both is
+        /// refused rather than resolved. With no `--remote` there is no server
+        /// to name a set on, so it is refused there too — a set on this machine
+        /// is a path, and that is `NAME`.
+        ///
+        /// With `--remote`, one of this or `NAME` is required: a server holds
+        /// many sets and this command will not guess which one was meant.
+        #[arg(long, value_name = "NAME", conflicts_with = "name")]
+        set: Option<String>,
     },
     /// Check a snapshot's stored chunks against their recorded hashes.
     Verify {
@@ -1024,12 +1050,11 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
             clean,
             dry_run,
             remote,
-        } => match remote {
-            Some(address) => {
-                run_restore_remote(&destination, &name, version, clean, dry_run, &address).await
-            }
-            None => run_restore(&destination, &name, version, clean, dry_run).await,
-        },
+            set,
+        } => {
+            let set = requested_set("restore", name, set.as_deref(), remote.as_deref())?;
+            dispatch_restore(&destination, set, version, clean, dry_run).await
+        }
         Command::Verify { name, version } => run_verify(&name, version).await,
         Command::Pack {
             name,
@@ -1079,15 +1104,49 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
             name,
             numbers_only,
             remote,
-        } => match remote {
-            Some(address) => run_versions_remote(&name, numbers_only, &address).await,
-            None => run_versions(&name, numbers_only).await,
-        },
+            set,
+        } => {
+            let set = requested_set("versions", name, set.as_deref(), remote.as_deref())?;
+            dispatch_versions(set, numbers_only).await
+        }
         Command::Serve {
             root,
             bind,
             scratch,
         } => run_serve(&root, bind.as_deref(), scratch.as_deref(), &jobs).await,
+    }
+}
+
+/// Run `restore`: the same command whether the set is here or on a server.
+///
+/// **Which of the two it is is decided by [`requested_set`] and nowhere else**,
+/// so both routes go through the same resolution of the two spellings of a set
+/// and neither can acquire a rule of its own. Split out of [`dispatch_inner`]
+/// only to keep that match readable; it holds no work of its own.
+async fn dispatch_restore(
+    destination: &std::path::Path,
+    set: Set,
+    version: Option<u32>,
+    clean: bool,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    match set {
+        Set::Local(name) => run_restore(destination, &name, version, clean, dry_run).await,
+        Set::Remote { name, address } => {
+            run_restore_remote(destination, &name, version, clean, dry_run, &address).await
+        }
+    }
+}
+
+/// Run `versions`, over the same [`requested_set`] as `restore`.
+///
+/// Together these two are the commands that name a set on a server, and they
+/// answer that question the same way for the same reason: `--set` and `NAME`
+/// are one set said twice.
+async fn dispatch_versions(set: Set, numbers_only: bool) -> std::io::Result<()> {
+    match set {
+        Set::Local(name) => run_versions(&name, numbers_only).await,
+        Set::Remote { name, address } => run_versions_remote(&name, numbers_only, &address).await,
     }
 }
 
@@ -1358,24 +1417,10 @@ fn print_version(
 /// List a set held by a `lepatch serve`, printing exactly what a local listing
 /// of the same set would.
 ///
-/// The fetch is [`lepatch::client::Remote`]'s. Everything here is deciding which
-/// text is a set name — the positional NAME is a name on the server, not a path
-/// on this machine — and printing what came back.
-async fn run_versions_remote(
-    name: &std::path::Path,
-    numbers_only: bool,
-    address: &str,
-) -> std::io::Result<()> {
-    let Some(set) = name.to_str() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{} is not a name this client can send: a set on a server is named by text",
-                name.display()
-            ),
-        ));
-    };
-
+/// The fetch is [`lepatch::client::Remote`]'s. Everything here is printing what
+/// came back; [`requested_set`] decided what text is a set name — the positional
+/// `NAME` and `--set` are the same set, and neither is a path on this machine.
+async fn run_versions_remote(set: &str, numbers_only: bool, address: &str) -> std::io::Result<()> {
     let remote = lepatch::client::Remote::new(address)?;
 
     for listed in remote.versions(set).await? {
@@ -1694,23 +1739,13 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
 /// [`have_for`] named.
 async fn run_restore_remote(
     destination: &std::path::Path,
-    name: &std::path::Path,
+    set: &str,
     version: Option<u32>,
     clean: bool,
     dry_run: bool,
     address: &str,
 ) -> std::io::Result<()> {
     use lepatch::client::Outcome;
-
-    let Some(set) = name.to_str() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{} is not a name this client can send: a set on a server is named by text",
-                name.display()
-            ),
-        ));
-    };
 
     let remote = lepatch::client::Remote::new(address)?;
     lepatch::client::check_set(set)?;
@@ -2469,6 +2504,138 @@ fn report_pack(
             packed.payload,
             packed.table
         ),
+    }
+}
+
+/// The set a command works on, and where it lives.
+///
+/// **Two spellings, one resolution, and this is where they are reconciled.**
+/// `NAME` and `--set NAME` both name a set, `NAME` being the older spelling and
+/// `--set` the one every other remote command uses. They are not two arguments
+/// that happen to agree; they are one argument said twice, and saying it twice
+/// is a conflict clap refuses rather than a value one of them wins.
+#[derive(Debug)]
+enum Set {
+    /// No `--remote`: the set is here, and `NAME` is its base path.
+    Local(std::path::PathBuf),
+    /// `--remote URL`: the set is named on that server, by one path component.
+    Remote {
+        /// The address of the server holding it.
+        address: String,
+        /// The set's name there.
+        name: String,
+    },
+}
+
+/// Resolve which set `restore` or `versions` was pointed at, or say why not.
+///
+/// **The local arm is the one every existing invocation takes**, and it is the
+/// same path it always was: `NAME` is a filesystem path and `--set` is refused,
+/// because a set on this machine is a path and there is no server to name one
+/// on. Nothing here opens a file, and `Set::Local` carries the `PathBuf`
+/// straight through to the command that reads it.
+///
+/// **`--set` is the same set as `NAME` under `--remote`, and the two are
+/// refused together** rather than resolved. A command line that names a set
+/// twice and disagrees with itself (`restore DST docs --set other`) has no
+/// meaning this can invent, and picking one of the two spellings silently is how
+/// a run restores the wrong tree without saying so. `clap` refuses it, because
+/// `--set` carries `conflicts_with = "name"` — so the conflict is a usage error
+/// before this is reached, and this arm is here for the case where the two
+/// command flags are given together through some other route.
+///
+/// **Neither given is an error naming both spellings**, because the fix for a
+/// missing argument is a user knowing which of two they left out.
+fn requested_set(
+    command: &str,
+    name: Option<std::path::PathBuf>,
+    set: Option<&str>,
+    remote: Option<&str>,
+) -> std::io::Result<Set> {
+    // One sentence for the conflict, because there are two places below that can
+    // reach it and a refusal a user sees twice must not read twice.
+    let conflict = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`lepatch {command}` names the set twice: NAME and `--set NAME` are the same set \
+                 said two ways, and this run will not choose between them. Give one"
+            ),
+        )
+    };
+
+    // Defensive rather than reachable: `clap` refuses this before dispatch, on
+    // both `restore` and `versions`, because `--set` declares
+    // `conflicts_with = "name"`. It is here so that a future caller which
+    // resolves the two spellings itself cannot get a silent winner out of this.
+    if name.is_some() && set.is_some() {
+        return Err(conflict());
+    }
+
+    let Some(address) = remote else {
+        // `--set` alone, with no server. Naming a set on a machine that has no
+        // server to name one on is a mistake worth a sentence rather than a
+        // silent fall-through to the path the user did not type.
+        if set.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run has \
+                     no `--remote` to name that server on. A set on this machine is a path, so pass \
+                     it as NAME"
+                ),
+            ));
+        }
+
+        let Some(name) = name else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`lepatch {command}` was given no set: pass the base path of the backup set it \
+                     should work on (e.g. `photos`)"
+                ),
+            ));
+        };
+
+        return Ok(Set::Local(name));
+    };
+
+    match (name, set) {
+        // The older spelling: a path here is a set's name on that server, and
+        // it still has to be one the client can send.
+        (Some(name), None) => {
+            let Some(text) = name.to_str() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{} is not a name this client can send: a set on a server is named by text",
+                        name.display()
+                    ),
+                ));
+            };
+
+            Ok(Set::Remote {
+                address: address.to_string(),
+                name: text.to_string(),
+            })
+        }
+        // `--set`: already the one shape a set on a server is named by, so it
+        // is checked by whatever asks the server rather than here.
+        (None, Some(name)) => Ok(Set::Remote {
+            address: address.to_string(),
+            name: name.to_string(),
+        }),
+        (None, None) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`lepatch {command} --remote {address}` was given no set: name it on that server \
+                 either as NAME (`docs`) or with `--set NAME` (`--set docs`)"
+            ),
+        )),
+        // Unreachable, because the conflict above refused it. Named so the match
+        // is exhaustive, and with the same sentence, because a refusal reachable
+        // two ways must not read two ways.
+        (Some(_), Some(_)) => Err(conflict()),
     }
 }
 

@@ -969,6 +969,22 @@ $ lepatch versions ~/backups/docs
 $ lepatch versions docs --remote http://127.0.0.1:8480        # identical output
 ```
 
+**The set can be named either way, and one of them is the flag the rest of the
+remote commands already use.** `backup --remote`, `pack --remote` and `merge
+--remote` spell it `--set docs`, and `restore --remote` does now, so `versions`
+does too rather than being the one command that answers `--set` with *unexpected
+argument*. The two spellings are one set, and giving both is refused rather than
+resolved — a command line that says `docs` and `--set other` has no meaning a
+client may invent:
+
+```console
+$ lepatch versions docs --remote http://127.0.0.1:8480
+$ lepatch versions --remote http://127.0.0.1:8480 --set docs    # the same listing
+```
+
+Without `--remote` there is no server to name a set on, so `--set` is refused
+there: a set on this machine is a path, and that is `NAME`.
+
 Two things follow from that, and both are refusals rather than behaviours. The
 argument is the set's **name** on that server, not a path to one, so it is
 `docs` and never `backups/docs`. And a set the server does not hold is an

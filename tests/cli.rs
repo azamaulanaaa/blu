@@ -121,6 +121,39 @@ fn backup_then_restore_reproduces_the_tree() {
 }
 
 #[test]
+fn a_local_restore_still_takes_a_path_and_asks_for_no_set_flag() {
+    // **`--set` was added to `restore` for `--remote`, and the local arm has to
+    // be untouched by it.** A set on this machine is a path, so `NAME` is that
+    // path and nothing else — and a `--set` with no `--remote` names a set on a
+    // server that this run has not asked to talk to, so it is refused rather
+    // than quietly ignored. Both halves are checked here, on the same set, so a
+    // change that made `--set` fall through to the path would fail rather than
+    // pass as a local restore that happened to work.
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    // The positional path, no `--set` and no `--remote`.
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    let before = common::describe(&dir.path().join("src"));
+    let after = common::describe(&dir.path().join("out"));
+    assert_eq!(before, after, "the restored tree differs from the source");
+
+    // And the refusal, which is what keeps the flag from meaning "the set" here.
+    let refused = fails(dir.path(), &["restore", "out2", "--set", "snap"]);
+
+    assert!(
+        refused.contains("--set") && refused.contains("NAME"),
+        "the refusal should name the flag and what to pass instead: {refused}"
+    );
+    assert!(
+        !dir.path().join("out2").exists(),
+        "a refused restore created the destination anyway"
+    );
+}
+
+#[test]
 fn each_backup_claims_the_next_version() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
