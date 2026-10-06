@@ -2,28 +2,31 @@
 //!
 //! ## What this is
 //!
-//! **The reading half of a remote set, and only that.** A server keeps sets and
-//! hands out what it holds; [`Remote::versions`] is one `GET`, and it answers
-//! with the same numbers and the same snapshot hashes that `lepatch versions`
-//! reads off a local directory.
+//! **The client half of a backup, over a socket.** A local backup writes a set on
+//! this machine. A remote one packs the same tree, uploads the pack, and asks the
+//! server to merge it into a set the server keeps. So there are two halves here
+//! and they answer different questions:
 //!
-//! Nothing here writes. The pushing half is `lepatch pack` and `lepatch merge`
-//! with a `curl` between them, and it has no client because it has no need of
-//! one: the pack is a file, and `lepatch merge` already opens a file. What a
-//! remote *listing* needs is a network round trip and nothing else, so this
-//! module is one request and the parsing that keeps honest.
+//! * **What does that server hold?** [`Remote::versions`] is one `GET`, and it
+//!   answers with the same numbers and the same snapshot hashes that
+//!   `lepatch versions` reads off a local directory.
+//! * **How does a tree get there?** [`Remote::begin_upload`] and [`Upload::send`]
+//!   carry the pack — four requests, of which one is the transfer —
+//!   [`Remote::start_merge`] asks a server to merge it, and [`Remote::await_job`]
+//!   waits for the job that runs it. [`Remote::merge_pack`] is those four in the
+//!   order they have to happen, with the cleanup a failed push owes the server
+//!   wired in.
 //!
-//! ## Why the output is the same as a local listing
+//! ## Why the output is the same as a local run's
 //!
 //! **A script that works against a local set works unchanged against a remote
-//! one.** So the values handed back are the same *types* a local listing
-//! produces — a [`std::io::Result`] carrying a [`std::io::Error`] of a chosen
-//! kind, and a [`BlobId`](crate::storage::BlobId) rather than the text of one
-//! — and the caller prints them through the same `say!` in the same order.
-//! Nothing here formats a line for a terminal, and nothing here decides which
-//! fields a line carries.
+//! one.** So the values handed back are the same *types* a local run produces —
+//! a [`std::io::Result`] carrying a [`std::io::Error`] of a chosen kind, and a
+//! [`BlobId`](crate::storage::BlobId) rather than the text of one — and the
+//! caller prints them through the same code. Nothing here formats a line for a
+//! terminal, and nothing here decides which fields a line carries.
 //!
-//! ## Why an error names the address
+//! ## Why an error names the address, and quotes the server
 //!
 //! Every failure here says **which server, and what it said**.
 //!
@@ -32,7 +35,15 @@
 //! not resolve — and `could not read the response` throws all of it away. So a
 //! connect failure carries the address it tried, and a refusal carries the
 //! server's own sentence out of its problem document rather than a paraphrase of
-//! it. See [`Remote::versions`] for the shape those take.
+//! it. The `error` module holds the table both ends agree on, and
+//! [`Remote::versions`] shows the shape those errors take.
+//!
+//! ## Why these futures are not `Send`
+//!
+//! Every request here runs inside a [`tokio::task::LocalSet`] it enters itself.
+//! That is `awc`'s requirement rather than this crate's, and [`Remote::versions`]
+//! documents it in full. So a caller on a multi-threaded runtime spawns these with
+//! [`tokio::task::spawn_local`], and nothing else about the call changes.
 //!
 //! ## TLS
 //!
@@ -44,12 +55,20 @@
 //!
 //! [`lepatch merge`]: crate::command::merge
 
+mod error;
+mod jobs;
+mod uploads;
 mod versions;
 
 use std::io;
 
 use std::fmt::Write as _;
 
+pub use jobs::{
+    Job, Kind, MergeCompression, Merged, MergedAlready, MergedCommitted, Outcome, PackSummary,
+    State,
+};
+pub use uploads::{PACK_MEDIA_TYPE, Upload, UploadCommit};
 pub use versions::Version;
 
 /// How long a request to a remote server may take before it is called a failure.
@@ -273,6 +292,53 @@ pub(crate) fn set_path(name: &str) -> io::Result<String> {
     Ok(encoded)
 }
 
+/// One server-issued id as it goes into a URL path.
+///
+/// **Encoded rather than validated, because this id is not the caller's choice.**
+/// A set name is something a user types and is told about when it is wrong, so
+/// [`set_path`] checks it and explains itself. An upload or a job id is something
+/// the server chose and this client read back out of a document, so the only
+/// thing worth doing with it is making sure it cannot climb out of its own path
+/// segment — which a server answering `{"job":"../../v1/version"}` could
+/// otherwise talk this client into requesting.
+///
+/// An id is never empty in practice, and one that is is refused by the request
+/// that names it rather than here.
+pub(crate) fn segment(id: &str) -> String {
+    let mut encoded = String::with_capacity(id.len());
+    for byte in id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+
+    encoded
+}
+
+/// Refuse a name a server will not accept as a set's, without sending anything.
+///
+/// **The same rule `set_path` applies, and for the same reason: before the
+/// bytes.** A command that is about to upload a pack — and, for `backup
+/// --remote`, about to take a whole backup first — can ask this whether the name
+/// it was given is a name, and be told the server's own complaint, rather than
+/// finding out after the transfer that the path was never going to be one.
+///
+/// Returns the same [`io::Error`] `set_path` would, so the sentence a user
+/// reads is the one every other set name in this crate produces.
+///
+/// # Errors
+///
+/// Returns an error if `name` is empty or is not a single normal path
+/// component — a set on a server is named by one name, not by a path.
+pub fn check_set(name: &str) -> io::Result<()> {
+    set_path(name).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Remote, base_of, set_path};
@@ -367,6 +433,26 @@ mod tests {
     }
 
     #[test]
+    fn a_set_the_server_would_refuse_is_refused_before_anything_is_sent() {
+        // The point of the public half: `check_set` and `set_path` are one rule,
+        // so this asserting against `set_path` is what stops them being two.
+        assert!(super::check_set("docs").is_ok());
+        assert!(super::check_set("photos 2024").is_ok());
+
+        for name in ["", "a/b", "../etc", "backups/docs"] {
+            let early = super::check_set(name).unwrap_err();
+            let late = set_path(name).unwrap_err();
+
+            assert_eq!(early.kind(), late.kind(), "`--set {name:?}`");
+            assert_eq!(
+                early.to_string(),
+                late.to_string(),
+                "`--set {name:?}` should read the same either way"
+            );
+        }
+    }
+
+    #[test]
     fn a_path_is_refused_with_a_message_that_says_which_half_is_wrong() {
         let error = set_path("backups/docs").unwrap_err();
 
@@ -391,5 +477,16 @@ mod tests {
         // Without this, a path that did not start at the root would be appended
         // to whatever the address already carried.
         assert!(remote.url("v1/sets").is_err());
+    }
+
+    #[test]
+    fn a_server_issued_id_cannot_climb_out_of_its_own_path_segment() {
+        // An id is not typed by a user, so it is encoded rather than validated,
+        // and the encoding is the whole of the guarantee. A server answering
+        // `{"job":"../../v1/version"}` must not be able to talk this client into
+        // requesting something other than a job.
+        assert_eq!(super::segment("abc123"), "abc123");
+        assert_eq!(super::segment("../../v1/version"), "..%2F..%2Fv1%2Fversion");
+        assert_eq!(super::segment("a b"), "a%20b");
     }
 }

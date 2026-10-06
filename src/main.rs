@@ -117,6 +117,36 @@ enum Command {
         /// backup currently holds.
         #[arg(long)]
         dry_run: bool,
+        /// Push the result to a `lepatch serve` at this address, over HTTP.
+        ///
+        /// **The local work is done first and is not optional.** The tree is
+        /// backed up into the local set `NAME`, that set is packed by the same
+        /// `lepatch pack` a local run uses, and only the pack goes over the wire
+        /// — so a remote backup is the local backup, and a server that refuses it
+        /// has cost a transfer and nothing else.
+        ///
+        /// The pack is written to a temporary file, which is removed when the run
+        /// ends. Nothing names it, so nothing about it is reported beyond the
+        /// merge the server performed.
+        ///
+        /// `--set` says which set on that server to merge it into, and is
+        /// required: a server holds many sets and this command will not guess
+        /// which one was meant. A set on a server is named by one path component
+        /// — `--set docs`, not `backups/docs`.
+        ///
+        /// The merge happens on the server, holding that set's own write lock,
+        /// and this command waits for the job and reports what it published. A
+        /// job that failed is a failure and a non-zero exit.
+        ///
+        /// `--dry-run` is refused alongside it. A dry run stores nothing, so
+        /// there would be no pack to push, and a run that printed a plan and
+        /// said nothing about the push would leave the reader guessing whether
+        /// the server was asked at all.
+        #[arg(long, value_name = "URL")]
+        remote: Option<String>,
+        /// The name of the set on that server to merge this backup into.
+        #[arg(long, value_name = "NAME")]
+        set: Option<String>,
     },
     /// Apply a pack into a backup set, as a new version of it.
     ///
@@ -186,6 +216,38 @@ enum Command {
         /// does not hold its base.
         #[arg(long)]
         dry_run: bool,
+        /// Hand this pack to a `lepatch serve` at this address, over HTTP.
+        ///
+        /// **The merge happens on the server, not here.** The pack is uploaded and
+        /// the server merges it into `--set`, holding that set's own write lock
+        /// for the length of the work. So this is not a local merge followed by an
+        /// upload: the version this publishes is numbered by the server's set and
+        /// committed in the server's store, and `BASE` — the destination a local
+        /// merge writes into — is not touched. It is still named, because the
+        /// command line is the same command line either way; only the half that
+        /// does the work moves.
+        ///
+        /// `--set` is the set on that server, and is required: a server holds
+        /// many sets and this command will not guess which one was meant. It is
+        /// named by one path component — `--set docs`, not `backups/docs`.
+        ///
+        /// `--compression` is the server's, in the same vocabulary: `keep`
+        /// stores each chunk as the pack carries it and a level asks the server to
+        /// re-encode it.
+        ///
+        /// A pack the set already holds is reported as already merged, naming the
+        /// version that holds it, exactly as a local merge reports it. A job that
+        /// failed or was cancelled is a failure and a non-zero exit; the server's
+        /// own sentence is what is printed.
+        ///
+        /// `--dry-run` is refused alongside it: the server has no plan-only
+        /// merge, so a dry run here would report a plan about a local set that
+        /// this run does not touch.
+        #[arg(long, value_name = "URL")]
+        remote: Option<String>,
+        /// The name of the set on that server to merge this pack into.
+        #[arg(long, value_name = "NAME")]
+        set: Option<String>,
     },
     /// Rebuild the per-version index files from the store's commit records.
     ///
@@ -405,6 +467,33 @@ enum Command {
         /// what makes its figures the real run's.
         #[arg(long)]
         dry_run: bool,
+        /// Push the pack this run writes to a `lepatch serve` at this address.
+        ///
+        /// The pack is written to `--out` exactly as it is without this, and it is
+        /// that file which is uploaded — so the artifact on disk and the artifact
+        /// the server merges are the same bytes, and a push is not a second pack
+        /// of the same version built by different code.
+        ///
+        /// `--set` is the set on that server to merge it into, and is required:
+        /// a server holds many sets and this command will not guess which one was
+        /// meant. It is named by one path component — `--set docs`, not
+        /// `backups/docs`.
+        ///
+        /// The merge happens on the server and this command waits for it. A pack
+        /// the set already holds is reported as already merged, naming the version
+        /// that holds it; a job that failed is a failure and a non-zero exit.
+        ///
+        /// A delta pack (`--from`) is only merged if the server's set holds the
+        /// version it assumes, which is the same rule a local merge applies to its
+        /// own destination.
+        ///
+        /// `--dry-run` is refused alongside it: no pack is written, so there is
+        /// nothing to push.
+        #[arg(long, value_name = "URL")]
+        remote: Option<String>,
+        /// The name of the set on that server to merge this pack into.
+        #[arg(long, value_name = "NAME")]
+        set: Option<String>,
     },
     /// Bring a directory up to the version a pack carries, writing only what is
     /// missing.
@@ -863,10 +952,32 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
             compression_level,
             chunk_profile,
             dry_run,
+            remote,
+            set,
         } => {
             let compression = compression_policy(compression_level);
             let profile = chunk_profile.unwrap_or_default();
-            run_backup(&source, &name, segment_size, compression, profile, dry_run).await
+
+            match requested_push(remote, set.as_ref(), dry_run, "backup")? {
+                None => run_backup(&source, &name, segment_size, compression, profile, dry_run)
+                    .await
+                    .map(|_| ()),
+                Some(push) => {
+                    // The local backup runs first and through exactly the same
+                    // code a local run uses; the push is what follows it, and it
+                    // packs the version this run committed rather than the tip.
+                    let committed =
+                        run_backup(&source, &name, segment_size, compression, profile, false)
+                            .await?;
+
+                    match committed {
+                        Some(version) => push.backed_up(&name, version).await,
+                        // Unreachable: `requested_push` refuses `--dry-run`
+                        // alongside `--remote`, and this call does not pass it.
+                        None => Ok(()),
+                    }
+                }
+            }
         }
         Command::Restore {
             destination,
@@ -884,16 +995,20 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
             full,
             compression,
             dry_run,
+            remote,
+            set,
         } => {
-            run_pack(
-                &name,
-                &out,
-                version,
-                effective_from(from, full),
-                compression,
-                dry_run,
-            )
-            .await
+            let from = effective_from(from, full);
+
+            match requested_push(remote, set.as_ref(), dry_run, "pack")? {
+                None => run_pack(&name, &out, version, from, compression, dry_run).await,
+                Some(push) => {
+                    run_pack(&name, &out, version, from, compression, false).await?;
+                    // The file `run_pack` just wrote and reported, not a second
+                    // pack of the same version.
+                    push.pack(&out, compression).await
+                }
+            }
         }
         Command::Apply {
             pack,
@@ -907,7 +1022,14 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
             name,
             compression,
             dry_run,
-        } => run_merge(&pack, &name, compression, dry_run).await,
+            remote,
+            set,
+        } => match requested_push(remote, set.as_ref(), dry_run, "merge")? {
+            // The server does the merge, so the local destination `name` is not
+            // opened, not locked, and not created.
+            Some(push) => push.pack(&pack, compression).await,
+            None => run_merge(&pack, &name, compression, dry_run).await,
+        },
         Command::Reindex { name, dry_run } => run_reindex(&name, dry_run).await,
         Command::Versions {
             name,
@@ -1341,6 +1463,11 @@ fn parse_keep_or_level(what: &str) -> Result<KeepOrLevel, String> {
 /// it is there. Opening for writing to learn whether a set exists would create
 /// it. That is the one thing a dry run must never do. So the first backup of a
 /// location plans as an all-new version rather than failing.
+///
+/// **Returns the version it committed, or `None` for a dry run.** The local path
+/// ignores it, which is the whole of the local path's involvement with a remote
+/// backup: the number is there for the push that follows, which packs *that*
+/// version rather than whichever one is newest when the push gets there.
 async fn run_backup(
     source: &std::path::Path,
     name: &std::path::Path,
@@ -1348,7 +1475,7 @@ async fn run_backup(
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
     dry_run: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<u32>> {
     let set = IndexSet::new(name);
 
     // The store is append-only with one commit point at the end of a run. So two
@@ -1409,7 +1536,9 @@ async fn run_backup(
         let fresh = existing.is_none();
 
         let plan = backup_plan(source, options, existing).await?;
-        return report_backup_plan(&set, &plan, fresh);
+        report_backup_plan(&set, &plan, fresh)?;
+
+        return Ok(None);
     }
 
     // Opening discards a torn tail in the last segment. A torn tail is an
@@ -1437,7 +1566,7 @@ async fn run_backup(
         "backup complete"
     );
 
-    Ok(())
+    Ok(Some(committed.version))
 }
 
 /// Say what a backup would have stored, on stdout, and that it stored nothing.
@@ -1886,60 +2015,11 @@ async fn run_pack(
     compression: KeepOrLevel,
     dry_run: bool,
 ) -> std::io::Result<()> {
-    let set = IndexSet::new(name);
-    let store = storage::BlobStore::open_for_reading(set.base()).await?;
-    let (version, snapshot_id) = select_version(&set, &store, version)?;
+    let (version, packed) = write_pack(name, out, version, from, compression, dry_run).await?;
 
-    tracing::info!(
-        name = %set.base().display(),
-        version,
-        from,
-        out = %out.display(),
-        compression = ?compression,
-        dry_run,
-        "packing"
-    );
-
-    // The decoded snapshot is needed on both paths. The plan is resolved
-    // from it rather than from the store's records. A dry run that counted
-    // records would be counting the wrong thing.
-    let snapshot = load_snapshot(&store, snapshot_id).await?;
-
-    // A delta is the same pack with fewer chunks in it. The base that it
-    // assumes is part of what has to be worked out before the contents are. The
-    // base decides which chunks survive. It is also what an apply later checks
-    // the destination against.
-    let base = match from {
-        None => None,
-        Some(base_version) => {
-            let (base_version, base_id) = select_version(&set, &store, Some(base_version))?;
-            Some(lepatch::command::Base {
-                version: base_version,
-                id: base_id,
-                snapshot: load_snapshot(&store, base_id).await?,
-            })
-        }
-    };
-
-    let packed = lepatch::command::pack(
-        &store,
-        &lepatch::command::Version {
-            number: version,
-            snapshot,
-        },
-        |id| store.locate(id),
-        base,
-        out,
-        lepatch::command::PackOptions {
-            dry_run,
-            compression: compression.pack_policy(),
-        },
-    )
-    .await?;
-
-    // A plan reports and stops. It has read the version and every chunk that
-    // it would write. So everything after this point on the real path would only
-    // say what the plan has already worked out.
+    // A plan reports and stops, and it wrote no pack, so there is nothing to
+    // push — which is the other half of the refusal above, stated where the
+    // run actually stops rather than where the flag is read.
     if dry_run {
         report_pack(version, out, &packed)?;
         return Ok(());
@@ -2006,6 +2086,355 @@ fn report_pack(
             packed.table
         ),
     }
+}
+
+/// The `--remote`/`--set` pair, resolved into a [`Push`] or refused.
+///
+/// **`None` means `--remote` was not given, and the caller then runs the local
+/// command exactly as it always did.** That is the whole of what keeps the local
+/// path unchanged: there is no push object threaded through it, no `Option` to
+/// forget to check, and no branch inside the code that walks a tree. A remote
+/// command line is a different command line, and it takes a different route.
+///
+/// `dry_run` is refused here rather than inside the push, because a dry run
+/// writes nothing and so there would be nothing to push. Saying so before any
+/// work is done is the point: the alternative is a plan printed about a local set
+/// and silence about the server, which reads as "it was pushed".
+fn requested_push(
+    remote: Option<String>,
+    set: Option<&String>,
+    dry_run: bool,
+    command: &str,
+) -> std::io::Result<Option<Push>> {
+    let Some(address) = remote else {
+        return Ok(None);
+    };
+
+    if dry_run {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "`lepatch {command} --dry-run` and `--remote` do not go together: a dry run \
+                 writes nothing, so there is no pack to push, and the plan it prints is about \
+                 the local set alone"
+            ),
+        ));
+    }
+
+    Push::open(&address, set.map(String::as_str)).map(Some)
+}
+
+/// A `lepatch serve` this run is pushing a pack to, and the set to put it in.
+///
+/// **One type for the three push directions, because they differ only in where
+/// the pack comes from.** `backup --remote` packs a version the local run just
+/// committed, `pack --remote` pushes the file it was asked to write, and
+/// `merge --remote` pushes a file it was handed — and all three then do the same
+/// thing: upload, ask the server to merge it into one set, wait, and report. The
+/// reporting lives here too, so a pushed pack and a merged one cannot say
+/// different things about the same event.
+///
+/// ## Why the set name is asked for rather than derived
+///
+/// **A server holds many sets and this run cannot know which one was meant.**
+/// There is no path here that names one — the set is a name on the other
+/// machine — so a run without `--set` has nothing to guess from. It says so,
+/// rather than inventing `docs` or picking the only set the server happens to
+/// hold. The name is checked with [`lepatch::client::check_set`] before the
+/// first byte moves, so a name that is really a path is refused here rather than
+/// after a transfer.
+struct Push {
+    /// The client, which has already refused an address it cannot speak to.
+    remote: lepatch::client::Remote,
+    /// The set on that server, checked to be one path component.
+    set: String,
+}
+
+impl Push {
+    /// A push to `address`, into `set`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `address` is not an `http://` address this client can
+    /// use, or if `set` is absent or is not a single path component. Both are
+    /// checked here, before the caller does any work — a backup takes a whole
+    /// version before its pack exists, and a mistyped address or set name should
+    /// not be discovered after that.
+    fn open(address: &str, set: Option<&str>) -> std::io::Result<Self> {
+        let remote = lepatch::client::Remote::new(address)?;
+
+        let Some(set) = set else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "--remote {address} also needs --set NAME: a server holds many sets, and this \
+                     command will not guess which one a pack is meant for (`--set docs`)"
+                ),
+            ));
+        };
+
+        lepatch::client::check_set(set)?;
+
+        Ok(Self {
+            remote,
+            set: set.to_string(),
+        })
+    }
+
+    /// The merge policy this push asks the server for.
+    ///
+    /// **The command's own `--compression`, translated rather than reinterpreted.**
+    /// `keep` means the same thing on both sides — store what the pack carries —
+    /// and a level is a level. The two policies are different types because they
+    /// answer different questions (what is on the wire versus what a set is
+    /// opened with), and this is the one place the answer crosses.
+    fn compression(compression: KeepOrLevel) -> lepatch::client::MergeCompression {
+        match compression {
+            KeepOrLevel::Keep => lepatch::client::MergeCompression::Keep,
+            KeepOrLevel::Level(level) => lepatch::client::MergeCompression::Reencode(level),
+        }
+    }
+
+    /// Pack the version `backup` just committed, and push that pack.
+    ///
+    /// **The pack is built by [`write_pack`], which is the whole of `lepatch
+    /// pack`'s work.** So a remote backup is a local backup followed by the pack
+    /// the local path would have written, and the two produce the same bytes:
+    /// same store, same version, same chunker output. Nothing here re-derives a
+    /// snapshot or re-reads a chunk.
+    ///
+    /// The pack goes to a file in the system temporary directory rather than
+    /// beside the set, and that file is removed when the push ends however it
+    /// ends: a pack nobody named is not something to leave in a user's
+    /// directory, and a run that failed half-way has already said so.
+    async fn backed_up(&self, name: &std::path::Path, version: u32) -> std::io::Result<()> {
+        let pack = std::env::temp_dir().join(format!(
+            "lepatch-push-{}-{version}.pack",
+            std::process::id()
+        ));
+
+        // `keep`, and not a level. `backup --compression-level` is the policy
+        // the *local* set is opened with — what this machine stores — and it says
+        // nothing about how a server should store what arrives. The pack already
+        // carries the local set's stored form, and `keep` is what writes that
+        // form rather than decoding and re-encoding every chunk a second time.
+        let written = write_pack(name, &pack, Some(version), None, KeepOrLevel::Keep, false).await;
+
+        // The pack is removed whatever `written` said, so a failure to build it
+        // cannot leave one behind and a failure to push it cannot leave it
+        // either. Its own error is dropped: the caller is already failing with a
+        // sentence about the push, and "the temporary pack could not be removed"
+        // would send the reader after the wrong problem.
+        let pushed = match written {
+            Ok(_) => self.pack(&pack, KeepOrLevel::Keep).await,
+            Err(e) => Err(e),
+        };
+
+        let _ = std::fs::remove_file(&pack);
+
+        pushed
+    }
+
+    /// Upload `pack`, ask the server to merge it, and report what it published.
+    ///
+    /// **The merge is the server's, not a local one followed by an upload.**
+    /// `merge_pack` is one request sequence: begin the upload, send the bytes,
+    /// commit, and start a merge into this set. The server opens the set, takes
+    /// its own write lock, and commits a version in its own numbering. So the
+    /// version this reports is the server's, and a pack pushed to a set that
+    /// already holds it is answered with the version that holds it rather than
+    /// an error.
+    ///
+    /// The job is awaited rather than handed back, so the exit code is about the
+    /// merge: a job that failed or was cancelled is an error carrying the
+    /// server's own sentence, and this prints nothing on stdout for it. There is
+    /// no path here that reports a merge which did not happen.
+    async fn pack(&self, pack: &std::path::Path, compression: KeepOrLevel) -> std::io::Result<()> {
+        // Read before the upload rather than after: the merge request names an
+        // upload, and an upload of bytes this machine does not have would fail at
+        // the server with a sentence about the network rather than about the
+        // file.
+        let bytes = std::fs::read(pack)?;
+
+        tracing::info!(
+            server = %self.remote.address(),
+            set = %self.set,
+            pack = %pack.display(),
+            bytes = bytes.len(),
+            "pushing pack"
+        );
+
+        let job = self
+            .remote
+            .merge_pack(&self.set, bytes, Self::compression(compression))
+            .await?;
+
+        // Reported as it moves, on the same target and with the same counter
+        // names a local merge uses. The merge is happening on the other machine,
+        // so this is the only place a long push says anything at all.
+        let finished = self
+            .remote
+            .await_job_with(&job, |counters| {
+                let shown = counters
+                    .iter()
+                    .map(|(name, value)| format!("{name} {value}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                tracing::info!("merging on {}: {shown}", self.remote.address());
+            })
+            .await?;
+
+        self.report(&finished, pack)
+    }
+
+    /// Say what the server's merge published, in the words a local merge uses.
+    ///
+    /// **One set of sentences for both sides of a transfer.** The figures are the
+    /// server's — it read them out of the plan it committed — and the wording is
+    /// `report_merge`'s and `report_already_merged`'s, so a script that reads a
+    /// merge report does not have to learn a second one because the merge
+    /// happened over HTTP. Only the two names differ, and they have to: the set is
+    /// a name on a server rather than a path here, and the server is named because
+    /// a push is a thing done *to* somewhere and a report that did not say where
+    /// would be about a set on no machine in particular.
+    fn report(&self, job: &lepatch::client::Job, pack: &std::path::Path) -> std::io::Result<()> {
+        use lepatch::client::{Merged as RemoteMerged, Outcome};
+
+        let Some(Outcome::Merged(merged)) = &job.result else {
+            return Err(std::io::Error::other(format!(
+                "job {} finished without saying what it merged",
+                job.id
+            )));
+        };
+
+        match merged {
+            RemoteMerged::Committed(committed) => {
+                tracing::info!(
+                    server = %self.remote.address(),
+                    set = %committed.set,
+                    version = committed.version,
+                    snapshot = %&committed.snapshot,
+                    base = committed.base,
+                    chunks = committed.chunks,
+                    fresh = committed.fresh,
+                    held = committed.held,
+                    bytes = committed.bytes,
+                    "merge complete"
+                );
+
+                let since = match committed.base {
+                    Some(base) => format!(" since {base}"),
+                    None => String::new(),
+                };
+
+                say!(
+                    "merged version {}{since}: {} chunks, {} new, {} already held, {} bytes \
+                     stored from {}",
+                    committed.version,
+                    committed.chunks,
+                    committed.fresh,
+                    committed.held,
+                    committed.bytes,
+                    pack.display(),
+                )?;
+                say!(
+                    "{}  {} on {}",
+                    &committed.snapshot,
+                    committed.set,
+                    self.remote.address(),
+                )
+            }
+            RemoteMerged::Already(already) => {
+                tracing::info!(
+                    server = %self.remote.address(),
+                    set = %already.set,
+                    version = already.version,
+                    "merge: already merged, nothing to do"
+                );
+
+                say!(
+                    "already merged: {} on {} holds this version as version {}; nothing to do",
+                    already.set,
+                    self.remote.address(),
+                    already.version,
+                )
+            }
+        }
+    }
+}
+
+/// Pack a version of the set at `name` into `out`, and report what the pack holds.
+///
+/// **The one place a pack is written**, so `lepatch pack` and the pack a remote
+/// backup pushes are the same file built by the same code. The run it is taken
+/// from does not matter: `backup --remote` hands the version it just committed to
+/// this, and a `pack --remote` hands the version its own `--version` named, and
+/// both arrive here as one `Option<u32>`.
+///
+/// Returns the version it resolved, alongside what the pack holds. The caller
+/// reports it, so `pack --version 2` says 2 and `pack` with no version says the
+/// one the set resolved to — which is the number the report line is about, and
+/// which a caller that only has the return value could not work out.
+async fn write_pack(
+    name: &std::path::Path,
+    out: &std::path::Path,
+    version: Option<u32>,
+    from: Option<u32>,
+    compression: KeepOrLevel,
+    dry_run: bool,
+) -> std::io::Result<(u32, lepatch::command::Packed)> {
+    let set = IndexSet::new(name);
+    let store = storage::BlobStore::open_for_reading(set.base()).await?;
+    let (version, snapshot_id) = select_version(&set, &store, version)?;
+
+    tracing::info!(
+        name = %set.base().display(),
+        version,
+        from,
+        out = %out.display(),
+        compression = ?compression,
+        dry_run,
+        "packing"
+    );
+
+    // The decoded snapshot is needed on both paths. The plan is resolved
+    // from it rather than from the store's records. A dry run that counted
+    // records would be counting the wrong thing.
+    let snapshot = load_snapshot(&store, snapshot_id).await?;
+
+    // A delta is the same pack with fewer chunks in it. The base that it
+    // assumes is part of what has to be worked out before the contents are. The
+    // base decides which chunks survive. It is also what an apply later checks
+    // the destination against.
+    let base = match from {
+        None => None,
+        Some(base_version) => {
+            let (base_version, base_id) = select_version(&set, &store, Some(base_version))?;
+            Some(lepatch::command::Base {
+                version: base_version,
+                id: base_id,
+                snapshot: load_snapshot(&store, base_id).await?,
+            })
+        }
+    };
+
+    let packed = lepatch::command::pack(
+        &store,
+        &lepatch::command::Version {
+            number: version,
+            snapshot,
+        },
+        |id| store.locate(id),
+        base,
+        out,
+        lepatch::command::PackOptions {
+            dry_run,
+            compression: compression.pack_policy(),
+        },
+    )
+    .await?;
+
+    Ok((version, packed))
 }
 
 /// Apply `pack` into the set at `name` as a new version.
