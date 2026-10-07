@@ -343,11 +343,16 @@ expect_used = "deny"
 # still adds **no TLS backend** — see its entry above — and `h2` is still the
 # only unmaintained crate the advisory check has to ignore.
 #
-# `warn`, not `allow`, and not `deny`. `deny.toml` already records this stance --
-# `[bans] multiple-versions = "warn"` -- on the grounds that "the count is still
-# reported, so a regression is visible". Until `awc` was added the graph happened
-# to hold no duplicates, so the lint never had to be relaxed and the manifest was
-# quietly stricter than the policy it was meant to express.
+# `allow`, and the reporting moves to `deny.toml`, which is where it already was.
+#
+# `warn` looks like the middle course and is not: CI runs clippy with
+# `-- -D warnings`, which promotes this back to an error, so `warn` is `deny` with
+# extra steps. `allow` is the only level that survives that flag.
+#
+# Nothing is lost. `[bans] multiple-versions = "warn"` in deny.toml reports every
+# one of these, and CI runs `cargo deny check bans` in its own job, so the count
+# stays visible on every build -- in the tool whose job that is, rather than in a
+# clippy lint that duplicates it and would need a second suppression.
 #
 # It is a table rather than an inline `multiple_crate_versions = "warn"` because a
 # bare lint and a lint group both sit at priority 0, and Cargo refuses that
@@ -355,7 +360,7 @@ expect_used = "deny"
 # `priority = 1` is what puts this entry AFTER the `cargo` group and lets it win.
 # Every other lint in that group stays denied.
 [lints.clippy.multiple_crate_versions]
-level = "warn"
+level = "allow"
 priority = 1
 
 # The profile that 'dist' will build with
