@@ -45,7 +45,7 @@ async fn round_trip_preserves_exact_bytes_across_chunk_boundaries() {
 }
 
 #[tokio::test]
-async fn round_trip_handles_files_larger_than_the_chunk_maximum() {
+async fn round_trip_reproduces_a_file_larger_than_the_chunk_maximum() {
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
 

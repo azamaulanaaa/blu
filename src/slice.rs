@@ -132,6 +132,9 @@ where
     /// Returns an error for a seek before the start of the slice, or one past the
     /// limit. It also returns an error when the delta is too large to express as
     /// a relative seek.
+    ///
+    /// It also returns an error if the reader under the slice cannot be seeked.
+    /// The inner seek is the last thing this does, and its error is not replaced.
     #[tracing::instrument(level = "trace", skip(self), err)]
     fn start_seek(mut self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
         let new_position = match position {

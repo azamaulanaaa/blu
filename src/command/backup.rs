@@ -493,7 +493,7 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{} is not a directory; a backup is of a directory tree",
+                "{} is not a directory. A backup is of a directory tree",
                 root.display()
             ),
         ));

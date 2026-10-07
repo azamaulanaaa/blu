@@ -32,7 +32,7 @@ fn frame_of(bytes: &[u8]) -> Vec<u8> {
 
 /// The decompressed bytes come back, in order and complete.
 #[tokio::test]
-async fn it_yields_the_decompressed_bytes() {
+async fn a_decompress_reader_yields_the_decompressed_bytes() {
     let raw = payload(100_000);
     let frame = frame_of(&raw);
 
@@ -92,7 +92,7 @@ async fn something_that_is_not_a_frame_is_refused() {
 /// That is the kind of corruption that passes a length check.
 /// Only comparing the whole tree catches it.
 #[tokio::test]
-async fn it_seeks_where_it_says_from_every_origin() {
+async fn a_decompress_reader_seeks_where_it_says_from_every_origin() {
     let raw = payload(60_000);
     let mut reader = DecompressReader::new(frame_of(&raw), 60_000).await.unwrap();
 
@@ -277,7 +277,7 @@ async fn a_record_claiming_an_absurd_length_is_refused() {
 /// One that printed a whole decompressed chunk would put a hundred kilobytes of
 /// text into somebody's terminal.
 #[tokio::test]
-async fn its_debug_form_does_not_include_the_payload() {
+async fn a_decompress_reader_debug_form_does_not_include_the_payload() {
     let raw = payload(2_000);
     let reader = DecompressReader::new(frame_of(&raw), 2_000).await.unwrap();
 

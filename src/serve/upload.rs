@@ -76,6 +76,9 @@ impl Uploads {
     ///
     /// Returns an error if the scratch directory cannot be created.
     ///
+    /// It also returns an error if the upload's own file cannot be created there.
+    /// The directory can exist and still refuse the file.
+    ///
     /// Returns an error if the upload registry's lock was poisoned by an earlier
     /// panic.
     pub async fn begin(&self, id: &str) -> io::Result<PathBuf> {
@@ -192,7 +195,7 @@ impl Uploads {
         if written == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "the upload arrived empty; a pack has a header and an index at minimum",
+                "the upload arrived empty. A pack has a header and an index at minimum",
             ));
         }
 
@@ -264,7 +267,7 @@ fn remove(path: &Path) -> io::Result<()> {
 fn no_upload(id: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
-        format!("no upload {id:?}; create one with POST /v1/uploads first"),
+        format!("no upload {id:?}. Create one with POST /v1/uploads first"),
     )
 }
 

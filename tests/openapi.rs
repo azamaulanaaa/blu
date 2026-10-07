@@ -398,7 +398,7 @@ fn operation_ids() -> Vec<String> {
 }
 
 #[test]
-fn the_two_counts_agree() {
+fn the_declaration_helpers_find_every_schema_and_operation() {
     // A cheap sanity check on the helpers above rather than on the document: if
     // `declared` or `operation_ids` stopped finding anything, every other test
     // in this file would pass vacuously.

@@ -495,6 +495,9 @@ impl IndexSet {
     ///
     /// Returns an error if another process holds the lock, and an error if the
     /// lock file cannot be created.
+    ///
+    /// It also returns an error if the set's own directory cannot be created,
+    /// because the lock file is a sibling of it.
     pub fn lock(&self) -> io::Result<Lock> {
         self.ensure_directory()?;
 
@@ -512,7 +515,7 @@ impl IndexSet {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
                 e.kind(),
                 format!(
-                    "{} is locked by another lepatch process; if none is running, remove it",
+                    "{} is locked by another lepatch process. If none is running, remove it",
                     path.display()
                 ),
             )),

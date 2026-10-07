@@ -123,9 +123,9 @@ impl Upload {
     ///
     /// # Errors
     ///
-    /// Returns an error if the upload is not held — a `404` is
-    /// [`io::ErrorKind::NotFound`], carrying the server's sentence — or if the
-    /// bytes are not a pack this build reads.
+    /// Returns an error if the server cannot be reached, if the upload is not held
+    /// — a `404` is [`io::ErrorKind::NotFound`], carrying the server's sentence —
+    /// or if the bytes are not a pack this build reads.
     pub async fn send(&self, pack: Vec<u8>) -> io::Result<()> {
         tokio::task::LocalSet::new()
             .run_until(self.send_inner(pack))
@@ -171,9 +171,9 @@ impl Upload {
     ///
     /// # Errors
     ///
-    /// Returns an error if the upload is not held — a `404` is
-    /// [`io::ErrorKind::NotFound`] — or if what arrived is not a pack this
-    /// build reads.
+    /// Returns an error if the server cannot be reached, if the upload is not held
+    /// — a `404` is [`io::ErrorKind::NotFound`] — or if what arrived is not a pack
+    /// this build reads.
     pub async fn commit(&self) -> io::Result<UploadCommit> {
         tokio::task::LocalSet::new()
             .run_until(self.commit_inner())

@@ -184,9 +184,9 @@ impl Report {
                 "{} of {} chunks failed verification: {}{}",
                 self.failures.len(),
                 self.chunks,
-                listed.join("; "),
+                listed.join(", "),
                 if more > 0 {
-                    format!("; and {more} more")
+                    format!(", and {more} more")
                 } else {
                     String::new()
                 },

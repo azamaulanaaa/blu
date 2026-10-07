@@ -200,7 +200,10 @@ pub struct Applied {
 /// Returns an error if a chunk about to be written does not hash to the hash it is
 /// addressed by.
 /// Returns an error if the tree cannot be written.
+/// Returns an error if the tree already at `root` cannot be read.
 /// Every one of those is checked before the first byte is written.
+/// It also returns an error if a link task or an attribute task stopped before
+/// it finished.
 /// A run that fails during verification leaves the destination exactly as it
 /// found it.
 /// A run that fails later may have written some of the delta.

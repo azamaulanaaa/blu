@@ -395,7 +395,7 @@ fn removing_an_absent_manifest_does_nothing() {
 
 /// A path with non-ASCII bytes in it round-trips.
 #[test]
-fn a_manifest_handles_a_path_that_is_not_ascii() {
+fn a_manifest_still_trusts_a_path_that_is_not_ascii() {
     let dir = tempfile::tempdir().unwrap();
     let destination = dir.path().join("tree");
     let name = "café–π.bin";
@@ -416,7 +416,7 @@ fn a_manifest_handles_a_path_that_is_not_ascii() {
 /// A path with a newline in it round-trips, which a length-prefixed format allows
 /// and a line-oriented one would not.
 #[test]
-fn a_manifest_handles_a_path_with_a_newline_in_it() {
+fn a_manifest_still_trusts_a_path_with_a_newline_in_it() {
     let dir = tempfile::tempdir().unwrap();
     let destination = dir.path().join("tree");
     let name = "two\nlines.bin";

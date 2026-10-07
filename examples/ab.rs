@@ -319,12 +319,12 @@ async fn curve(stores: &std::path::Path, src: &std::path::Path, shared: usize) {
     if on_disk >= total * 0.99 {
         let _ = writeln!(
             out,
-            "  {on_disk:.0} MiB reached the store; nothing was deduplicated away"
+            "  {on_disk:.0} MiB reached the store. Nothing was deduplicated away"
         );
     } else {
         let _ = writeln!(
             out,
-            "  {on_disk:.0} MiB reached the store; the other {:.0} MiB was read and hashed, then \
+            "  {on_disk:.0} MiB reached the store. The other {:.0} MiB was read and hashed, then \
              deduplicated away",
             total - on_disk
         );

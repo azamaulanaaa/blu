@@ -115,7 +115,7 @@ impl JobId {
         let bytes = <blake3::Hash>::from_hex(text).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidFilename,
-                format!("{text:?} is not a job id; a job id is 64 hexadecimal characters"),
+                format!("{text:?} is not a job id. A job id is 64 hexadecimal characters"),
             )
         })?;
 
@@ -538,7 +538,7 @@ impl Jobs {
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                format!("job {id} has already finished; there is nothing to cancel"),
+                format!("job {id} has already finished. There is nothing to cancel"),
             ));
         }
 

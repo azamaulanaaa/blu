@@ -821,7 +821,7 @@ fn a_filesystem_failure_names_the_path_and_keeps_its_kind() {
 
 /// The async wrapper is the same wrapper, awaited.
 #[tokio::test]
-async fn the_async_wrapper_behaves_the_same() {
+async fn the_async_wrapper_names_the_path_and_keeps_its_kind() {
     let missing = std::path::Path::new("/nonexistent-lepatch/segment.bin");
 
     let error = lepatch::storage::at_async(missing, "open", tokio::fs::File::open(missing))

@@ -264,10 +264,15 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// Returns an error only if the manifest's path cannot be formed.
+    /// Returns no error. A destination with no file name to take a suffix from,
+    /// a manifest that cannot be read, and a manifest that does not decode are
+    /// all a miss.
     /// Every I/O failure while reading it is reported as a miss.
     /// None of them leaves a caller with anything it could not also do by finding
     /// no manifest at all.
+    ///
+    /// [`Self::save`] and [`Self::remove`] do return an error, because a path they
+    /// cannot form is a destination they cannot write beside.
     pub fn load(destination: &Path) -> io::Result<Option<Self>> {
         let Ok(path) = Self::path_for(destination) else {
             return Ok(None);

@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_tick_always_reports() {
+    fn the_first_tick_is_due_and_every_one_after_it_is_not() {
         let mut progress = Progress::new(Phase::Backup);
         assert!(progress.due());
         // And then it goes quiet.

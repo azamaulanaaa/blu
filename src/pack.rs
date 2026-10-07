@@ -668,12 +668,13 @@ impl Pack {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file is too short to hold a trailer. It returns an
-    /// error if the file does not end with the pack magic. It returns an error
-    /// if the file does not begin with one. It returns an
-    /// error if the file is a format version this build does not read, or if its
-    /// index does not decode. A header that disagrees with its own index, on the
-    /// chunk count or on where the payload ends, is refused rather than believed.
+    /// Returns an error if the file cannot be opened, measured, seeked or read.
+    /// It returns an error if the file is too short to hold a trailer. It returns
+    /// an error if the file does not end with the pack magic. It returns an error
+    /// if the file does not begin with one. It returns an error if the file is a
+    /// format version this build does not read, or if its index does not decode. A
+    /// header that disagrees with its own index, on the chunk count or on where
+    /// the payload ends, is refused rather than believed.
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut file = crate::storage::at(path, "open", fs::File::open(path))?;
         let len = file.metadata()?.len();
@@ -1897,6 +1898,9 @@ const fn position(at: u32) -> usize {
 /// # Errors
 ///
 /// Returns an error naming the offset that does not fit and why.
+///
+/// It also returns an error if the index names no records at all over a payload
+/// that is not empty. That refusal names no offset, because there is none.
 fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io::Result<Vec<u32>> {
     let min_header = u64::try_from(crate::storage::MIN_RECORD_HEADER).unwrap_or(u64::MAX);
 

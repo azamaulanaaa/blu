@@ -237,6 +237,10 @@ impl<'a> Request<'a> {
     ///
     /// Panics if the connection fails or the response is not HTTP/1.1 with a
     /// status line. A test that cannot connect has nothing to assert.
+    ///
+    /// It also panics if the request cannot be written in full, or if the answer
+    /// cannot be read to the end. A stub that closes the connection mid-answer
+    /// reaches both.
     pub(crate) async fn send(self, address: std::net::SocketAddr) -> Response {
         let mut stream = TcpStream::connect(address)
             .await

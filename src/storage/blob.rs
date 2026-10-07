@@ -475,7 +475,7 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "version {version} does not exist in {}; it holds {} version(s)",
+                        "version {version} does not exist in {}. It holds {} version(s)",
                         self.set.base().display(),
                         contents.commits.len()
                     ),

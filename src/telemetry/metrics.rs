@@ -1160,7 +1160,7 @@ mod tests {
                 .find(|span| span.name == name)
                 .unwrap_or_else(|| {
                     panic!(
-                        "no span named {name}; got {:?}",
+                        "no span named {name}. It got {:?}",
                         spans.iter().map(|s| s.name.as_ref()).collect::<Vec<_>>()
                     )
                 });

@@ -242,7 +242,7 @@ impl ByteRange {
         let spec = header.trim().strip_prefix("bytes=").ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{header:?} is not a byte range; this server serves `bytes=`"),
+                format!("{header:?} is not a byte range. This server serves `bytes=`"),
             )
         })?;
 
@@ -253,7 +253,7 @@ impl ByteRange {
         if spec.contains(',') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "several ranges were asked for; ask for one at a time",
+                "several ranges were asked for. Ask for one at a time",
             ));
         }
 
@@ -271,7 +271,7 @@ impl ByteRange {
         if start.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "a suffix range (`bytes=-N`) is not served; ask for `bytes=first-last`",
+                "a suffix range (`bytes=-N`) is not served. Ask for `bytes=first-last`",
             ));
         }
 
@@ -343,7 +343,7 @@ pub(super) fn fetch_plan(resolved: &Resolved, have: &[String]) -> io::Result<Vec
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "{text:?} is not a chunk hash; a chunk hash is 64 hexadecimal characters"
+                        "{text:?} is not a chunk hash. A chunk hash is 64 hexadecimal characters"
                     ),
                 )
             })
