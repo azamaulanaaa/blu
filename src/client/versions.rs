@@ -80,6 +80,9 @@ impl Remote {
     /// sentence — or if the answer is not the shape described in this module.
     /// Every one of those messages names the server, and none of them is an
     /// empty list.
+    ///
+    /// Returns an error if `set` is empty or is not one path component, because
+    /// the name goes into the request path before anything is sent.
     pub async fn versions(&self, set: &str) -> io::Result<Vec<Version>> {
         tokio::task::LocalSet::new()
             .run_until(self.versions_inner(set))

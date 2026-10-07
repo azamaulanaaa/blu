@@ -80,8 +80,8 @@ pub(crate) async fn read(url: &str, response: &mut awc::ClientResponse) -> io::R
             return io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{url} is answering with more than the {PAYLOAD_LIMIT} bytes this client will \
-                     read for one document"
+                    "{url} sent more than the {PAYLOAD_LIMIT} bytes this client reads for one \
+                     document"
                 ),
             );
         }
@@ -155,8 +155,8 @@ pub(crate) fn drift(url: &str, what: &str, reason: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
-            "{url} answered with {what} this client does not understand: {reason}. Nothing is \
-             reported rather than an empty value; `lepatch serve` documents the shape in \
+            "{url} answered with {what} this client does not understand: {reason}. This client \
+             reports nothing rather than an empty value. `lepatch serve` documents the shape in \
              openapi/lepatch.json"
         ),
     )

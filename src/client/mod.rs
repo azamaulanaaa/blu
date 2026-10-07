@@ -129,9 +129,9 @@ impl Remote {
     /// # Errors
     ///
     /// Returns an error if `address` is not an `http://` address this client can
-    /// use: empty, not HTTP, carrying a query or a fragment, holding whitespace,
-    /// or naming no host. A trailing `/` is dropped, so the address the server
-    /// prints and the address a user types both work.
+    /// use: empty, not HTTP, an `https://` address this client cannot speak, a
+    /// query or a fragment, whitespace, or no host. A trailing `/` is dropped,
+    /// so the address the server prints and the address a user types both work.
     pub fn new(address: &str) -> io::Result<Self> {
         Ok(Self {
             base: base_of(address)?,

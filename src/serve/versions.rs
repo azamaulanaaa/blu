@@ -36,6 +36,9 @@ pub(super) struct Listed {
 /// # Errors
 ///
 /// Returns an error if the set's directory cannot be read.
+///
+/// Returns [`io::ErrorKind::NotFound`] if the name is not a set at all: no
+/// segment file is there, so there is nothing to list versions of.
 pub(super) fn indexed(base: &std::path::Path) -> io::Result<Vec<Listed>> {
     let set = crate::layout::IndexSet::new(base);
 
@@ -88,6 +91,9 @@ pub(super) struct Resolved {
 /// Returns an error if the version does not resolve, or if the set cannot be
 /// read. Both are `InvalidData` or `NotFound`, and both are `422` or `404` on
 /// the wire.
+///
+/// Returns an error if the version's snapshot names a chunk the set does not
+/// hold, because the figures this returns count the chunks the version needs.
 pub(super) async fn resolve(
     store: &BlobStore<Read, Compression>,
     version: u32,

@@ -80,8 +80,14 @@ async fn seeking_repositions_within_the_limit() {
     assert_eq!(out, data[100..500]);
 }
 
+/// A relative seek is measured from where the reader is, and an end-relative
+/// seek from the slice's limit.
+///
+/// The name says the property rather than "works": a reader that measured
+/// `Current` from the start would return the right bytes for a first seek and
+/// the wrong ones for a second, which is exactly what this asserts.
 #[tokio::test]
-async fn seeking_relative_and_from_the_end_works() {
+async fn a_relative_seek_is_measured_from_the_current_position_and_an_end_seek_from_the_limit() {
     let data = bytes(1000);
     let mut reader = SliceAsyncReader::new(Cursor::new(data.clone()), 500);
 
@@ -92,6 +98,14 @@ async fn seeking_relative_and_from_the_end_works() {
     reader.read_to_end(&mut out).await.unwrap();
 
     assert_eq!(out, data[150..500]);
+
+    // From the end now: -100 of a 500-byte limit is offset 400.
+    reader.seek(SeekFrom::End(-100)).await.unwrap();
+
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail).await.unwrap();
+
+    assert_eq!(tail, data[400..500]);
 }
 
 #[tokio::test]

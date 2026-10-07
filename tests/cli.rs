@@ -1680,7 +1680,7 @@ fn an_unprivileged_restore_finishes_and_reports_its_owners() {
         "and it should say what it could not do, got: {said}"
     );
     assert!(
-        said.contains("Re-run as root"),
+        said.contains("Run as root"),
         "naming what would fix it, got: {said}"
     );
 
@@ -2871,8 +2871,8 @@ fn a_dry_restore_writes_no_file_no_directory_and_no_claim() {
     let logs = ok_logs(dir.path(), &["restore", "out", "snap", "--dry-run"]);
     assert!(
         logs.contains(
-            "note: 5 entries in this version record an owner, which a restore may not be \
-             able to set without privilege"
+            "note: 5 entries in this version record an owner. A restore may not be \
+             able to set an owner without privilege"
         ),
         "a dry restore should bound what it might not be able to set: {logs}"
     );
@@ -2941,7 +2941,7 @@ fn a_dry_pack_writes_no_file_and_reports_what_it_would_hold() {
         "a dry pack prints a plan and not a hash: {plan}"
     );
     assert!(
-        plan.contains("nothing written to v1.pack"),
+        plan.contains("This run wrote nothing to v1.pack"),
         "a dry pack should say the file was not written: {plan}"
     );
 
@@ -2952,7 +2952,7 @@ fn a_dry_pack_writes_no_file_and_reports_what_it_would_hold() {
         plan.lines()
             .last()
             .expect("a summary line")
-            .split("; nothing")
+            .split(". This run wrote nothing")
             .next()
             .unwrap_or_default(),
     );
@@ -3019,7 +3019,7 @@ fn a_dry_delta_pack_reports_the_chunks_it_would_leave_out() {
         plan.lines()
             .last()
             .expect("a summary line")
-            .split("; nothing")
+            .split(". This run wrote nothing")
             .next()
             .unwrap_or_default(),
     );
@@ -4235,7 +4235,7 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
         "a plan for a set that is not there should say it would create one: {plan}"
     );
     assert!(
-        plan.contains("nothing written"),
+        plan.contains("This run wrote nothing"),
         "and should say it wrote nothing: {plan}"
     );
     assert!(
@@ -4284,7 +4284,7 @@ fn a_dry_merge_writes_nothing_and_reports_what_it_would_merge() {
 
     let plan = ok(dir.path(), &["merge", "v2.pack", "received", "--dry-run"]);
     assert!(
-        plan.contains("version 2") && plan.contains("nothing written"),
+        plan.contains("version 2") && plan.contains("This run wrote nothing"),
         "a plan for a version the set lacks should report it: {plan}"
     );
     assert_eq!(
@@ -4345,7 +4345,7 @@ fn a_dry_merge_refuses_a_delta_whose_base_the_set_lacks() {
     let plan = ok(dir.path(), &["merge", "v2.delta", "received", "--dry-run"]);
     assert!(plan.contains("since 1"), "{plan}");
     assert!(
-        plan.contains("nothing written"),
+        plan.contains("This run wrote nothing"),
         "a dry merge should say it wrote nothing: {plan}"
     );
     assert_eq!(
@@ -4607,7 +4607,7 @@ fn a_dry_merge_reports_the_same_figures_under_every_compression() {
         let report = ok(dir.path(), &args);
 
         assert!(
-            report.contains("nothing written"),
+            report.contains("This run wrote nothing"),
             "a dry merge with {} should say it wrote nothing: {report}",
             flag.join(" ")
         );
@@ -4864,7 +4864,7 @@ fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
             "a dry pack as {form} wrote the file it was asked about"
         );
         assert!(
-            plan.contains("nothing written"),
+            plan.contains("This run wrote nothing"),
             "a dry pack as {form} should say it wrote nothing: {plan}"
         );
 
@@ -4874,7 +4874,7 @@ fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
             plan.lines()
                 .last()
                 .expect("a summary line")
-                .split("; nothing")
+                .split(". This run wrote nothing")
                 .next()
                 .unwrap_or_default(),
         );

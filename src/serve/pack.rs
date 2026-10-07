@@ -111,6 +111,16 @@ impl Resolved {
 /// Returns an error if the set cannot be read, if the version does not resolve,
 /// or if the snapshot cannot be encoded on this platform.
 ///
+/// Returns an error if the version's snapshot cannot be read or does not
+/// decode.
+///
+/// Returns an error if the version's snapshot names a chunk the set does not
+/// hold, because the plan that builds the pack resolves every chunk it names.
+///
+/// Returns an error if a named base version does not resolve, or if the base
+/// version's snapshot cannot be read or does not decode. A delta that named no
+/// resolvable base would leave out chunks that nothing checked.
+///
 /// A **cached read handle** is used, so this is one scan per set rather than one
 /// per request. The handle is evicted when a merge publishes into that set, which
 /// is what keeps a cached one from answering a listing that omits a version that
@@ -224,9 +234,10 @@ impl ByteRange {
     /// # Errors
     ///
     /// Returns an error for anything this server does not serve: a unit other
-    /// than bytes, a suffix range, several ranges, or a malformed number. The
-    /// refusal says which, because a client that guessed the wrong syntax needs
-    /// to be told the right one.
+    /// than bytes, a suffix range, several ranges, a malformed number, and a
+    /// range whose last byte is before its first. The refusal says which,
+    /// because a client that guessed the wrong syntax needs to be told the
+    /// right one.
     pub fn parse(header: &str) -> io::Result<Self> {
         let spec = header.trim().strip_prefix("bytes=").ok_or_else(|| {
             io::Error::new(

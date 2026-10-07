@@ -128,6 +128,9 @@ impl Remote {
     /// or version it does not hold is a `404` — if the answer is not the shape of
     /// a plan, or if the plan is not a set of ranges that could be written into a
     /// file of the length it names.
+    ///
+    /// Returns an error if `set` is empty or is not one path component, because
+    /// the name goes into the request path before anything is sent.
     pub async fn plan_pack(
         &self,
         set: &str,
@@ -183,6 +186,11 @@ impl Remote {
     /// answers anything but `206`** — a `200` would be the whole pack, and
     /// writing that at an offset would corrupt the file — or if the body is not
     /// exactly the range asked for.
+    ///
+    /// Returns an error if `set` is empty or is not one path component, or if
+    /// `range` covers no bytes and so has no `Range` header this client sends.
+    ///
+    /// Returns an error if `out` cannot be written.
     pub async fn fetch_range<W>(
         &self,
         set: &str,
@@ -235,8 +243,8 @@ impl Remote {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{url} answered {status} to a range request rather than the 206 one; its body \
-                     is not the range asked for, and writing it at offset {} of the pack would \
+                    "{url} answered {status} to a range request, not to the 206 one. Its body \
+                     is not the range asked for. Writing it at offset {} of the pack would \
                      leave a file that opens and is wrong",
                     range.start
                 ),
@@ -260,7 +268,7 @@ impl Remote {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!(
-                    "{url} sent {written} bytes for {header}, which is {} bytes; the file \
+                    "{url} sent {written} bytes for {header}, which is {} bytes. The file \
                      would have a hole in it",
                     range.len()
                 ),
@@ -459,8 +467,8 @@ impl<'a> Pull<'a> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "the ranges this server sent leave chunk {} out of the pack, and this pull \
-                     did not say it already held it; the file would restore zeroes for it",
+                    "the ranges this server sent leave chunk {} out of the pack. This pull \
+                     did not say it already held it. The file would restore zeroes for it",
                     chunk.id
                 ),
             ));
@@ -594,9 +602,9 @@ fn check_plan(url: &str, plan: &PackPlan) -> io::Result<()> {
             return Err(drift_plan(
                 url,
                 &format!(
-                    "range {}..{} overlaps the one before it; ranges are fetched one at a time \
-                     and written at their offsets, so two answers for the same bytes would have \
-                     one of them win",
+                    "range {}..{} overlaps the range before it. This client fetches ranges \
+                     one at a time and writes each one at its own offset. Two answers for \
+                     the same bytes would have one of them win",
                     range.start, range.end
                 ),
             ));
@@ -644,9 +652,9 @@ fn header_for(range: &Range) -> io::Result<String> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "refusing to fetch {}..{}, which is not a range: the header this client sends is \
-                 inclusive, and an empty one would read as `bytes={}-` and take the rest of the \
-                 pack",
+                "refusing to fetch {}..{}, which is not a range. The header this client sends \
+                 is inclusive. An empty range would read as `bytes={}-` and take the rest of \
+                 the pack",
                 range.start, range.end, range.start
             ),
         ));

@@ -122,8 +122,8 @@ impl MergeCompression {
                 Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "{level} is not a compression level: it is 0, meaning as-is, through \
-                         {MAX_COMPRESSION_LEVEL}"
+                        "{level} is not a compression level. A level is from 0, which means \
+                         as-is, through {MAX_COMPRESSION_LEVEL}"
                     ),
                 ))
             }
@@ -940,10 +940,17 @@ mod tests {
         );
     }
 
+    /// A job that has stopped is terminal whichever way it stopped, and only the
+    /// two states that have not stopped are not. Named for the property rather
+    /// than for the states it lists: an agent choosing what to run reads the
+    /// property, and the inverse of an earlier name of this test was the one that
+    /// sent it past the guard against reporting a failed job as a success.
     #[test]
-    fn only_a_succeeded_job_is_a_state_that_is_not_terminal() {
+    fn is_terminal_is_true_for_every_stopped_state_and_false_for_a_running_one() {
+        // The two that are still running.
         assert!(!State::Queued.is_terminal());
         assert!(!State::Running.is_terminal());
+        // The three that have stopped, whichever way they stopped.
         assert!(State::Succeeded.is_terminal());
         assert!(State::Failed.is_terminal());
         assert!(State::Cancelled.is_terminal());

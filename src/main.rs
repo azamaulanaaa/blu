@@ -87,8 +87,8 @@ enum Command {
         /// already there: no record depends on where a boundary fell.
         #[arg(long, value_name = "SIZE", value_parser = parse_size)]
         segment_size: Option<u64>,
-        /// How hard to compress record payloads: 0 stores them as they are, 1
-        /// (default) is fastest, 9 is smallest.
+        /// How hard to compress record payloads. 0 stores them as they are. 1 (default)
+        /// is fastest. 9 is smallest.
         ///
         /// Only affects records written from now on, and never rewrites what is
         /// already there: every record names the codec it was written with, so a
@@ -179,9 +179,9 @@ enum Command {
         /// Base path of the backup set to merge into, e.g. `photos` creates
         /// `photos.0000.bin` and `photos.lock`.
         name: std::path::PathBuf,
-        /// How each chunk the pack carries is stored: `keep` (the default) writes
-        /// the stored form the pack already has, `0` writes the content as it is,
-        /// and 1 to 9 decode and store a zstd frame at that level.
+        /// How each chunk the pack carries is stored. `keep` (the default) writes the stored
+        /// form the pack already has. `0` writes the content as it is. 1 to 9 decode and store
+        /// a zstd frame at that level.
         ///
         /// `keep` is what makes a merge of a compressed pack cheap: a chunk the
         /// source set deduplicated as a frame is written as that frame, rather than
@@ -499,9 +499,9 @@ enum Command {
         /// and correct for any client — which is what makes it the one worth caching.
         #[arg(long)]
         full: bool,
-        /// How each chunk is written into the pack: `keep` (the default) writes
-        /// the stored form the set already has, `0` writes the content as it is,
-        /// and 1 to 9 decode and write a zstd frame at that level.
+        /// How each chunk is written into the pack. `keep` (the default) writes the stored
+        /// form the set already has. `0` writes the content as it is. 1 to 9 decode and write
+        /// a zstd frame at that level.
         ///
         /// `keep` is what makes packing a compressed set cheap: a chunk the set
         /// deduplicated as a frame is copied as that frame rather than decoded and
@@ -919,7 +919,7 @@ fn parse_size(raw: &str) -> std::result::Result<u64, String> {
         "t" | "tb" | "tib" => 1024_u64 * 1024 * 1024 * 1024,
         other => {
             return Err(format!(
-                "`{other}` is not a size lepatch knows; use B, KiB, MiB, GiB or TiB"
+                "`{other}` is not a size lepatch knows. Use B, KiB, MiB, GiB or TiB"
             ));
         }
     };
@@ -1208,7 +1208,7 @@ async fn stop_signal() -> std::io::Error {
 fn interrupted() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Interrupted,
-        "interrupted; any claim on a backup set or destination has been released",
+        "interrupted. This run released its claim on a backup set or destination",
     )
 }
 
@@ -1831,6 +1831,13 @@ async fn run_restore_remote(
 ///
 /// Returns an error if the pack cannot be planned, fetched or opened, or if the
 /// apply refuses the destination.
+///
+/// Returns an error if the server answers a plan whose length is not the length
+/// its own pack summary named, because the file this run assembles would not be
+/// the file the server described.
+///
+/// Returns an error if the destination claim cannot be taken, which includes
+/// another run holding it.
 #[expect(
     clippy::too_many_arguments,
     reason = "a restore's own arguments, plus the pack"
@@ -1895,8 +1902,8 @@ async fn pull_and_apply(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "{} planned a {}-byte pack and then described a {}-byte one; the file this run \
-                 assembles would not be the file it fetched",
+                "{} planned a {}-byte pack and then described a {}-byte one. The file \
+                 this run assembles would not be the file it fetched",
                 remote.address(),
                 summary.length,
                 plan.length
@@ -2202,12 +2209,12 @@ fn report_restore_plan(
     // that did not mention it would be the least useful thing it could do.
     if clean {
         say!(
-            "dry run: {} would be emptied first, and the tree assembled beside it",
+            "dry run: {} would be emptied first. This run would assemble the tree beside it",
             destination.display()
         )?;
     } else {
         say!(
-            "dry run: anything already in {} would be left alone; pass --clean for an \
+            "dry run: anything already in {} would be left alone. Pass --clean for an \
              exact copy",
             destination.display()
         )?;
@@ -2218,8 +2225,8 @@ fn report_restore_plan(
         // owner at all. Only trying to set one says whether this process can.
         // Claiming either outcome would be a guess.
         eprintln!(
-            "note: {} entr{} in this version record an owner, which a restore may not be \
-             able to set without privilege",
+            "note: {} entr{} in this version record an owner. A restore may not be \
+             able to set an owner without privilege",
             plan.unowned,
             if plan.unowned == 1 { "y" } else { "ies" },
         );
@@ -2253,9 +2260,9 @@ fn report_restored(restored: &lepatch::command::Restored) {
 /// the run did not have.
 fn report_unowned(count: u64, what: &str) {
     eprintln!(
-        "note: {count} entr{} in this {what} recorded an owner this process could not set, \
-         which takes privilege; their contents, permissions and times are correct. \
-         Re-run as root to set them",
+        "note: {count} entr{} in this {what} recorded an owner this process could not set. \
+         Setting an owner takes privilege. Their contents, permissions and times are correct. \
+         Run as root to set them",
         if count == 1 { "y" } else { "ies" },
     );
 }
@@ -2289,7 +2296,8 @@ fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "refusing to clean {}: it holds the backup set being restored from ({})",
+                "refusing to clean {}. This path holds the backup set being restored \
+                 from ({})",
                 target.display(),
                 segment.display()
             ),
@@ -2304,8 +2312,8 @@ fn check_clean_destination(destination: &std::path::Path, set: &IndexSet) -> std
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "refusing to clean {}: the backup set being restored from is written there \
-                 ({} and following)",
+                "refusing to clean {}. This run writes the backup set being restored \
+                 from there ({} and following)",
                 target.display(),
                 set.base().display()
             ),
@@ -2409,7 +2417,7 @@ async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Re
 fn effective_from(from: Option<u32>, full: bool) -> Option<u32> {
     if full {
         if let Some(from) = from {
-            say!("note: --full overrides --from {from}; packing the whole version").ok();
+            say!("note: --full overrides --from {from}. This run packs the whole version").ok();
         }
         return None;
     }
@@ -2450,7 +2458,7 @@ async fn run_pack(
     // and this line is only reachable for one.
     let (Some(bytes), Some(content)) = (packed.bytes, packed.content) else {
         return Err(std::io::Error::other(
-            "the pack was written but reported neither a length nor a content hash",
+            "this run wrote the pack, and the pack reported neither a length nor a content hash",
         ));
     };
 
@@ -2495,8 +2503,8 @@ fn report_pack(
         // about a file that does not exist. So the figure is left out. What did
         // happen is said instead.
         None => say!(
-            "dry run: {held}, {} bytes of payload, {} bytes of file table; nothing written \
-             to {}",
+            "dry run: {held}, {} bytes of payload, {} bytes of file table. This run wrote \
+             nothing to {}",
             packed.payload,
             packed.table,
             out.display()
@@ -2560,8 +2568,8 @@ fn requested_set(
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "`lepatch {command}` names the set twice: NAME and `--set NAME` are the same set \
-                 said two ways, and this run will not choose between them. Give one"
+                "`lepatch {command}` names the set twice. NAME and `--set NAME` are the same \
+                 set said two ways, and this run will not choose between them. Give one"
             ),
         )
     };
@@ -2582,9 +2590,9 @@ fn requested_set(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run has \
-                     no `--remote` to name that server on. A set on this machine is a path, so pass \
-                     it as NAME"
+                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run \
+                     has no `--remote` to name that server on. A set on this machine is a \
+                     path, so pass it as NAME"
                 ),
             ));
         }
@@ -2593,8 +2601,8 @@ fn requested_set(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "`lepatch {command}` was given no set: pass the base path of the backup set it \
-                     should work on (e.g. `photos`)"
+                    "`lepatch {command}` received no set. Pass the base path of the \
+                     backup set it should work on (e.g. `photos`)"
                 ),
             ));
         };
@@ -2610,7 +2618,8 @@ fn requested_set(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "{} is not a name this client can send: a set on a server is named by text",
+                        "{} is not a name this client can send. A set on a server takes \
+                         its name as text",
                         name.display()
                     ),
                 ));
@@ -2630,8 +2639,9 @@ fn requested_set(
         (None, None) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "`lepatch {command} --remote {address}` was given no set: name it on that server \
-                 either as NAME (`docs`) or with `--set NAME` (`--set docs`)"
+                "`lepatch {command} --remote {address}` received no set. Name it on \
+                     that server either as NAME (`docs`) or with `--set NAME` \
+                     (`--set docs`)"
             ),
         )),
         // Unreachable, because the conflict above refused it. Named so the match
@@ -2672,9 +2682,9 @@ fn requested_push(
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run has \
-                     no `--remote` to name that server on. A set on this machine is a path, so pass \
-                     it as the destination path instead"
+                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run \
+                     has no `--remote` to name that server on. A set on this machine is a \
+                     path, so pass it as the destination path instead"
                 ),
             ));
         }
@@ -2686,9 +2696,9 @@ fn requested_push(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "`lepatch {command} --dry-run` and `--remote` do not go together: a dry run \
-                 writes nothing, so there is no pack to push, and the plan it prints is about \
-                 the local set alone"
+                "`lepatch {command} --dry-run` and `--remote` do not go together. A dry \
+                 run writes nothing, so there is no pack to push. The plan it prints is \
+                 about the local set alone"
             ),
         ));
     }
@@ -2739,8 +2749,9 @@ impl Push {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "--remote {address} also needs --set NAME: a server holds many sets, and this \
-                     command will not guess which one a pack is meant for (`--set docs`)"
+                    "--remote {address} also needs --set NAME. A server holds many sets. \
+                     This command will not guess which one a pack is meant for \
+                     (`--set docs`)"
                 ),
             ));
         };
@@ -2925,7 +2936,7 @@ impl Push {
                 );
 
                 say!(
-                    "already merged: {} on {} holds this version as version {}; nothing to do",
+                    "already merged: {} on {} holds this version as version {}. Nothing to do",
                     already.set,
                     self.remote.address(),
                     already.version,
@@ -3210,8 +3221,8 @@ fn warn_behind_tip<W: storage::WriteMode, C: storage::Compressor>(
     }
 
     eprintln!(
-        "warning: this pack is version {from} and {} is at version {tip}; merging publishes it \
-         as version {}, and a restore with no --version will return that one",
+        "warning: this pack is version {from} and {} is at version {tip}. Merging \
+         publishes it as version {}. A restore with no --version will return that one",
         set.base().display(),
         tip.saturating_add(1),
     );
@@ -3228,7 +3239,7 @@ fn warn_behind_tip<W: storage::WriteMode, C: storage::Compressor>(
 /// question is *which* version, so a client can ask for that one by number.
 fn report_already_merged(set: &IndexSet, version: u32) -> std::io::Result<()> {
     say!(
-        "already merged: {} holds this version as version {version}; nothing to do",
+        "already merged: {} holds this version as version {version}. Nothing to do",
         set.base().display()
     )
 }
@@ -3296,8 +3307,8 @@ fn report_merge_plan(set: &IndexSet, planned: &Planned, fresh: bool) -> std::io:
     };
 
     say!(
-        "dry run: version {}{since}: {} chunks, {} new, {} already held, {} bytes to store, \
-         nothing written to {}",
+        "dry run: version {}{since}: {} chunks, {} new, {} already held, {} bytes to \
+         store. This run wrote nothing to {}",
         plan.version,
         plan.chunks,
         plan.fresh,
@@ -3387,8 +3398,8 @@ fn report_applied(
     // was an update or a whole tree.
     if dry_run {
         say!(
-            "dry run: would fetch {} of {} bytes in {} range(s); {} of {} chunks are already \
-             held, {} chunks would be written into {} file(s)",
+            "dry run: would fetch {} of {} bytes in {} range(s). {} of {} chunks are \
+             already held. {} chunks would be written into {} file(s)",
             applied.fetched,
             pack.payload_len(),
             applied.ranges,
@@ -3399,8 +3410,8 @@ fn report_applied(
         )?;
     } else {
         say!(
-            "fetched {} of {} bytes in {} range(s); {} of {} chunks were already held, \
-             {} chunks written into {} file(s)",
+            "fetched {} of {} bytes in {} range(s). {} of {} chunks were already \
+             held. This run wrote {} chunks into {} file(s)",
             applied.fetched,
             pack.payload_len(),
             applied.ranges,
@@ -3416,9 +3427,9 @@ fn report_applied(
     // "nothing there".
     if applied.extra > 0 {
         let what = match (dry_run, applied.removed) {
-            (true, 0) => "would be left alone; pass --prune to remove them",
+            (true, 0) => "would be left alone. Pass --prune to remove them",
             (true, _) => "would be removed by --prune",
-            (false, _) => "left alone; pass --prune to remove them",
+            (false, _) => "left alone. Pass --prune to remove them",
         };
         eprintln!(
             "note: {} unrecorded entr{} under {} {what}",
@@ -3443,8 +3454,8 @@ fn report_applied(
             // owner at all. Only trying to set one says whether this process can.
             // Claiming either outcome would be a guess.
             eprintln!(
-                "note: {} entr{} in this version record an owner, which an apply may not be \
-                 able to set without privilege",
+                "note: {} entr{} in this version record an owner. An apply may not be \
+                 able to set an owner without privilege",
                 applied.unowned,
                 if applied.unowned == 1 { "y" } else { "ies" },
             );
@@ -3577,8 +3588,8 @@ mod tests {
         assert_eq!(
             recorded.get("chunks"),
             Some(&7),
-            "a client's view of a running job must not move when the terminal is \
-             turned down: {recorded:?}"
+            "a client's view of a running job must not move when the operator turns \
+             the terminal down: {recorded:?}"
         );
         assert_eq!(
             recorded.get("read"),

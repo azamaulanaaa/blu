@@ -176,8 +176,14 @@ async fn restore_does_not_leave_trailing_bytes_from_a_previous_larger_file() {
     assert_eq!(fs::read(destination.join("shrunk")).unwrap(), b"short");
 }
 
+/// A restore without `--clean` leaves an entry the version does not name alone,
+/// and writes the entries it does.
+///
+/// The name says the property rather than "succeeds": the interesting half is
+/// the stale file, because a restore that pruned it would be correct against a
+/// version whose tree it happens to match, and wrong against every other one.
 #[tokio::test]
-async fn restore_over_an_existing_tree_succeeds() {
+async fn a_restore_without_clean_leaves_a_stale_entry_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     fs::create_dir_all(source.join("sub")).unwrap();
@@ -192,7 +198,14 @@ async fn restore_over_an_existing_tree_succeeds() {
 
     common::run_restore(&blob, committed.snapshot, &destination).await;
 
+    // The version's own entry is written.
     assert_eq!(fs::read(destination.join("sub/file")).unwrap(), b"fresh");
+    // And the entry the version does not name is still there, byte for byte.
+    assert_eq!(
+        fs::read(destination.join("stale")).unwrap(),
+        b"left over",
+        "a restore without --clean must not remove an entry the version does not name"
+    );
 }
 
 /// A directory's recorded time survives the links created inside it.

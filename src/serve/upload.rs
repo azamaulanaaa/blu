@@ -75,6 +75,9 @@ impl Uploads {
     /// # Errors
     ///
     /// Returns an error if the scratch directory cannot be created.
+    ///
+    /// Returns an error if the upload registry's lock was poisoned by an earlier
+    /// panic.
     pub async fn begin(&self, id: &str) -> io::Result<PathBuf> {
         let path = self.scratch.join(format!("{id}.pack"));
 
@@ -96,6 +99,9 @@ impl Uploads {
     /// # Errors
     ///
     /// Returns an error if no upload has this id.
+    ///
+    /// Returns an error if the upload registry's lock was poisoned by an earlier
+    /// panic.
     pub fn path(&self, id: &str) -> io::Result<PathBuf> {
         self.locked()?.get(id).cloned().ok_or_else(|| no_upload(id))
     }
@@ -142,6 +148,13 @@ impl Uploads {
     /// accepts. **The check is `Pack::open` itself**, run before the upload is
     /// recorded as complete, so `commit` is not the first place a client hears
     /// that what it sent was not a pack.
+    ///
+    /// Returns an error if the scratch file cannot be created, written, flushed
+    /// or synced. A scratch directory that has filled up fails here.
+    ///
+    /// Returns an error if the upload arrived with no bytes at all. That case is
+    /// named rather than left to the length error `Pack::open` reports on its
+    /// own.
     pub async fn put<S, E>(&self, id: &str, payload: S) -> io::Result<Pack>
     where
         S: futures_util::Stream<Item = Result<actix_web::web::Bytes, E>> + Unpin,
@@ -194,6 +207,9 @@ impl Uploads {
     /// # Errors
     ///
     /// Returns an error if the upload is not held or is not a pack.
+    ///
+    /// Returns an error if the upload registry's lock was poisoned by an earlier
+    /// panic.
     pub fn open(&self, id: &str) -> io::Result<Pack> {
         Pack::open(&self.path(id)?)
     }
@@ -204,6 +220,9 @@ impl Uploads {
     ///
     /// Returns an error if the file cannot be removed. A `Drop` guard runs the
     /// same removal, so this failing does not leave the file behind.
+    ///
+    /// Returns an error if the upload registry's lock was poisoned by an earlier
+    /// panic.
     pub fn discard(&self, id: &str) -> io::Result<()> {
         let path = self.locked()?.remove(id);
 
@@ -348,8 +367,11 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Discarding an upload whose file is already gone removes nothing and does not
+    /// fail, because both the success and the failure path of a merge call it and one
+    /// may run after the other.
     #[tokio::test]
-    async fn discarding_an_upload_that_is_already_gone_succeeds() {
+    async fn discarding_an_upload_whose_file_is_already_gone_does_not_fail() {
         // Both paths out of a job — success and failure — call this, and one of
         // them may run after the other.
         let (_dir, uploads) = scratch_dir();

@@ -133,6 +133,9 @@ mod serde_lite {
         /// Returns an error if the body is not a JSON object, or if a field is
         /// the wrong type. Both are `400`: the request was understood as a shape
         /// and does not fit it.
+        ///
+        /// Returns an error if `version` or `base` is a whole number that does
+        /// not fit a `u32`, which is a number where this shape wants a version.
         pub(super) fn read(body: &str) -> Result<Self, super::ApiError> {
             let fields = super::parse_fields(body)?;
 
@@ -150,6 +153,11 @@ mod serde_lite {
         /// # Errors
         ///
         /// As [`PackRequest::read`].
+        ///
+        /// Also if `have` is present and is not a list of chunk hashes, or if any
+        /// entry in it is not a string. A `have` this server cannot read is not
+        /// an empty one: a hash sent in the wrong shape becomes a chunk the
+        /// client did not claim to hold, and the pack it writes has a hole in it.
         pub(super) fn read(body: &str) -> Result<Self, super::ApiError> {
             let fields = super::parse_fields(body)?;
 
@@ -287,10 +295,11 @@ fn reported_address(
     addrs: &[std::net::SocketAddr],
     bind: &str,
 ) -> std::io::Result<std::net::SocketAddr> {
-    addrs
-        .first()
-        .copied()
-        .ok_or_else(|| std::io::Error::other(format!("bound to {bind} but reported no address")))
+    addrs.first().copied().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "this server bound to {bind} but reported no address"
+        ))
+    })
 }
 
 /// The app every worker gets: the router, and nothing around it.
@@ -516,9 +525,9 @@ async fn request_pack(
         && !policy.eq_ignore_ascii_case("keep")
     {
         return error(&ApiError::unprocessable(format!(
-            "compression {policy:?} cannot be served from a set: a re-encode is not in the set's \
-             bytes. `keep` is the only policy a pack resource supports, and it is the \
-             default on both `lepatch pack` and `lepatch merge`"
+            "compression {policy:?} cannot be served from a set. The set holds no bytes for \
+             a re-encode. `keep` is the only policy a pack resource supports. `lepatch pack` \
+             and `lepatch merge` both default to `keep`"
         )));
     }
 
@@ -834,7 +843,7 @@ fn merge_compression(value: Option<&str>) -> Result<MergeSpec, ApiError> {
                 Ok(MergeSpec::Level(level))
             }
             _ => Err(ApiError::bad_request(format!(
-                "{other:?} is not `keep` or a compression level from 0 to {}",
+                "{other:?} is not `keep` and is not a compression level from 0 to {}",
                 crate::storage::MAX_COMPRESSION_LEVEL
             ))),
         };
@@ -1127,7 +1136,7 @@ fn serve_range(resolved: &Resolved, asked: Option<ByteRange>) -> HttpResponse {
                     (
                         "title",
                         Json::string(format!(
-                            "bytes={}- is past the end of a {length}-byte pack",
+                            "bytes={}- starts past the end of a {length}-byte pack",
                             parsed.start
                         )),
                     ),
@@ -1135,7 +1144,7 @@ fn serve_range(resolved: &Resolved, asked: Option<ByteRange>) -> HttpResponse {
                     (
                         "detail",
                         Json::string(format!(
-                            "bytes={}- is past the end of a {length}-byte pack",
+                            "bytes={}- starts past the end of a {length}-byte pack",
                             parsed.start
                         )),
                     ),
@@ -1184,10 +1193,10 @@ fn whole_pack_refusal(length: u64) -> Option<ApiError> {
     Some(ApiError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         format!(
-            "refusing to send a {length}-byte pack in one response: an un-ranged pack fetch is \
+            "refusing to send a {length}-byte pack in one response. An un-ranged pack fetch is \
              held in memory, and this server sends at most {WHOLE_PACK_LIMIT} bytes that way. \
              Fetch a pack this size with `POST /v1/packs/{{id}}/plan`, which returns the byte \
-             ranges you lack, and request those ranges one at a time with a `Range` header"
+             ranges you lack. Request those ranges one at a time with a `Range` header"
         ),
     ))
 }
@@ -1246,7 +1255,7 @@ fn header_range(request: &HttpRequest) -> Option<String> {
 fn requested_from(id: &str) -> Result<Requested, ApiError> {
     let (name, rest) = id.split_once('@').ok_or_else(|| {
         ApiError::bad_request(format!(
-            "{id:?} is not a pack id; a pack id is `set@version` or `set@version-base`"
+            "{id:?} is not a pack id. A pack id is `set@version` or `set@version-base`"
         ))
     })?;
 
@@ -1428,7 +1437,7 @@ mod tests {
             let detail = error.to_string();
             assert!(
                 detail.contains(&format!(
-                    "{wire:?} is not `keep` or a compression level from 0 to"
+                    "{wire:?} is not `keep` and is not a compression level from 0 to"
                 )),
                 "the refusal should name the value and the range, and says {detail:?}"
             );

@@ -135,7 +135,7 @@ impl Sets {
         if components.next().is_some() || only != Component::Normal(name.as_ref()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidFilename,
-                format!("{name:?} is not a single name; a set is named by one path component"),
+                format!("{name:?} is not a single name. A set is named by one path component"),
             ));
         }
 
@@ -207,6 +207,10 @@ impl Sets {
     /// # Errors
     ///
     /// Returns an error if the root cannot be read.
+    ///
+    /// Returns an error if an entry of that directory cannot be read, or if the
+    /// segments or index files of a listed set cannot be read. A set whose own
+    /// figures cannot be read is not skipped: it is reported.
     pub fn list(&self) -> io::Result<Vec<(String, usize, usize)>> {
         let mut out = Vec::new();
 
@@ -293,6 +297,9 @@ impl Sets {
     /// Returns an error if `name` is not a usable set name, or if the set cannot
     /// be opened — which includes a name that names nothing, and a set that is
     /// damaged.
+    ///
+    /// Returns an error if the read cache's lock was poisoned by an earlier
+    /// panic.
     pub async fn reader(&self, name: &str) -> io::Result<Arc<BlobStore<Read, Compression>>> {
         // Resolved before the lookup, so a name the registry would refuse is
         // refused rather than half-served, and so the key it caches under is the
@@ -329,6 +336,9 @@ impl Sets {
     ///
     /// Returns an error if `name` is not a usable set name, or if the set cannot
     /// be opened.
+    ///
+    /// Returns an error if the write lock's lock was poisoned by an earlier
+    /// panic.
     ///
     /// The handle is opened **while the mutex is held**, every time, and then
     /// dropped. That is deliberate, and it is cheaper than it sounds: the
@@ -417,9 +427,8 @@ impl Sets {
         map: &'a Mutex<HashMap<String, T>>,
         what: &str,
     ) -> io::Result<std::sync::MutexGuard<'a, HashMap<String, T>>> {
-        map.lock().map_err(|_| {
-            io::Error::other(format!("the {what} lock was poisoned by an earlier panic"))
-        })
+        map.lock()
+            .map_err(|_| io::Error::other(format!("an earlier panic poisoned the {what} lock")))
     }
 }
 

@@ -520,8 +520,12 @@ impl Jobs {
     /// # Errors
     ///
     /// Returns an error if no job has this id, or if the job has already
-    /// finished — both reported as `NotFound` and `AlreadyExists` respectively,
-    /// which is what a client can act on.
+    /// finished. Both are reported as [`std::io::ErrorKind::AlreadyExists`], which
+    /// is a `409` on the wire: a client that lost the race deserves a definite
+    /// answer, and neither case is a job that can still be stopped.
+    ///
+    /// Returns an error if the handle registry's lock was poisoned by an
+    /// earlier panic. That one is not `AlreadyExists` and becomes a `500`.
     pub fn cancel(&self, id: JobId) -> std::io::Result<()> {
         if self
             .inner
