@@ -357,6 +357,11 @@ impl<'a> Pull<'a> {
     /// response chunk is ever in memory and a range can be any size. A range
     /// already inside one this pull was told has been written is skipped.
     ///
+    /// **The bytes are in the file when this returns.** The file at `path` is
+    /// about to be read back through another descriptor — by [`Pull::open`], or
+    /// by a caller that opens it itself — so a write still sitting in a handle's
+    /// buffer when this call ended would be read as a hole.
+    ///
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened for writing or seeked, or if
@@ -451,6 +456,22 @@ impl<'a> Pull<'a> {
             moved.ranges = moved.ranges.saturating_add(1);
             on_progress(moved);
         }
+
+        // **Before this returns, not after the handle is dropped.** A write on a
+        // `tokio::fs::File` is a copy into the handle's own buffer, and the
+        // `write(2)` behind it runs on a blocking task that has not necessarily
+        // run when the copy is acknowledged. So `write_all` returning says the
+        // bytes were accepted, not that they are in the file — and the caller
+        // reads this file back through a *different* descriptor, which sees
+        // whatever that task has got to. A pack whose trailer was in the last
+        // write is then a file with a hole at the end of it, which is the one
+        // thing the check in `Pull::open` cannot see, because the trailer is
+        // read before it.
+        //
+        // Flushing here also closes the window between two writes: a second
+        // `write` over the same path seeks a fresh handle, and seeks do not
+        // order themselves against a write another handle has outstanding.
+        file.flush().await?;
 
         Ok(moved)
     }

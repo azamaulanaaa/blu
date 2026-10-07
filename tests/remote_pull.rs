@@ -87,6 +87,18 @@ const REFUSAL: Duration = Duration::from_secs(60);
 /// Names the log files, one pair per run, inside the test's own temp dir.
 static RUNS: AtomicU64 = AtomicU64::new(0);
 
+/// How many pulls
+/// [`every_pull_leaves_the_whole_file_in_place_before_it_is_opened`] has going
+/// at once, and how many each of its threads makes.
+///
+/// **A count, not a timeout.** The race that test holds is between two threads
+/// in one process, so it is the number of runs on the machine at once that
+/// decides whether it is caught at all — see that test.
+const CONCURRENT_PULLS: u32 = 8;
+
+/// Pulls each of [`CONCURRENT_PULLS`] makes: thirty-two in all.
+const PULLS_EACH: u32 = 4;
+
 /// The address a server printed, as `--remote` wants it.
 fn remote_of(server: &Server) -> String {
     format!("http://{}", server.address())
@@ -364,6 +376,94 @@ fn a_tree_backed_up_remotely_restores_remotely_byte_for_byte() {
     );
 
     assert_identical(&before, &common::describe(&out));
+}
+
+/// Every pull assembles a file and then reads it back through a different
+/// descriptor, and the bytes have to be in that file by then.
+///
+/// **The defect this holds.** A write on the handle a pull assembles into is a
+/// copy into that handle's own buffer; the `write(2)` behind it runs on a
+/// blocking task, and it has not necessarily run when the copy is acknowledged.
+/// A pull that dropped the handle at that point handed `Pack::open` a file whose
+/// trailer was still unwritten — a hole at the end of the file, read through a
+/// fresh descriptor that saw zeroes where the magic should be, reported as
+/// `it does not end with a pack's magic, so it is truncated or is not one`. The
+/// pack was never at fault, and neither was the server.
+///
+/// **Why these pulls run at the same time.** The window between the last write
+/// being acknowledged and the blocking task issuing it is a scheduling race
+/// between two threads in one process, and it is won by the main thread far more
+/// often when nothing else is running: sixteen pulls of this fixture, one after
+/// another, caught the defect in none of them. With [`CONCURRENT_PULLS`] runs on
+/// the machine at once it is one pull in five. So the count here is chosen for
+/// the miss probability rather than for the clock — thirty-two pulls at one in
+/// five is a miss in about one run in ten thousand — and every one of them has
+/// to restore the whole tree, or the test fails.
+#[test]
+fn every_pull_leaves_the_whole_file_in_place_before_it_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = tree(dir.path());
+    let server = Server::start(&served_root(dir.path()));
+    let address = remote_of(&server);
+
+    push(dir.path(), "src", &address);
+
+    let before = common::describe(&source);
+    assert!(
+        before.len() >= 7,
+        "the fixture should hold a nested file, an empty file, an empty directory and a large \
+         binary; it holds {} entries",
+        before.len()
+    );
+
+    let pulls: Vec<_> = (0..CONCURRENT_PULLS)
+        .map(|pull| {
+            let source = source.clone();
+            let address = address.clone();
+            let dir = dir.path().to_path_buf();
+
+            thread::spawn(move || {
+                // Described per thread, because the walk is over the tree that
+                // went up and every thread compares against that and not
+                // against what another thread restored.
+                let before = common::describe(&source);
+
+                // **A destination of its own each time.** A second pull into a
+                // destination that already holds the version reads its manifest
+                // and fetches only the pack's fixed regions, which is a
+                // different write pattern from the one this is about: one
+                // range, the whole pack.
+                for round in 0..PULLS_EACH {
+                    let destination = tempfile::tempdir().unwrap();
+                    let out = destination.path().join("out");
+                    let stdout = ok(
+                        &dir,
+                        &[
+                            "restore",
+                            out.to_str().unwrap(),
+                            "docs",
+                            "--remote",
+                            &address,
+                        ],
+                    );
+
+                    let (fetched, length) = fetched(&stdout);
+                    assert_eq!(
+                        fetched, length,
+                        "pull {pull} round {round} did not fetch the whole pack:\n{stdout}"
+                    );
+                    assert_identical(&before, &common::describe(&out));
+                }
+            })
+        })
+        .collect();
+
+    // A failure inside a pull is a failure of this test, and `join` is what says
+    // so: a panicked thread nobody joined would not fail anything.
+    for pull in pulls {
+        pull.join()
+            .expect("every pull should restore the whole tree");
+    }
 }
 
 #[test]
