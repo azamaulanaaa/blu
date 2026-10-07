@@ -197,6 +197,13 @@ impl Sets {
     /// does not turn into a `404` later on; it simply is not there, which is what
     /// a directory listing means.
     ///
+    /// **Only under a name a request can be answered for.** Every listed name is
+    /// a fixed point of the normalisation [`Sets::base`] applies, so the store a
+    /// listing names and the store a request reaches are the same directory. A
+    /// set whose own base is shaped like one of its segments — `report.2024.bin`
+    /// — is addressable only through that clash, and is not listed at all; see
+    /// the fixed-point check in the body.
+    ///
     /// # Errors
     ///
     /// Returns an error if the root cannot be read.
@@ -237,7 +244,22 @@ impl Sets {
 
             // Off the filesystem rather than off the wire, but the same rule: a
             // name the registry would refuse to serve is not listed.
-            if self.base(name).is_err() || !seen.insert(name.to_string()) {
+            let Ok(resolved) = self.base(name) else {
+                continue;
+            };
+
+            // **And the name has to be a fixed point of the normalisation.**
+            // `self.base` cuts a segment-shaped tail off a *second* time, so a
+            // set whose own base is segment-shaped does not survive it:
+            // `report.2024.bin`, whose files are `report.2024.bin.0000.bin`, is
+            // listed under `report.2024.bin` and every request for that name
+            // resolves to `<root>/report` — a different store, and a merge into
+            // the wrong one. A name that cannot be requested back is not listed.
+            //
+            // No write in this build can produce one, because every write goes
+            // through `IndexSet`; the realistic route is a root created or copied
+            // from outside, which is the state the test builds.
+            if resolved != set.base() || !seen.insert(name.to_string()) {
                 continue;
             }
 
@@ -538,5 +560,71 @@ mod tests {
         let sets = Sets::new(dir.path().to_path_buf());
 
         assert_eq!(sets.list().unwrap().len(), 0);
+    }
+
+    /// Put one empty segment file for a set whose base is `base`, by hand.
+    ///
+    /// **The files are written directly rather than through a merge, because
+    /// that is the only way to reach a set whose *own base* is shaped like a
+    /// segment.** Every write in this crate goes through `IndexSet`, which strips
+    /// such a tail off before anything is created, so a merge cannot produce one.
+    /// The reachable route is a root copied in from outside.
+    ///
+    /// A segment lives *beside* its base rather than inside a directory named
+    /// after it — [`IndexSet::segments`] reads the base's own parent — so this
+    /// writes `<base>.0000.bin` into the root itself.
+    fn store_with_one_segment(root: &Path, base: &str) {
+        std::fs::write(root.join(format!("{base}.0000.bin")), b"").unwrap();
+    }
+
+    #[test]
+    fn a_set_whose_own_base_is_shaped_like_a_segment_is_not_listed() {
+        // **The listing named a store no request could reach.** `report.2024.bin`
+        // is the base, and its segment is `report.2024.bin.0000.bin`. The listing
+        // takes the name off `IndexSet`, which strips one tail and stops — so the
+        // set is listed as `report.2024.bin`. But [`Sets::base`] strips a tail
+        // again on the way in, and `.2024.bin` is shaped exactly like one, so a
+        // request for `report.2024.bin` resolves to `<root>/report`. Listing it
+        // would be advertising a set under a name that merges into a different
+        // store.
+        let dir = tempfile::tempdir().unwrap();
+        store_with_one_segment(dir.path(), "report.2024.bin");
+
+        let sets = Sets::new(dir.path().to_path_buf());
+
+        assert!(
+            sets.list().unwrap().is_empty(),
+            "a set that cannot be requested back must not be listed"
+        );
+
+        // Stated the other way round as well, because the two directions are
+        // different code: the name is refused *and* the path it would reach is
+        // somebody else's.
+        assert_eq!(
+            sets.base("report.2024.bin").unwrap(),
+            dir.path().join("report"),
+            "the name resolves to a different store, which is why it is unlisted"
+        );
+        assert_ne!(
+            sets.base("report.2024.bin").unwrap(),
+            dir.path().join("report.2024.bin")
+        );
+    }
+
+    #[test]
+    fn an_ordinary_set_beside_an_unaddressable_one_is_still_listed() {
+        // The check is per set, not a bail-out: one unclashable set in a root
+        // must not take the rest of the listing with it. `photos.2024` is here
+        // because it is the *near* miss — a dotted name that is not shaped like a
+        // segment, and so is addressable.
+        let dir = tempfile::tempdir().unwrap();
+        store_with_one_segment(dir.path(), "report.2024.bin");
+        store_with_one_segment(dir.path(), "docs");
+        store_with_one_segment(dir.path(), "photos.2024");
+
+        let listed = Sets::new(dir.path().to_path_buf()).list().unwrap();
+
+        let names: Vec<&str> = listed.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, ["docs", "photos.2024"]);
     }
 }

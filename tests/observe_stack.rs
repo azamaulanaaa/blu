@@ -445,6 +445,13 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
     });
 }
 
+/// How long [`await_job`] waits for a job to reach a terminal state.
+///
+/// **A deadline, not an iteration count.** `400` rounds of `10 ms` is 4 s of
+/// sleeping *plus* 400 round-trips, so the real budget grew with per-request
+/// latency on a loaded machine.
+const JOB_BUDGET: Duration = Duration::from_secs(15);
+
 /// Poll `GET /v1/jobs/{job}` until it reaches a terminal state, and hand back
 /// the whole document.
 ///
@@ -452,7 +459,9 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
 /// a helper that returned only the result would be asserting about something
 /// else.
 async fn await_job(address: std::net::SocketAddr, job: &str) -> serde_json::Value {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + JOB_BUDGET;
+
+    loop {
         let response = Request::new("GET", &format!("/v1/jobs/{job}"))
             .send(address)
             .await;
@@ -468,11 +477,17 @@ async fn await_job(address: std::net::SocketAddr, job: &str) -> serde_json::Valu
         match state {
             "succeeded" => return document,
             "failed" | "cancelled" => panic!("job {job} {state}: {document}"),
-            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            _ => {}
         }
-    }
 
-    panic!("job {job} did not finish in time");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job {job} did not finish within {}s",
+            JOB_BUDGET.as_secs()
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A small pack to push, made by this crate's own commands.

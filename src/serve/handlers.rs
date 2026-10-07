@@ -747,7 +747,7 @@ async fn merge_pack(
         Err(e) => return error(&e),
     };
 
-    let (route, compression) = match merge_compression(request.compression.as_deref()) {
+    let spec = match merge_compression(request.compression.as_deref()) {
         Ok(answer) => answer,
         Err(e) => return error(&e),
     };
@@ -760,56 +760,78 @@ async fn merge_pack(
     }
 
     let id = jobs.spawn("merge", move |_handle| async move {
-        merge_into(&sets, &uploads, &name, &upload, route, compression).await
+        merge_into(&sets, &uploads, &name, &upload, spec).await
     });
 
     accepted(id)
 }
 
-/// A merge's `compression`, as the **two** answers it is.
+/// A merge's `compression`, as the one value both of its answers come from.
 ///
-/// A level names which write path the merge takes per chunk
+/// **Two answers to one word, and both are derived here.** A level names which
+/// write path the merge takes per chunk
 /// ([`crate::command::MergeCompression`]) *and* the policy the receiving set is
 /// opened with ([`crate::storage::Compression`]), because the store is what
-/// encodes a re-encoded chunk.
-/// They come out of one parse of one number so that they cannot disagree: a
-/// merge taking the re-encode path with the set opened under some other level
-/// would write frames at a level no client asked for, which is the defect this
-/// function exists to make impossible.
+/// encodes a re-encoded chunk. So the level is *held*, and the two answers are
+/// computed from it, rather than the two answers being carried separately and
+/// agreeing by inspection. A merge taking the re-encode path with the set opened
+/// under some other level would write frames at a level no client asked for, and
+/// there is no longer a way to write that call down: the disagreement is not a
+/// state this type has.
+///
+/// The same shape as the CLI's `KeepOrLevel`, and for the same reason — see
+/// `KeepOrLevel::policy` in `main.rs`, which this is the server half of.
 ///
 /// `keep` names neither, so it answers the default policy.
 /// The verbatim path does not compress a chunk; the only record it writes through
 /// the store's own policy is the snapshot, and a set opened for writing has to be
 /// opened with something. The default is what every other command opens a set
 /// with, and it is what `lepatch merge` opens one at when the flag says `keep`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeSpec {
+    /// Store what the pack carries, frame and all.
+    Keep,
+    /// Decode every chunk and store it at this zstd level, 0 meaning as-is.
+    Level(u8),
+}
+
+impl MergeSpec {
+    /// Which write path the merge takes per chunk.
+    fn route(self) -> crate::command::MergeCompression {
+        match self {
+            Self::Keep => crate::command::MergeCompression::Keep,
+            Self::Level(_) => crate::command::MergeCompression::Reencode,
+        }
+    }
+
+    /// The policy the receiving set is opened with.
+    ///
+    /// **The user's `0`, which means as-is.** `Compression::zstd` would clamp it
+    /// to 1, which is not what a command line's 0 means, so this goes through
+    /// `from_level`. This is the same function `lepatch merge --compression 0`
+    /// reaches through `KeepOrLevel::policy`.
+    fn policy(self) -> crate::storage::Compression {
+        match self {
+            Self::Keep => crate::storage::Compression::default(),
+            Self::Level(level) => crate::storage::Compression::from_level(level),
+        }
+    }
+}
+
+/// Read a merge's `compression` off the wire.
 ///
 /// # Errors
 ///
 /// Returns a `400` for anything that is neither `keep` nor a level from 0 to
 /// [`crate::storage::MAX_COMPRESSION_LEVEL`], naming the value and the range.
-fn merge_compression(
-    value: Option<&str>,
-) -> Result<
-    (
-        crate::command::MergeCompression,
-        crate::storage::Compression,
-    ),
-    ApiError,
-> {
+fn merge_compression(value: Option<&str>) -> Result<MergeSpec, ApiError> {
     // Absent is `keep` too, and is the flag's default at both ends.
     if let Some(other) = value
         && !other.eq_ignore_ascii_case("keep")
     {
         return match other.parse::<u8>() {
             Ok(level) if u64::from(level) <= u64::from(crate::storage::MAX_COMPRESSION_LEVEL) => {
-                Ok((
-                    crate::command::MergeCompression::Reencode,
-                    // The user's `0`, which means as-is. `Compression::zstd` would
-                    // clamp it to 1, which is not what a command line's 0 means.
-                    // This is the same function `lepatch merge --compression 0`
-                    // reaches through `KeepOrLevel::policy`.
-                    crate::storage::Compression::from_level(level),
-                ))
+                Ok(MergeSpec::Level(level))
             }
             _ => Err(ApiError::bad_request(format!(
                 "{other:?} is not `keep` or a compression level from 0 to {}",
@@ -818,10 +840,7 @@ fn merge_compression(
         };
     }
 
-    Ok((
-        crate::command::MergeCompression::Keep,
-        crate::storage::Compression::default(),
-    ))
+    Ok(MergeSpec::Keep)
 }
 
 /// The merge itself, as a job runs it.
@@ -839,21 +858,21 @@ fn merge_compression(
 ///    the next listing would omit the version this merge just published — a wrong
 ///    answer rather than a slow one.
 ///
-/// `compression` is the write policy the set is opened with. It is a separate
-/// argument from `policy` only because the two are different types that happen to
-/// come out of the same number; see [`merge_compression`].
+/// `spec` is the one value both the write policy and the merge route are derived
+/// from, rather than the two of them as separate arguments. They are different
+/// types that come out of one parse, and a signature taking them separately is a
+/// signature that can be edited into disagreement; see [`MergeSpec`].
 async fn merge_into(
     sets: &Sets,
     uploads: &Uploads,
     name: &str,
     upload: &str,
-    policy: crate::command::MergeCompression,
-    compression: crate::storage::Compression,
+    spec: MergeSpec,
 ) -> Result<Json, String> {
     // Every `?` here is an `io::Error`; the job wants a sentence. One
     // conversion at the boundary rather than a `map_err` on each call.
     let attempt = sets
-        .writing(name, compression, |store| async move {
+        .writing(name, spec.policy(), |store| async move {
             let reason = |e: std::io::Error| e.to_string();
 
             let base_path = sets.base(name).map_err(reason)?;
@@ -861,7 +880,7 @@ async fn merge_into(
             let _claim = set.lock().map_err(reason)?;
 
             let pack = uploads.open(upload).map_err(reason)?;
-            crate::command::merge(&store, &pack, policy)
+            crate::command::merge(&store, &pack, spec.route())
                 .await
                 .map_err(reason)
         })
@@ -1315,10 +1334,11 @@ mod tests {
 
     #[test]
     fn a_merge_compression_is_a_level_and_the_policy_it_opens_the_set_with() {
-        // **Both halves, or the endpoint has the defect this function is here to
+        // **Both halves, or the endpoint has the defect this type is here to
         // prevent.** The route alone is not a compression policy: the set is what
         // encodes a re-encoded chunk, so `9` and the default are the same run if
-        // the second half is dropped.
+        // the second half is dropped. They are read off one value here, so the
+        // pair cannot be edited apart.
         //
         // `0` is the one that has to be checked rather than inferred, because
         // `Compression::zstd(0)` clamps to 1 and a command line's `0` means as-is.
@@ -1329,14 +1349,53 @@ mod tests {
             ("1", crate::storage::Compression::zstd(1)),
             ("9", crate::storage::Compression::zstd(9)),
         ] {
-            let (route, policy) = merge_compression(Some(wire)).unwrap();
+            let spec = merge_compression(Some(wire)).unwrap();
 
             assert_eq!(
-                route,
+                spec.route(),
                 crate::command::MergeCompression::Reencode,
                 "{wire} is a level, so the merge must take the re-encode path"
             );
-            assert_eq!(policy, expected, "{wire} must open the set at {expected:?}");
+            assert_eq!(
+                spec.policy(),
+                expected,
+                "{wire} must open the set at {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_route_and_the_policy_are_derived_from_the_one_thing_the_wire_named() {
+        // **The invariant, as a property over every answer.** A `MergeSpec`
+        // cannot be in a state where its two answers disagree, because neither
+        // answer is stored — both are computed. So there is no table of pairs to
+        // keep in step; there is one value and two functions over it.
+        for (wire, route, policy) in [
+            (
+                None,
+                crate::command::MergeCompression::Keep,
+                crate::storage::Compression::default(),
+            ),
+            (
+                Some("keep"),
+                crate::command::MergeCompression::Keep,
+                crate::storage::Compression::default(),
+            ),
+            (
+                Some("0"),
+                crate::command::MergeCompression::Reencode,
+                crate::storage::Compression::Off,
+            ),
+            (
+                Some("9"),
+                crate::command::MergeCompression::Reencode,
+                crate::storage::Compression::zstd(9),
+            ),
+        ] {
+            let spec = merge_compression(wire).unwrap();
+
+            assert_eq!(spec.route(), route, "{wire:?}: the write path per chunk");
+            assert_eq!(spec.policy(), policy, "{wire:?}: the set's write policy");
         }
     }
 
@@ -1346,10 +1405,10 @@ mod tests {
         // policy — which is what `lepatch merge --compression keep` opens the
         // local set with, so a push and a local merge agree.
         for wire in [None, Some("keep"), Some("KEEP")] {
-            let (route, policy) = merge_compression(wire).unwrap();
+            let spec = merge_compression(wire).unwrap();
 
-            assert_eq!(route, crate::command::MergeCompression::Keep);
-            assert_eq!(policy, crate::storage::Compression::default());
+            assert_eq!(spec.route(), crate::command::MergeCompression::Keep);
+            assert_eq!(spec.policy(), crate::storage::Compression::default());
         }
     }
 

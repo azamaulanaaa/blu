@@ -206,9 +206,25 @@ async fn request_pack(server: &Server, set: &str, version: Option<u32>) -> serde
     await_job(server, &job).await
 }
 
+/// How long [`await_job`] waits for a job to reach a terminal state.
+///
+/// **The longest wait in the suite, on the biggest fixture.** The merge this
+/// polls is a ~34 MB pack, and a slow machine must not turn a slow run into a
+/// failed one — so this is a budget rather than a poll count.
+const JOB_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Poll a job until it finishes, and return its `result`.
+///
+/// **A deadline, not an iteration count.** `400` rounds of `5 ms` is 2 s of
+/// sleeping *plus* 400 HTTP round-trips, so the real budget grew with
+/// per-request latency on a loaded machine — and this is the tightest clock in
+/// the suite, because its fixture is the big one. So the budget is the number in
+/// the source, and a failing run says how long it waited rather than how many
+/// times it asked.
 async fn await_job(server: &Server, job: &str) -> serde_json::Value {
-    for _ in 0..400 {
+    let deadline = std::time::Instant::now() + JOB_BUDGET;
+
+    loop {
         let response = Request::new("GET", &format!("/v1/jobs/{job}"))
             .send(server.address())
             .await;
@@ -229,11 +245,17 @@ async fn await_job(server: &Server, job: &str) -> serde_json::Value {
             "failed" | "cancelled" => {
                 panic!("job {job} {state}: {}", response.text())
             }
-            _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            _ => {}
         }
-    }
 
-    panic!("job {job} did not finish in time");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job {job} did not finish within {}s",
+            JOB_BUDGET.as_secs()
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 /// Upload a pack and merge it into `set`, returning the merge's result.

@@ -282,8 +282,22 @@ pub(crate) fn set_path(name: &str) -> io::Result<String> {
         ));
     }
 
-    let mut encoded = String::with_capacity(name.len());
-    for byte in name.bytes() {
+    Ok(encode_component(name))
+}
+
+/// One path component, percent-encoded.
+///
+/// **One function for both callers, because the encoder is not the part that
+/// differs.** A set name and a server-issued id differ in whether they are
+/// validated or only made safe, and the bytes that come out are the same either
+/// way — so the loop that produces them is written once, here.
+///
+/// The unreserved set is RFC 3986's, and `.` is in it rather than out of it:
+/// the set names in this crate carry dots (`photos.2024`), and encoding them
+/// would be a set name no request could name back.
+fn encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 encoded.push(char::from(byte));
@@ -296,7 +310,7 @@ pub(crate) fn set_path(name: &str) -> io::Result<String> {
         }
     }
 
-    Ok(encoded)
+    encoded
 }
 
 /// One server-issued id as it goes into a URL path.
@@ -312,19 +326,7 @@ pub(crate) fn set_path(name: &str) -> io::Result<String> {
 /// An id is never empty in practice, and one that is is refused by the request
 /// that names it rather than here.
 pub(crate) fn segment(id: &str) -> String {
-    let mut encoded = String::with_capacity(id.len());
-    for byte in id.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                encoded.push(char::from(byte));
-            }
-            _ => {
-                let _ = write!(encoded, "%{byte:02X}");
-            }
-        }
-    }
-
-    encoded
+    encode_component(id)
 }
 
 /// Refuse a name a server will not accept as a set's, without sending anything.
