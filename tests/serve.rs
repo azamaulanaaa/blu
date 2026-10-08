@@ -287,6 +287,20 @@ async fn push_with(
     pack_path: &Path,
     compression: Option<&str>,
 ) -> serde_json::Value {
+    let job = start_merge(server, set, pack_path, compression).await;
+    await_job(server, &job).await
+}
+
+/// Upload a pack and start a merge into `set`, and return the merge's job id.
+///
+/// [`push_with`] waits for the merge. This does not, because a test about two
+/// streams at once has to open both of them while both merges are still running.
+async fn start_merge(
+    server: &Server,
+    set: &str,
+    pack_path: &Path,
+    compression: Option<&str>,
+) -> String {
     let begin = Request::new("POST", "/v1/uploads")
         .send(server.address())
         .await;
@@ -320,8 +334,7 @@ async fn push_with(
         .await;
     assert_eq!(accepted.status, 202, "body: {}", accepted.text());
 
-    let job = accepted.field("job").unwrap().as_str().unwrap().to_string();
-    await_job(server, &job).await
+    accepted.field("job").unwrap().as_str().unwrap().to_string()
 }
 
 /// A pack of a fresh tree, in its own subdirectory of `dir`.
@@ -1544,6 +1557,75 @@ async fn a_job_can_be_watched_over_sse() {
     // And it agrees with what polling says, which is the property that makes the
     // two worth having.
     await_job(&server, &job).await;
+}
+
+#[tokio::test]
+async fn two_concurrent_merges_streams_carry_only_their_own_result() {
+    /// One window of the second merge's fixture.
+    const WINDOW: usize = 4 << 20;
+
+    // **One stream per job, end to end.** Both jobs broadcast on one channel, so
+    // a subscriber to the first merge was sent the second merge's events, and a
+    // `JobEvent` carries no job id, so the consumer had nothing to filter on.
+    // A merge result names its set, so the leak is visible in the body.
+    //
+    // The split waits for both merges. A live event that crosses from the second
+    // job is therefore certain to arrive, rather than being a race against the
+    // second merge finishing first.
+    let dir = tempfile::tempdir().unwrap();
+    let alpha_pack = pack_of(dir.path(), "alpha", 2).await;
+
+    // **Big enough that the second merge is still running when the first stream
+    // opens**, because that overlap is the whole defect. Four windows of one
+    // long stream, cut at disjoint offsets, so none is a prefix of another and
+    // deduplication has nothing to collapse. Smaller than [`slow_pack`], because
+    // this test needs the merge to outlast a socket connect, not a reporting
+    // interval.
+    let beta_source = common::source(&dir.path().join("beta"));
+    for (i, window) in common::noisy(4 * WINDOW).chunks(WINDOW).enumerate() {
+        fs::write(beta_source.join(format!("f{i}.bin")), window).unwrap();
+    }
+    let beta_blob = dir.path().join("beta-local");
+    backup(&beta_source, &beta_blob).await;
+    let beta_pack = dir.path().join("beta.pack");
+    pack(&beta_blob, &beta_pack).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    let alpha = start_merge(&server, "alpha", &alpha_pack, None).await;
+    let beta = start_merge(&server, "beta", &beta_pack, None).await;
+
+    let alpha_stream = read_events(server.address(), &alpha, async {
+        let _ = await_job(&server, &alpha).await;
+        let _ = await_job(&server, &beta).await;
+    })
+    .await;
+
+    let beta_stream = read_events(server.address(), &beta, async {
+        let _ = await_job(&server, &beta).await;
+    })
+    .await;
+
+    assert_eq!(alpha_stream.status, 200);
+    assert_eq!(beta_stream.status, 200);
+
+    for (stream, own, foreign) in [
+        (&alpha_stream, "alpha", "beta"),
+        (&beta_stream, "beta", "alpha"),
+    ] {
+        let text = format!("{}{}", stream.replay, stream.live);
+
+        assert!(
+            text.contains(&format!("\"{own}\"")),
+            "a stream must carry its own merge result: {text}"
+        );
+        assert!(
+            !text.contains(&format!("\"{foreign}\"")),
+            "a stream must not carry another job's events: {text}"
+        );
+    }
 }
 
 #[tokio::test]

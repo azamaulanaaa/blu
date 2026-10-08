@@ -65,6 +65,15 @@ const RETAINED: usize = 256;
 /// anyone needs replayed.
 const REPLAY: usize = 64;
 
+/// How many events one job's live channel holds before a slow reader lags.
+///
+/// **Four times [`REPLAY`], and that ratio is the point.** The history is the
+/// last `REPLAY` events of one job, so a reader that falls behind by more than
+/// this bound has already fallen behind by more than the crate promises to
+/// replay. One channel held every job's events before, so a busy job pushed an
+/// unrelated subscriber past a bound it never spent.
+const CHANNEL: usize = 4 * REPLAY;
+
 /// A job's identity.
 ///
 /// BLAKE3 over the process id, the time the process started and a counter. Three
@@ -293,7 +302,17 @@ impl Default for Jobs {
 struct Inner {
     jobs: Mutex<HashMap<JobId, Job>>,
     handles: Mutex<HashMap<JobId, JoinHandle<()>>>,
-    events: broadcast::Sender<JobEvent>,
+    /// The live event channel of each job, one per job.
+    ///
+    /// **One channel per job, not one for the process.** One channel sent a
+    /// subscriber the events of every other job, and [`JobEvent`] carries no job
+    /// id, so the consumer had nothing to filter them out on. The same channel
+    /// also shared one capacity, so a busy job made an unrelated subscriber lag
+    /// and `handlers.rs` ended that stream.
+    ///
+    /// Taken **after** [`Inner::replay`], never before, so the two locks are
+    /// always held in one order.
+    events: Mutex<HashMap<JobId, broadcast::Sender<JobEvent>>>,
     /// Recent events per job, so a late subscriber is not told nothing.
     ///
     /// **This lock also covers the `send` in `broadcast`.** The history and the
@@ -303,16 +322,38 @@ struct Inner {
     replay: Mutex<HashMap<JobId, Vec<JobEvent>>>,
 }
 
+impl Inner {
+    /// The live sender of one job, made if the job has not broadcast yet.
+    ///
+    /// **Called with `replay` already held, and the receiver taken here.** That
+    /// is what keeps each event exactly once: [`Jobs::subscribe`] creates the
+    /// receiver and reads the history under one guard, so an event either lands
+    /// before the receiver exists or after it, never between the two.
+    fn sender(&self, id: JobId) -> broadcast::Sender<JobEvent> {
+        // A poisoned map must not silence the live stream, so a poisoned lock
+        // still yields the sender it holds.
+        let mut events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        events.entry(id).or_insert_with(new_channel).clone()
+    }
+}
+
+/// A new live channel, for one job that has not broadcast yet.
+fn new_channel() -> broadcast::Sender<JobEvent> {
+    broadcast::channel(CHANNEL).0
+}
+
 impl Jobs {
     /// A registry with no jobs in it.
     #[must_use]
     pub fn new() -> Self {
-        let (events, _) = broadcast::channel(1024);
         Self {
             inner: Arc::new(Inner {
                 jobs: Mutex::new(HashMap::new()),
                 handles: Mutex::new(HashMap::new()),
-                events,
+                events: Mutex::new(HashMap::new()),
                 replay: Mutex::new(HashMap::new()),
             }),
         }
@@ -631,9 +672,10 @@ impl Jobs {
     /// snapshot was on **neither** and reached nobody at all.
     ///
     /// What is still bounded, and is not claimed here to be more: the history is
-    /// the last `REPLAY` events, and the receiver has the broadcast's own finite
-    /// capacity. A subscriber that falls further behind than that is told the
-    /// stream lagged and can poll `GET /v1/jobs/{id}` for what it missed.
+    /// the last `REPLAY` events, and the receiver has its own job's finite
+    /// channel. A subscriber that falls further behind than that is told the
+    /// stream lagged and can poll `GET /v1/jobs/{id}` for what it missed. The
+    /// channel belongs to one job, so only that job's events can make it lag.
     ///
     /// # Errors
     ///
@@ -661,10 +703,10 @@ impl Jobs {
         let Ok(replay) = self.inner.replay.lock() else {
             // A poisoned history is still worth a live receiver: a subscriber
             // gets the events from here on and loses only the replay.
-            return Ok((self.inner.events.subscribe(), Vec::new()));
+            return Ok((self.inner.sender(id).subscribe(), Vec::new()));
         };
 
-        let receiver = self.inner.events.subscribe();
+        let receiver = self.inner.sender(id).subscribe();
         let history = replay.get(&id).cloned().unwrap_or_default();
 
         Ok((receiver, history))
@@ -680,14 +722,14 @@ impl Jobs {
         let Ok(mut replay) = self.inner.replay.lock() else {
             // A poisoned history must not also silence the live stream, so the
             // send still happens — it is only the replay that is lost.
-            let _ = self.inner.events.send(event);
+            let _ = self.inner.sender(id).send(event);
             return;
         };
 
         // A send with nobody listening is not a failure. Every event here may
         // have no subscriber at all, which is the normal case for a job whose
         // client polls.
-        let _ = self.inner.events.send(event.clone());
+        let _ = self.inner.sender(id).send(event.clone());
 
         // `entry().or_default()` rather than `get_mut()`. `get_mut` returns
         // `None` for a job that has not recorded an event yet, so the **first**
@@ -745,8 +787,25 @@ impl Jobs {
             if !retired.is_empty()
                 && let Ok(mut replay) = self.inner.replay.lock()
             {
-                for id in retired {
-                    replay.remove(&id);
+                for id in &retired {
+                    replay.remove(id);
+                }
+
+                // **Beside the replay, under the same guard.** A retired job's
+                // channel goes with the job and its history, so the map of
+                // channels does not grow for ever.
+                //
+                // **At retirement and not at a terminal state.** Dropping the
+                // channel when the job finishes would make `subscribe` answer
+                // `NotFound` for a finished job and lose the replay a client
+                // reads after the fact.
+                let mut events = self
+                    .inner
+                    .events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for id in &retired {
+                    events.remove(id);
                 }
             }
         }
@@ -802,6 +861,73 @@ impl JobHandle {
 #[cfg(test)]
 mod tests {
     use super::{JobEvent, JobId, Jobs, State};
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    #[tokio::test]
+    async fn a_subscriber_does_not_receive_another_jobs_events() {
+        // **One stream per job, not one per process.** A subscriber to the first
+        // job was sent the second job's counters, because both jobs broadcast on
+        // one channel and [`JobEvent`] carries no job id, so the consumer had
+        // nothing to filter on.
+        let jobs = Jobs::new();
+        let watched = jobs.spawn("pack", |_| async {
+            std::future::pending::<()>().await;
+            Ok(super::Json::Null)
+        });
+        let other = jobs.spawn("merge", |_| async {
+            std::future::pending::<()>().await;
+            Ok(super::Json::Null)
+        });
+
+        let (mut receiver, _history) = jobs.subscribe(watched).unwrap();
+
+        // The watched job has already broadcast `running`. Taken off here, so
+        // what the assertion below reports is the other job's events alone.
+        while receiver.try_recv().is_ok() {}
+
+        jobs.emit_progress(other, vec![("chunks".to_string(), 42)]);
+
+        let first = receiver.try_recv();
+        assert!(
+            matches!(&first, Err(TryRecvError::Empty)),
+            "a subscriber must not receive another job's events: {first:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_jobs_events_cannot_lag_this_subscribers_stream() {
+        // **The shared capacity was a shared failure.** One channel held the
+        // events of every job, so a busy job pushed an unrelated subscriber past
+        // the bound. `handlers.rs` maps that lag to a closed stream, so the
+        // subscriber lost a stream it never asked to lose.
+        //
+        // The count clears the capacity the whole process used to share, so this
+        // fails before the fix as well as after it.
+        const FOREIGN_EVENTS: u32 = 2_048;
+
+        let jobs = Jobs::new();
+        let watched = jobs.spawn("pack", |_| async {
+            std::future::pending::<()>().await;
+            Ok(super::Json::Null)
+        });
+        let other = jobs.spawn("merge", |_| async {
+            std::future::pending::<()>().await;
+            Ok(super::Json::Null)
+        });
+
+        let (mut receiver, _history) = jobs.subscribe(watched).unwrap();
+        while receiver.try_recv().is_ok() {}
+
+        for value in 0..FOREIGN_EVENTS {
+            jobs.emit_progress(other, vec![("chunks".to_string(), u64::from(value))]);
+        }
+
+        let first = receiver.try_recv();
+        assert!(
+            matches!(&first, Err(TryRecvError::Empty)),
+            "another job's events must neither arrive nor lag this stream: {first:?}"
+        );
+    }
 
     #[tokio::test]
     async fn a_job_starts_queued_and_ends_succeeded() {
