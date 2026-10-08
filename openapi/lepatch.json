@@ -878,10 +878,10 @@
         ],
         "operationId": "streamJob",
         "summary": "The same events, as a stream.",
-        "description": "Server-Sent Events rather than WebSockets: this is one-directional, it is text, and it reconnects on its own. A client that does not want a stream polls `GET /v1/jobs/{id}` instead, and both read the same events, so the two agree.\n\nFour event names: `state` on every transition, `progress` on each counter tick, `result` once, and `error` when the job fails. `error` is the counterpart to `result`: a failed job carries the reason on the stream, so a client that reads only events does not have to fall back to polling to find out what went wrong.",
+        "description": "Server-Sent Events rather than WebSockets: this is one-directional and it is text. A client that does not want a stream polls `GET /v1/jobs/{id}` instead, and both read the same events, so the two agree.\n\nThere is no resumption. The server sends no event id, so a client has no `Last-Event-ID` to send back. A new subscriber gets the whole stored history again, not only what it missed. The replay holds only the last 64 events.\n\nFour event names: `state` on every transition, `progress` on each counter tick, `result` once, and `error` when the job fails. `error` is the counterpart to `result`: a failed job carries the reason on the stream, so a client that reads only events does not have to fall back to polling to find out what went wrong.",
         "responses": {
           "200": {
-            "description": "The stream. It is closed when the job finishes.",
+            "description": "The stream. It stays open after the job finishes, and it ends when the client goes away or the server stops.",
             "content": {
               "text/event-stream": {
                 "schema": {

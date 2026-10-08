@@ -964,13 +964,17 @@ async fn cancel_job(jobs: web::Data<super::Jobs>, path: web::Path<String>) -> Ht
 
 /// `GET /v1/jobs/{id}/events` — the same events, as a stream.
 ///
-/// **Server-Sent Events rather than `WebSockets`.** This is one-directional, it is
-/// text, and it reconnects on its own with a `Last-Event-ID`. A WebSocket would
-/// buy a direction this endpoint does not have and cost a handshake, a frame
-/// protocol and a second thing to keep working.
+/// **Server-Sent Events rather than `WebSockets`.** This is one-directional and it
+/// is text. A WebSocket would buy a direction this endpoint does not have and
+/// cost a handshake, a frame protocol and a second thing to keep working.
+///
+/// **No resumption, because the server sends no event id.** A client therefore
+/// has no `Last-Event-ID` to send back. A new subscriber gets the whole stored
+/// history again, not only what it missed. The replay holds only the last 64
+/// events.
 ///
 /// A client that does not want a stream polls `GET /v1/jobs/{id}` instead. Both
-/// read the same [`JobEvent`]s, so the two agree.
+/// report the same values, so the two agree.
 #[actix_web::get("/v1/jobs/{id}/events")]
 async fn job_events(jobs: web::Data<super::Jobs>, path: web::Path<String>) -> HttpResponse {
     let id = match JobId::parse(&path.into_inner()) {
