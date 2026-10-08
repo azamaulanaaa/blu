@@ -523,7 +523,7 @@ enum Command {
         ///
         /// Affects the file and nothing else: the version is still resolved and
         /// every chunk still located, so the counts and the byte totals are the
-        /// pack's own. `--out` is neither created nor overwritten. The size on disk
+        /// pack's own. `<OUT>` is neither created nor overwritten. The size on disk
         /// and the content hash are not reported, because both are properties of a
         /// file this run does not write.
         ///
@@ -535,7 +535,7 @@ enum Command {
         dry_run: bool,
         /// Push the pack this run writes to a `lepatch serve` at this address.
         ///
-        /// The pack is written to `--out` exactly as it is without this, and it is
+        /// The pack is written to `<OUT>` exactly as it is without this, and it is
         /// that file which is uploaded — so the artifact on disk and the artifact
         /// the server merges are the same bytes, and a push is not a second pack
         /// of the same version built by different code.
@@ -2432,7 +2432,7 @@ fn effective_from(from: Option<u32>, full: bool) -> Option<u32> {
 /// finishes.
 ///
 /// A dry run builds the same plan and stops before the file is touched. So the
-/// run neither creates nor overwrites `--out`. The size on disk and the content
+/// run neither creates nor overwrites `<OUT>`. The size on disk and the content
 /// hash are absent from a plan rather than guessed. The size depends on the
 /// header and the chunk index. The hash is the hash of the file. A file that
 /// this run does not write is the only thing either figure could be about.

@@ -3265,7 +3265,7 @@ fn every_writing_subcommand_documents_its_dry_run() {
             "not the set's directory",
         ),
         ("restore", "still checked", "no claim is taken"),
-        ("pack", "still located", "`--out` is neither created"),
+        ("pack", "still located", "`<OUT>` is neither created"),
         ("apply", "hashed", "no manifest recorded"),
         (
             "reindex",
