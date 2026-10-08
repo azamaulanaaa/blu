@@ -4,10 +4,13 @@
 /.cargo/registry
 /.cargo/git
 
-# Store files. `lepatch backup <dir> <base>` writes `<base>.NNNN.bin`,
-# `<base>.vNNNN.idx` and `<base>.lock` into the *current directory* when the base
-# is a bare name, and a test that runs the binary without setting a working
-# directory leaves one here. `git add -A` will otherwise commit one, and a
-# committed `photos.0000.bin` is a 12-byte store header that looks like data.
-*.NNNN.bin
-*.vNNNN.idx
+# Store files. `lepatch backup <dir> <base>` writes `<base>.NNNN.bin` and
+# `<base>.vNNNN.idx` into the *current directory* when the base is a bare name,
+# and a test that runs the binary without setting a working directory leaves one
+# here. `git add -A` will otherwise commit one, and a committed
+# `photos.0000.bin` is a 12-byte store header that looks like data.
+#
+# The command also creates `<base>.lock` while it writes. It deletes that file
+# when it closes the lock, so the two rules below cover every file it leaves.
+*.[0-9][0-9][0-9][0-9].bin
+*.v[0-9][0-9][0-9][0-9].idx
