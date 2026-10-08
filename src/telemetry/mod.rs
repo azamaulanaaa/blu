@@ -423,7 +423,7 @@ fn crate_name() -> &'static str {
     env!("CARGO_PKG_NAME")
 }
 
-/// This build's version — `0.5.1`, and the number `GET /v1/version` reports.
+/// This build's version, and the number `GET /v1/version` reports.
 fn crate_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

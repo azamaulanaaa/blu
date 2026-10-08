@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "lepatch",
-    "version": "0.5.1",
+    "version": "0.6.0",
     "description": "Serve a backup set over HTTP.\n\nThe server moves packs and nothing else. It never takes a path on its own disk: there is no endpoint that snapshots a server-local tree and none that restores into one. The client runs `lepatch backup` and `lepatch pack` locally, uploads the pack, and the server merges it. For a restore the server packs a version and the client fetches the chunks it lacks and merges or applies it locally.\n\n**There is no authentication.** Anyone who can reach the port can read every set this server keeps and can append versions to them. That is a decision, not an oversight. The bind address defaults to 127.0.0.1.\n\nA pack's bytes are a pack, verbatim: `GET /v1/packs/{id}` serves them under `application/x-lepatch-pack`, and a client can hand what it fetched straight to `Pack::open` and then to `lepatch merge` or `lepatch apply`.",
     "license": {
       "name": "GPL-2.0-or-later",
@@ -1026,7 +1026,7 @@
           "version": {
             "type": "string",
             "description": "This build's version.",
-            "example": "0.5.1"
+            "example": "0.6.0"
           },
           "snapshot_format": {
             "type": "integer",
