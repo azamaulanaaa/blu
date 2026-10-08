@@ -398,6 +398,63 @@ fn operation_ids() -> Vec<String> {
 }
 
 #[test]
+fn every_response_that_points_somewhere_also_carries_a_body() {
+    // A `2xx` that is not a `204` owes the client a body, and a `Location` header
+    // is a promise: follow it and you find the thing this response is about.
+    //
+    // `DELETE /v1/jobs/{id}` used to break both halves at once. It answered `202`
+    // with a description and nothing else — no body, no `Location` — while the
+    // handler sent a job handle and a `Location`. A client that follows the
+    // documented shape got nothing, and a generated client had no type to read.
+    //
+    // The check is on the status and not on the header, because `204` is the one
+    // success that legitimately has no body: it is a `204` and not a `2xx`
+    // precisely so a client does not go looking for content. The media type is
+    // not pinned to JSON either, because `GET /v1/jobs/{id}/events` answers
+    // `text/event-stream` and that is a body too.
+    let paths = document()["paths"].as_object().unwrap();
+
+    for (path, item) in paths {
+        for (method, operation) in item.as_object().unwrap() {
+            if method == "parameters" {
+                continue;
+            }
+
+            for (code, response) in operation["responses"].as_object().unwrap() {
+                if !code.starts_with('2') || code == "204" {
+                    continue;
+                }
+
+                let content = response.get("content").and_then(Value::as_object);
+                let media_types = content.map(|media| media.values().collect::<Vec<_>>());
+                assert!(
+                    media_types.as_ref().is_some_and(|media| !media.is_empty()),
+                    "{method} {path} answers {code} with no body. If that is deliberate \
+                     the answer is a 204; if it is a handle, it needs a schema."
+                );
+
+                for media_type in media_types.unwrap_or_default() {
+                    assert!(
+                        media_type.get("schema").is_some(),
+                        "{method} {path} answers {code} with a body and no schema, so a \
+                         client has no type to read it as"
+                    );
+                }
+
+                if response["headers"].get("Location").is_some() {
+                    assert!(
+                        response["headers"]["Location"].get("description").is_some(),
+                        "{method} {path} answers {code} with a `Location` header that says \
+                         nothing, so a client that follows it gets a URL and no idea what \
+                         is at the other end"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_declaration_helpers_find_every_schema_and_operation() {
     // A cheap sanity check on the helpers above rather than on the document: if
     // `declared` or `operation_ids` stopped finding anything, every other test

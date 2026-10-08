@@ -49,6 +49,7 @@ pub const DOCUMENT: &str = include_str!("../../openapi/lepatch.json");
 /// never referenced is a leftover, and one that is referenced and never defined is
 /// a dangling `$ref` — so `tests/openapi.rs` checks both directions.
 pub const SCHEMAS: &[&str] = &[
+    "Accepted",
     "Error",
     "Job",
     "JobList",

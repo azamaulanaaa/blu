@@ -202,6 +202,20 @@ async fn request_pack(server: &Server, set: &str, version: Option<u32>) -> serde
         "a 202 must say where the job is"
     );
 
+    // The `202` is a **handle**, not the job: `Accepted.required` is `job` and
+    // `Accepted` has no `kind`, no `state`, and no `progress`. The document used
+    // to type this body as `Job`, whose `required` list is eight fields, so a
+    // generated client read a handle and got a type error. The keys are asserted
+    // exactly rather than by containment, because a field added to the handler
+    // without a schema is the same bug wearing a different hat.
+    let accepted_body: serde_json::Value = serde_json::from_str(&accepted.text()).unwrap();
+    let keys: Vec<&String> = accepted_body.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys,
+        vec!["job"],
+        "a 202 carries a job id and nothing else; the `Accepted` schema says so"
+    );
+
     let job = accepted.field("job").unwrap().as_str().unwrap().to_string();
     await_job(server, &job).await
 }

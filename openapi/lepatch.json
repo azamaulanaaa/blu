@@ -258,7 +258,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Job"
+                  "$ref": "#/components/schemas/Accepted"
                 }
               }
             }
@@ -498,6 +498,7 @@
             "description": "The upload slot.",
             "headers": {
               "Location": {
+                "description": "The slot to `PUT` the bytes to, and to `DELETE` if the upload is abandoned. There is no `GET` on it: what arrived is read back with `POST /v1/uploads/{id}/commit`.",
                 "schema": {
                   "type": "string"
                 }
@@ -692,6 +693,7 @@
             "description": "Accepted. The job's result is a MergedCommitted or a MergedAlready.",
             "headers": {
               "Location": {
+                "description": "The job to poll or watch.",
                 "schema": {
                   "type": "string"
                 }
@@ -700,7 +702,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Job"
+                  "$ref": "#/components/schemas/Accepted"
                 }
               }
             }
@@ -814,7 +816,22 @@
         "description": "Aborts the task, which drops its future, which runs the destructors inside it \u2014 so an upload's file is removed and a set's claim is dropped.\n\n**No rollback is needed**, and that is what makes it safe. A store is append-only with one commit record at the end of a run, so an aborted merge published no version and left a torn tail the next open reclaims.\n\nA `409` against a finished job, which is a definite answer rather than a 202 for something that will not happen.",
         "responses": {
           "202": {
-            "description": "Stopping."
+            "description": "Stopping. The job is still listed and may already have finished; poll it for the state.",
+            "headers": {
+              "Location": {
+                "description": "The job to poll.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Accepted"
+                }
+              }
+            }
           },
           "400": {
             "description": "Not a job id.",
@@ -952,6 +969,21 @@
       }
     },
     "schemas": {
+      "Accepted": {
+        "type": "object",
+        "description": "A job to wait for. Every operation that answers `202` returns this, and it is the same `Location` the header names, so a client polls `GET /v1/jobs/{job}` for the `Job` itself.\n\n**This is not a `Job`.** It carries the id and nothing else: the work has not started, so there is no kind, no state, and no progress to report. A generated client that is handed a `Job` here cannot read it.",
+        "required": [
+          "job"
+        ],
+        "properties": {
+          "job": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "The id of the job. The same value as the `Location` header.",
+            "example": "6f1e2d0c4b8a9f3e5d7c1b2a3948576e0f1d2c3b4a5968778b9cadbecf012345"
+          }
+        }
+      },
       "Error": {
         "type": "object",
         "description": "RFC 9457 problem details. Every non-2xx response is this shape, so a client parses one thing whatever went wrong.\n\n`title` and `detail` are the same sentence: this crate's errors are deliberately flat and complete, and the server does not translate them into a second vocabulary. A client shows `detail` and the user reads the error the command line would have printed.",
