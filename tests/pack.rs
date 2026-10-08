@@ -3300,8 +3300,8 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
 /// to a path that used to take none. The figures: under a level the plan is
 /// resolved through the same encoder the writer uses. So `payload` is the size of
 /// the records that *would* be written rather than the size of the ones the set
-/// holds. That is what makes the plan worth reading. The absence: no file at
-/// `--out`, created or overwritten.
+/// holds. That is what makes the plan worth reading. The absence: no file at the
+/// pack's output path, created or overwritten.
 ///
 /// The plan and the run are compared figure for figure, on every number the report
 /// carries. A plan that reported the source set's sizes would report about a file

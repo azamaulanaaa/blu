@@ -4825,8 +4825,8 @@ fn every_pack_compression_restores_through_every_merge_compression() {
 /// which is why every form is run here rather than only the new ones.
 ///
 /// What would falsify it: figures that differ between the plan and the run, or a
-/// file at `--out` afterwards. A `payload` that did not move with the flag would
-/// falsify it too.
+/// file at the pack's output path afterwards. A `payload` that did not move with
+/// the flag would falsify it too.
 #[test]
 fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
     let dir = tempfile::tempdir().unwrap();

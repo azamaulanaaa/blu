@@ -449,7 +449,7 @@ impl Pack {
     /// `path` alone. It does not replace that pack with a file that cannot be
     /// opened. A pack is derived output, so a partial one is a file to write
     /// again rather than a thing to recover. The pack a *previous* run wrote is
-    /// not this run's to lose, and `--out` usually names one.
+    /// not this run's to lose, and the pack's own path usually names one.
     /// One chunk is buffered at a time, never a whole version. The index and the
     /// snapshot both grow with what is being packed.
     ///
