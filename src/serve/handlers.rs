@@ -1060,8 +1060,8 @@ fn render_event(event: &JobEvent) -> actix_web::web::Bytes {
 /// variants are matched.
 ///
 /// **Next to the `match`, because the `match` is the thing that can fall out of
-/// step with it.** An event variant added above renders a name this list does not
-/// name, and nothing else here would notice. So the list is the renderer's own
+/// step with it.** An event variant added above used to render a name this list
+/// did not name, and nothing else here noticed. So the list is the renderer's own
 /// vocabulary, published for `tests/openapi.rs` to check the `OpenAPI` document
 /// against — the description of `GET /v1/jobs/{id}/events` promises a client a
 /// closed set of names to switch on, and a promise that is one name short is
@@ -1072,7 +1072,11 @@ fn render_event(event: &JobEvent) -> actix_web::web::Bytes {
 /// has to be able to compare it against the code without reaching into a private
 /// module. The renderer's own `match` is checked against this list by
 /// `every_rendered_event_is_a_named_one` below.
-pub const EVENT_NAMES: &[&str] = &["state", "progress", "result", "error"];
+///
+/// Read from the `JobEvent` declaration, which is one list of variants. A name
+/// written out here was a third copy of the same set: a variant could be added to
+/// the enum, the `match` would compile, and this list would still be short by one.
+pub const EVENT_NAMES: &[&str] = JobEvent::NAMES;
 
 /// The word a state is reported under, matching the JSON in a job document.
 fn state_name(state: State) -> &'static str {
@@ -1343,7 +1347,7 @@ mod tests {
     use super::{
         EVENT_NAMES, WHOLE_PACK_LIMIT, merge_compression, render_event, whole_pack_refusal,
     };
-    use crate::serve::{JobEvent, Json, State};
+    use crate::serve::JobEvent;
 
     #[test]
     fn a_merge_compression_is_a_level_and_the_policy_it_opens_the_set_with() {
@@ -1496,25 +1500,29 @@ mod tests {
         );
     }
 
-    /// One of each [`JobEvent`], so the renderer's whole vocabulary is covered.
-    fn every_event() -> Vec<JobEvent> {
-        vec![
-            JobEvent::State(State::Running),
-            JobEvent::Progress(vec![("chunks".to_string(), 3)]),
-            JobEvent::Result(Json::Null),
-            JobEvent::Error("a reason".to_string()),
-        ]
-    }
-
     #[test]
     fn every_rendered_event_is_a_named_one() {
         // **The chain that makes `EVENT_NAMES` worth exporting.** The renderer
-        // matches on `JobEvent`, so a variant added there renders a name that no
-        // other list knows about. This compares the two directions: every name the
-        // renderer can produce is in the list, and every name in the list is
-        // produced. `tests/openapi.rs` then holds the document's description to
-        // that list, which is the last link.
-        let rendered: Vec<String> = every_event()
+        // matches on `JobEvent`, so a variant added there used to render a name
+        // that no other list knew about. This compares the two directions: every
+        // name the renderer can produce is in the list, and every name in the
+        // list is produced. `tests/openapi.rs` then holds the document's
+        // description to that list, which is the last link.
+        //
+        // The set rendered is `JobEvent::samples`, which the `JobEvent`
+        // declaration builds. It used to be a list of the four variants written
+        // out here. Adding a fifth variant then left it at four, `rendered` at
+        // four and `EVENT_NAMES` at four, and this test passed while the new name
+        // reached no list and no document. A probe confirmed it.
+        //
+        // **Both sides are compared in order, because a set is not enough.** The
+        // two lists come from one declaration and so share an order. Swapping
+        // the names on two render arms leaves every name in `EVENT_NAMES` and
+        // both lengths at four, so a membership test and a length test both pass,
+        // and a state change goes out as a counter tick. Which name belongs to
+        // which variant is the whole claim, so it is compared position by
+        // position.
+        let rendered: Vec<String> = JobEvent::samples()
             .iter()
             .map(|event| {
                 let frame = String::from_utf8(render_event(event).to_vec())
@@ -1527,18 +1535,30 @@ mod tests {
             })
             .collect();
 
-        for name in &rendered {
-            assert!(
-                EVENT_NAMES.contains(&name.as_str()),
-                "the renderer emits {name:?}, which EVENT_NAMES does not list"
-            );
-        }
+        // Ordered on both sides, so this also catches a name the declaration
+        // gained and the renderer did not. `no_event_is_named_twice` below takes
+        // the one case this cannot: a duplicate the renderer also renders.
+        let declared: Vec<String> = EVENT_NAMES.iter().map(|name| (*name).to_string()).collect();
 
         assert_eq!(
-            rendered.len(),
-            EVENT_NAMES.len(),
-            "EVENT_NAMES lists {} names and the renderer produces {rendered:?}",
-            EVENT_NAMES.len()
+            rendered, declared,
+            "the renderer and the declaration must agree on which name goes with \
+             which variant, and in what order"
         );
+    }
+
+    #[test]
+    fn no_event_is_named_twice() {
+        // A duplicate would let this file agree with itself while the stream
+        // carried one frame under one name and another frame under the same one.
+        // The ordered comparison above cannot see it either: a name copied into
+        // the declaration and into the render arm lands in both lists, in both
+        // orders, and the two still match.
+        //
+        // The same guard the router has, over `ROUTES`, for the same reason.
+        let mut seen = std::collections::HashSet::new();
+        for name in EVENT_NAMES {
+            assert!(seen.insert(*name), "`{name}` is listed twice");
+        }
     }
 }

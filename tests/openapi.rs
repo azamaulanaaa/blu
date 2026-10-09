@@ -284,10 +284,11 @@ fn the_events_description_names_every_event_the_stream_can_carry() {
     // frame was added and the document was not, so it is checked against
     // [`lepatch::serve::EVENT_NAMES`] rather than trusted.
     //
-    // That constant is the renderer's own list: `render_event` matches on
-    // `JobEvent`, and `every_rendered_event_is_a_named_one` in `handlers.rs`
-    // holds the two in step. So this is the last link in a chain that starts at
-    // the `match`, not a list written out here that could rot on its own.
+    // That constant comes from the `JobEvent` declaration in `jobs.rs`, and
+    // `render_event` is held to it in `handlers.rs` by
+    // `every_rendered_event_is_a_named_one`. So this is the last link in a chain
+    // that starts at the declaration, not a list written out here that could rot
+    // on its own.
     let description = document()["paths"]["/v1/jobs/{id}/events"]["get"]["description"]
         .as_str()
         .expect("the events operation describes itself");
@@ -300,16 +301,37 @@ fn the_events_description_names_every_event_the_stream_can_carry() {
         );
     }
 
-    // And it must not still be counting them. "Three event names" beside four of
-    // them is a description that tells a client the list is closed and is not.
-    let wrong = ["Two", "Three", "Five", "Six"]
-        .iter()
-        .map(|count| format!("{count} event names"))
-        .find(|phrase| description.contains(phrase.as_str()));
+    // And the count beside the list has to be the count. "Three event names"
+    // beside four of them is a description that tells a client the list is
+    // closed and is not.
+    //
+    // **This reads the number out of the prose rather than listing the numbers
+    // that are wrong.** It used to forbid "Two", "Three", "Five" and "Six",
+    // which left "Four" open. Adding a fifth variant then had to write "Five"
+    // to be correct, and the guard failed the correct answer.
+    //
+    // **Every count phrase in the paragraph is collected, not the first one
+    // found.** A description that counts twice has contradicted itself, and a
+    // guard that picked the lower number would pass a document that names two
+    // different totals. So the assertion below is against a one-element list, and
+    // a second phrase fails it.
+    let words = [
+        "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven",
+        "Twelve",
+    ];
 
-    assert!(
-        wrong.is_none(),
-        "the events description says {wrong:?} and the renderer has {}: {description}",
+    let counted: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter(|(_, word)| description.contains(&format!("{word} event names")))
+        .map(|(at, _)| at + 1)
+        .collect();
+
+    assert_eq!(
+        counted,
+        vec![lepatch::serve::EVENT_NAMES.len()],
+        "the events description counts {counted:?} and the renderer has one set of {}: \
+         {description}",
         lepatch::serve::EVENT_NAMES.len()
     );
 }

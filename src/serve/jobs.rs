@@ -209,18 +209,94 @@ impl State {
     }
 }
 
-/// One thing that changed about a job.
-#[derive(Debug, Clone, PartialEq)]
-pub enum JobEvent {
+/// Every [`JobEvent`] variant, declared once.
+///
+/// **The enum, its wire names, and one example of it all come from this one
+/// list.** The three used to be written out in three files. The compiler forced
+/// one edit of them and no other, so a new variant could reach the wire with a
+/// name that no list held and no document described, and every test passed. A
+/// probe did exactly that: it added a `note` variant with its render arm, left
+/// `EVENT_NAMES` at four names, and both the render test and the document test
+/// stayed green.
+///
+/// Rust cannot list an enum's variants at run time, so a list is what lists
+/// them. One arm per variant, and the arm carries the payload type, the `event:`
+/// name, and a value of that type. Adding a variant now costs one arm and
+/// cannot leave the sample list behind.
+///
+/// **The sample is the payload, not a built event, and that is the part that
+/// makes it a guard.** An earlier version took a whole `JobEvent` expression,
+/// so an arm could name one variant and sample another and still compile. The
+/// render arm for that variant would then never run in any test. Writing
+/// `Self::$variant($value)` puts the two in the same type: a payload that does
+/// not fit the variant is a compile error, and no sample can reach for a
+/// different variant.
+///
+/// `render_event` in `handlers.rs` still matches on the enum and still writes
+/// the name a second time. That match is exhaustive, so the compiler demands the
+/// new arm, and `every_rendered_event_is_a_named_one` checks that the two names
+/// agree. A macro cannot write a payload, so it cannot remove that repetition.
+///
+/// **`strum` would list these variants too, and it is the rejected option
+/// rather than the chosen one.** `strum::VariantNames` gives a derive that
+/// emits a `VARIANTS` array. It trades a dependency and a proc-macro for the
+/// list above, and it buys nothing here: this list has to carry a payload value
+/// and a wire name per arm, and neither has anywhere to go in a derive. The
+/// crate rejects `utoipa` and a `build.rs` emitter for the `OpenAPI` document
+/// for the same reason it rejects this: a generated answer is harder to read in
+/// a diff than the thing it replaced.
+macro_rules! job_events {
+    (
+        $(
+            $(#[doc = $doc:literal])*
+            $variant:ident($payload:ty) => $name:literal, $value:expr;
+        )*
+    ) => {
+        /// One thing that changed about a job.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum JobEvent {
+            $(
+                $(#[doc = $doc])*
+                $variant($payload),
+            )*
+        }
+
+        impl JobEvent {
+            /// Every `event:` name the SSE renderer can put on the wire.
+            ///
+            /// Read from the declaration above, so it cannot name a variant that
+            /// does not exist and cannot miss one that does.
+            ///
+            /// Crate-private on purpose. `EVENT_NAMES` in `handlers.rs` is the
+            /// export the document test reads, and this is where it comes from.
+            pub(crate) const NAMES: &'static [&'static str] = &[$($name),*];
+
+            /// One event of every variant, in declaration order.
+            ///
+            /// A test renders each and reads the name off the frame. Nothing
+            /// written by hand decides what "every" means.
+            #[cfg(test)]
+            #[must_use]
+            pub(crate) fn samples() -> Vec<Self> {
+                vec![$( Self::$variant($value) ),*]
+            }
+        }
+    };
+}
+
+job_events! {
     /// The job's state changed.
-    State(State),
+    State(State) => "state", State::Running;
+
     /// The job's counters moved.
     ///
     /// Integers keyed by the name [`crate::progress::Counter`] reports under, so
     /// a client renders a progress bar without knowing this crate's enum.
-    Progress(Vec<(String, u64)>),
+    Progress(Vec<(String, u64)>) => "progress", vec![("chunks".to_string(), 3)];
+
     /// The job finished, and this is its result.
-    Result(Json),
+    Result(Json) => "result", Json::Null;
+
     /// The job finished, and this is why it did not.
     ///
     /// **The counterpart to [`JobEvent::Result`], and it exists because a
@@ -231,7 +307,7 @@ pub enum JobEvent {
     /// when the stream has not told it what happened. The sentence is the same one
     /// the poll reports — the `Err` the work returned, verbatim, not a rewording —
     /// so the two cannot disagree.
-    Error(String),
+    Error(String) => "error", "a reason".to_string();
 }
 
 /// A job, as a client sees it.
