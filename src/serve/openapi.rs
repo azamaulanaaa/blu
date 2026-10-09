@@ -42,18 +42,24 @@
 /// lose is not a contract.
 pub const DOCUMENT: &str = include_str!("../../openapi/lepatch.json");
 
-/// Every schema name the handlers produce, and the document must define.
+/// Every schema name in `components.schemas`, mirrored from the code side.
 ///
-/// The other half of the drift check. `ROUTES` in the parent module says what the
-/// router answers; this says what the bodies are. A schema that is defined and
-/// never referenced is a leftover, and one that is referenced and never defined is
-/// a dangling `$ref` — so `tests/openapi.rs` checks both directions.
+/// The document is the source of truth, so this list does not define the API. It
+/// restates the schema set so that `tests/openapi.rs` can compare the code with
+/// the document and name the schema that drifted. The list holds request schemas
+/// as well as response schemas. A handler reads `MergeRequest`, `PackRequest`
+/// and `RestorePlan`, and writes `Job`.
+///
+/// `ROUTES` in the parent module mirrors the operation set in the same way.
+///
+/// Keep the list sorted. One added or one removed schema then reads as one line
+/// in a diff, and a reviewer sees a missing entry instead of a reshuffled list.
 pub const SCHEMAS: &[&str] = &[
     "Accepted",
     "Error",
     "Job",
-    "JobList",
     "JobKind",
+    "JobList",
     "JobState",
     "MergeRequest",
     "MergedAlready",
@@ -62,13 +68,15 @@ pub const SCHEMAS: &[&str] = &[
     "PackRequest",
     "PackSummary",
     "Range",
-    "SetSummary",
+    "RestorePlan",
+    "ServerInfo",
     "SetList",
+    "SetSummary",
     "Upload",
     "UploadCommit",
+    "Version",
     "VersionInfo",
     "VersionList",
-    "ServerInfo",
 ];
 
 /// The media type a pack is sent and accepted as.

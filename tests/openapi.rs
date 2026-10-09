@@ -144,9 +144,13 @@ fn every_defined_schema_is_referenced_and_declared() {
     //
     // A schema nothing references is a leftover from a route that was removed,
     // and it is the first thing a reader trusts because it is in the document.
-    // And the whole point of `SCHEMAS` is that it lists what the handlers
-    // produce, so a handler that grows a body and does not update it is a
-    // mismatch between the code and the contract.
+    //
+    // The other direction is the whole point of `SCHEMAS`. That list mirrors the
+    // document schema set from the code side, so a handler that grows a body and
+    // does not add its schema there is a mismatch between the code and the
+    // contract. It was missing: the check ran only the other way, and so it
+    // caught a name the document dropped and never caught a name it gained.
+    // `every_schema_the_document_defines_is_in_the_code_list` closes that gap.
     let referenced: BTreeSet<String> = references().into_iter().collect();
 
     for name in defined_schemas() {
@@ -163,6 +167,31 @@ fn every_defined_schema_is_referenced_and_declared() {
             "SCHEMAS lists {declared}, which the document does not define"
         );
     }
+}
+
+#[test]
+fn every_schema_the_document_defines_is_in_the_code_list() {
+    // **The silent-gap check for the code side.** `SCHEMAS` restates the
+    // document schema set so a reviewer and a test can compare the two. A
+    // handler that grows a body, the document gains the schema for it, and the
+    // code list does not, is drift that the other direction cannot see.
+    //
+    // `Version` was the live case. `VersionList.versions` is an array of it, so
+    // the document defined it while the code list named only `VersionList`.
+    // `RestorePlan` was the second one, as the request body of
+    // `POST /v1/packs/{id}/plan`.
+    let mut from_code: Vec<&str> = lepatch::serve::SCHEMAS.to_vec();
+    from_code.sort_unstable();
+
+    let names = defined_schemas();
+    let defined: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut defined: Vec<&str> = defined;
+    defined.sort_unstable();
+
+    assert_eq!(
+        defined, from_code,
+        "the document schema set and SCHEMAS have drifted apart"
+    );
 }
 
 #[test]
