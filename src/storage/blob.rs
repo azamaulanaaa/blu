@@ -42,6 +42,26 @@
 //! to the end of its last valid record. That reclaims the space a failed run left.
 //! A store from another build is a backup that somebody cares about. A store that
 //! does not begin with the store magic is therefore refused rather than scanned.
+//!
+//! # Remote backends
+//!
+//! Remote backends use the same record format. The local durability mechanics
+//! do not apply. These mechanics stay local:
+//!
+//! - Reserved-offset appends.
+//! - Tail truncation.
+//! - File syncs.
+//! - The file lock.
+//!
+//! A remote backend mirrors sealed segments as immutable objects. It mirrors
+//! index files as immutable objects. It uploads each object whole. It stages
+//! the mutable tail locally.
+//!
+//! A blob placement names a segment, an offset, and lengths. A remote backend
+//! reads the blob with a ranged fetch.
+//!
+//! The backend answers deduplication checks from a cached index. It loads the
+//! index once. It does not make one round trip per chunk.
 
 use std::{
     borrow::Cow,

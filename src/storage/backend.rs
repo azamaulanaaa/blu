@@ -150,6 +150,12 @@ pub trait StoragePut: Send + Sync {
     /// A run calls this once, after its last data record and before
     /// [`StoragePut::commit`]. The run's durability point, not each blob's.
     ///
+    /// A remote backend provides this by making the uploaded bytes durable.
+    /// It finishes the object writes. It does not use `fsync`.
+    ///
+    /// The ordering matters. The syscall does not matter. The backend makes
+    /// data durable first. It shows the commit after.
+    ///
     /// # Errors
     ///
     /// Returns an error if the data cannot be made durable.
@@ -160,6 +166,11 @@ pub trait StoragePut: Send + Sync {
     /// Called after [`StoragePut::sync_data`], and itself durable. A run that
     /// stops before this leaves nothing behind. A run that reports success without
     /// this publishes a version that nothing can restore from.
+    ///
+    /// A remote backend shows the commit only after the named data is
+    /// durable. It treats sealed segments as immutable objects. It uploads
+    /// each object whole. It never appends at an offset. It never truncates
+    /// a remote tail.
     ///
     /// # Errors
     ///
