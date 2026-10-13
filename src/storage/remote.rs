@@ -6,9 +6,10 @@
 //! the refusal of passwords in the address. It dials nothing. The connection
 //! arrives with the operator backend.
 //!
-//! Three schemes:
+//! Four schemes:
 //!
 //! - `s3://bucket[/prefix]`.
+//! - `ftp://[user@]host[:port][/prefix]`.
 //! - `sftp://[user@]host[:port][/prefix]`.
 //! - `file:///dir` for a local directory through the same spelling.
 //!
@@ -24,6 +25,8 @@ use url::Url;
 pub enum RemoteScheme {
     /// `s3://bucket[/prefix]`.
     S3,
+    /// `ftp://[user@]host[:port][/prefix]`, plain FTP.
+    Ftp,
     /// `sftp://[user@]host[:port][/prefix]`.
     Sftp,
     /// `file:///dir`, a local directory through the URL spelling.
@@ -35,6 +38,7 @@ impl RemoteScheme {
     fn of(name: &str) -> Option<Self> {
         match name {
             "s3" => Some(Self::S3),
+            "ftp" => Some(Self::Ftp),
             "sftp" => Some(Self::Sftp),
             "file" => Some(Self::File),
             _ => None,
@@ -46,6 +50,7 @@ impl RemoteScheme {
     pub fn name(self) -> &'static str {
         match self {
             Self::S3 => "s3",
+            Self::Ftp => "ftp",
             Self::Sftp => "sftp",
             Self::File => "file",
         }
@@ -55,7 +60,7 @@ impl RemoteScheme {
 /// A parsed remote store address.
 ///
 /// The location means one thing per scheme: a bucket for `s3`, an authority
-/// for `sftp`, a directory for `file`. The prefix is
+/// for `ftp` and `sftp`, a directory for `file`. The prefix is
 /// a key scope inside the location. It is empty when the address names none.
 /// It never starts or ends with `/`. It keeps percent-encoding as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +108,7 @@ impl RemoteUrl {
                 io::ErrorKind::InvalidInput,
                 format!(
                     "{address:?} holds no ://: a remote store looks like s3://bucket/backups, \
-                     sftp://host/backups, or file:///dir/backups"
+                     ftp://host/backups, sftp://host/backups, or file:///dir/backups"
                 ),
             ));
         }
@@ -119,7 +124,7 @@ impl RemoteUrl {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "{:?} is not a store scheme: use s3, sftp, or file",
+                    "{:?} is not a store scheme: use s3, ftp, sftp, or file",
                     url.scheme()
                 ),
             )
@@ -150,7 +155,7 @@ impl RemoteUrl {
 
         let (location, prefix) = match scheme {
             RemoteScheme::S3 => split_bucket(&url, raw_authority)?,
-            RemoteScheme::Sftp => split_authority(&url, raw_authority, true)?,
+            RemoteScheme::Ftp | RemoteScheme::Sftp => split_authority(&url, raw_authority, true)?,
             RemoteScheme::File => split_file_path(&url)?,
         };
 
@@ -302,7 +307,7 @@ fn split_bucket(url: &Url, raw_authority: &str) -> io::Result<(String, String)> 
 
 /// Split a `host[:port][/prefix]` authority into authority and prefix.
 ///
-/// `user_info` allows one `user@` before the host, for `sftp`. The password
+/// `user_info` allows one `user@` before the host, for `ftp` and `sftp`. The password
 /// check already ran: anything after a colon in the user info fails there.
 /// An `@` with no user fails here.
 fn split_authority(
@@ -395,6 +400,13 @@ mod tests {
             ("s3://bucket/backups", RemoteScheme::S3, "bucket", "backups"),
             ("s3://bucket", RemoteScheme::S3, "bucket", ""),
             ("s3://bucket/a/b", RemoteScheme::S3, "bucket", "a/b"),
+            ("ftp://host/backups", RemoteScheme::Ftp, "host", "backups"),
+            (
+                "ftp://user@host:21/a",
+                RemoteScheme::Ftp,
+                "user@host:21",
+                "a",
+            ),
             ("sftp://host/backups", RemoteScheme::Sftp, "host", "backups"),
             (
                 "sftp://user@host:22/a",
@@ -437,7 +449,6 @@ mod tests {
             "",
             "   ",
             "bucket/backups",
-            "ftp://host/backups",
             "s3://buck et/a",
             "s3://bucket/a?x=1",
             "s3://bucket/a#frag",
@@ -445,6 +456,8 @@ mod tests {
             "s3://Bucket/a",
             "s3://bucket/a//b",
             "s3://host:99999/a",
+            "ftp:///a",
+            "ftp://user:pass@host/a",
             "sftp://user:pass@host/a",
             "sftp://@host/a",
             "sftp:///a",

@@ -106,7 +106,7 @@ enum Command {
         pack: std::path::PathBuf,
         /// The backup set to merge into: a local path (`photos`), a serve
         /// set (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy.
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy.
         target: String,
         /// How each chunk the pack carries is stored. `keep` (the default) writes the stored
         /// form the pack already has. `0` writes the content as it is. 1 to 9 decode and store
@@ -153,7 +153,7 @@ enum Command {
         /// does not hold.
         #[arg(long)]
         dry_run: bool,
-        /// Directory holding the staging copy for a `file://` target.
+        /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
         /// inside it. Defaults to the system cache. Refused for local and
@@ -166,7 +166,7 @@ enum Command {
     /// They are a cache: nothing is lost if they are missing or wrong.
     Reindex {
         /// The backup set to rebuild: a local path (`photos`) or a keyed
-        /// store (`file:///mnt/drive/docs`), pulled into staging first and
+        /// store (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`), pulled into staging first and
         /// pushed back afterwards. An `http://` target is refused: the index
         /// lives on the server, where no endpoint rebuilds it.
         target: String,
@@ -179,7 +179,7 @@ enum Command {
         /// real one — and no lock is taken, because taking one creates a file.
         #[arg(long)]
         dry_run: bool,
-        /// Directory holding the staging copy for a `file://` target.
+        /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
         /// inside it. Defaults to the system cache. Refused for local targets:
@@ -200,12 +200,12 @@ enum Command {
     Versions {
         /// The backup set to inspect: a local path (`photos`), a serve set
         /// (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy.
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy.
         target: String,
         /// Print just the version numbers, one per line, and nothing else.
         #[arg(long)]
         numbers_only: bool,
-        /// Directory holding the staging copy for a `file://` target.
+        /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
         /// inside it. Defaults to the system cache. Refused for local and
@@ -265,7 +265,7 @@ enum Command {
         destination: std::path::PathBuf,
         /// The backup set to restore from: a local path (`photos`), a serve
         /// set (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy:
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy:
         /// an `http://` restore fetches a pack over the socket and applies
         /// it, and a `file://` restore pulls into staging first. Reads never
         /// push back.
@@ -295,7 +295,7 @@ enum Command {
         /// reads the pack.
         #[arg(long)]
         dry_run: bool,
-        /// Directory holding the staging copy for a `file://` target.
+        /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
         /// inside it. Defaults to the system cache. Refused for local and
@@ -306,13 +306,13 @@ enum Command {
     /// Check a snapshot's stored chunks against their recorded hashes.
     Verify {
         /// The backup set to check: a local path (`photos`) or a keyed store
-        /// (`file:///mnt/drive/docs`). An `http://` target is refused: the
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). An `http://` target is refused: the
         /// server exposes versions and packs, not chunk verification.
         target: String,
         /// Version to check, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
-        /// Directory holding the staging copy for a `file://` target.
+        /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
         /// inside it. Defaults to the system cache. Refused for local targets:
@@ -349,7 +349,7 @@ enum Command {
     Pack {
         /// The backup set to pack from: a local path (`photos`), a serve set
         /// (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy:
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy:
         /// a `file://` set is pulled into staging first, and an `http://`
         /// set is packed on the server and fetched.
         target: String,
@@ -416,7 +416,7 @@ enum Command {
         /// is refused rather than silently kept.
         #[arg(long)]
         dry_run: bool,
-        /// Directory holding the staging copy for a `file://` target.
+        /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
         /// inside it. Defaults to the system cache. Refused for local and
@@ -885,7 +885,7 @@ struct BackupArgs {
     /// The backup set to write: a local path (`photos`, creating
     /// `photos.0000.bin` and `photos.lock`), a serve set
     /// (`http://127.0.0.1:8480/docs`), or a keyed store
-    /// (`file:///mnt/drive/docs`). Remote targets hold no local copy: a
+    /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy: a
     /// `file://` set is pulled into staging, backed up there, and pushed
     /// back, and an `http://` set is backed up into temporary staging,
     /// packed, and merged on the server.
@@ -931,7 +931,7 @@ struct BackupArgs {
     /// would be wrong.
     #[arg(long)]
     dry_run: bool,
-    /// Directory holding the staging copy for a `file://` target.
+    /// Directory holding the staging copy for a store target.
     ///
     /// One subdirectory per store address; the set name selects the set
     /// inside it. Defaults to the system cache. Refused for local and
@@ -2562,7 +2562,7 @@ fn report_pack(
 ///
 /// One `TARGET`: a local path (`photos`), a serve set
 /// (`http://127.0.0.1:8480/docs`), or a keyed store
-/// (`file:///mnt/drive/docs`). Anything holding `://` is a remote address
+/// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Anything holding `://` is a remote address
 /// and anything else is a path on this machine. Remote targets hold no local
 /// copy: a store target works in staging and an `http://` target works on
 /// the server.
@@ -2647,23 +2647,101 @@ struct StoreTarget {
     staging: std::path::PathBuf,
 }
 
+/// A connected keyed store: local or through the operator.
+///
+/// One type because the staged runners are generic over one backend. The
+/// local arm works in every build. The operator arm exists behind
+/// `--features remote` only.
+enum StoreBackend {
+    /// A local directory, through `file://`.
+    Local(storage::LocalDirStore),
+    /// An operator over the network.
+    #[cfg(feature = "remote")]
+    Remote(opendal::Operator),
+}
+
+impl storage::AsyncObjectStore for StoreBackend {
+    async fn keys(&self) -> std::io::Result<Vec<String>> {
+        match self {
+            Self::Local(backend) => backend.keys().await,
+            #[cfg(feature = "remote")]
+            Self::Remote(operator) => operator.keys().await,
+        }
+    }
+
+    async fn stat(&self, key: &str) -> std::io::Result<Option<u64>> {
+        match self {
+            Self::Local(backend) => backend.stat(key).await,
+            // Fully qualified: `Operator` already has an inherent `stat`
+            // returning metadata, and method resolution prefers it.
+            #[cfg(feature = "remote")]
+            Self::Remote(operator) => storage::AsyncObjectStore::stat(operator, key).await,
+        }
+    }
+
+    async fn read_range(&self, key: &str, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
+        match self {
+            Self::Local(backend) => backend.read_range(key, offset, len).await,
+            #[cfg(feature = "remote")]
+            Self::Remote(operator) => operator.read_range(key, offset, len).await,
+        }
+    }
+
+    async fn write_bytes(&self, key: &str, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Local(backend) => backend.write_bytes(key, data).await,
+            #[cfg(feature = "remote")]
+            Self::Remote(operator) => operator.write_bytes(key, data).await,
+        }
+    }
+
+    async fn import_file(&self, key: &str, path: &std::path::Path) -> std::io::Result<u64> {
+        match self {
+            Self::Local(backend) => backend.import_file(key, path).await,
+            #[cfg(feature = "remote")]
+            Self::Remote(operator) => operator.import_file(key, path).await,
+        }
+    }
+
+    async fn export_file(&self, key: &str, path: &std::path::Path) -> std::io::Result<u64> {
+        match self {
+            Self::Local(backend) => backend.export_file(key, path).await,
+            #[cfg(feature = "remote")]
+            Self::Remote(operator) => operator.export_file(key, path).await,
+        }
+    }
+}
+
 /// Open the backend behind `url`.
 ///
-/// Only `file://` connects in this build: a local directory needs no
-/// operator. Every other scheme names its refusal instead of guessing at
-/// semantics that would corrupt the set.
-fn connect_store(url: &storage::RemoteUrl) -> std::io::Result<storage::LocalDirStore> {
-    match url.scheme() {
-        storage::RemoteScheme::File => Ok(storage::LocalDirStore::new(url.location())),
-        scheme => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "{}:// stores have no backend in this build yet: only file:// stores connect \
-                 without the operator backend",
-                scheme.name()
-            ),
-        )),
+/// `file://` opens a local directory in every build. Other schemes need a
+/// `--features remote` build, and fail closed without one. `https://`
+/// endpoints need `remote-tls` on top.
+fn connect_store(url: &storage::RemoteUrl) -> std::io::Result<StoreBackend> {
+    if url.scheme() == storage::RemoteScheme::File {
+        return Ok(StoreBackend::Local(storage::LocalDirStore::new(
+            url.location(),
+        )));
     }
+    connect_remote(url)
+}
+
+/// Open a network backend behind `url`, in a `--features remote` build.
+#[cfg(feature = "remote")]
+fn connect_remote(url: &storage::RemoteUrl) -> std::io::Result<StoreBackend> {
+    storage::connect(url).map(StoreBackend::Remote)
+}
+
+/// Refuse a network backend in a build without one.
+#[cfg(not(feature = "remote"))]
+fn connect_remote(url: &storage::RemoteUrl) -> std::io::Result<StoreBackend> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "{}:// stores need --features remote: this build speaks file:// only",
+            url.scheme().name()
+        ),
+    ))
 }
 
 /// Refuse an empty staging copy with the store address, not the cache path.
@@ -3963,22 +4041,30 @@ mod tests {
 
         let bad_url = super::resolve_target(
             "versions",
-            "ftp://host/backups",
+            "gopher://host/backups",
             Some(std::path::Path::new("/stage")),
         )
         .unwrap_err();
         assert_eq!(bad_url.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    /// Only `file://` connects in this build. Other schemes name their
-    /// refusal with `Unsupported`, not with a connection failure. No network.
+    /// `file://` connects in every build. Other schemes need `--features
+    /// remote`: without it they fail closed, with it they read configuration.
+    /// No network either way.
     #[test]
-    fn only_file_stores_connect_before_the_operator() {
+    fn remote_schemes_connect_only_behind_the_feature() {
         let file = lepatch::storage::RemoteUrl::parse("file:///remote").unwrap();
         assert!(super::connect_store(&file).is_ok());
 
         let s3 = lepatch::storage::RemoteUrl::parse("s3://bucket/backups").unwrap();
-        let refused = super::connect_store(&s3).unwrap_err();
-        assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
+        match super::connect_store(&s3) {
+            Ok(_) => panic!("an s3 store must not connect in this test: no network"),
+            Err(refused) => {
+                #[cfg(feature = "remote")]
+                assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+                #[cfg(not(feature = "remote"))]
+                assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
+            }
+        }
     }
 }

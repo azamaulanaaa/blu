@@ -31,6 +31,9 @@
 //!   The store scans staging only, never the backend.
 //! * `remote` parses a remote address without connecting. The connection
 //!   arrives with the operator backend.
+//! * `operator` builds that backend from an address and the environment,
+//!   behind `--features remote`. Without the feature this module is absent
+//!   and every non-`file://` scheme fails closed.
 
 mod backend;
 mod blob;
@@ -46,6 +49,9 @@ mod remote;
 mod segment;
 mod version_index;
 
+#[cfg(feature = "remote")]
+mod operator;
+
 pub use backend::{AsyncReadSeek, StorageGet, StoragePut, StreamReadSeeker};
 pub use blob::{BlobStore, Read, Write, WriteMode};
 pub use compression::{Compression, Compressor, Decompressor, MAX_COMPRESSION_LEVEL, Zstd};
@@ -57,6 +63,8 @@ pub use mirror::{
     push_to_remote_async, staging_set_path,
 };
 pub use object::{AsyncObjectStore, LocalDirStore, MemoryStore, ObjectStore};
+#[cfg(feature = "remote")]
+pub use operator::connect;
 pub use plan::{Plan, PlannedChunk};
 pub use record::Codec;
 /// The layout version of the store's records, served at `GET /v1/version`.

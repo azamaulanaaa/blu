@@ -748,10 +748,11 @@ saying what it would empty.
 ### Keyed stores
 
 A `file://` target works a set through a keyed backend instead of a local
-path. Only `file://` connects in this build. The set is the last component
-of the address — `file:///mnt/drive/docs` is the store `file:///mnt/drive`
-holding the set `docs`. It is pulled into a staging copy, the local command
-runs there, and a write pushes back:
+path. `file://` connects in every build. `sftp://`, `ftp://`,
+and `s3://` need a `--features remote` build, and fail closed without one.
+The set is the last component of the address — `file:///mnt/drive/docs` is
+the store `file:///mnt/drive` holding the set `docs`. It is pulled into a
+staging copy, the local command runs there, and a write pushes back:
 
 ```console
 $ lepatch backup ~/Documents file:///mnt/drive/docs
@@ -761,7 +762,15 @@ $ lepatch restore /tmp/out file:///mnt/drive/docs
 
 `--staging` selects the staging directory. Without it the system cache holds
 the copy. A machine with none is told to pass `--staging`. Reads never push
-back. Other schemes name their refusal. No backend is connected yet.
+back.
+
+Endpoints and secrets arrive through the environment. `LEPATCH_S3_ENDPOINT`
+names the S3 endpoint. The S3 identity is `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`. `sftp://` takes its user
+from the address or `LEPATCH_SFTP_USER`. Its key file comes from
+`LEPATCH_SFTP_KEY`. `ftp://` defaults to anonymous. Nothing is guessed.
+A missing piece fails before the first byte moves. `https://` endpoints fail
+closed too. No build links a TLS backend.
 
 ## What is preserved
 

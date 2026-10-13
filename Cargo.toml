@@ -257,10 +257,43 @@ tracing-opentelemetry = { version = "0.32", default-features = false }
 # plaintext, which is the same refusal `lepatch versions --remote` makes for an
 # `https://` server.
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client"] }
+# Keyed stores beyond `file://` (`src/storage/operator.rs`).
+#
+# Optional, so the default build holds no operator, no new transports, and no
+# TLS backend at all — the same position `telemetry-tls` takes above, one
+# stricter: without `--features remote`, `sftp://`, `ftp://`, and
+# `s3://` fail closed with `Unsupported` rather than connecting.
+#
+# Even the `remote` build carries no TLS, and that is a licence decision
+# rather than a taste one. Every reqwest TLS backend verifies through
+# `rustls-platform-verifier`, which pulls `webpki-root-certs` under
+# `CDLA-Permissive-2.0` — the licence `deny.toml` deliberately refuses to take
+# a compatibility position on — and the native-TLS one links system OpenSSL,
+# a build toolchain this crate does not require. So the transport below is
+# plain HTTP: `http://` endpoints connect, and `https://` ones are refused by
+# name at connect time rather than downgraded. `ftp://` and `sftp://` never
+# touch HTTP either way.
+#
+# `default-features = false` keeps the layers this crate does not use out;
+# retry and timeout stay because a network fails mid-run, and the tokio
+# executor stays because the mirror awaits the operator on it.
+opendal = { version = "0.59", default-features = false, features = ["services-memory", "services-s3", "services-ftp", "services-sftp", "executors-tokio", "layers-retry", "layers-timeout"], optional = true }
+# Plain-HTTP transport for the operator above, installed process-wide on
+# connect. A direct dependency rather than a facade feature, because every
+# facade transport bundles a TLS backend this build refuses to link.
+opendal-http-transport-reqwest = { version = "0.59", default-features = false, optional = true }
 
 [features]
 # Windows file identity, needed to detect hard links there.
 experimental = []
+# Keyed stores over the network: `sftp://`, `ftp://`, and `s3://`
+# through `--store`. Off by default, so the shipped binary speaks `file://`
+# only. Turning it on pulls the operator, its service backends, and a plain
+# HTTP transport — weight a default `cargo build` should not carry, and still
+# no TLS anywhere, so `https://` endpoints stay refused by name. Changes
+# nothing else: the same flags resolve the same way, and the mirror refuses
+# the same divergences.
+remote = ["dep:opendal", "dep:opendal-http-transport-reqwest"]
 # **Telemetry over `https://`, and nothing else.**
 #
 # Off by default, so the shipped binary has no TLS backend at all — see the
