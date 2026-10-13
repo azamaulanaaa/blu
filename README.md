@@ -21,6 +21,7 @@ $ lepatch reindex docs                 # rebuild the per-version index files
 $ lepatch pack docs game.pack          # one version as a single distributable file
 $ lepatch merge game.pack other        # and one version into another set
 $ lepatch serve ./backups              # and put a set over HTTP — see "Serving"
+$ lepatch backup ~/Documents --store file:///mnt/drive --set docs  # no local set — see "Keyed stores"
 ```
 
 `--version N` selects a specific version; without it, restore, verify and pack use
@@ -729,6 +730,24 @@ command that was asked to make one.
 **`--clean` deserves the check.** A clean restore is the one operation here that
 destroys what is already there, and a dry run of it empties nothing while still
 saying what it would empty.
+
+### Keyed stores
+
+`--store` works a set through a keyed backend instead of a local path.
+Only `file://` connects in this build. The set is pulled into a staging
+copy, the local command runs there, and a backup pushes back:
+
+```console
+$ lepatch backup ~/Documents --store file:///mnt/drive --set docs
+$ lepatch versions --store file:///mnt/drive --set docs
+$ lepatch restore /tmp/out --store file:///mnt/drive --set docs
+```
+
+`--set` names the set on that store. `backup` requires it. `restore` and
+`versions` also take the name as `NAME`, as with `--remote`. `--staging`
+selects the staging directory. Without it the system cache holds the copy.
+A machine with none is told to pass `--staging`. Reads never push back.
+Other schemes name their refusal. No backend is connected yet.
 
 ## What is preserved
 

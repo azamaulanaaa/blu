@@ -5023,3 +5023,71 @@ fn a_set_named_with_a_server_is_not_refused() {
         "naming the set twice should be the parser's conflict, not a connection failure: {stderr}"
     );
 }
+
+/// A backup through `--store file://` lands in the keyed store, and a
+/// restore through it brings the tree back. Staging is explicit, so the test
+/// touches no cache directory. Two tiny files keep the run small.
+#[test]
+fn store_file_backup_restore_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let source = dir.join("src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.txt"), b"first file").unwrap();
+    fs::write(source.join("b.txt"), b"second file").unwrap();
+
+    let store = format!("file://{}", dir.join("remote").display());
+    let args = |rest: &[&str]| {
+        let mut owned = vec!["backup".to_string(), "src".to_string()];
+        owned.extend(rest.iter().map(|s| s.to_string()));
+        owned
+    };
+    let run = |owned: Vec<String>| {
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        ok(dir, &refs)
+    };
+
+    run(args(&[
+        "--store",
+        &store,
+        "--set",
+        "docs",
+        "--staging",
+        "staging",
+    ]));
+    assert!(
+        dir.join("remote").join("docs.0000.bin").is_file(),
+        "the backup must land in the keyed store"
+    );
+
+    let listed = run(vec![
+        "versions".to_string(),
+        "--store".to_string(),
+        store.clone(),
+        "--set".to_string(),
+        "docs".to_string(),
+        "--staging".to_string(),
+        "staging".to_string(),
+        "--numbers-only".to_string(),
+    ]);
+    assert_eq!(
+        listed.trim(),
+        "1",
+        "one backup means version one: {listed:?}"
+    );
+
+    run(vec![
+        "restore".to_string(),
+        "out".to_string(),
+        "--store".to_string(),
+        store,
+        "--set".to_string(),
+        "docs".to_string(),
+        "--staging".to_string(),
+        "staging".to_string(),
+    ]);
+
+    let before = common::describe(&dir.join("src"));
+    let after = common::describe(&dir.join("out"));
+    assert_eq!(before, after, "the restored tree differs from the source");
+}
