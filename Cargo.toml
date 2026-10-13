@@ -282,6 +282,22 @@ opendal = { version = "0.59", default-features = false, features = ["services-me
 # connect. A direct dependency rather than a facade feature, because every
 # facade transport bundles a TLS backend this build refuses to link.
 opendal-http-transport-reqwest = { version = "0.59", default-features = false, optional = true }
+# TLS transport for the operator (`src/storage/tls.rs`), behind `remote-tls`.
+#
+# rustls with ring and the operating system's roots: no compiled-in Mozilla
+# bundle (CDLA, refused), no system OpenSSL (absent toolchain), no cmake
+# (aws-lc). Each crate below is already in the graph through reqwest or the
+# telemetry stack, so naming them adds no new crates — only the features this
+# use needs. `hyper-util` drives the connections, `hyper-rustls` wraps them in
+# TLS, `rustls-native-certs` loads the system roots, and `http`, `http-body`
+# and `bytes` move the bytes.
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [features]
 # Windows file identity, needed to detect hard links there.
@@ -294,6 +310,13 @@ experimental = []
 # nothing else: the same flags resolve the same way, and the mirror refuses
 # the same divergences.
 remote = ["dep:opendal", "dep:opendal-http-transport-reqwest"]
+# TLS for keyed stores: `https://` S3 endpoints through
+# `--store`. Implies `remote`. Off by default, so even a `remote` build fails
+# `https://` closed by name. Turning it on verifies with rustls/ring against
+# the operating system's roots — no Mozilla bundle, no OpenSSL, no cmake —
+# and changes nothing else: `file://`, `ftp://`, `sftp://`, and plain-HTTP
+# endpoints resolve and behave exactly as without it.
+remote-tls = ["remote", "dep:bytes", "dep:http", "dep:http-body-util", "dep:hyper-rustls", "dep:hyper-util", "dep:rustls", "dep:rustls-native-certs"]
 # **Telemetry over `https://`, and nothing else.**
 #
 # Off by default, so the shipped binary has no TLS backend at all — see the

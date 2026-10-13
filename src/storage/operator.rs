@@ -52,9 +52,8 @@ const COPY_CHUNK: u64 = 4 * 1024 * 1024;
 ///   `LEPATCH_SFTP_KEY` and is required: this backend speaks key auth only.
 ///   Host keys stay strict.
 ///
-/// `https://` endpoints are refused: this build links no TLS
-/// transport, so they would fail mid-run. Refused here, they fail with the
-/// reason instead.
+/// `https://` endpoints need `--features remote-tls`, and fail
+/// closed without it. With the feature they build like anything else.
 ///
 /// Returns `InvalidInput` naming the missing piece. Never guesses.
 ///
@@ -65,9 +64,10 @@ const COPY_CHUNK: u64 = 4 * 1024 * 1024;
 /// first operation.
 pub fn connect(url: &RemoteUrl) -> io::Result<Operator> {
     opendal::init_default_registry();
-    if url.scheme() == RemoteScheme::S3 {
-        opendal_http_transport_reqwest::install_default();
-    }
+    #[cfg(feature = "remote-tls")]
+    super::tls::install()?;
+    #[cfg(not(feature = "remote-tls"))]
+    opendal_http_transport_reqwest::install_default();
 
     let (scheme, config) = config_for(url)?;
     let operator =
@@ -115,8 +115,8 @@ fn env(name: &str) -> Option<String> {
 /// S3 configuration: bucket from the address, endpoint and identity from the
 /// environment.
 ///
-/// Refuses `https://` endpoints: this build links no TLS transport, so an
-/// `https://` endpoint would fail mid-run. Refused here, it fails with the
+/// Refuses `https://` endpoints without `--features remote-tls`: without a
+/// TLS transport they would fail mid-run. Refused here, they fail with the
 /// reason instead.
 fn s3_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
     let endpoint = env("LEPATCH_S3_ENDPOINT").ok_or_else(|| {
@@ -135,11 +135,12 @@ fn s3_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
 /// Split from [`s3_config`] so tests cover the shape without touching the
 /// process environment, which Rust forbids outside `unsafe`.
 fn s3_config_for(url: &RemoteUrl, endpoint: &str) -> io::Result<Vec<(String, String)>> {
-    if endpoint.starts_with("https://") {
+    if endpoint.starts_with("https://") && !tls_supported() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "an https:// S3 endpoint needs a TLS transport this build does not link: \
-             use an http:// endpoint on the same trust boundary",
+            "an https:// S3 endpoint needs --features remote-tls: this build links no \
+             TLS transport, so it would fail mid-run. Rebuild with the feature, or use \
+             an http:// endpoint on the same trust boundary",
         ));
     }
 
@@ -222,6 +223,15 @@ fn sftp_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
         ("user".to_string(), user),
         ("key".to_string(), key),
     ])
+}
+
+/// Whether this build links a TLS transport.
+///
+/// One predicate for the `https://` gate:
+///
+/// without `remote-tls` it fails closed, with it it never fires.
+fn tls_supported() -> bool {
+    cfg!(feature = "remote-tls")
 }
 
 /// Split `[user@]authority` at the last `@`.
@@ -543,9 +553,11 @@ mod tests {
         }
     }
 
-    /// `https://` endpoints fail closed: this build links no
-    /// TLS transport. No network and no environment writes: the S3 shape is
-    /// covered through its pure half.
+    /// `https://` endpoints fail closed without
+    /// `--features remote-tls`: this build links no TLS transport. No network
+    /// and no environment writes: the S3 shape is covered through its pure
+    /// half.
+    #[cfg(not(feature = "remote-tls"))]
     #[test]
     fn tls_endpoints_are_refused_without_a_tls_transport() {
         let url = RemoteUrl::parse("s3://bucket/a").unwrap();
@@ -562,6 +574,21 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == "endpoint" && v == "http://127.0.0.1:9000"),
             "an http endpoint configures: {plain:?}"
+        );
+    }
+
+    /// `https://` endpoints build with `--features
+    /// remote-tls`: the transport verifies. No network: building never dials.
+    #[cfg(feature = "remote-tls")]
+    #[test]
+    fn tls_endpoints_build_with_a_tls_transport() {
+        let url = RemoteUrl::parse("s3://bucket/a").unwrap();
+        let configured = s3_config_for(&url, "https://s3.amazonaws.com").unwrap();
+        assert!(
+            configured
+                .iter()
+                .any(|(k, v)| k == "endpoint" && v == "https://s3.amazonaws.com"),
+            "an https endpoint configures under remote-tls: {configured:?}"
         );
     }
 

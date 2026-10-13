@@ -357,11 +357,23 @@ async fn an_address_that_is_not_http_is_refused_before_anything_is_sent() {
     );
 
     // An unknown store scheme names the schemes it could have been.
-    let scheme = fails(dir.path(), &["versions", "ftp://host/docs"]);
+    let scheme = fails(dir.path(), &["versions", "gopher://host/docs"]);
     assert!(
         scheme.contains("not a store scheme"),
         "an unknown scheme should be told what the schemes are: {scheme}"
     );
+
+    // A known network scheme without a network backend fails closed rather
+    // than connecting. With `--features remote` it would dial, so this half
+    // only runs in a build that holds no backend at all.
+    #[cfg(not(feature = "remote"))]
+    {
+        let closed = fails(dir.path(), &["versions", "ftp://host/docs"]);
+        assert!(
+            closed.contains("--features remote"),
+            "a network scheme in a local-only build should name the feature: {closed}"
+        );
+    }
 
     // Anything else without `://` is a local path, and a local path that is
     // not a set is the local miss rather than a usage error.

@@ -106,7 +106,7 @@ enum Command {
         pack: std::path::PathBuf,
         /// The backup set to merge into: a local path (`photos`), a serve
         /// set (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy.
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy.
         target: String,
         /// How each chunk the pack carries is stored. `keep` (the default) writes the stored
         /// form the pack already has. `0` writes the content as it is. 1 to 9 decode and store
@@ -166,7 +166,7 @@ enum Command {
     /// They are a cache: nothing is lost if they are missing or wrong.
     Reindex {
         /// The backup set to rebuild: a local path (`photos`) or a keyed
-        /// store (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`), pulled into staging first and
+        /// store (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`), pulled into staging first and
         /// pushed back afterwards. An `http://` target is refused: the index
         /// lives on the server, where no endpoint rebuilds it.
         target: String,
@@ -200,7 +200,7 @@ enum Command {
     Versions {
         /// The backup set to inspect: a local path (`photos`), a serve set
         /// (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy.
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy.
         target: String,
         /// Print just the version numbers, one per line, and nothing else.
         #[arg(long)]
@@ -265,7 +265,7 @@ enum Command {
         destination: std::path::PathBuf,
         /// The backup set to restore from: a local path (`photos`), a serve
         /// set (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy:
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy:
         /// an `http://` restore fetches a pack over the socket and applies
         /// it, and a `file://` restore pulls into staging first. Reads never
         /// push back.
@@ -306,7 +306,7 @@ enum Command {
     /// Check a snapshot's stored chunks against their recorded hashes.
     Verify {
         /// The backup set to check: a local path (`photos`) or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). An `http://` target is refused: the
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). An `http://` target is refused: the
         /// server exposes versions and packs, not chunk verification.
         target: String,
         /// Version to check, defaulting to the most recent usable one.
@@ -349,7 +349,7 @@ enum Command {
     Pack {
         /// The backup set to pack from: a local path (`photos`), a serve set
         /// (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy:
+        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy:
         /// a `file://` set is pulled into staging first, and an `http://`
         /// set is packed on the server and fetched.
         target: String,
@@ -885,7 +885,7 @@ struct BackupArgs {
     /// The backup set to write: a local path (`photos`, creating
     /// `photos.0000.bin` and `photos.lock`), a serve set
     /// (`http://127.0.0.1:8480/docs`), or a keyed store
-    /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Remote targets hold no local copy: a
+    /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy: a
     /// `file://` set is pulled into staging, backed up there, and pushed
     /// back, and an `http://` set is backed up into temporary staging,
     /// packed, and merged on the server.
@@ -2562,7 +2562,7 @@ fn report_pack(
 ///
 /// One `TARGET`: a local path (`photos`), a serve set
 /// (`http://127.0.0.1:8480/docs`), or a keyed store
-/// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`). Anything holding `://` is a remote address
+/// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Anything holding `://` is a remote address
 /// and anything else is a path on this machine. Remote targets hold no local
 /// copy: a store target works in staging and an `http://` target works on
 /// the server.

@@ -1560,17 +1560,24 @@ dependencies = [
  "actix-web",
  "awc",
  "blake3",
+ "bytes",
  "clap",
  "criterion",
  "fastcdc",
  "filetime",
  "futures-util",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
  "opendal",
  "opendal-http-transport-reqwest",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "rustls",
+ "rustls-native-certs",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1752,7 +1759,6 @@ dependencies = [
  "opendal-service-ftp",
  "opendal-service-s3",
  "opendal-service-sftp",
- "opendal-service-webdav",
 ]
 
 [[package]]
@@ -1869,21 +1875,6 @@ dependencies = [
  "openssh-sftp-client",
  "serde",
  "tokio",
-]
-
-[[package]]
-name = "opendal-service-webdav"
-version = "0.59.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd439c1cc6f407d29df60555e104df84741a57abac63c1683fb5e6fc822266ef"
-dependencies = [
- "anyhow",
- "bytes",
- "http 1.5.0",
- "log",
- "opendal-core",
- "quick-xml 0.41.0",
- "serde",
 ]
 
 [[package]]

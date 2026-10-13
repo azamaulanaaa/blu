@@ -769,8 +769,9 @@ names the S3 endpoint. The S3 identity is `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`. `sftp://` takes its user
 from the address or `LEPATCH_SFTP_USER`. Its key file comes from
 `LEPATCH_SFTP_KEY`. `ftp://` defaults to anonymous. Nothing is guessed.
-A missing piece fails before the first byte moves. `https://` endpoints fail
-closed too. No build links a TLS backend.
+A missing piece fails before the first byte moves. `https://` endpoints need
+`--features remote-tls`: rustls with ring and the system roots, no Mozilla
+bundle, no OpenSSL. Without it they fail closed by name.
 
 ## What is preserved
 

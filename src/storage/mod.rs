@@ -51,6 +51,8 @@ mod version_index;
 
 #[cfg(feature = "remote")]
 mod operator;
+#[cfg(feature = "remote-tls")]
+mod tls;
 
 pub use backend::{AsyncReadSeek, StorageGet, StoragePut, StreamReadSeeker};
 pub use blob::{BlobStore, Read, Write, WriteMode};
