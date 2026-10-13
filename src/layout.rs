@@ -61,7 +61,7 @@
 //! instead of losing it silently the way `Path::with_extension` does.
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -222,6 +222,23 @@ fn strip_segment_tail(path: PathBuf) -> PathBuf {
     }
 }
 
+/// The number in file `name`, if `name` holds one of the set files with `base`.
+///
+/// This function uses the same grammar as the set file listing. It takes a
+/// file name. It does not take a path. Remote listings filter object keys with
+/// the same rule. They need no filesystem. The function compares names as
+/// bytes. See the listing function for the non-UTF-8 reason.
+fn numbered_name(name: &OsStr, base: &OsStr, tag: &str, ext: &str) -> Option<u32> {
+    let full = name.as_encoded_bytes();
+    let (stem, digits) = tail_of(full, tag, ext)?;
+
+    if stem != base.as_encoded_bytes() {
+        return None;
+    }
+
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
 impl IndexSet {
     /// A backup set whose files are named after `base`.
     ///
@@ -295,6 +312,37 @@ impl IndexSet {
         self.suffixed(&format!("{segment:0SEGMENT_DIGITS$}.{SEGMENT_EXTENSION}"))
     }
 
+    /// File name of segment `segment`, without any directory.
+    ///
+    /// This is the object key for the segment. A remote backend stores the
+    /// segment under this key. The key holds the set base file name and the
+    /// same suffix as [`IndexSet::segment_path`]. A remote listing returns
+    /// keys. It does not return paths. Filtering that listing needs the name
+    /// alone. Use [`IndexSet::segment_number`] to parse the name back with
+    /// this set base.
+    #[must_use]
+    pub fn segment_name(&self, segment: u32) -> OsString {
+        let mut name = self
+            .base
+            .file_name()
+            .map_or_else(OsString::new, OsStr::to_os_string);
+        name.push(format!(".{segment:0SEGMENT_DIGITS$}.{SEGMENT_EXTENSION}"));
+
+        name
+    }
+
+    /// Number in `name`, if `name` is this set segment file name.
+    ///
+    /// Use a file name from a listing for `name`. The listing can hold local
+    /// directory entries. It can hold remote object keys. Do not use a path.
+    /// A remote backend lists keys under a prefix. It keeps the keys that this
+    /// function accepts. It uses the same grammar as [`IndexSet::segments`].
+    /// It does not touch the filesystem.
+    #[must_use]
+    pub fn segment_number(&self, name: &OsStr) -> Option<u32> {
+        numbered_name(name, self.base_name(), "", SEGMENT_EXTENSION)
+    }
+
     /// Every segment of the set that is on disk, in order.
     ///
     /// Reads the directory rather than probing for `0`, `1`, `2` until one is
@@ -363,6 +411,30 @@ impl IndexSet {
     #[must_use]
     pub fn index_path(&self, version: u32) -> PathBuf {
         self.suffixed(&format!("v{version:0SEGMENT_DIGITS$}.{INDEX_EXTENSION}"))
+    }
+
+    /// File name of the index file for `version`, without any directory.
+    ///
+    /// This is the object key for the index. A remote backend stores the index
+    /// under this key. Use [`IndexSet::index_number`] to parse the key back.
+    #[must_use]
+    pub fn index_name(&self, version: u32) -> OsString {
+        let mut name = self
+            .base
+            .file_name()
+            .map_or_else(OsString::new, OsStr::to_os_string);
+        name.push(format!(".v{version:0SEGMENT_DIGITS$}.{INDEX_EXTENSION}"));
+
+        name
+    }
+
+    /// Number in `name`, if `name` is this set index file name.
+    ///
+    /// Use a file name from a listing for `name`. See
+    /// [`IndexSet::segment_number`] for the rule.
+    #[must_use]
+    pub fn index_number(&self, name: &OsStr) -> Option<u32> {
+        numbered_name(name, self.base_name(), "v", INDEX_EXTENSION)
     }
 
     /// Every version that has an index file, in order.
@@ -463,14 +535,7 @@ impl IndexSet {
     /// between two views produced the same way, which is what the method is
     /// defined to support. This is not a claim about what the bytes mean.
     fn numbered_file(path: &Path, base: &OsStr, tag: &str, ext: &str) -> Option<u32> {
-        let full = path.file_name()?.as_encoded_bytes();
-        let (name, digits) = tail_of(full, tag, ext)?;
-
-        if name != base.as_encoded_bytes() {
-            return None;
-        }
-
-        std::str::from_utf8(digits).ok()?.parse().ok()
+        numbered_name(path.file_name()?, base, tag, ext)
     }
 
     /// Append `suffix` to the base path's file name, leaving the base itself
@@ -535,5 +600,33 @@ impl Drop for Lock {
     fn drop(&mut self) {
         self.file.take();
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IndexSet;
+    use std::ffi::OsStr;
+
+    /// Remote listings filter object keys with the same grammar as the local
+    /// directory scan. The test does not touch the filesystem. The test stays
+    /// small on purpose. It uses a few names in memory. It uses no directories
+    /// and no files.
+    #[test]
+    fn listing_names_round_trip_through_the_set() {
+        let set = IndexSet::new("/data/photos");
+
+        assert_eq!(set.segment_name(0), OsStr::new("photos.0000.bin"));
+        assert_eq!(set.segment_name(7), OsStr::new("photos.0007.bin"));
+        assert_eq!(set.index_name(1), OsStr::new("photos.v0001.idx"));
+
+        assert_eq!(set.segment_number(OsStr::new("photos.0000.bin")), Some(0));
+        assert_eq!(set.segment_number(OsStr::new("photos.0007.bin")), Some(7));
+        assert_eq!(set.segment_number(OsStr::new("other.0000.bin")), None);
+        assert_eq!(set.segment_number(OsStr::new("photos.v0001.idx")), None);
+
+        assert_eq!(set.index_number(OsStr::new("photos.v0001.idx")), Some(1));
+        assert_eq!(set.index_number(OsStr::new("photos.0001.bin")), None);
+        assert_eq!(set.index_number(OsStr::new("photos.v0001.idx.tmp")), None);
     }
 }

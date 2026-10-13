@@ -59,6 +59,15 @@ pub struct VersionIndex {
 }
 
 impl VersionIndex {
+    /// Byte length of an encoded version index.
+    ///
+    /// This is the byte length of an encoded version index. A remote backend
+    /// expects exactly this many bytes in the index object. A fetched object
+    /// of any other length is no usable index. A local file of the wrong
+    /// length gives the same result. [`VersionIndex::read`] returns `None`
+    /// for it.
+    pub const LEN: usize = LEN;
+
     /// The file's bytes.
     #[must_use]
     pub fn to_bytes(self) -> [u8; LEN] {
@@ -103,6 +112,25 @@ impl VersionIndex {
             ordinal: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             snapshot: BlobId::from_bytes(snapshot),
         })
+    }
+
+    /// Decode index bytes fetched from anywhere, or `None`.
+    ///
+    /// This is the remote counterpart to [`VersionIndex::read`]. A backend
+    /// reads the index object with one GET. It sends the bytes to this
+    /// function. These cases all mean no usable index:
+    ///
+    /// - Absent data.
+    /// - Truncated data.
+    /// - Data with a wrong checksum.
+    /// - Unreadable data.
+    ///
+    /// The caller then falls back to the commit-record scan. The local path
+    /// applies the same rule. The backend writes the bytes with
+    /// [`VersionIndex::to_bytes`] and one PUT.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        Self::try_from(bytes).ok()
     }
 
     /// Write this index to `path`, durably.
@@ -200,4 +228,35 @@ fn temporary_for(path: &Path) -> std::path::PathBuf {
     name.push(".tmp");
 
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VersionIndex;
+    use crate::storage::BlobId;
+
+    /// Index bytes round-trip without the filesystem.
+    ///
+    /// A remote backend writes [`VersionIndex::to_bytes`] with one PUT. It
+    /// reads the bytes with one GET into [`VersionIndex::decode`]. Wrong
+    /// length and torn bytes mean no usable index. They never cause an error.
+    /// The test uses a few dozen bytes in memory.
+    #[test]
+    fn index_bytes_round_trip_without_the_filesystem() {
+        let index = VersionIndex {
+            version: 7,
+            segment: 2,
+            ordinal: 3,
+            snapshot: BlobId::from_bytes([5u8; 32]),
+        };
+
+        let bytes = index.to_bytes();
+        assert_eq!(bytes.len(), VersionIndex::LEN);
+        assert_eq!(VersionIndex::decode(&bytes), Some(index));
+        assert_eq!(VersionIndex::decode(&bytes[..VersionIndex::LEN - 1]), None);
+
+        let mut torn = bytes;
+        torn[0] ^= 0xff;
+        assert_eq!(VersionIndex::decode(&torn), None);
+    }
 }

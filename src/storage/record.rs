@@ -425,7 +425,12 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 ///
 /// One segment's worth of headers and no payloads: what a lookup that would
 /// otherwise scan the whole set costs instead.
-pub(super) fn commits_in(file: &mut std::fs::File, segment: u32) -> io::Result<Vec<BlobId>> {
+///
+/// This function takes any `Read + Seek` source. It does not need a file
+/// handle. A future remote backend can scan bytes it fetched with ranged
+/// reads. It needs no local file. The source can start at any position. The
+/// scan seeks for itself.
+pub(super) fn commits_in(file: &mut (impl Read + Seek), segment: u32) -> io::Result<Vec<BlobId>> {
     Ok(scan(file, segment, Blobs::Discard)?.commits)
 }
 
@@ -460,13 +465,19 @@ impl Blobs {
 /// `segment`. A set is therefore scanned one segment at a time, never as a
 /// concatenation.
 ///
+/// This function takes any `Read + Seek` source. It does not need a file
+/// handle. The same walk works over a local file. It works over an in-memory
+/// buffer. It works over bytes a remote backend fetched with ranged reads.
+/// The scan finds the length by seeking to the end. It does not read file
+/// metadata.
+///
 /// # Errors
 ///
 /// Returns an error if the seek or read fails. A file whose contents are not a
 /// store is not an error here. That check belongs to [`crate::storage::blob`],
 /// because only that module can tell a truncated tail from a file that was never
 /// a store.
-pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::Result<Scan> {
+pub(super) fn scan(file: &mut (impl Read + Seek), segment: u32, blobs: Blobs) -> io::Result<Scan> {
     scan_with_buffer(file, segment, blobs, SCAN_BUFFER)
 }
 
@@ -489,12 +500,16 @@ pub(super) fn scan(file: &mut std::fs::File, segment: u32, blobs: Blobs) -> io::
 /// enforce. A floor would be a claim about the size being *sensible*, and the
 /// caller is the only one who knows what it is measuring.
 pub(super) fn scan_with_buffer(
-    file: &mut std::fs::File,
+    file: &mut (impl Read + Seek),
     segment: u32,
     blobs: Blobs,
     scan_buffer: usize,
 ) -> io::Result<Scan> {
-    let file_len = file.metadata()?.len();
+    // This code finds the length by seeking. It does not read file metadata.
+    // The source can be any seekable bytes. A remote backend reports the
+    // object length separately. It provides a seekable view of the fetched
+    // bytes. Both cases take this path.
+    let file_len = file.seek(SeekFrom::End(0))?;
     let mut scan = Scan::default();
 
     // The allocation and how much of it is valid are separate, deliberately.
@@ -634,7 +649,7 @@ pub(super) fn scan_with_buffer(
 }
 
 /// Fill `buffer`, reporting whether the whole of it was read.
-fn read_exact_or_eof(file: &mut std::fs::File, buffer: &mut [u8]) -> io::Result<bool> {
+fn read_exact_or_eof(file: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> {
     let mut filled = 0;
     while filled < buffer.len() {
         match file.read(&mut buffer[filled..])? {
@@ -648,6 +663,51 @@ fn read_exact_or_eof(file: &mut std::fs::File, buffer: &mut [u8]) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan works over any `Read + Seek` source. It does not need files.
+    ///
+    /// A remote backend provides bytes it fetched with ranged reads. It does
+    /// not provide a file handle. Scanning those bytes must give the same
+    /// answer as scanning the file they came from. The scan needs no
+    /// filesystem. The test stays small on purpose. It uses one blob and one
+    /// commit. It uses a few hundred bytes in memory.
+    #[test]
+    fn a_scan_over_in_memory_bytes_finds_the_same_records() {
+        use std::io::Cursor;
+
+        let mut bytes = encode_store_header(0).to_vec();
+
+        let mut hash = [0u8; HASH];
+        hash[0] = 1;
+        let mut header = Vec::new();
+        encode_header(&mut header, Kind::Blob, Codec::Raw, &hash, 3, 3);
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&[7u8; 3]);
+
+        let mut snapshot = [0u8; HASH];
+        snapshot[0] = 9;
+        let mut commit_header = Vec::new();
+        encode_header(
+            &mut commit_header,
+            Kind::Commit,
+            Codec::Raw,
+            &snapshot,
+            HASH as u64,
+            HASH as u64,
+        );
+        bytes.extend_from_slice(&commit_header);
+        bytes.extend_from_slice(&snapshot);
+
+        let mut cursor = Cursor::new(bytes.clone());
+        let scanned = scan(&mut cursor, 0, Blobs::Index).unwrap();
+        assert_eq!(scanned.blobs.len(), 1);
+        assert_eq!(scanned.commits, vec![BlobId::from_bytes(snapshot)]);
+        assert_eq!(scanned.end, bytes.len() as u64);
+
+        let mut cursor = Cursor::new(bytes);
+        let commits = commits_in(&mut cursor, 0).unwrap();
+        assert_eq!(commits, vec![BlobId::from_bytes(snapshot)]);
+    }
 
     /// A segment whose records are sized so that a header lands in the last few
     /// bytes of the scan buffer.

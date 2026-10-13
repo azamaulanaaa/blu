@@ -1518,10 +1518,12 @@ fn create_segment(path: &Path, segment: u32) -> io::Result<()> {
 ///
 /// This function never repairs and never truncates. A file that does not start with
 /// the store magic is somebody's data that this build does not understand.
-fn check_store_header(file: &mut std::fs::File, path: &Path) -> io::Result<u32> {
-    use std::io::{Read as _, Seek as _};
-
-    let len = file.metadata()?.len();
+///
+/// This function takes any `Read + Seek` source. A remote backend can check
+/// header bytes it fetched. It needs no local file. The function finds the
+/// length by seeking to the end. It does not read file metadata.
+fn check_store_header(file: &mut (impl io::Read + io::Seek), path: &Path) -> io::Result<u32> {
+    let len = io::Seek::seek(file, io::SeekFrom::End(0))?;
     if len < STORE_HEADER as u64 {
         return Err(not_a_store(path, "it is too short to hold a store header"));
     }
@@ -1530,8 +1532,8 @@ fn check_store_header(file: &mut std::fs::File, path: &Path) -> io::Result<u32> 
 
     // From the start, whatever the handle is positioned at. A handle that has just
     // written the header is left at the end of the file.
-    file.seek(io::SeekFrom::Start(0))?;
-    file.read_exact(&mut header)?;
+    io::Seek::seek(file, io::SeekFrom::Start(0))?;
+    io::Read::read_exact(file, &mut header)?;
 
     record::decode_store_header(&header).map_err(|fault| {
         let why = match fault {
