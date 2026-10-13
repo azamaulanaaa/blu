@@ -133,6 +133,17 @@ clap = { version = "4.5.53", features = ["derive"] }
 # chooses its response bytes, and does not hand-roll a JSON grammar to avoid a
 # crate it already links.
 serde_json = "1.0"
+# Address parsing for remote stores (`src/storage/remote.rs`).
+#
+# ALREADY a transitive dependency, through `actix-web` and `reqwest` — it is in
+# `Cargo.lock` unconditionally, with the default features this crate uses. So
+# naming it here adds **zero** crates to the graph, the same position
+# `serde_json` takes above. What it buys over a hand-rolled split at `://` is
+# the authority grammar: user info, ports, and IPv6 brackets, all rejected or
+# split by a parser that has seen every malformed address before. Policy stays
+# here: the scheme allowlist, the bucket shape, and the refusal of passwords
+# in the address are this crate's rules, not the parser's.
+url = "2.5"
 fastcdc = "5.0.0"
 filetime = "0.2.29"
 # The streaming half of the server: the body of a ranged pack response, and the

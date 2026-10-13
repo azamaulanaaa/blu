@@ -25,6 +25,12 @@
 //! * `locate` finds a version's snapshot without scanning the whole set.
 //! * `version_index` holds the per-version index file that makes that cheap.
 //! * `error` says what a filesystem call's error reports.
+//! * `object` is the keyed backend seam behind mirroring: whole small
+//!   objects, ranged reads, and streaming copies, local or in memory.
+//! * `mirror` copies finished files between local staging and a backend.
+//!   The store scans staging only, never the backend.
+//! * `remote` parses a remote address without connecting. The connection
+//!   arrives with the operator backend.
 
 mod backend;
 mod blob;
@@ -32,8 +38,11 @@ mod compression;
 mod error;
 mod hash;
 mod locate;
+mod mirror;
+mod object;
 mod plan;
 mod record;
+mod remote;
 mod segment;
 mod version_index;
 
@@ -43,6 +52,11 @@ pub use compression::{Compression, Compressor, Decompressor, MAX_COMPRESSION_LEV
 pub use error::{at, at_async};
 pub use hash::BlobId;
 pub use locate::{Resolved, resolve, resolve_with};
+pub use mirror::{
+    MirrorStats, default_cache_root, pull_from_remote, pull_from_remote_async, push_to_remote,
+    push_to_remote_async, staging_set_path,
+};
+pub use object::{AsyncObjectStore, LocalDirStore, MemoryStore, ObjectStore};
 pub use plan::{Plan, PlannedChunk};
 pub use record::Codec;
 /// The layout version of the store's records, served at `GET /v1/version`.
@@ -50,6 +64,7 @@ pub use record::Codec;
 /// Public so a client can ask what a server can read before it sends it
 /// anything. See [`record::FORMAT_VERSION`].
 pub use record::FORMAT_VERSION;
+pub use remote::{RemoteScheme, RemoteUrl};
 pub use segment::SegmentLimit;
 pub use version_index::VersionIndex;
 

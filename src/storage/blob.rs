@@ -57,6 +57,8 @@
 //! index files as immutable objects. It uploads each object whole. It stages
 //! the mutable tail locally.
 //!
+//! See [`crate::storage::mirror`] for the copy in both directions.
+//!
 //! A blob placement names a segment, an offset, and lengths. A remote backend
 //! reads the blob with a ranged fetch.
 //!
