@@ -1,5 +1,5 @@
-//! `lepatch restore --remote`: a tree that went up over a socket comes back down
-//! one, byte for byte.
+//! `lepatch restore` of a serve set: a tree that went up over a socket comes
+//! back down one, byte for byte.
 //!
 //! The push half of a remote backup is [`tests/client_rest.rs`], and the wire
 //! itself is [`tests/serve.rs`]. What this file holds is the direction nobody
@@ -29,13 +29,9 @@
 //! * **`a_pull_of_a_set_the_server_does_not_hold_is_a_failure_that_says_which`**
 //!   and **`a_pull_from_an_address_nothing_is_listening_on_is_a_failure_that_says_which`**
 //!   are the two refusals a user meets first, and both are also *hang* tests.
-//! * **the `--set` tests** are about the two spellings of one name. The help text
-//!   claimed `--set docs` and `docs` meant the same thing and clap rejected the
-//!   flag outright, so the claim was false; what is asserted here is that the two
-//!   now restore **the same tree**, that naming the set twice is refused rather
-//!   than resolved, and that naming it neither way says which of the two is
-//!   missing. A command line that names a set twice and disagrees with itself has
-//!   no meaning a client may invent, so nothing here asserts a precedence.
+//! * **the removed flags** stay removed: `--remote` and `--set` named the
+//!   server and the set as two arguments, and one `TARGET` names both, so
+//!   either flag is a usage error that writes nothing.
 //!
 //! ## Why every run here is bounded by a deadline
 //!
@@ -99,9 +95,14 @@ const CONCURRENT_PULLS: u32 = 8;
 /// Pulls each of [`CONCURRENT_PULLS`] makes: thirty-two in all.
 const PULLS_EACH: u32 = 4;
 
-/// The address a server printed, as `--remote` wants it.
+/// The address a server printed: the server half of a serve TARGET.
 fn remote_of(server: &Server) -> String {
     format!("http://{}", server.address())
+}
+
+/// The serve set `docs` on the server at `address`, as one TARGET.
+fn serve_target(address: &str) -> String {
+    format!("{address}/docs")
 }
 
 /// Run the binary in `dir`, and hand back what it produced.
@@ -272,18 +273,15 @@ fn served_root(dir: &Path) -> PathBuf {
     root
 }
 
-/// Push the tree at `src` to `address` as the set `docs`, and return the address.
+/// Push the tree at `src` to the serve set `docs` at `address`.
 ///
-/// **Through `--remote`, not around it.** The half of this branch that goes up
-/// is only worth testing if it goes up the way a user sends it: a local backup
-/// into `local`, that version packed, the pack uploaded, the merge run on the
-/// server. A fixture that built the server's set with the library would leave
-/// the push untested while the pull looked fine.
+/// **Through one TARGET, not around it.** The half of this branch that goes
+/// up is only worth testing if it goes up the way a user sends it: the tree
+/// backed up straight into the serve set, packed there, the pack uploaded,
+/// the merge run on the server. A fixture that built the server's set with
+/// the library would leave the push untested while the pull looked fine.
 fn push(dir: &Path, src: &str, address: &str) -> String {
-    ok(
-        dir,
-        &["backup", src, "local", "--remote", address, "--set", "docs"],
-    )
+    ok(dir, &["backup", src, &serve_target(address)])
 }
 
 /// Compare two trees the only way that can fail: every path, every byte.
@@ -349,13 +347,7 @@ fn a_tree_backed_up_remotely_restores_remotely_byte_for_byte() {
     let out = destination.path().join("out");
     let stdout = ok(
         dir.path(),
-        &[
-            "restore",
-            out.to_str().unwrap(),
-            "docs",
-            "--remote",
-            &address,
-        ],
+        &["restore", out.to_str().unwrap(), &serve_target(&address)],
     );
 
     // The tree that went up is worth comparing: an empty fixture would make the
@@ -438,13 +430,7 @@ fn every_pull_leaves_the_whole_file_in_place_before_it_is_opened() {
                     let out = destination.path().join("out");
                     let stdout = ok(
                         &dir,
-                        &[
-                            "restore",
-                            out.to_str().unwrap(),
-                            "docs",
-                            "--remote",
-                            &address,
-                        ],
+                        &["restore", out.to_str().unwrap(), &serve_target(&address)],
                     );
 
                     let (fetched, length) = fetched(&stdout);
@@ -486,13 +472,7 @@ fn the_second_pull_fetches_fewer_bytes() {
     let restore = |dir: &Path| {
         ok(
             dir,
-            &[
-                "restore",
-                out.to_str().unwrap(),
-                "docs",
-                "--remote",
-                &address,
-            ],
+            &["restore", out.to_str().unwrap(), &serve_target(&address)],
         )
     };
 
@@ -568,9 +548,7 @@ fn a_pull_restores_the_version_it_was_asked_for() {
         &[
             "restore",
             out.to_str().unwrap(),
-            "docs",
-            "--remote",
-            &address,
+            &serve_target(&address),
             "--version",
             "1",
         ],
@@ -608,9 +586,7 @@ fn a_pull_of_a_set_the_server_does_not_hold_is_a_failure_that_says_which() {
         &[
             "restore",
             out.to_str().unwrap(),
-            "nosuch",
-            "--remote",
-            &address,
+            &format!("{address}/nosuch"),
         ],
         REFUSAL,
     );
@@ -646,13 +622,7 @@ fn a_pull_from_an_address_nothing_is_listening_on_is_a_failure_that_says_which()
 
     let stderr = fails(
         dir.path(),
-        &[
-            "restore",
-            out.to_str().unwrap(),
-            "docs",
-            "--remote",
-            &address,
-        ],
+        &["restore", out.to_str().unwrap(), &serve_target(&address)],
         REFUSAL,
     );
 
@@ -663,19 +633,16 @@ fn a_pull_from_an_address_nothing_is_listening_on_is_a_failure_that_says_which()
     assert!(!out.exists(), "nothing was fetched, so nothing was written");
 }
 
-/// `--set docs` and `docs` are the same set, and they restore the same tree.
+/// One `TARGET` names the set, however it is spelled on disk or on the wire.
 ///
-/// **The help text made this claim and clap rejected the flag**, so the two
-/// spellings had never both been run. Asserting that both exit 0 would hold for
-/// a `--set` that named a different set, or for one the client resolved to
-/// nothing, so what is compared is the two restored trees *and* the tree that
+/// Two pulls of the same serve target restore the same tree as the tree that
 /// went up — every path and every byte, the same walk every other test here
 /// uses. Two destinations of their own, because a second pull into a
 /// destination that already holds the version reads the manifest and fetches
 /// only the pack's fixed regions, which would make the two runs differ for a
-/// reason that has nothing to do with the flag.
+/// reason that has nothing to do with the address.
 #[test]
-fn a_set_named_by_flag_restores_the_same_tree_as_the_one_named_positionally() {
+fn a_serve_target_restores_the_tree_that_went_up_twice_over() {
     let dir = tempfile::tempdir().unwrap();
     let source = tree(dir.path());
     let server = Server::start(&served_root(dir.path()));
@@ -683,52 +650,37 @@ fn a_set_named_by_flag_restores_the_same_tree_as_the_one_named_positionally() {
 
     push(dir.path(), "src", &address);
 
-    let positional_dir = tempfile::tempdir().unwrap();
-    let positional = positional_dir.path().join("out");
+    let first_dir = tempfile::tempdir().unwrap();
+    let first = first_dir.path().join("out");
     ok(
         dir.path(),
-        &[
-            "restore",
-            positional.to_str().unwrap(),
-            "docs",
-            "--remote",
-            &address,
-        ],
+        &["restore", first.to_str().unwrap(), &serve_target(&address)],
     );
 
-    let flagged_dir = tempfile::tempdir().unwrap();
-    let flagged = flagged_dir.path().join("out");
+    let second_dir = tempfile::tempdir().unwrap();
+    let second = second_dir.path().join("out");
     ok(
         dir.path(),
-        &[
-            "restore",
-            flagged.to_str().unwrap(),
-            "--remote",
-            &address,
-            "--set",
-            "docs",
-        ],
+        &["restore", second.to_str().unwrap(), &serve_target(&address)],
     );
 
     let before = common::describe(&source);
-    assert_identical(&before, &common::describe(&positional));
-    assert_identical(&before, &common::describe(&flagged));
-    assert_identical(&common::describe(&positional), &common::describe(&flagged));
+    assert_identical(&before, &common::describe(&first));
+    assert_identical(&before, &common::describe(&second));
+    assert_identical(&common::describe(&first), &common::describe(&second));
 }
 
-/// Two names for one set are a conflict, not a precedence.
+/// The removed flags stay removed.
 ///
-/// `restore DST docs --set other` says two different things about which set to
-/// restore. Letting either win silently is how a run restores the wrong tree
-/// without mentioning it, so the run is refused — and the message has to name
-/// **both** spellings, because "an argument was unexpected" is not enough for a
-/// user who has read the help promising that these two are the same set.
+/// `--remote` and `--set` named the server and the set as two arguments. One
+/// `TARGET` names both, so either flag is a usage error now — exit 2 from
+/// clap, before any request is made — and a refused pull writes nothing.
 ///
-/// **Exit 2, not 1**: this is clap refusing a combination of arguments before
-/// any of the command runs, which is what `lepatch versions snap --dry-run` does
-/// and what a script distinguishes from a run that failed while working.
+/// **Exit 2, not 1**: this is clap refusing an argument before any of the
+/// command runs, which is what a script distinguishes from a run that failed
+/// while working.
 #[test]
-fn naming_the_set_both_ways_is_refused_and_names_the_conflict() {
+fn the_removed_remote_and_set_flags_are_usage_errors() {
     let dir = tempfile::tempdir().unwrap();
     tree(dir.path());
     let server = Server::start(&served_root(dir.path()));
@@ -738,66 +690,41 @@ fn naming_the_set_both_ways_is_refused_and_names_the_conflict() {
 
     let destination = tempfile::tempdir().unwrap();
     let out = destination.path().join("out");
+    let target = serve_target(&address);
 
-    let output = lepatch(
-        dir.path(),
-        &[
+    for args in [
+        vec![
+            "restore",
+            out.to_str().unwrap(),
+            target.as_str(),
+            "--set",
+            "other",
+        ],
+        vec![
             "restore",
             out.to_str().unwrap(),
             "docs",
             "--remote",
             &address,
-            "--set",
-            "other",
         ],
-    );
-    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+    ] {
+        let output = lepatch(dir.path(), &args);
+        let said = String::from_utf8_lossy(&output.stderr).into_owned();
 
-    assert!(
-        !output.status.success(),
-        "naming the set twice should be refused\nstdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "a combination of arguments clap refuses is a usage error\nstderr: {said}"
-    );
-    assert!(said.contains("--set"), "the refusal names the flag: {said}");
-    assert!(
-        said.contains("NAME") && said.contains("cannot be used with"),
-        "and it names the positional it collides with: {said}"
-    );
-    assert!(!out.exists(), "nothing was fetched, so nothing was written");
-}
-
-/// Naming the set neither way says which of the two is missing.
-///
-/// **The fix for a missing argument is knowing which of two you left out.** A
-/// message that said only "`--remote` needs a set" would send a user to the
-/// help, find two spellings, and have to work out which one the error meant.
-#[test]
-fn a_pull_naming_no_set_at_all_says_which_of_the_two_is_missing() {
-    let dir = tempfile::tempdir().unwrap();
-    let server = Server::start(&served_root(dir.path()));
-    let address = remote_of(&server);
-
-    let destination = tempfile::tempdir().unwrap();
-    let out = destination.path().join("out");
-
-    let stderr = fails(
-        dir.path(),
-        &["restore", out.to_str().unwrap(), "--remote", &address],
-        REFUSAL,
-    );
-
-    assert!(
-        stderr.contains("--set"),
-        "the refusal names the flag that would have supplied the set: {stderr}"
-    );
-    assert!(
-        stderr.contains("NAME"),
-        "and it names the positional that would have supplied it: {stderr}"
-    );
+        assert!(
+            !output.status.success(),
+            "a removed flag should be refused\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "an argument clap refuses is a usage error\nstderr: {said}"
+        );
+        assert!(
+            said.contains("unexpected argument"),
+            "the refusal names the mistake: {said}"
+        );
+    }
     assert!(!out.exists(), "nothing was fetched, so nothing was written");
 }

@@ -1,4 +1,4 @@
-//! `lepatch versions --remote`: the same listing a local set gives, from a
+//! `lepatch versions` of a serve set: the same listing a local set gives, from a
 //! server somewhere else.
 //!
 //! The claim this file exists to hold is one line long — **a script written
@@ -42,9 +42,14 @@ use std::{
 
 use common::server::{Server, Stub};
 
-/// The address a server printed, as `--remote` wants it.
+/// The address a server printed: the server half of a serve TARGET.
 fn remote_of(server: &Server) -> String {
     format!("http://{}", server.address())
+}
+
+/// The serve set `docs` on the server at `address`, as one TARGET.
+fn serve_target(address: &str) -> String {
+    format!("{address}/docs")
 }
 
 /// Run the binary and hand back its output.
@@ -158,7 +163,7 @@ fn assert_both_modes_match_the_local_listing(root: &Path, set: &Path, address: &
 
     assert_eq!(
         remote,
-        ok(root, &["versions", "docs", "--remote", address]),
+        ok(root, &["versions", &serve_target(address)]),
         "the remote listing is not the local one, byte for byte"
     );
 
@@ -168,7 +173,7 @@ fn assert_both_modes_match_the_local_listing(root: &Path, set: &Path, address: &
         numbers,
         ok(
             root,
-            &["versions", "docs", "--remote", address, "--numbers-only"]
+            &["versions", &serve_target(address), "--numbers-only"]
         ),
         "the remote --numbers-only listing is not the local one, byte for byte"
     );
@@ -225,7 +230,7 @@ async fn a_set_name_holding_a_space_is_the_same_set() {
         ok(dir.path(), &["versions", local_path.as_str()]),
         ok(
             dir.path(),
-            &["versions", "photos 2024", "--remote", &address]
+            &["versions", &format!("{address}/photos%202024")]
         ),
         "a set name holding a space should name the same set on both sides"
     );
@@ -260,7 +265,7 @@ async fn a_set_the_server_does_not_hold_carries_its_own_sentence() {
 
     let stderr = fails(
         &root,
-        &["versions", "nosuch", "--remote", &remote_of(&server)],
+        &["versions", &format!("{}/nosuch", remote_of(&server))],
     );
 
     assert!(
@@ -286,7 +291,7 @@ async fn a_set_the_server_does_not_hold_prints_nothing() {
 
     let output = lepatch(
         &root,
-        &["versions", "nosuch", "--remote", &remote_of(&server)],
+        &["versions", &format!("{}/nosuch", remote_of(&server))],
     );
 
     assert_eq!(
@@ -313,7 +318,7 @@ async fn an_unreachable_address_names_the_address_it_tried() {
 
     let address = format!("http://{closed}");
 
-    let stderr = fails(dir.path(), &["versions", "docs", "--remote", &address]);
+    let stderr = fails(dir.path(), &["versions", &serve_target(&address)]);
 
     assert!(
         stderr.contains(&address),
@@ -342,24 +347,30 @@ async fn an_address_that_is_not_http_is_refused_before_anything_is_sent() {
     let dir = tempfile::tempdir().unwrap();
 
     // `https://` first, and it is the case with a reason worth reading: there
-    // is no TLS backend in the graph, so an `https://` address is a refusal
+    // is no TLS backend in the graph, so an `https://` target is a refusal
     // rather than a connection attempt in the clear to something that believes
     // it is secure.
-    let tls = fails(
-        dir.path(),
-        &["versions", "docs", "--remote", "https://example.test"],
-    );
+    let tls = fails(dir.path(), &["versions", "https://example.test/docs"]);
     assert!(
         tls.contains("needs TLS"),
-        "an https address should say why it is refused: {tls}"
+        "an https target should say why it is refused: {tls}"
     );
 
-    for address in ["ftp://host", "127.0.0.1:8480", "//127.0.0.1:8480", ""] {
-        let stderr = fails(dir.path(), &["versions", "docs", "--remote", address]);
+    // An unknown store scheme names the schemes it could have been.
+    let scheme = fails(dir.path(), &["versions", "ftp://host/docs"]);
+    assert!(
+        scheme.contains("not a store scheme"),
+        "an unknown scheme should be told what the schemes are: {scheme}"
+    );
+
+    // Anything else without `://` is a local path, and a local path that is
+    // not a set is the local miss rather than a usage error.
+    for target in ["127.0.0.1:8480", "//127.0.0.1:8480", ""] {
+        let stderr = fails(dir.path(), &["versions", target]);
 
         assert!(
-            stderr.contains("http://"),
-            "`--remote {address:?}` should be told what an address looks like: {stderr}"
+            stderr.contains("no backup set"),
+            "{target:?} is a local path, so it should get the local miss: {stderr}"
         );
     }
 }
@@ -374,7 +385,7 @@ async fn a_path_rather_than_a_name_is_refused_before_anything_is_sent() {
 
     let stderr = fails(
         dir.path(),
-        &["versions", "backups/docs", "--remote", &address],
+        &["versions", &format!("{address}/backups/docs")],
     );
 
     assert!(
@@ -419,7 +430,7 @@ async fn a_response_this_client_cannot_read_fails_loudly() {
         let stub = Stub::answering_200(body);
         let address = format!("http://{}", stub.address());
 
-        let output = lepatch(dir.path(), &["versions", "docs", "--remote", &address]);
+        let output = lepatch(dir.path(), &["versions", &serve_target(&address)]);
 
         assert_eq!(
             output.status.code(),
@@ -458,7 +469,7 @@ async fn an_empty_listing_is_an_empty_list_and_not_a_failure() {
     let stub = Stub::answering_200(r#"{"versions":[]}"#);
     let address = format!("http://{}", stub.address());
 
-    let output = lepatch(dir.path(), &["versions", "docs", "--remote", &address]);
+    let output = lepatch(dir.path(), &["versions", &serve_target(&address)]);
 
     assert!(
         output.status.success(),
@@ -515,78 +526,57 @@ async fn a_listing_of_a_set_that_exists_holds_every_version_the_server_names() {
     );
 }
 
-/// `--set docs` and `docs` are the same set, and list the same versions.
+/// One `TARGET` lists what the local path lists, and the removed flags fail.
 ///
-/// **`versions --remote` grew `--set` for the reason `restore` did**: every
-/// other remote command spells the set that way, and a user who learned `--set`
-/// from `backup` should not be told it does not exist here. Bytes are compared,
-/// as everywhere in this file — "the same versions" is a weaker claim than "the
-/// same lines", and the claim is about stdout.
+/// A serve target lists the same versions as the served path, byte for byte —
+/// the claim this whole file exists to hold. `--remote` and `--set` named the
+/// server and the set as two arguments, and one `TARGET` names both, so either
+/// flag is a usage error now: clap exits 2 before any request is made, and a
+/// refused listing prints nothing on stdout, as any other refusal does.
 #[tokio::test]
-async fn a_set_named_by_flag_lists_the_same_versions_as_the_one_named_positionally() {
+async fn a_serve_target_lists_what_the_local_path_lists_and_old_flags_fail() {
     let dir = tempfile::tempdir().unwrap();
     let (root, set) = served_three_versions(dir.path()).await;
     let server = Server::start(&root);
     let address = remote_of(&server);
 
-    let positional = ok(&root, &["versions", "docs", "--remote", &address]);
-    let flagged = ok(&root, &["versions", "--remote", &address, "--set", "docs"]);
+    let listed = ok(&root, &["versions", &serve_target(&address)]);
 
     assert!(
-        !positional.is_empty(),
+        !listed.is_empty(),
         "the fixture should hold three versions, so this compares two non-empty listings"
     );
     assert_eq!(
-        flagged, positional,
-        "`--set docs` should list what `docs` lists, byte for byte"
+        listed,
+        ok(&root, &["versions", set.display().to_string().as_str()]),
+        "the serve target should list what the local path lists, byte for byte"
     );
 
-    // And what it lists is the local set's listing, which is the claim this
-    // whole file exists to hold. `versions NAME` with no `--remote` reads the
-    // filesystem, so this is the local command's own output.
-    assert_eq!(
-        positional,
-        ok(&root, &["versions", set.display().to_string().as_str()])
-    );
-}
+    for args in [
+        vec!["versions", "docs", "--remote", address.as_str()],
+        vec!["versions", "--remote", address.as_str(), "--set", "docs"],
+    ] {
+        let output = lepatch(&root, &args);
+        let said = String::from_utf8_lossy(&output.stderr).into_owned();
 
-/// Two names for one set are a conflict on `versions` too.
-///
-/// **The same rule as `restore`, because it is the same rule.** A command line
-/// that says `docs` and `--set other` has no meaning this client may invent, so
-/// the run is refused before any request is made and the refusal names both
-/// spellings.
-#[tokio::test]
-async fn naming_the_set_both_ways_on_a_listing_is_refused() {
-    let dir = tempfile::tempdir().unwrap();
-    let (root, _set) = served_three_versions(dir.path()).await;
-    let server = Server::start(&root);
-
-    let output = lepatch(
-        &root,
-        &[
-            "versions",
-            "docs",
-            "--remote",
-            &remote_of(&server),
-            "--set",
-            "other",
-        ],
-    );
-    let said = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    assert!(
-        !output.status.success(),
-        "naming the set twice should be refused\nstdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert!(
-        said.contains("--set") && said.contains("NAME"),
-        "the refusal should name both spellings of the set: {said}"
-    );
-    assert_eq!(
-        output.stdout,
-        Vec::<u8>::new(),
-        "a refused listing prints nothing on stdout, as any other refusal does"
-    );
+        assert!(
+            !output.status.success(),
+            "a removed flag should be refused\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "an argument clap refuses is a usage error\nstderr: {said}"
+        );
+        assert!(
+            said.contains("unexpected argument"),
+            "the refusal names the mistake: {said}"
+        );
+        assert_eq!(
+            output.stdout,
+            Vec::<u8>::new(),
+            "a refused listing prints nothing on stdout, as any other refusal does"
+        );
+    }
 }

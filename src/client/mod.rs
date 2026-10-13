@@ -182,7 +182,7 @@ fn base_of(address: &str) -> io::Result<String> {
     if address.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "no server address: `--remote` wants the address `lepatch serve` printed, \
+            "no server address: a serve target wants the address `lepatch serve` printed, \
              which looks like http://127.0.0.1:8480",
         ));
     }
@@ -332,10 +332,10 @@ pub(crate) fn segment(id: &str) -> String {
 /// Refuse a name a server will not accept as a set's, without sending anything.
 ///
 /// **The same rule `set_path` applies, and for the same reason: before the
-/// bytes.** A command that is about to upload a pack — and, for `backup
-/// --remote`, about to take a whole backup first — can ask this whether the name
-/// it was given is a name, and be told the server's own complaint, rather than
-/// finding out after the transfer that the path was never going to be one.
+/// bytes.** A command that is about to upload a pack — and, for a backup to a
+/// serve target, about to stage a whole backup first — can ask this whether the
+/// name it was given is a name, and be told the server's own complaint, rather
+/// than finding out after the transfer that the path was never going to be one.
 ///
 /// Returns the same [`io::Error`] `set_path` would, so the sentence a user
 /// reads is the one every other set name in this crate produces.
@@ -346,6 +346,122 @@ pub(crate) fn segment(id: &str) -> String {
 /// component — a set on a server is named by one name, not by a path.
 pub fn check_set(name: &str) -> io::Result<()> {
     set_path(name).map(|_| ())
+}
+
+/// Split a full serve address into its server and its set name.
+///
+/// A `TARGET` names both halves at once: `http://127.0.0.1:8480/docs` is the
+/// server `http://127.0.0.1:8480` holding the set `docs`. The set is the
+/// single path segment after the authority, percent-decoded, and follows the
+/// one-component rule. An `https://` address is refused for the same reason
+/// [`Remote::new`] refuses one: neither end speaks TLS.
+///
+/// # Errors
+///
+/// Returns an error when the address is not `http://`, when it names no host,
+/// when it names no set, or when it names more than one path segment.
+pub fn split_serve_target(target: &str) -> io::Result<(String, String)> {
+    let trimmed = target.trim();
+    if trimmed.to_ascii_lowercase().starts_with("https://") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{target} needs TLS, and this client has none: `lepatch serve` offers no TLS \
+                 either, so use the http:// address it printed, or put a terminator in front of it"
+            ),
+        ));
+    }
+    let Some(rest) = trimmed.strip_prefix("http://") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{target:?} is not a serve address: a remote set looks like \
+                 http://127.0.0.1:8480/docs"
+            ),
+        ));
+    };
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{target:?} holds whitespace, which cannot be in an address"),
+        ));
+    }
+    if trimmed.contains('?') || trimmed.contains('#') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{target:?} carries a query or a fragment; a serve address is a scheme, a host, \
+                 a port, and one set name"
+            ),
+        ));
+    }
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => ("", ""),
+    };
+    if host.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{target:?} names no host"),
+        ));
+    }
+    // The address half, validated the same way `Remote::new` validates one.
+    let address = format!("http://{host}");
+    Remote::new(&address)?;
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{target:?} names no set: append the set name (`{target}/docs`)"),
+        ));
+    }
+    if path.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidFilename,
+            format!(
+                "{path:?} is a path, and a set on a server is named by one path component: \
+                 pass the set's name (`docs`), not where it lives (`backups/docs`)"
+            ),
+        ));
+    }
+    let set = percent_decode(path)?;
+    check_set(&set)?;
+    Ok((address, set))
+}
+
+/// Decode one percent-encoded path segment.
+fn percent_decode(segment: &str) -> io::Result<String> {
+    let mut out = Vec::with_capacity(segment.len());
+    let bytes = segment.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{segment:?} ends in an incomplete percent-encoding"),
+                ));
+            }
+            let hex = &segment[i + 1..i + 3];
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{segment:?} holds %{hex}, which is not percent-encoding"),
+                )
+            })?;
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{segment:?} is not UTF-8 once decoded"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -497,5 +613,31 @@ mod tests {
         assert_eq!(super::segment("abc123"), "abc123");
         assert_eq!(super::segment("../../v1/version"), "..%2F..%2Fv1%2Fversion");
         assert_eq!(super::segment("a b"), "a%20b");
+    }
+
+    #[test]
+    fn a_serve_target_splits_into_address_and_set() {
+        let (address, set) = super::split_serve_target("http://127.0.0.1:8480/docs").unwrap();
+        assert_eq!(address, "http://127.0.0.1:8480");
+        assert_eq!(set, "docs");
+
+        let (address, set) =
+            super::split_serve_target("http://127.0.0.1:8480/photos%202024").unwrap();
+        assert_eq!(address, "http://127.0.0.1:8480");
+        assert_eq!(set, "photos 2024");
+
+        for target in [
+            "http://127.0.0.1:8480",
+            "http://127.0.0.1:8480/",
+            "http://127.0.0.1:8480/a/b",
+            "https://example.test/docs",
+            "photos",
+            "http://",
+        ] {
+            assert!(
+                super::split_serve_target(target).is_err(),
+                "{target:?} must be refused"
+            );
+        }
     }
 }

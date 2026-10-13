@@ -159,7 +159,7 @@ impl Drop for Server {
 /// ## Why this exists
 ///
 /// **A client has to be tested against a server that has changed, and this
-/// build cannot produce one.** The shape `lepatch versions --remote` reads is
+/// build cannot produce one.** The shape `lepatch versions` of a serve target
 /// the shape `lepatch serve` writes, so every response the real server can send
 /// is a response the client understands — and a parser that read permissively
 /// would pass against it forever. The only way to ask what a client does with

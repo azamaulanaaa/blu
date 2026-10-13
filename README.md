@@ -21,8 +21,22 @@ $ lepatch reindex docs                 # rebuild the per-version index files
 $ lepatch pack docs game.pack          # one version as a single distributable file
 $ lepatch merge game.pack other        # and one version into another set
 $ lepatch serve ./backups              # and put a set over HTTP — see "Serving"
-$ lepatch backup ~/Documents --store file:///mnt/drive --set docs  # no local set — see "Keyed stores"
+$ lepatch backup ~/Documents file:///mnt/drive/docs  # no local set — see "Keyed stores"
 ```
+
+Every command that takes a set takes one `TARGET`:
+
+```console
+$ lepatch backup ~/Documents docs                  # a local path
+$ lepatch backup ~/Documents file:///mnt/drive/docs  # a keyed store
+$ lepatch backup ~/Documents http://127.0.0.1:8480/docs  # a lepatch serve set
+```
+
+Anything holding `://` is a remote address and anything else is a path on
+this machine. A remote target holds no local copy: a `file://` set is pulled
+into staging, worked on there, and pushed back after a write, and an
+`http://` set is worked on by the server. `--staging` selects the staging
+directory for a store target; without it the system cache holds the copy.
 
 `--version N` selects a specific version; without it, restore, verify and pack use
 the most recent one that completed successfully.
@@ -533,7 +547,7 @@ that level, for a receiving set with a compression policy of its own: under `kee
 would be holding the *sender's* frames. Neither rewrites anything already in the set,
 because every record names the codec it was written with, so this is a policy for
 what arrives from now on, exactly as `backup --compression-level` is one for what
-goes in. With `--remote` the server does the merging, and it opens the set at the
+goes in. With an `http://` target the server does the merging, and it opens the set at the
 same level, so a level sent over HTTP is the level those records are written at
 rather than the server's default.
 
@@ -733,21 +747,21 @@ saying what it would empty.
 
 ### Keyed stores
 
-`--store` works a set through a keyed backend instead of a local path.
-Only `file://` connects in this build. The set is pulled into a staging
-copy, the local command runs there, and a backup pushes back:
+A `file://` target works a set through a keyed backend instead of a local
+path. Only `file://` connects in this build. The set is the last component
+of the address — `file:///mnt/drive/docs` is the store `file:///mnt/drive`
+holding the set `docs`. It is pulled into a staging copy, the local command
+runs there, and a write pushes back:
 
 ```console
-$ lepatch backup ~/Documents --store file:///mnt/drive --set docs
-$ lepatch versions --store file:///mnt/drive --set docs
-$ lepatch restore /tmp/out --store file:///mnt/drive --set docs
+$ lepatch backup ~/Documents file:///mnt/drive/docs
+$ lepatch versions file:///mnt/drive/docs
+$ lepatch restore /tmp/out file:///mnt/drive/docs
 ```
 
-`--set` names the set on that store. `backup` requires it. `restore` and
-`versions` also take the name as `NAME`, as with `--remote`. `--staging`
-selects the staging directory. Without it the system cache holds the copy.
-A machine with none is told to pass `--staging`. Reads never push back.
-Other schemes name their refusal. No backend is connected yet.
+`--staging` selects the staging directory. Without it the system cache holds
+the copy. A machine with none is told to pass `--staging`. Reads never push
+back. Other schemes name their refusal. No backend is connected yet.
 
 ## What is preserved
 
@@ -968,13 +982,13 @@ $ curl -sS -H 'range: bytes=0-' localhost:8480/v1/packs/docs@3 > docs.pack
 $ lepatch merge docs.pack mirror
 ```
 
-**`lepatch versions --remote` is the one thing here with no `curl` in it.**
+**`lepatch versions` of a serve set is the one thing here with no `curl` in it.**
 Both flows above are `curl` because they move packs, and this is the question
 you ask before either of them — *what does that server actually hold?* — so it
 is a subcommand rather than an example to paste:
 
 ```console
-$ lepatch versions docs --remote http://127.0.0.1:8480
+$ lepatch versions http://127.0.0.1:8480/docs
 1  1976fecc6c84aaa9053093fdd22c4289d45014439b13d3fb84b9248f20863f5e
 2  245b2b54d4d91a0a90a2a95ca9bf2e83ffc3b2cc5bcfa95f8ba7caaf60e51ec0
 ```
@@ -983,42 +997,26 @@ $ lepatch versions docs --remote http://127.0.0.1:8480
 Not the same versions — the same *bytes*: same fields, same order, same
 two-space separator, `--numbers-only` and all. So a script written against a
 local set works unchanged against a remote one, and the only difference on the
-command line is the flag:
+command line is the target:
 
 ```console
 $ lepatch versions ~/backups/docs
-$ lepatch versions docs --remote http://127.0.0.1:8480        # identical output
+$ lepatch versions http://127.0.0.1:8480/docs        # identical output
 ```
 
-**The set can be named either way, and one of them is the flag the rest of the
-remote commands already use.** `backup --remote`, `pack --remote` and `merge
---remote` spell it `--set docs`, and `restore --remote` does now, so `versions`
-does too rather than being the one command that answers `--set` with *unexpected
-argument*. The two spellings are one set, and giving both is refused rather than
-resolved — a command line that says `docs` and `--set other` has no meaning a
-client may invent:
+The argument is the set's address on that server: the server's address plus
+the set's **name**, one path component, so it is `docs` and never
+`backups/docs`. A set the server does not hold is an error carrying **the
+server's own sentence** — the same `no backup set at …` a mistyped local path
+produces, because the server does not translate its errors and this client
+does not paraphrase them:
 
 ```console
-$ lepatch versions docs --remote http://127.0.0.1:8480
-$ lepatch versions --remote http://127.0.0.1:8480 --set docs    # the same listing
-```
-
-Without `--remote` there is no server to name a set on, so `--set` is refused
-there: a set on this machine is a path, and that is `NAME`.
-
-Two things follow from that, and both are refusals rather than behaviours. The
-argument is the set's **name** on that server, not a path to one, so it is
-`docs` and never `backups/docs`. And a set the server does not hold is an
-error carrying **the server's own sentence** — the same `no backup set at …` a
-mistyped local path produces, because the server does not translate its errors
-and this client does not paraphrase them:
-
-```console
-$ lepatch versions nosuch --remote http://127.0.0.1:8480
+$ lepatch versions http://127.0.0.1:8480/nosuch
 error: no backup set at /srv/backups/nosuch (looked in /srv/backups)
 ```
 
-**`--remote` refuses `https://`.** There is no TLS backend in the dependency
+**An `http://` target refuses `https://`.** There is no TLS backend in the
 graph — `awc` is built with every TLS feature off, and `lepatch serve` offers
 no TLS either — so an `https://` address is refused by name rather than
 downgraded to a connection in the clear to something that believes it is
@@ -1167,10 +1165,10 @@ all; `cargo build --features telemetry-tls` turns on `rustls` for the
 exporter's HTTP client and changes nothing else — no endpoint, no span and no
 flag behaves differently. Without it an `https://` endpoint fails to connect
 rather than being downgraded to a connection in the clear, which is the same
-refusal `versions --remote` makes for an `https://` server. A build that does
+refusal `versions` of an `https://` serve target makes. A build that does
 speak `https` trusts the operating system's certificate store.
 
-**Almost every exporter setting is still the operator's.** The standard
+The standard
 `OTEL_BSP_*` variables move the span batch schedule, its queue and its batch
 size, and `OTEL_METRIC_EXPORT_INTERVAL` moves how often metrics are collected.
 The one that is not is the export timeout: this crate sets it to ten seconds,
@@ -1226,7 +1224,7 @@ inbound `traceparent` or `tracestate` header is extracted and the span is
 parented to it, so a client that is itself instrumented sees one trace across
 both ends; a request with no such header starts its own trace, which is the
 correct answer for a client that is not instrumented — and the answer this
-crate's own `lepatch versions --remote` gets, since it sends no header.
+crate's own `lepatch versions` of a serve target gets, since it sends no header.
 `http.route` is the **template** (`/v1/sets/{set}/versions`), never the path, so
 seventeen route templates and four methods are the whole of the cardinality; a
 request for a route that does not exist carries no `http.route` at all rather

@@ -1,7 +1,7 @@
 //! The client's REST surface: a backup pushed to a server, end to end.
 //!
 //! Everything here goes through [`lepatch::client::Remote`] — the same type
-//! `lepatch versions --remote` uses — against a real `lepatch serve` started as
+//! `lepatch versions` of a serve target uses — against a real `lepatch serve`
 //! a user starts it, reached over a socket. Nothing reaches into `src/serve`
 //! and nothing parses a response by hand, because a client tested against
 //! something other than the server a client really talks to is a client tested
@@ -16,7 +16,7 @@
 //! * **A push that is not a version.** `a_merge_the_client_starts_publishes_a
 //!   version_the_set_then_holds` asserts the whole chain: the upload lands, the
 //!   merge job succeeds, and `versions` on the same server now names a version —
-//!   which is the claim `lepatch backup --remote` would make.
+//!   which is the claim `lepatch backup` to a serve target would make.
 //! * **A failed job reported as a success.** This is the bug `9ab42a7` fixed on
 //!   the server side, and the client half of it is the one a caller would not
 //!   catch: `a_failed_job_is_an_error_carrying_the_servers_own_sentence` drives a
@@ -59,7 +59,7 @@ use tokio::io::AsyncReadExt as _;
 /// server that moved it would fail these tests rather than quietly pass them.
 const SCRATCH: &str = ".lepatch-serve";
 
-/// A client for `server`, as `--remote` would build one.
+/// A client for `server`, as a serve target would build one.
 fn remote_of(server: &Server) -> Remote {
     Remote::new(&format!("http://{}", server.address())).unwrap()
 }

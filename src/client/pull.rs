@@ -47,7 +47,7 @@
 //! the client does not hold is not a saving; it is a hole in the file this
 //! function then hands to a restore. An empty `have` is always correct and always
 //! wasteful, and this client chooses between the two at the call site rather than
-//! guessing here — see `lepatch restore --remote`.
+//! guessing here — see a `restore` of a serve target.
 
 use std::{collections::HashSet, io, path::Path};
 

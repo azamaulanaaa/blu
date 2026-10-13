@@ -80,8 +80,8 @@
 //!   nothing else: no endpoint, no span and no flag behaves differently. Without
 //!   it an `https://` endpoint fails to connect rather than quietly
 //!   downgrading, which is the same refusal
-//!   [`lepatch versions --remote`](crate::client) makes. See the
-//!   `opentelemetry-otlp` entry in `Cargo.toml`.
+//!   [`lepatch versions`](crate::client) of an `https://` serve target makes. See
+//!   the `opentelemetry-otlp` entry in `Cargo.toml`.
 //! * **No logs signal.** `opentelemetry`'s `logs` feature is off on every crate
 //!   in this graph and nothing bridges a `tracing` *event* into an OpenTelemetry
 //!   log record. Diagnostics stay on stderr, filtered by `RUST_LOG`, `--verbose`

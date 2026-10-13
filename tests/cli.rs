@@ -121,31 +121,35 @@ fn backup_then_restore_reproduces_the_tree() {
 }
 
 #[test]
-fn a_local_restore_still_takes_a_path_and_asks_for_no_set_flag() {
-    // **`--set` was added to `restore` for `--remote`, and the local arm has to
-    // be untouched by it.** A set on this machine is a path, so `NAME` is that
-    // path and nothing else — and a `--set` with no `--remote` names a set on a
-    // server that this run has not asked to talk to, so it is refused rather
-    // than quietly ignored. Both halves are checked here, on the same set, so a
-    // change that made `--set` fall through to the path would fail rather than
-    // pass as a local restore that happened to work.
+fn a_local_restore_takes_a_path_and_no_other_spelling() {
+    // A set on this machine is a path, so `TARGET` is that path and nothing
+    // else. The removed `--set`/`--remote`/`--store` flags are usage errors
+    // now rather than something a local run quietly ignores.
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
     ok(dir.path(), &["backup", "src", "snap"]);
 
-    // The positional path, no `--set` and no `--remote`.
+    // The positional path, and nothing else.
     ok(dir.path(), &["restore", "out", "snap"]);
 
     let before = common::describe(&dir.path().join("src"));
     let after = common::describe(&dir.path().join("out"));
     assert_eq!(before, after, "the restored tree differs from the source");
 
-    // And the refusal, which is what keeps the flag from meaning "the set" here.
-    let refused = fails(dir.path(), &["restore", "out2", "--set", "snap"]);
-
+    // And the refusal, which is what keeps a removed flag from meaning
+    // anything here. Exit 2: clap refusing an argument is a usage error, not
+    // a run that failed while working.
+    let output = lepatch(dir.path(), &["restore", "out2", "--set", "snap"]);
+    assert!(!output.status.success(), "a removed flag should be refused");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an argument clap refuses is a usage error"
+    );
+    let refused = stderr(&output);
     assert!(
-        refused.contains("--set") && refused.contains("NAME"),
-        "the refusal should name the flag and what to pass instead: {refused}"
+        refused.contains("unexpected argument"),
+        "the refusal names the mistake: {refused}"
     );
     assert!(
         !dir.path().join("out2").exists(),
@@ -4908,124 +4912,68 @@ fn a_dry_pack_reports_the_figures_of_the_run_it_would_make() {
     );
 }
 
-/// `--set` names a set on a `lepatch serve`. Without `--remote` there is no
-/// server to name one on, so the flag is refused rather than discarded.
+/// The removed flags stay removed.
 ///
-/// **It used to be discarded.** `requested_push` returned early when `--remote`
-/// was absent, without looking at `--set` at all, so
-/// `lepatch backup SRC SNAP --set docs` backed up to `SNAP`, said nothing about
-/// `docs`, and exited 0. A user who typed the set they wanted was told by their
-/// exit code that they had got it -- which is the same class of silent lie as
-/// the progress events that reached nobody and the job that reported success
-/// having failed.
-///
-/// All three push commands share `requested_push`, so one test each: a fix that
-/// closed only `backup` would leave the other two discarding the flag.
+/// `--remote`, `--store`, and `--set` named the far side and the set as extra
+/// arguments. One `TARGET` names both, so any of those flags is a usage error
+/// now — exit 2 from clap, before any command runs — on every command that
+/// takes a set.
 #[test]
-fn a_set_named_without_a_server_to_name_it_on_is_refused() {
+fn removed_remote_store_and_set_flags_are_usage_errors() {
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
     build_tree(dir);
-
-    // A destination that does not exist, so a run that got past the refusal
-    // would fail later for a different reason and the message would be wrong.
+    ok(dir, &["backup", "src", "snap"]);
     let missing = dir.join("no-such-store");
 
-    for (command, args) in [
-        ("backup", vec!["src", "snap", "--set", "docs"]),
-        ("pack", vec!["snap", "out.pack", "--set", "docs"]),
-        (
-            "merge",
-            vec!["out.pack", &missing.display().to_string(), "--set", "docs"],
-        ),
-    ] {
-        let mut all = vec![command];
-        all.extend(args.iter().copied());
-        let stderr = fails(dir, &all);
-
-        assert!(
-            stderr.contains("--set") && stderr.contains("--remote"),
-            "`lepatch {command} --set` without `--remote` must name both the flag it was given \
-             and the one it needed; stderr was: {stderr}"
-        );
-
-        // The refusal has to be about the flag, not about the path that follows
-        // it. A run that complained about `no-such-store` would have got past
-        // this check.
-        if command == "merge" {
-            assert!(
-                !stderr.contains("no-such-store"),
-                "`merge` refused for the wrong reason -- about the destination rather than about \
-                 `--set`: {stderr}"
-            );
-        }
-    }
-}
-
-/// The same refusal, on the two read commands, which resolve through
-/// `requested_set` rather than `requested_push`. Named here so the two
-/// spellings are one rule with one test each rather than one rule tested once.
-#[test]
-fn a_set_named_without_a_server_is_refused_by_the_read_commands_too() {
-    let dir = tempfile::tempdir().unwrap();
-    let dir = dir.path();
-    build_tree(dir);
-    let missing = dir.join("no-such-dest");
-    let _ = &missing;
-
-    // Only `--set`, and no NAME beside it: on both of these `name` is optional,
-    // so the flag can stand alone, and passing both is the `conflicts_with`
-    // refusal rather than the one this test is about.
-    for command in ["restore", "versions"] {
-        let args: Vec<&str> = if command == "restore" {
-            vec![command, "out", "--set", "docs"]
-        } else {
-            vec![command, "--set", "docs"]
-        };
-        let stderr = fails(dir, &args);
-        assert!(
-            stderr.contains("--set") && stderr.contains("--remote"),
-            "`lepatch {command} --set` without `--remote` must say what it wanted and what it \
-             needed; stderr was: {stderr}"
-        );
-    }
-}
-
-/// And the flag still works when there IS a server, so the refusal above cannot
-/// be satisfied by breaking `--set` outright.
-#[test]
-fn a_set_named_with_a_server_is_not_refused() {
-    // Clap is what decides this one, and it decides it before any filesystem is
-    // touched, so an address nothing is listening on is enough: the run must
-    // get as far as trying to connect, which is a different failure entirely.
-    let dir = tempfile::tempdir().unwrap();
-    let dir = dir.path();
-    build_tree(dir);
-
-    // `--set` alone, because naming the set twice is `conflicts_with` and would
-    // be a different refusal than the one guarded here.
-    let output = lepatch(
-        dir,
-        &[
-            "versions",
-            "--remote",
-            "http://127.0.0.1:1",
+    for args in [
+        vec!["backup", "src", "snap", "--remote", "http://127.0.0.1:1"],
+        vec!["backup", "src", "snap", "--set", "docs"],
+        vec![
+            "backup",
+            "src",
+            "snap",
+            "--store",
+            "file:///nowhere",
             "--set",
             "docs",
         ],
-    );
-    let stderr = stderr(&output);
+        vec!["pack", "snap", "out.pack", "--set", "docs"],
+        vec!["pack", "snap", "out.pack", "--remote", "http://127.0.0.1:1"],
+        vec![
+            "merge",
+            "out.pack",
+            missing.to_str().unwrap(),
+            "--set",
+            "docs",
+        ],
+        vec!["restore", "out", "snap", "--set", "docs"],
+        vec!["versions", "snap", "--set", "docs"],
+        vec!["verify", "snap", "--set", "docs"],
+        vec!["reindex", "snap", "--set", "docs"],
+    ] {
+        let output = lepatch(dir, &args);
+        let stderr = stderr(&output);
 
-    // `--set` with `NAME` is refused by `conflicts_with`, so the same spelling
-    // twice cannot be what we are testing here.
-    assert!(
-        !stderr.contains("cannot be used with"),
-        "naming the set twice should be the parser's conflict, not a connection failure: {stderr}"
-    );
+        assert!(
+            !output.status.success(),
+            "`lepatch {}` with a removed flag should be refused",
+            args.join(" ")
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "an argument clap refuses is a usage error; stderr was: {stderr}"
+        );
+        assert!(
+            stderr.contains("unexpected argument"),
+            "the refusal names the mistake; stderr was: {stderr}"
+        );
+    }
 }
 
-/// A backup through `--store file://` lands in the keyed store, and a
-/// restore through it brings the tree back. Staging is explicit, so the test
+/// A backup to a `file://` target lands in the keyed store, and a restore
+/// through it brings the tree back. Staging is explicit, so the test
 /// touches no cache directory. Two tiny files keep the run small.
 #[test]
 fn store_file_backup_restore_round_trip() {
@@ -5036,25 +4984,19 @@ fn store_file_backup_restore_round_trip() {
     fs::write(source.join("a.txt"), b"first file").unwrap();
     fs::write(source.join("b.txt"), b"second file").unwrap();
 
-    let store = format!("file://{}", dir.join("remote").display());
-    let args = |rest: &[&str]| {
-        let mut owned = vec!["backup".to_string(), "src".to_string()];
-        owned.extend(rest.iter().map(|s| s.to_string()));
-        owned
-    };
+    let target = format!("file://{}/docs", dir.join("remote").display());
     let run = |owned: Vec<String>| {
         let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
         ok(dir, &refs)
     };
 
-    run(args(&[
-        "--store",
-        &store,
-        "--set",
-        "docs",
-        "--staging",
-        "staging",
-    ]));
+    run(vec![
+        "backup".to_string(),
+        "src".to_string(),
+        target.clone(),
+        "--staging".to_string(),
+        "staging".to_string(),
+    ]);
     assert!(
         dir.join("remote").join("docs.0000.bin").is_file(),
         "the backup must land in the keyed store"
@@ -5062,10 +5004,7 @@ fn store_file_backup_restore_round_trip() {
 
     let listed = run(vec![
         "versions".to_string(),
-        "--store".to_string(),
-        store.clone(),
-        "--set".to_string(),
-        "docs".to_string(),
+        target.clone(),
         "--staging".to_string(),
         "staging".to_string(),
         "--numbers-only".to_string(),
@@ -5079,10 +5018,7 @@ fn store_file_backup_restore_round_trip() {
     run(vec![
         "restore".to_string(),
         "out".to_string(),
-        "--store".to_string(),
-        store,
-        "--set".to_string(),
-        "docs".to_string(),
+        target,
         "--staging".to_string(),
         "staging".to_string(),
     ]);

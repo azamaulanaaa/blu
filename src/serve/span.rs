@@ -86,8 +86,8 @@
 //!    request and the propagator turns them into an `opentelemetry::Context`.
 //!    A request with no `traceparent` extracts an empty context, which is a root
 //!    span — the correct answer for a client that is not instrumented, and the
-//!    answer this crate's own `lepatch versions --remote` gets, since it sends
-//!    no header at all.
+//!    answer this crate's own `lepatch versions` of a serve target gets, since it
+//!    sends no header at all.
 //! 2. **Parent.** `Span::set_parent` attaches that context to the span before it
 //!    is ever entered, so the server's span joins the client's trace rather than
 //!    starting a second one beside it.

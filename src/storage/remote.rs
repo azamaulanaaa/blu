@@ -167,6 +167,77 @@ impl RemoteUrl {
         self.scheme
     }
 
+    /// Split a full set address into its store and its set name.
+    ///
+    /// A `TARGET` names both halves at once: `s3://bucket/backups/docs` is the
+    /// store `s3://bucket/backups` holding the set `docs`, and
+    /// `file:///mnt/drive/docs` is the directory `/mnt/drive` holding the set
+    /// `docs`. The set is always the last path component, and the store is
+    /// everything before it. The set name follows the one-component rule, so
+    /// a path cannot escape its staging directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the address names no set (`s3://bucket` with no
+    /// path), or when the last component is not a set name.
+    pub fn split_set(address: &str) -> io::Result<(Self, String)> {
+        let full = Self::parse(address)?;
+        let (store, set) = match full.scheme {
+            RemoteScheme::File => {
+                let path = full.location.trim_end_matches('/');
+                let Some(slash) = path.rfind('/') else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{address:?} names no set: append the set name (`{address}/docs`)"),
+                    ));
+                };
+                let (parent, name) = path.split_at(slash);
+                let name = &name[1..];
+                let parent = if parent.is_empty() { "/" } else { parent };
+                if name.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{address:?} names no set: append the set name (`{address}docs`)"),
+                    ));
+                }
+                crate::client::check_set(name)?;
+                (
+                    Self {
+                        scheme: RemoteScheme::File,
+                        location: parent.to_string(),
+                        prefix: String::new(),
+                    },
+                    name.to_string(),
+                )
+            }
+            scheme => {
+                if full.prefix.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{address:?} names no set: append the set name (`{address}/docs`)"),
+                    ));
+                }
+                let (store_prefix, set) = match full.prefix.rfind('/') {
+                    Some(i) => (
+                        full.prefix[..i].to_string(),
+                        full.prefix[i + 1..].to_string(),
+                    ),
+                    None => (String::new(), full.prefix.clone()),
+                };
+                crate::client::check_set(&set)?;
+                (
+                    Self {
+                        scheme,
+                        location: full.location.clone(),
+                        prefix: store_prefix,
+                    },
+                    set,
+                )
+            }
+        };
+        Ok((store, set))
+    }
+
     /// Bucket, authority, or directory, per scheme.
     #[must_use]
     pub fn location(&self) -> &str {
@@ -358,7 +429,7 @@ mod tests {
         }
     }
 
-    /// Malformed addresses fail with InvalidInput. Each case names its own
+    /// Malformed addresses fail with `InvalidInput`. Each case names its own
     /// reason. Strings only.
     #[test]
     fn malformed_addresses_are_refused() {
@@ -387,5 +458,30 @@ mod tests {
                 "{address:?} must be refused"
             );
         }
+    }
+
+    /// A full set address splits into its store and its set. The store keeps
+    /// everything but the last component. Strings only.
+    #[test]
+    fn set_addresses_split_into_store_and_set() {
+        let (store, set) = RemoteUrl::split_set("s3://bucket/backups/docs").unwrap();
+        assert_eq!(store.to_string(), "s3://bucket/backups");
+        assert_eq!(set, "docs");
+
+        let (store, set) = RemoteUrl::split_set("s3://bucket/docs").unwrap();
+        assert_eq!(store.to_string(), "s3://bucket");
+        assert_eq!(set, "docs");
+
+        let (store, set) = RemoteUrl::split_set("file:///mnt/drive/docs").unwrap();
+        assert_eq!(store.to_string(), "file:///mnt/drive");
+        assert_eq!(set, "docs");
+
+        for address in ["s3://bucket", "s3://bucket/", "file:///"] {
+            assert!(
+                RemoteUrl::split_set(address).is_err(),
+                "{address:?} names no set"
+            );
+        }
+        assert!(RemoteUrl::split_set("s3://bucket/a/b/c").is_ok());
     }
 }

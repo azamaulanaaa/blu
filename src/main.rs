@@ -64,7 +64,7 @@ struct Args {
     /// **This build has no TLS backend unless it was compiled with
     /// `--features telemetry-tls`.** Without it, an `https://` endpoint fails to
     /// connect rather than being downgraded — the same refusal
-    /// `versions --remote` makes. That matches `lepatch serve`, which offers no
+    /// `versions` of an `https://` serve target makes. That matches `lepatch serve`, which offers no
     /// TLS either: a telemetry backend is expected to sit on the same trust
     /// boundary as the thing it is describing. A build that does speak `https`
     /// reads the operating system's trust store, not one compiled in.
@@ -104,9 +104,10 @@ enum Command {
     Merge {
         /// The pack to merge.
         pack: std::path::PathBuf,
-        /// Base path of the backup set to merge into, e.g. `photos` creates
-        /// `photos.0000.bin` and `photos.lock`.
-        name: std::path::PathBuf,
+        /// The backup set to merge into: a local path (`photos`), a serve
+        /// set (`http://127.0.0.1:8480/docs`), or a keyed store
+        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy.
+        target: String,
         /// How each chunk the pack carries is stored. `keep` (the default) writes the stored
         /// form the pack already has. `0` writes the content as it is. 1 to 9 decode and store
         /// a zstd frame at that level.
@@ -130,6 +131,10 @@ enum Command {
         /// different vocabulary with a different default: one flag with two
         /// meanings turns a mistyped option into a confusing one rather than an
         /// obvious one.
+        ///
+        /// With an `http://` target the server does the merging and opens its
+        /// set at this level, so a level sent over HTTP is the level those
+        /// records are written at rather than the server's default.
         #[arg(long, value_name = "KEEP_OR_LEVEL", default_value = "keep",
               value_parser = parse_keep_or_level)]
         compression: KeepOrLevel,
@@ -142,49 +147,29 @@ enum Command {
         /// not the set's directory if it is not there yet — and no lock is taken,
         /// since the claim is a file. A delta is still refused for a set that
         /// does not hold its base.
+        ///
+        /// Refused with an `http://` target: the server has no plan-only
+        /// merge, so a dry run here would report a plan about a set this run
+        /// does not hold.
         #[arg(long)]
         dry_run: bool,
-        /// Hand this pack to a `lepatch serve` at this address, over HTTP.
+        /// Directory holding the staging copy for a `file://` target.
         ///
-        /// **The merge happens on the server, not here.** The pack is uploaded and
-        /// the server merges it into `--set`, holding that set's own write lock
-        /// for the length of the work. So this is not a local merge followed by an
-        /// upload: the version this publishes is numbered by the server's set and
-        /// committed in the server's store, and `BASE` — the destination a local
-        /// merge writes into — is not touched. It is still named, because the
-        /// command line is the same command line either way; only the half that
-        /// does the work moves.
-        ///
-        /// `--set` is the set on that server, and is required: a server holds
-        /// many sets and this command will not guess which one was meant. It is
-        /// named by one path component — `--set docs`, not `backups/docs`.
-        ///
-        /// `--compression` is the server's, in the same vocabulary: `keep`
-        /// stores each chunk as the pack carries it and a level asks the server to
-        /// re-encode it. The server opens the set at that level, so the level is
-        /// what the re-encoded records are written at rather than the server's
-        /// default.
-        ///
-        /// A pack the set already holds is reported as already merged, naming the
-        /// version that holds it, exactly as a local merge reports it. A job that
-        /// failed or was cancelled is a failure and a non-zero exit; the server's
-        /// own sentence is what is printed.
-        ///
-        /// `--dry-run` is refused alongside it: the server has no plan-only
-        /// merge, so a dry run here would report a plan about a local set that
-        /// this run does not touch.
-        #[arg(long, value_name = "URL")]
-        remote: Option<String>,
-        /// The name of the set on that server to merge this pack into.
-        #[arg(long, value_name = "NAME")]
-        set: Option<String>,
+        /// One subdirectory per store address; the set name selects the set
+        /// inside it. Defaults to the system cache. Refused for local and
+        /// `http://` targets: without a store there is no copy to stage.
+        #[arg(long, value_name = "DIR")]
+        staging: Option<std::path::PathBuf>,
     },
     /// Rebuild the per-version index files from the store's commit records.
     ///
     /// They are a cache: nothing is lost if they are missing or wrong.
     Reindex {
-        /// Base path of the backup set to rebuild.
-        name: std::path::PathBuf,
+        /// The backup set to rebuild: a local path (`photos`) or a keyed
+        /// store (`file:///mnt/drive/docs`), pulled into staging first and
+        /// pushed back afterwards. An `http://` target is refused: the index
+        /// lives on the server, where no endpoint rebuilds it.
+        target: String,
         /// Say how many index files would be written, and write none of them.
         ///
         /// Affects nothing but the writing: the set is still opened and scanned, so
@@ -194,6 +179,13 @@ enum Command {
         /// real one — and no lock is taken, because taking one creates a file.
         #[arg(long)]
         dry_run: bool,
+        /// Directory holding the staging copy for a `file://` target.
+        ///
+        /// One subdirectory per store address; the set name selects the set
+        /// inside it. Defaults to the system cache. Refused for local targets:
+        /// without a store there is no copy to stage.
+        #[arg(long, value_name = "DIR")]
+        staging: Option<std::path::PathBuf>,
     },
     /// List the versions a backup set holds, oldest first.
     ///
@@ -201,58 +193,24 @@ enum Command {
     /// still exists and still restores, so this can under-report and never
     /// over-reports.
     ///
-    /// **The same listing is printed whether the set is local or remote.** With
-    /// `--remote` the set lives on a `lepatch serve` and nothing is read from
-    /// disk, but the lines are the same lines: `{version}  {snapshot}`, or just
+    /// **The same listing is printed whether the set is local or remote.**
+    /// The lines are the same lines: `{version}  {snapshot}`, or just
     /// `{version}` under `--numbers-only`. A script written against a local set
     /// works unchanged against a remote one.
     Versions {
-        /// Base path of the backup set to inspect.
-        ///
-        /// With `--remote`, the *name* of the set on that server rather than a
-        /// path to one: `docs`, not `backups/docs` — and `--set docs` says the
-        /// same thing.
-        name: Option<std::path::PathBuf>,
+        /// The backup set to inspect: a local path (`photos`), a serve set
+        /// (`http://127.0.0.1:8480/docs`), or a keyed store
+        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy.
+        target: String,
         /// Print just the version numbers, one per line, and nothing else.
         #[arg(long)]
         numbers_only: bool,
-        /// List a set held by a `lepatch serve`, at this address, over HTTP.
-        ///
-        /// The address is the one the server printed on its first line, which is
-        /// why that line goes to stdout. `http://` only: this client has no TLS
-        /// and `lepatch serve` offers none, so an `https://` address is refused
-        /// rather than quietly downgraded.
-        ///
-        /// A set the server does not hold is an error carrying the server's own
-        /// sentence, exactly as a mistyped local path is.
-        #[arg(long, value_name = "URL")]
-        remote: Option<String>,
-        /// The name of the set on that server to list.
-        ///
-        /// The same set `NAME` names under `--remote`, spelled as a flag:
-        /// `--set docs` and `docs` mean the same thing, and giving both is
-        /// refused rather than resolved. With no `--remote` there is no server
-        /// to name a set on, so it is refused there too — a set on this machine
-        /// is a path, and that is `NAME`.
-        ///
-        /// With `--remote`, one of this or `NAME` is required: a server holds
-        /// many sets and this command will not guess which one was meant.
-        #[arg(long, value_name = "NAME", conflicts_with = "name")]
-        set: Option<String>,
-        /// List a set in a keyed store at this URL, through staging.
-        ///
-        /// Prints the same lines as a local listing. Only `file://` connects
-        /// in this build. `--set` (or `NAME`) names the set on that store.
-        /// `--staging` selects the staging directory; without it the system
-        /// cache holds the copy.
-        #[arg(long, value_name = "URL", conflicts_with = "remote")]
-        store: Option<String>,
-        /// Directory holding the staging copy for `--store`.
+        /// Directory holding the staging copy for a `file://` target.
         ///
         /// One subdirectory per store address; the set name selects the set
-        /// inside it. Defaults to the system cache. Needs `--store`: without
-        /// a store there is no copy to stage.
-        #[arg(long, value_name = "DIR", requires = "store")]
+        /// inside it. Defaults to the system cache. Refused for local and
+        /// `http://` targets: without a store there is no copy to stage.
+        #[arg(long, value_name = "DIR")]
         staging: Option<std::path::PathBuf>,
     },
     /// Serve the backup sets under a directory over HTTP.
@@ -305,13 +263,13 @@ enum Command {
     Restore {
         /// Directory to restore into.
         destination: std::path::PathBuf,
-        /// Base path of the backup set to restore from.
-        ///
-        /// With `--remote` this is **the name of the set on that server** rather
-        /// than a path here — `--set docs` and `docs` mean the same thing, and the
-        /// same as what `versions --remote` takes. Nothing on this machine is
-        /// opened, because nothing on this machine holds the version.
-        name: Option<std::path::PathBuf>,
+        /// The backup set to restore from: a local path (`photos`), a serve
+        /// set (`http://127.0.0.1:8480/docs`), or a keyed store
+        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy:
+        /// an `http://` restore fetches a pack over the socket and applies
+        /// it, and a `file://` restore pulls into staging first. Reads never
+        /// push back.
+        target: String,
         /// Version to restore, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
@@ -331,76 +289,36 @@ enum Command {
         /// file, no directory, no attribute, no `.partial` beside the destination —
         /// and no claim is taken there, which is what lets a plan be taken against
         /// a destination another restore is using.
+        ///
+        /// With an `http://` target the pack is still fetched: the report has
+        /// to come from the same probe an apply would take, and that probe
+        /// reads the pack.
         #[arg(long)]
         dry_run: bool,
-        /// Pull the version from a `lepatch serve` at this address, instead of
-        /// from a set on this machine.
-        ///
-        /// **The whole restore happens over the socket.** No set is opened here:
-        /// `NAME` — or `--set`, which is the same set — is the set's name on that
-        /// server. The server packs the version,
-        /// this run fetches the ranges it is missing into a sparse file, and the
-        /// pack is applied to the destination through exactly the code
-        /// `lepatch apply` uses — so a destination holding a version is brought
-        /// up to this one by writing only what it lacks, and one holding nothing
-        /// is given the lot.
-        ///
-        /// **Only the chunks this destination already holds are left out of the
-        /// fetch.** A record of a previous apply beside the destination says which
-        /// version that tree is, and a tree still where that record left it holds
-        /// every chunk of it. So a second pull of the same version transfers the
-        /// pack's header, snapshot, index and trailer and nothing else, and a pull
-        /// into a fresh directory transfers the whole pack. Anything less certain
-        /// — no record, a record for another version, a file that has moved since —
-        /// falls back to the whole pack, which is always right and never wrong.
-        ///
-        /// The pack is assembled in a temporary file and removed when the run
-        /// ends, however it ends. A pull that fails half-way leaves the
-        /// destination as it was rather than a tree of zeroes.
-        ///
-        /// `--clean` removes entries this version does not record, which is what
-        /// it says for a local restore: the destination ends up holding the
-        /// version and nothing else. It is a prune rather than an emptying,
-        /// because there is no local set to protect the destination from.
-        ///
-        /// `--dry-run` still fetches the pack. The report has to come from the
-        /// same probe an apply would take, and that probe reads the pack.
-        #[arg(long, value_name = "URL")]
-        remote: Option<String>,
-        /// The name of the set on that server to restore from.
-        ///
-        /// The same set `NAME` names under `--remote`, spelled as a flag:
-        /// `--set docs` and `docs` mean the same thing, and giving both is
-        /// refused rather than resolved. With no `--remote` there is no server
-        /// to name a set on, so it is refused there too — a set on this machine
-        /// is a path, and that is `NAME`.
-        ///
-        /// With `--remote`, one of this or `NAME` is required: a server holds
-        /// many sets and this command will not guess which one was meant.
-        #[arg(long, value_name = "NAME", conflicts_with = "name")]
-        set: Option<String>,
-        /// Pull the version from a keyed store at this URL, through staging.
-        ///
-        /// Only `file://` connects in this build. `--set` (or `NAME`) names
-        /// the set on that store. `--staging` selects the staging directory;
-        /// without it the system cache holds the copy. Reads never push back.
-        #[arg(long, value_name = "URL", conflicts_with = "remote")]
-        store: Option<String>,
-        /// Directory holding the staging copy for `--store`.
+        /// Directory holding the staging copy for a `file://` target.
         ///
         /// One subdirectory per store address; the set name selects the set
-        /// inside it. Defaults to the system cache. Needs `--store`: without
-        /// a store there is no copy to stage.
-        #[arg(long, value_name = "DIR", requires = "store")]
+        /// inside it. Defaults to the system cache. Refused for local and
+        /// `http://` targets: without a store there is no copy to stage.
+        #[arg(long, value_name = "DIR")]
         staging: Option<std::path::PathBuf>,
     },
     /// Check a snapshot's stored chunks against their recorded hashes.
     Verify {
-        /// Base path of the backup set to check.
-        name: std::path::PathBuf,
+        /// The backup set to check: a local path (`photos`) or a keyed store
+        /// (`file:///mnt/drive/docs`). An `http://` target is refused: the
+        /// server exposes versions and packs, not chunk verification.
+        target: String,
         /// Version to check, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
+        /// Directory holding the staging copy for a `file://` target.
+        ///
+        /// One subdirectory per store address; the set name selects the set
+        /// inside it. Defaults to the system cache. Refused for local targets:
+        /// without a store there is no copy to stage.
+        #[arg(long, value_name = "DIR")]
+        staging: Option<std::path::PathBuf>,
     },
     /// Write one version's chunks to a single distributable file.
     ///
@@ -429,8 +347,12 @@ enum Command {
     /// `restore --version N`, and with no `--version` you get the set's most
     /// recent version, which is not necessarily the one this pack was built from.
     Pack {
-        /// Base path of the backup set to pack from.
-        name: std::path::PathBuf,
+        /// The backup set to pack from: a local path (`photos`), a serve set
+        /// (`http://127.0.0.1:8480/docs`), or a keyed store
+        /// (`file:///mnt/drive/docs`). Remote targets hold no local copy:
+        /// a `file://` set is pulled into staging first, and an `http://`
+        /// set is packed on the server and fetched.
+        target: String,
         /// Where to write the pack. Overwritten if it is already there.
         out: std::path::PathBuf,
         /// Version to pack, defaulting to the most recent usable one.
@@ -488,35 +410,19 @@ enum Command {
         /// reports what that run would write rather than what the set holds: a dry
         /// run of `--compression 9` costs an encode per chunk, and that cost is
         /// what makes its figures the real run's.
+        ///
+        /// With an `http://` target only `keep` packs: the server serves the
+        /// records it holds and re-encodes nothing, so any other `--compression`
+        /// is refused rather than silently kept.
         #[arg(long)]
         dry_run: bool,
-        /// Push the pack this run writes to a `lepatch serve` at this address.
+        /// Directory holding the staging copy for a `file://` target.
         ///
-        /// The pack is written to `<OUT>` exactly as it is without this, and it is
-        /// that file which is uploaded — so the artifact on disk and the artifact
-        /// the server merges are the same bytes, and a push is not a second pack
-        /// of the same version built by different code.
-        ///
-        /// `--set` is the set on that server to merge it into, and is required:
-        /// a server holds many sets and this command will not guess which one was
-        /// meant. It is named by one path component — `--set docs`, not
-        /// `backups/docs`.
-        ///
-        /// The merge happens on the server and this command waits for it. A pack
-        /// the set already holds is reported as already merged, naming the version
-        /// that holds it; a job that failed is a failure and a non-zero exit.
-        ///
-        /// A delta pack (`--from`) is only merged if the server's set holds the
-        /// version it assumes, which is the same rule a local merge applies to its
-        /// own destination.
-        ///
-        /// `--dry-run` is refused alongside it: no pack is written, so there is
-        /// nothing to push.
-        #[arg(long, value_name = "URL")]
-        remote: Option<String>,
-        /// The name of the set on that server to merge this pack into.
-        #[arg(long, value_name = "NAME")]
-        set: Option<String>,
+        /// One subdirectory per store address; the set name selects the set
+        /// inside it. Defaults to the system cache. Refused for local and
+        /// `http://` targets: without a store there is no copy to stage.
+        #[arg(long, value_name = "DIR")]
+        staging: Option<std::path::PathBuf>,
     },
     /// Bring a directory up to the version a pack carries, writing only what is
     /// missing.
@@ -976,13 +882,14 @@ async fn dispatch(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Resu
 struct BackupArgs {
     /// Directory to back up.
     source: std::path::PathBuf,
-    /// Base path of the backup set, e.g. `photos` creates `photos.0000.bin`
-    /// and `photos.lock`.
-    ///
-    /// With `--store` this is refused: the local copy is staging, selected
-    /// by `--staging` or the system cache.
-    #[arg(conflicts_with = "store", required_unless_present = "store")]
-    name: Option<std::path::PathBuf>,
+    /// The backup set to write: a local path (`photos`, creating
+    /// `photos.0000.bin` and `photos.lock`), a serve set
+    /// (`http://127.0.0.1:8480/docs`), or a keyed store
+    /// (`file:///mnt/drive/docs`). Remote targets hold no local copy: a
+    /// `file://` set is pulled into staging, backed up there, and pushed
+    /// back, and an `http://` set is backed up into temporary staging,
+    /// packed, and merged on the server.
+    target: String,
     /// How large a segment may get before a new one is started, e.g. `4GiB`.
     ///
     /// Only affects segments written from now on, and never rewrites what is
@@ -1016,117 +923,34 @@ struct BackupArgs {
     /// the numbers a backup would have printed. Nothing is created: no segment,
     /// no index file, no lock, and not the set's directory if it is not there
     /// yet. No claim is taken either, so a plan can be taken against a set a
-    /// backup currently holds.
+    /// backup currently holds. A `file://` target is pulled into staging
+    /// first, so its plan is against the real set.
+    ///
+    /// Refused with an `http://` target: the plan would be computed against
+    /// empty temporary staging rather than the server's set, so its figures
+    /// would be wrong.
     #[arg(long)]
     dry_run: bool,
-    /// Push the result to a `lepatch serve` at this address, over HTTP.
-    ///
-    /// **The local work is done first and is not optional.** The tree is
-    /// backed up into the local set `NAME`, that set is packed by the same
-    /// `lepatch pack` a local run uses, and only the pack goes over the wire
-    /// — so a remote backup is the local backup, and a server that refuses it
-    /// has cost a transfer and nothing else.
-    ///
-    /// The pack is written to a temporary file, which is removed when the run
-    /// ends. Nothing names it, so nothing about it is reported beyond the
-    /// merge the server performed.
-    ///
-    /// `--set` says which set on that server to merge it into, and is
-    /// required: a server holds many sets and this command will not guess
-    /// which one was meant. A set on a server is named by one path component
-    /// — `--set docs`, not `backups/docs`.
-    ///
-    /// The merge happens on the server, holding that set's own write lock,
-    /// and this command waits for the job and reports what it published. A
-    /// job that failed is a failure and a non-zero exit.
-    ///
-    /// `--dry-run` is refused alongside it. A dry run stores nothing, so
-    /// there would be no pack to push, and a run that printed a plan and
-    /// said nothing about the push would leave the reader guessing whether
-    /// the server was asked at all.
-    #[arg(long, value_name = "URL")]
-    remote: Option<String>,
-    /// The name of the set on that server to merge this backup into.
-    #[arg(long, value_name = "NAME")]
-    set: Option<String>,
-    /// Work through a keyed store at this URL instead of a local set.
-    ///
-    /// Pulls the set into a staging copy, backs the tree up there with
-    /// exactly the code a local run uses, and pushes the result back.
-    /// Only `file://` connects in this build; other schemes name their
-    /// refusal.
-    ///
-    /// `--set` names the set on that store and is required. `NAME` is
-    /// refused: the local thing here is staging, not a set. `--staging`
-    /// selects the staging directory; without it the system cache holds
-    /// the copy.
-    ///
-    /// `--dry-run` is refused alongside it, for the same reason as
-    /// `--remote`: a dry run stores nothing, so there is nothing to push.
-    #[arg(long, value_name = "URL", conflicts_with = "remote")]
-    store: Option<String>,
-    /// Directory holding the staging copy for `--store`.
+    /// Directory holding the staging copy for a `file://` target.
     ///
     /// One subdirectory per store address; the set name selects the set
-    /// inside it. Defaults to the system cache. Needs `--store`: without
-    /// a store there is no copy to stage.
-    #[arg(long, value_name = "DIR", requires = "store")]
+    /// inside it. Defaults to the system cache. Refused for local and
+    /// `http://` targets: a local set needs no staging, and an `http://`
+    /// backup stages in a temporary directory that is removed afterwards.
+    #[arg(long, value_name = "DIR")]
     staging: Option<std::path::PathBuf>,
 }
 
 impl BackupArgs {
-    /// Run the backup locally, through `serve`, or through a keyed store.
+    /// Run the backup into a local path, a keyed store, or a server.
     async fn run(self) -> std::io::Result<()> {
         let compression = compression_policy(self.compression_level);
         let profile = self.chunk_profile.unwrap_or_default();
 
-        if let Some(url) = self.store {
-            if self.dry_run {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "`lepatch backup --dry-run` and `--store` do not go together. A dry \
-                     run writes nothing, so there is nothing to push. The plan it prints \
-                     would be about the staging copy alone",
-                ));
-            }
-            if self.name.is_some() {
-                return Err(store_name_conflict("backup"));
-            }
-            let target = requested_store_set(
-                "backup",
-                None,
-                self.set.as_deref(),
-                &url,
-                self.staging.as_deref(),
-                self.remote.as_deref(),
-            )?;
-            return run_backup_stored(
+        match resolve_target("backup", &self.target, self.staging.as_deref())? {
+            Target::Local(path) => run_backup(
                 &self.source,
-                &target,
-                self.segment_size,
-                compression,
-                profile,
-            )
-            .await
-            .map(|_| ());
-        }
-
-        // Without `--store`, clap required NAME. Without it the run has no set
-        // to write. The error is defensive: clap refuses the missing argument
-        // before dispatch, and this arm is here so a future caller cannot get
-        // a silent default out of it.
-        let Some(name) = self.name else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "`lepatch backup` received no set. Pass the base path of the \
-                 backup set it should write (e.g. `photos`)",
-            ));
-        };
-
-        match requested_push(self.remote, self.set.as_ref(), self.dry_run, "backup")? {
-            None => run_backup(
-                &self.source,
-                &name,
+                &path,
                 self.segment_size,
                 compression,
                 profile,
@@ -1134,26 +958,35 @@ impl BackupArgs {
             )
             .await
             .map(|_| ()),
-            Some(push) => {
-                // The local backup runs first and through exactly the same
-                // code a local run uses; the push is what follows it, and it
-                // packs the version this run committed rather than the tip.
-                let committed = run_backup(
+            Target::Store(target) => {
+                run_backup_stored(
                     &self.source,
-                    &name,
+                    &target,
                     self.segment_size,
                     compression,
                     profile,
-                    false,
+                    self.dry_run,
                 )
-                .await?;
-
-                match committed {
-                    Some(version) => push.backed_up(&name, version).await,
-                    // Unreachable: `requested_push` refuses `--dry-run`
-                    // alongside `--remote`, and this call does not pass it.
-                    None => Ok(()),
+                .await
+            }
+            Target::Serve { address, set } => {
+                if self.dry_run {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "`lepatch backup --dry-run` to an `http://` target plans against \
+                         empty staging rather than the server's set, so its figures would \
+                         be wrong. Plan against a local path or a `file://` store instead",
+                    ));
                 }
+                run_backup_serve(
+                    &self.source,
+                    &address,
+                    &set,
+                    self.segment_size,
+                    compression,
+                    profile,
+                )
+                .await
             }
         }
     }
@@ -1165,45 +998,36 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
         Command::Backup(args) => args.run().await,
         Command::Restore {
             destination,
-            name,
+            target,
             version,
             clean,
             dry_run,
-            remote,
-            set,
-            store,
             staging,
         } => {
-            let store = StoreArgs {
-                name,
-                set,
-                store,
-                staging,
-            };
-            if let Some(target) = store.target("restore", remote.as_deref())? {
-                return run_restore_stored(&destination, &target, version, clean, dry_run).await;
-            }
-            let StoreArgs { name, set, .. } = store;
-            let set = requested_set("restore", name, set.as_deref(), remote.as_deref())?;
-            dispatch_restore(&destination, set, version, clean, dry_run).await
+            let target = resolve_target("restore", &target, staging.as_deref())?;
+            dispatch_restore(&destination, target, version, clean, dry_run).await
         }
-        Command::Verify { name, version } => run_verify(&name, version).await,
+        Command::Verify {
+            target,
+            version,
+            staging,
+        } => {
+            let target = resolve_target("verify", &target, staging.as_deref())?;
+            dispatch_verify(target, version).await
+        }
         Command::Pack {
-            name,
+            target,
             out,
             version,
             from,
             full,
             compression,
             dry_run,
-            remote,
-            set,
+            staging,
         } => {
             let from = effective_from(from, full);
-            match requested_push(remote, set.as_ref(), dry_run, "pack")? {
-                None => run_pack(&name, &out, version, from, compression, dry_run).await,
-                Some(push) => push_built_pack(&name, &out, version, from, compression, push).await,
-            }
+            let target = resolve_target("pack", &target, staging.as_deref())?;
+            dispatch_pack(target, &out, version, from, compression, dry_run).await
         }
         Command::Apply {
             pack,
@@ -1214,21 +1038,30 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
         } => run_apply(&pack, &destination, prune, recheck, dry_run).await,
         Command::Merge {
             pack,
-            name,
+            target,
             compression,
             dry_run,
-            remote,
-            set,
-        } => dispatch_merge_command(pack, name, compression, dry_run, remote, set).await,
-        Command::Reindex { name, dry_run } => run_reindex(&name, dry_run).await,
-        Command::Versions {
-            name,
-            numbers_only,
-            remote,
-            set,
-            store,
             staging,
-        } => dispatch_versions_command(name, set, remote, store, staging, numbers_only).await,
+        } => {
+            let target = resolve_target("merge", &target, staging.as_deref())?;
+            dispatch_merge_command(pack, target, compression, dry_run).await
+        }
+        Command::Reindex {
+            target,
+            dry_run,
+            staging,
+        } => {
+            let target = resolve_target("reindex", &target, staging.as_deref())?;
+            dispatch_reindex(target, dry_run).await
+        }
+        Command::Versions {
+            target,
+            numbers_only,
+            staging,
+        } => {
+            let target = resolve_target("versions", &target, staging.as_deref())?;
+            dispatch_versions(target, numbers_only).await
+        }
         Command::Serve {
             root,
             bind,
@@ -1237,103 +1070,126 @@ async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io
     }
 }
 
-/// Run `restore`: the same command whether the set is here or on a server.
+/// Run `restore` against a local path, a keyed store, or a server.
 ///
-/// **Which of the two it is is decided by [`requested_set`] and nowhere else**,
-/// so both routes go through the same resolution of the two spellings of a set
-/// and neither can acquire a rule of its own. Split out of [`dispatch_inner`]
-/// only to keep that match readable; it holds no work of its own.
+/// Split out of [`dispatch_inner`] only to keep that match readable; it holds
+/// no work of its own.
 async fn dispatch_restore(
     destination: &std::path::Path,
-    set: Set,
+    target: Target,
     version: Option<u32>,
     clean: bool,
     dry_run: bool,
 ) -> std::io::Result<()> {
-    match set {
-        Set::Local(name) => run_restore(destination, &name, version, clean, dry_run).await,
-        Set::Remote { name, address } => {
-            run_restore_remote(destination, &name, version, clean, dry_run, &address).await
+    match target {
+        Target::Local(name) => run_restore(destination, &name, version, clean, dry_run).await,
+        Target::Serve { address, set } => {
+            run_restore_remote(destination, &set, version, clean, dry_run, &address).await
+        }
+        Target::Store(target) => {
+            run_restore_stored(destination, &target, version, clean, dry_run).await
         }
     }
 }
 
-/// Pack locally, then hand the file to the server.
+/// Run `verify` against a local path or a keyed store.
 ///
-/// Split out of [`dispatch_inner`] only to keep that match readable; the file
-/// `run_pack` wrote is pushed as-is, never packed twice.
-async fn push_built_pack(
-    name: &std::path::Path,
+/// An `http://` target is refused: the server exposes versions and packs,
+/// not chunk verification, so there is nothing here to check one against.
+async fn dispatch_verify(target: Target, version: Option<u32>) -> std::io::Result<()> {
+    match target {
+        Target::Local(name) => run_verify(&name, version).await,
+        Target::Store(target) => run_verify_stored(&target, version).await,
+        Target::Serve { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`lepatch verify` takes a local path or a `file://` target: the server exposes \
+             versions and packs, not chunk verification",
+        )),
+    }
+}
+
+/// Run `pack` against a local path, a keyed store, or a server.
+async fn dispatch_pack(
+    target: Target,
     out: &std::path::Path,
     version: Option<u32>,
     from: Option<u32>,
     compression: KeepOrLevel,
-    push: Push,
+    dry_run: bool,
 ) -> std::io::Result<()> {
-    run_pack(name, out, version, from, compression, false).await?;
-    // The file `run_pack` just wrote and reported, not a second pack of the
-    // same version.
-    push.pack(out, compression).await
-}
-
-/// Run `versions`, over the same [`requested_set`] as `restore`.
-///
-/// Together these two are the commands that name a set on a server, and they
-/// answer that question the same way for the same reason: `--set` and `NAME`
-/// are one set said twice.
-async fn dispatch_versions(set: Set, numbers_only: bool) -> std::io::Result<()> {
-    match set {
-        Set::Local(name) => run_versions(&name, numbers_only).await,
-        Set::Remote { name, address } => run_versions_remote(&name, numbers_only, &address).await,
+    match target {
+        Target::Local(name) => run_pack(&name, out, version, from, compression, dry_run).await,
+        Target::Store(target) => {
+            run_pack_stored(&target, out, version, from, compression, dry_run).await
+        }
+        Target::Serve { address, set } => {
+            if compression != KeepOrLevel::Keep {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "an `http://` target packs `keep` only: the server serves the records it \
+                     holds and re-encodes nothing",
+                ));
+            }
+            run_pack_serve(&address, &set, out, version, from, dry_run).await
+        }
     }
 }
 
-/// Run `merge`: the same command whether the pack lands here or on a server.
+/// Run `merge` against a local path, a keyed store, or a server.
 ///
-/// Split out of [`dispatch_inner`] only to keep that match readable, as with
-/// [`dispatch_restore`]; it holds no work of its own.
+/// With an `http://` target the merge happens on the server: the pack is
+/// uploaded, the server merges it holding that set's own write lock, and the
+/// published version is numbered by the server's set. A dry run is refused
+/// there: the server has no plan-only merge.
 async fn dispatch_merge_command(
     pack: std::path::PathBuf,
-    name: std::path::PathBuf,
+    target: Target,
     compression: KeepOrLevel,
     dry_run: bool,
-    remote: Option<String>,
-    set: Option<String>,
 ) -> std::io::Result<()> {
-    match requested_push(remote, set.as_ref(), dry_run, "merge")? {
-        // The server does the merge, so the local destination `name` is not
-        // opened, not locked, and not created.
-        Some(push) => push.pack(&pack, compression).await,
-        None => run_merge(&pack, &name, compression, dry_run).await,
+    match target {
+        Target::Local(name) => run_merge(&pack, &name, compression, dry_run).await,
+        Target::Store(target) => run_merge_stored(&pack, &target, compression, dry_run).await,
+        Target::Serve { address, set } => {
+            if dry_run {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "`lepatch merge --dry-run` to an `http://` target plans against nothing \
+                     this machine holds: the server has no plan-only merge. Plan against a \
+                     local path or a `file://` store instead",
+                ));
+            }
+            Push::open(&address, &set)?.pack(&pack, compression).await
+        }
     }
 }
 
-/// Run `versions`: the same command whether the set is here, on a server, or
-/// in a keyed store.
+/// Run `reindex` against a local path or a keyed store.
 ///
-/// Split out of [`dispatch_inner`] only to keep that match readable, as with
-/// [`dispatch_restore`]; the store route pulls into staging first.
-async fn dispatch_versions_command(
-    name: Option<std::path::PathBuf>,
-    set: Option<String>,
-    remote: Option<String>,
-    store: Option<String>,
-    staging: Option<std::path::PathBuf>,
-    numbers_only: bool,
-) -> std::io::Result<()> {
-    if let Some(url) = store {
-        let target = requested_store_set(
-            "versions",
-            name,
-            set.as_deref(),
-            &url,
-            staging.as_deref(),
-            remote.as_deref(),
-        )?;
-        return run_versions_stored(&target, numbers_only).await;
+/// An `http://` target is refused: the index lives on the server, where no
+/// endpoint rebuilds it.
+async fn dispatch_reindex(target: Target, dry_run: bool) -> std::io::Result<()> {
+    match target {
+        Target::Local(name) => run_reindex(&name, dry_run).await,
+        Target::Store(target) => run_reindex_stored(&target, dry_run).await,
+        Target::Serve { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`lepatch reindex` takes a local path or a `file://` target: the index lives on \
+             the server, where no endpoint rebuilds it",
+        )),
     }
-    let set = requested_set("versions", name, set.as_deref(), remote.as_deref())?;
-    dispatch_versions(set, numbers_only).await
+}
+
+/// Run `versions` against a local path, a keyed store, or a server.
+///
+/// Split out of [`dispatch_inner`] only to keep that match readable; the store
+/// route pulls into staging first.
+async fn dispatch_versions(target: Target, numbers_only: bool) -> std::io::Result<()> {
+    match target {
+        Target::Local(name) => run_versions(&name, numbers_only).await,
+        Target::Serve { address, set } => run_versions_remote(&set, numbers_only, &address).await,
+        Target::Store(target) => run_versions_stored(&target, numbers_only).await,
+    }
 }
 
 /// Resolve when the process is asked to stop. `SIGTERM` as well as Ctrl-C.
@@ -1582,7 +1438,7 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
 
 /// One line of a version listing, on whichever side the set is.
 ///
-/// **One function, so the two listings cannot drift.** `--remote` prints through
+/// **One function, so the two listings cannot drift.** A serve listing prints
 /// this and prints nothing else, which is what makes a script that reads a local
 /// set work unchanged against a remote one: same fields in the same order, the
 /// same two-space separator, the same `say!` and so the same broken-pipe
@@ -1604,8 +1460,9 @@ fn print_version(
 /// of the same set would.
 ///
 /// The fetch is [`lepatch::client::Remote`]'s. Everything here is printing what
-/// came back; [`requested_set`] decided what text is a set name — the positional
-/// `NAME` and `--set` are the same set, and neither is a path on this machine.
+/// came back; [`resolve_target`] decided what text is a set name — the last
+/// segment of the `http://` target — and neither it nor anything else here is
+/// a path on this machine.
 async fn run_versions_remote(set: &str, numbers_only: bool, address: &str) -> std::io::Result<()> {
     let remote = lepatch::client::Remote::new(address)?;
 
@@ -2703,339 +2560,91 @@ fn report_pack(
 
 /// The set a command works on, and where it lives.
 ///
-/// **Two spellings, one resolution, and this is where they are reconciled.**
-/// `NAME` and `--set NAME` both name a set, `NAME` being the older spelling and
-/// `--set` the one every other remote command uses. They are not two arguments
-/// that happen to agree; they are one argument said twice, and saying it twice
-/// is a conflict clap refuses rather than a value one of them wins.
+/// One `TARGET`: a local path (`photos`), a serve set
+/// (`http://127.0.0.1:8480/docs`), or a keyed store
+/// (`file:///mnt/drive/docs`). Anything holding `://` is a remote address
+/// and anything else is a path on this machine. Remote targets hold no local
+/// copy: a store target works in staging and an `http://` target works on
+/// the server.
 #[derive(Debug)]
-enum Set {
-    /// No `--remote`: the set is here, and `NAME` is its base path.
+enum Target {
+    /// A path on this machine.
     Local(std::path::PathBuf),
-    /// `--remote URL`: the set is named on that server, by one path component.
-    Remote {
-        /// The address of the server holding it.
+    /// A set on a `lepatch serve`.
+    Serve {
+        /// The server's address, without the set.
         address: String,
         /// The set's name there.
-        name: String,
+        set: String,
     },
+    /// A set in a keyed store, with its staging copy.
+    Store(StoreTarget),
 }
 
-/// Resolve which set `restore` or `versions` was pointed at, or say why not.
+/// Resolve one `TARGET` into where the set lives, or say why not.
 ///
-/// **The local arm is the one every existing invocation takes**, and it is the
-/// same path it always was: `NAME` is a filesystem path and `--set` is refused,
-/// because a set on this machine is a path and there is no server to name one
-/// on. Nothing here opens a file, and `Set::Local` carries the `PathBuf`
-/// straight through to the command that reads it.
-///
-/// **`--set` is the same set as `NAME` under `--remote`, and the two are
-/// refused together** rather than resolved. A command line that names a set
-/// twice and disagrees with itself (`restore DST docs --set other`) has no
-/// meaning this can invent, and picking one of the two spellings silently is how
-/// a run restores the wrong tree without saying so. `clap` refuses it, because
-/// `--set` carries `conflicts_with = "name"` — so the conflict is a usage error
-/// before this is reached, and this arm is here for the case where the two
-/// command flags are given together through some other route.
-///
-/// **Neither given is an error naming both spellings**, because the fix for a
-/// missing argument is a user knowing which of two they left out.
-fn requested_set(
+/// `http://` targets split into server and set; every other `://` target
+/// splits into store and set. `--staging` selects the staging directory for
+/// a store target and is refused otherwise: without a store there is no copy
+/// to stage, and an `http://` backup stages in a temporary directory that is
+/// removed afterwards.
+fn resolve_target(
     command: &str,
-    name: Option<std::path::PathBuf>,
-    set: Option<&str>,
-    remote: Option<&str>,
-) -> std::io::Result<Set> {
-    // One sentence for the conflict, because there are two places below that can
-    // reach it and a refusal a user sees twice must not read twice.
-    let conflict = || {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "`lepatch {command}` names the set twice. NAME and `--set NAME` are the same \
-                 set said two ways, and this run will not choose between them. Give one"
-            ),
-        )
-    };
-
-    // Defensive rather than reachable: `clap` refuses this before dispatch, on
-    // both `restore` and `versions`, because `--set` declares
-    // `conflicts_with = "name"`. It is here so that a future caller which
-    // resolves the two spellings itself cannot get a silent winner out of this.
-    if name.is_some() && set.is_some() {
-        return Err(conflict());
-    }
-
-    let Some(address) = remote else {
-        // `--set` alone, with no server. Naming a set on a machine that has no
-        // server to name one on is a mistake worth a sentence rather than a
-        // silent fall-through to the path the user did not type.
-        if set.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run \
-                     has no `--remote` to name that server on. A set on this machine is a \
-                     path, so pass it as NAME"
-                ),
-            ));
-        }
-
-        let Some(name) = name else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "`lepatch {command}` received no set. Pass the base path of the \
-                     backup set it should work on (e.g. `photos`)"
-                ),
-            ));
-        };
-
-        return Ok(Set::Local(name));
-    };
-
-    match (name, set) {
-        // The older spelling: a path here is a set's name on that server, and
-        // it still has to be one the client can send.
-        (Some(name), None) => {
-            let Some(text) = name.to_str() else {
+    raw: &str,
+    staging: Option<&std::path::Path>,
+) -> std::io::Result<Target> {
+    if raw.contains("://") {
+        if raw.trim().to_ascii_lowercase().starts_with("http") {
+            if staging.is_some() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "{} is not a name this client can send. A set on a server takes \
-                         its name as text",
-                        name.display()
+                        "`lepatch {command} --staging` needs a store target: an `http://` \
+                         target works on the server and stages nothing here"
                     ),
                 ));
-            };
-
-            Ok(Set::Remote {
-                address: address.to_string(),
-                name: text.to_string(),
-            })
+            }
+            let (address, set) = lepatch::client::split_serve_target(raw)?;
+            return Ok(Target::Serve { address, set });
         }
-        // `--set`: already the one shape a set on a server is named by, so it
-        // is checked by whatever asks the server rather than here.
-        (None, Some(name)) => Ok(Set::Remote {
-            address: address.to_string(),
-            name: name.to_string(),
-        }),
-        (None, None) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "`lepatch {command} --remote {address}` received no set. Name it on \
-                     that server either as NAME (`docs`) or with `--set NAME` \
-                     (`--set docs`)"
-            ),
-        )),
-        // Unreachable, because the conflict above refused it. Named so the match
-        // is exhaustive, and with the same sentence, because a refusal reachable
-        // two ways must not read two ways.
-        (Some(_), Some(_)) => Err(conflict()),
+        let (url, set) = storage::RemoteUrl::split_set(raw)?;
+        let root = match staging {
+            Some(dir) => dir.to_path_buf(),
+            None => storage::default_cache_root().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no cache directory holds a staging copy on this machine: pass `--staging DIR`",
+                )
+            })?,
+        };
+        let staging = storage::staging_set_path(&root, &url, &set)?;
+        return Ok(Target::Store(StoreTarget { url, set, staging }));
     }
-}
-
-/// The `--remote`/`--set` pair, resolved into a [`Push`] or refused.
-///
-/// **`None` means `--remote` was not given, and the caller then runs the local
-/// command exactly as it always did.** That is the whole of what keeps the local
-/// path unchanged: there is no push object threaded through it, no `Option` to
-/// forget to check, and no branch inside the code that walks a tree. A remote
-/// command line is a different command line, and it takes a different route.
-///
-/// `dry_run` is refused here rather than inside the push, because a dry run
-/// writes nothing and so there would be nothing to push. Saying so before any
-/// work is done is the point: the alternative is a plan printed about a local set
-/// and silence about the server, which reads as "it was pushed".
-fn requested_push(
-    remote: Option<String>,
-    set: Option<&String>,
-    dry_run: bool,
-    command: &str,
-) -> std::io::Result<Option<Push>> {
-    let Some(address) = remote else {
-        // `--set` names a set on a `lepatch serve`, and this run has no
-        // `--remote` to name that server on. It used to return here, which
-        // silently discarded the flag: `lepatch backup s snap --set docs` backed
-        // up to `snap`, said nothing, and exited 0. A user who typed the set they
-        // wanted was told by their exit code that they had got it.
-        //
-        // Refused for the same reason `requested_set` refuses it, and with the
-        // same words, so the two spellings are one rule rather than two.
-        if set.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "`lepatch {command} --set` names a set on a `lepatch serve`, and this run \
-                     has no `--remote` to name that server on. A set on this machine is a \
-                     path, so pass it as the destination path instead"
-                ),
-            ));
-        }
-
-        return Ok(None);
-    };
-
-    if dry_run {
+    if staging.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "`lepatch {command} --dry-run` and `--remote` do not go together. A dry \
-                 run writes nothing, so there is no pack to push. The plan it prints is \
-                 about the local set alone"
+                "`lepatch {command} --staging` needs a store target: a local path stages \
+                 nothing, so there is no copy to select a directory for"
             ),
         ));
     }
-
-    Push::open(&address, set.map(String::as_str)).map(Some)
+    Ok(Target::Local(std::path::PathBuf::from(raw)))
 }
 
 /// A set held by a keyed store, and the staging copy this machine works on.
 ///
 /// Resolution only. The staged runners pull into staging, run the local
-/// command there, and push back after a backup. Nothing else reads these
+/// command there, and push back after a write. Nothing else reads these
 /// fields.
 #[derive(Debug)]
 struct StoreTarget {
-    /// The parsed store address.
+    /// The store holding the set, without the set.
     url: storage::RemoteUrl,
     /// The set name on that store.
     set: String,
     /// Staging base path on this machine.
     staging: std::path::PathBuf,
-}
-
-/// The `--store` spellings, shared by the commands that work through staging.
-///
-/// One struct because every staged command resolves the same four flags the
-/// same way. [`requested_store_set`] does the work; this only carries it to
-/// the call.
-struct StoreArgs {
-    /// Base path of a local set, or the set name on a server or store.
-    name: Option<std::path::PathBuf>,
-    /// The set name on the far side.
-    set: Option<String>,
-    /// A keyed store holding the set.
-    store: Option<String>,
-    /// Directory holding the staging copy for `--store`.
-    staging: Option<std::path::PathBuf>,
-}
-
-impl StoreArgs {
-    /// Resolve `--store` into a target, or `None` for the local route.
-    fn target(&self, command: &str, remote: Option<&str>) -> std::io::Result<Option<StoreTarget>> {
-        let Some(url) = self.store.as_deref() else {
-            return Ok(None);
-        };
-        requested_store_set(
-            command,
-            self.name.clone(),
-            self.set.as_deref(),
-            url,
-            self.staging.as_deref(),
-            remote,
-        )
-        .map(Some)
-    }
-}
-
-/// Refuse `--remote` alongside `--store`.
-///
-/// Defensive: `clap` refuses the pair before dispatch, because `--store`
-/// declares `conflicts_with = "remote"`. It is checked here too, so a future
-/// caller that skips argument parsing cannot push one way and pull the other
-/// in a single run.
-fn refuse_remote_with_store(remote: Option<&str>, command: &str) -> std::io::Result<()> {
-    if remote.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "`lepatch {command}` takes `--remote` or `--store`, not both. One names a \
-                 `lepatch serve`, the other names a keyed store, and a run that talked to \
-                 both would merge two sets into one report"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// The conflict of naming a set twice under `--store`.
-///
-/// One sentence, because `requested_store_set` reaches it twice and a refusal
-/// a user sees twice must not read twice.
-fn store_name_conflict(command: &str) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "`lepatch {command}` names the set twice. NAME and `--set NAME` are the same \
-             set said two ways, and this run will not choose between them. Give one"
-        ),
-    )
-}
-
-/// Resolve `--store URL` with `NAME`/`--set` into a target, or say why not.
-///
-/// Mirrors [`requested_set`]: `NAME` and `--set` name the same set, giving
-/// both is refused, giving neither is refused naming `--set`. Refuses
-/// `--remote` alongside: one run talks to one far side. `--staging` selects
-/// the staging directory; without it the system cache holds the copy, and a
-/// machine with no cache directory is told to pass `--staging` rather than
-/// guessing.
-fn requested_store_set(
-    command: &str,
-    name: Option<std::path::PathBuf>,
-    set: Option<&str>,
-    store: &str,
-    staging: Option<&std::path::Path>,
-    remote: Option<&str>,
-) -> std::io::Result<StoreTarget> {
-    refuse_remote_with_store(remote, command)?;
-
-    if name.is_some() && set.is_some() {
-        return Err(store_name_conflict(command));
-    }
-
-    let url = storage::RemoteUrl::parse(store)?;
-
-    let set = match (name, set) {
-        (Some(name), None) => {
-            let Some(text) = name.to_str() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "{} is not a name this run can send. A set on a store takes \
-                         its name as text",
-                        name.display()
-                    ),
-                ));
-            };
-            text.to_string()
-        }
-        (None, Some(name)) => name.to_string(),
-        (None, None) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "`lepatch {command} --store {store}` received no set. Name it on \
-                     that store with `--set NAME` (`--set docs`)"
-                ),
-            ));
-        }
-        (Some(_), Some(_)) => return Err(store_name_conflict(command)),
-    };
-
-    let root = match staging {
-        Some(dir) => dir.to_path_buf(),
-        None => storage::default_cache_root().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "no cache directory holds a staging copy on this machine: pass `--staging DIR`",
-            )
-        })?,
-    };
-    let staging = storage::staging_set_path(&root, &url, &set)?;
-
-    Ok(StoreTarget { url, set, staging })
 }
 
 /// Open the backend behind `url`.
@@ -3078,15 +2687,16 @@ fn require_staged_set(staging: &IndexSet, target: &StoreTarget) -> std::io::Resu
 /// Back up into a keyed store through staging.
 ///
 /// Pulls the set into staging, backs the tree up there with exactly the code
-/// a local run uses, and pushes the result back. Reports the published
-/// version and the pushed bytes.
+/// a local run uses, and pushes the result back. A dry run pulls and plans
+/// with that same code and pushes nothing back.
 async fn run_backup_stored(
     source: &std::path::Path,
     target: &StoreTarget,
     segment_size: Option<u64>,
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
-) -> std::io::Result<u32> {
+    dry_run: bool,
+) -> std::io::Result<()> {
     let backend = connect_store(&target.url)?;
     let staging = IndexSet::new(&target.staging);
     storage::pull_from_remote_async(&backend, &staging).await?;
@@ -3097,12 +2707,13 @@ async fn run_backup_stored(
         segment_size,
         compression,
         profile,
-        false,
+        dry_run,
     )
     .await?;
+    if dry_run {
+        return Ok(());
+    }
     let Some(version) = committed else {
-        // Unreachable: `run_backup` reports `None` for a dry run only, and
-        // the `--store` arm refuses `--dry-run` before resolving the target.
         return Err(std::io::Error::other(
             "a backup that stored nothing published no version",
         ));
@@ -3118,7 +2729,67 @@ async fn run_backup_stored(
         "backup to store complete"
     );
 
-    Ok(version)
+    Ok(())
+}
+
+/// Counter keeping temporary work directories apart within one process.
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A scratch directory for one pure-remote run, removed afterwards.
+fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("lepatch-{prefix}-{}-{n}", std::process::id()))
+}
+
+/// Back up into a `lepatch serve` set, holding no local copy.
+///
+/// Backs the tree up into temporary staging with exactly the code a local
+/// run uses, packs the committed version, and has the server merge it. The
+/// staging directory is removed however the run ends: a remote backup leaves
+/// nothing behind here.
+async fn run_backup_serve(
+    source: &std::path::Path,
+    address: &str,
+    set: &str,
+    segment_size: Option<u64>,
+    compression: storage::Compression,
+    profile: reader::ChunkerProfile,
+) -> std::io::Result<()> {
+    let push = Push::open(address, set)?;
+    let work = temp_work_dir("backup");
+    std::fs::create_dir_all(&work)?;
+    let staging = work.join(set);
+    let pack_path = work.join("push.pack");
+
+    let result = async {
+        let committed =
+            run_backup(source, &staging, segment_size, compression, profile, false).await?;
+        let Some(version) = committed else {
+            return Err(std::io::Error::other(
+                "a backup that stored nothing published no version",
+            ));
+        };
+        // `keep`, and not a level. `backup --compression-level` is the policy
+        // the temporary set is opened with — what this machine staged — and it
+        // says nothing about how a server should store what arrives. The pack
+        // already carries the staged form, and `keep` writes that form rather
+        // than decoding and re-encoding every chunk a second time.
+        write_pack(
+            &staging,
+            &pack_path,
+            Some(version),
+            None,
+            KeepOrLevel::Keep,
+            false,
+        )
+        .await?;
+        push.pack(&pack_path, KeepOrLevel::Keep).await
+    }
+    .await;
+
+    let _ = std::fs::remove_dir_all(&work);
+
+    result
 }
 
 /// Restore from a keyed store through staging.
@@ -3153,25 +2824,248 @@ async fn run_versions_stored(target: &StoreTarget, numbers_only: bool) -> std::i
     run_versions(&target.staging, numbers_only).await
 }
 
+/// Pack a version of a keyed store into `out`.
+///
+/// Pulls the set into staging and packs from there with exactly the code a
+/// local run uses. Reads never push back.
+async fn run_pack_stored(
+    target: &StoreTarget,
+    out: &std::path::Path,
+    version: Option<u32>,
+    from: Option<u32>,
+    compression: KeepOrLevel,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    let backend = connect_store(&target.url)?;
+    let staging = IndexSet::new(&target.staging);
+    storage::pull_from_remote_async(&backend, &staging).await?;
+    require_staged_set(&staging, target)?;
+
+    run_pack(&target.staging, out, version, from, compression, dry_run).await
+}
+
+/// Pack a version of a `lepatch serve` set into `out`.
+///
+/// The pack is computed on the server and fetched whole: a pack is the one
+/// artifact a client fetches in full, so the destination's record saves
+/// nothing here.
+///
+/// A dry run reports the server's summary and fetches nothing: the counts
+/// are the pack's own, and the size on disk and the content hash are left
+/// out as properties of a file this run does not write.
+async fn run_pack_serve(
+    address: &str,
+    set: &str,
+    out: &std::path::Path,
+    version: Option<u32>,
+    from: Option<u32>,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    let remote = lepatch::client::Remote::new(address)?;
+    lepatch::client::check_set(set)?;
+
+    let started = remote.start_pack(set, version, from).await?;
+    let packed = remote
+        .await_job_with(&started, |counters| {
+            let shown = counters
+                .iter()
+                .map(|(name, value)| format!("{name} {value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("packing on {}: {shown}", remote.address());
+        })
+        .await?;
+
+    let Some(lepatch::client::Outcome::Packed(summary)) = &packed.result else {
+        return Err(std::io::Error::other(format!(
+            "job {} finished without saying what it packed",
+            packed.id
+        )));
+    };
+
+    tracing::info!(
+        server = %remote.address(),
+        set,
+        version = summary.version,
+        snapshot = %summary.snapshot,
+        chunks = summary.chunks,
+        length = summary.length,
+        out = %out.display(),
+        dry_run,
+        "packing a version from the server"
+    );
+
+    if dry_run {
+        let since = match from {
+            Some(base) => format!(" since {base}"),
+            None => format!("version {}", summary.version),
+        };
+        return say!(
+            "dry run: {}: {} chunks, {} bytes of payload. This run wrote nothing to {}",
+            since,
+            summary.chunks,
+            summary.payload_bytes,
+            out.display(),
+        );
+    }
+
+    fetch_pack_serve(&remote, set, out, summary, from).await
+}
+
+/// Fetch a server-packed version whole into `out`, and report what it holds.
+///
+/// Split out of [`run_pack_serve`] only to keep that function readable; the
+/// plan is checked against the summary before a byte is trusted, exactly as
+/// [`pull_and_apply`] checks its own.
+async fn fetch_pack_serve(
+    remote: &lepatch::client::Remote,
+    set: &str,
+    out: &std::path::Path,
+    summary: &lepatch::client::PackSummary,
+    from: Option<u32>,
+) -> std::io::Result<()> {
+    let pull = lepatch::client::Pull::new(
+        remote,
+        set,
+        summary.version,
+        std::collections::HashSet::default(),
+    );
+    pull.begin(summary.length, out).await?;
+    let plan = remote.plan_pack(set, summary.version, &[]).await?;
+    if plan.length != summary.length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} planned a {}-byte pack and then described a {}-byte one. The file \
+                 this run assembled would not be the file it fetched",
+                remote.address(),
+                summary.length,
+                plan.length
+            ),
+        ));
+    }
+    pull.write(&plan.ranges, out, |moved| {
+        tracing::info!(
+            server = %remote.address(),
+            ranges = moved.ranges,
+            bytes = moved.bytes,
+            total = moved.total,
+            "fetched"
+        );
+    })
+    .await?;
+    let fetched = pull.open(&plan, out)?;
+    drop(fetched);
+
+    let pack = Pack::open(out)?;
+    let content = lepatch::pack::hash_file(out).await?;
+    let packed = lepatch::command::Packed {
+        chunks: summary.chunks,
+        of: summary.chunks,
+        payload: pack.payload_len(),
+        table: pack.snapshot_len(),
+        base: from,
+        bytes: Some(summary.length),
+        content: Some(content),
+    };
+    tracing::info!(
+        version = summary.version,
+        chunks = summary.chunks,
+        bytes = summary.length,
+        snapshot = %summary.snapshot,
+        content = %&content,
+        "wrote pack"
+    );
+    say!("{}  {}", &content, out.display())?;
+    report_pack(summary.version, out, &packed)
+}
+
+/// Apply `pack` into a keyed store as a new version.
+///
+/// Pulls the set into staging, merges there with exactly the code a local run
+/// uses, and pushes the result back. A dry run pulls and plans with that same
+/// code and pushes nothing back.
+async fn run_merge_stored(
+    pack: &std::path::Path,
+    target: &StoreTarget,
+    compression: KeepOrLevel,
+    dry_run: bool,
+) -> std::io::Result<()> {
+    let backend = connect_store(&target.url)?;
+    let staging = IndexSet::new(&target.staging);
+    storage::pull_from_remote_async(&backend, &staging).await?;
+
+    run_merge(pack, &target.staging, compression, dry_run).await?;
+    if dry_run {
+        return Ok(());
+    }
+
+    let stats = storage::push_to_remote_async(&staging, &backend).await?;
+    tracing::info!(
+        set = %target.set,
+        store = %target.url,
+        pushed_files = stats.pushed_files,
+        pushed_bytes = stats.pushed_bytes,
+        "merge to store complete"
+    );
+
+    Ok(())
+}
+
+/// Check a keyed store through staging.
+///
+/// Pulls the set into staging and checks it with exactly the code a local run
+/// uses. Reads never push back.
+async fn run_verify_stored(target: &StoreTarget, version: Option<u32>) -> std::io::Result<()> {
+    let backend = connect_store(&target.url)?;
+    let staging = IndexSet::new(&target.staging);
+    storage::pull_from_remote_async(&backend, &staging).await?;
+    require_staged_set(&staging, target)?;
+
+    run_verify(&target.staging, version).await
+}
+
+/// Rebuild a keyed store's index files through staging.
+///
+/// Pulls the set into staging, rebuilds there with exactly the code a local
+/// run uses, and pushes the result back. A dry run pulls and plans with that
+/// same code and pushes nothing back.
+async fn run_reindex_stored(target: &StoreTarget, dry_run: bool) -> std::io::Result<()> {
+    let backend = connect_store(&target.url)?;
+    let staging = IndexSet::new(&target.staging);
+    storage::pull_from_remote_async(&backend, &staging).await?;
+    require_staged_set(&staging, target)?;
+
+    run_reindex(&target.staging, dry_run).await?;
+    if dry_run {
+        return Ok(());
+    }
+
+    let stats = storage::push_to_remote_async(&staging, &backend).await?;
+    tracing::info!(
+        set = %target.set,
+        store = %target.url,
+        pushed_files = stats.pushed_files,
+        pushed_bytes = stats.pushed_bytes,
+        "reindex to store complete"
+    );
+
+    Ok(())
+}
+
 /// A `lepatch serve` this run is pushing a pack to, and the set to put it in.
 ///
-/// **One type for the three push directions, because they differ only in where
-/// the pack comes from.** `backup --remote` packs a version the local run just
-/// committed, `pack --remote` pushes the file it was asked to write, and
-/// `merge --remote` pushes a file it was handed — and all three then do the same
-/// thing: upload, ask the server to merge it into one set, wait, and report. The
+/// Upload, ask the server to merge it into one set, wait, and report. The
 /// reporting lives here too, so a pushed pack and a merged one cannot say
 /// different things about the same event.
 ///
 /// ## Why the set name is asked for rather than derived
 ///
 /// **A server holds many sets and this run cannot know which one was meant.**
-/// There is no path here that names one — the set is a name on the other
-/// machine — so a run without `--set` has nothing to guess from. It says so,
-/// rather than inventing `docs` or picking the only set the server happens to
-/// hold. The name is checked with [`lepatch::client::check_set`] before the
-/// first byte moves, so a name that is really a path is refused here rather than
-/// after a transfer.
+/// The set arrives as the last segment of the `http://` target, so a target
+/// with no set is refused rather than guessed at. The name is checked with
+/// [`lepatch::client::check_set`] before the first byte moves, so a name that
+/// is really a path is refused here rather than after a transfer.
 struct Push {
     /// The client, which has already refused an address it cannot speak to.
     remote: lepatch::client::Remote,
@@ -3185,23 +3079,11 @@ impl Push {
     /// # Errors
     ///
     /// Returns an error if `address` is not an `http://` address this client can
-    /// use, or if `set` is absent or is not a single path component. Both are
-    /// checked here, before the caller does any work — a backup takes a whole
-    /// version before its pack exists, and a mistyped address or set name should
-    /// not be discovered after that.
-    fn open(address: &str, set: Option<&str>) -> std::io::Result<Self> {
+    /// use, or if `set` is not a single path component. Both are checked here,
+    /// before the caller does any work — a mistyped address or set name should
+    /// not be discovered after a transfer.
+    fn open(address: &str, set: &str) -> std::io::Result<Self> {
         let remote = lepatch::client::Remote::new(address)?;
-
-        let Some(set) = set else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "--remote {address} also needs --set NAME. A server holds many sets. \
-                     This command will not guess which one a pack is meant for \
-                     (`--set docs`)"
-                ),
-            ));
-        };
 
         lepatch::client::check_set(set)?;
 
@@ -3223,46 +3105,6 @@ impl Push {
             KeepOrLevel::Keep => lepatch::client::MergeCompression::Keep,
             KeepOrLevel::Level(level) => lepatch::client::MergeCompression::Reencode(level),
         }
-    }
-
-    /// Pack the version `backup` just committed, and push that pack.
-    ///
-    /// **The pack is built by [`write_pack`], which is the whole of `lepatch
-    /// pack`'s work.** So a remote backup is a local backup followed by the pack
-    /// the local path would have written, and the two produce the same bytes:
-    /// same store, same version, same chunker output. Nothing here re-derives a
-    /// snapshot or re-reads a chunk.
-    ///
-    /// The pack goes to a file in the system temporary directory rather than
-    /// beside the set, and that file is removed when the push ends however it
-    /// ends: a pack nobody named is not something to leave in a user's
-    /// directory, and a run that failed half-way has already said so.
-    async fn backed_up(&self, name: &std::path::Path, version: u32) -> std::io::Result<()> {
-        let pack = std::env::temp_dir().join(format!(
-            "lepatch-push-{}-{version}.pack",
-            std::process::id()
-        ));
-
-        // `keep`, and not a level. `backup --compression-level` is the policy
-        // the *local* set is opened with — what this machine stores — and it says
-        // nothing about how a server should store what arrives. The pack already
-        // carries the local set's stored form, and `keep` is what writes that
-        // form rather than decoding and re-encoding every chunk a second time.
-        let written = write_pack(name, &pack, Some(version), None, KeepOrLevel::Keep, false).await;
-
-        // The pack is removed whatever `written` said, so a failure to build it
-        // cannot leave one behind and a failure to push it cannot leave it
-        // either. Its own error is dropped: the caller is already failing with a
-        // sentence about the push, and "the temporary pack could not be removed"
-        // would send the reader after the wrong problem.
-        let pushed = match written {
-            Ok(_) => self.pack(&pack, KeepOrLevel::Keep).await,
-            Err(e) => Err(e),
-        };
-
-        let _ = std::fs::remove_file(&pack);
-
-        pushed
     }
 
     /// Upload `pack`, ask the server to merge it, and report what it published.
@@ -3395,11 +3237,11 @@ impl Push {
 
 /// Pack a version of the set at `name` into `out`, and report what the pack holds.
 ///
-/// **The one place a pack is written**, so `lepatch pack` and the pack a remote
-/// backup pushes are the same file built by the same code. The run it is taken
-/// from does not matter: `backup --remote` hands the version it just committed to
-/// this, and a `pack --remote` hands the version its own `--version` named, and
-/// both arrive here as one `Option<u32>`.
+/// **The one place a pack is written locally**, so `lepatch pack` and the pack
+/// a backup to a serve target pushes are the same file built by the same code.
+/// The run it is taken from does not matter: a serve backup hands the version
+/// it just staged to this, and a `pack` hands the version its own `--version`
+/// named, and both arrive here as one `Option<u32>`.
 ///
 /// Returns the version it resolved, alongside what the pack holds. The caller
 /// reports it, so `pack --version 2` says 2 and `pack` with no version says the
@@ -4045,75 +3887,87 @@ mod tests {
         );
     }
 
-    /// `--store` resolves to a parsed URL, a set name, and a staging path.
+    /// One `TARGET` resolves to a store, a set name, and a staging path.
     /// Explicit staging keeps the test off the environment: no cache
     /// directory is read. Small strings only, no filesystem.
     #[test]
-    fn store_resolution_names_url_set_and_staging() {
-        let target = super::requested_store_set(
+    fn target_resolution_names_store_set_and_staging() {
+        let target = super::resolve_target(
             "backup",
-            None,
-            Some("docs"),
-            "s3://bucket/backups",
+            "file:///remote/docs",
             Some(std::path::Path::new("/stage")),
-            None,
         )
         .unwrap();
 
+        let super::Target::Store(target) = target else {
+            panic!("a file:// target must resolve to a store");
+        };
         assert_eq!(target.set, "docs");
-        assert_eq!(target.url.to_string(), "s3://bucket/backups");
+        assert_eq!(target.url.to_string(), "file:///remote");
         assert!(target.staging.starts_with("/stage/lepatch/stores"));
         assert!(target.staging.ends_with("docs"));
     }
 
-    /// `--store` without `--set` is refused, and a set spelled twice is
-    /// refused with the same sentence shape as `--remote`. A bad URL fails in
-    /// parsing. `--remote` alongside is refused. Small strings only.
+    /// A `TARGET` with no `://` is a local path, and an `http://` target
+    /// splits into server and set. `--staging` with either is refused.
+    /// Small strings only.
     #[test]
-    fn store_resolution_refuses_what_it_cannot_name() {
-        let missing = super::requested_store_set(
+    fn target_resolution_splits_local_and_serve() {
+        let local = super::resolve_target("restore", "photos", None).unwrap();
+        assert!(
+            matches!(local, super::Target::Local(path) if path.as_os_str() == "photos"),
+            "a bare name must resolve to a local path"
+        );
+
+        let serve = super::resolve_target("versions", "http://127.0.0.1:8480/docs", None).unwrap();
+        assert!(
+            matches!(serve, super::Target::Serve { address, set }
+                if address == "http://127.0.0.1:8480" && set == "docs"),
+            "an http:// target must resolve to a server and a set"
+        );
+
+        let staged =
+            super::resolve_target("restore", "photos", Some(std::path::Path::new("/stage")))
+                .unwrap_err();
+        assert_eq!(staged.kind(), std::io::ErrorKind::InvalidInput);
+
+        let staged = super::resolve_target(
+            "versions",
+            "http://127.0.0.1:8480/docs",
+            Some(std::path::Path::new("/stage")),
+        )
+        .unwrap_err();
+        assert_eq!(staged.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// A store `TARGET` without a set is refused, and a bad URL fails in
+    /// parsing. Small strings only.
+    #[test]
+    fn target_resolution_refuses_what_it_cannot_name() {
+        let missing = super::resolve_target(
             "backup",
-            None,
-            None,
             "s3://bucket/backups",
             Some(std::path::Path::new("/stage")),
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(missing.kind(), std::io::ErrorKind::InvalidInput);
+        );
+        // `s3://bucket/backups` names the store `s3://bucket` holding the set
+        // `backups`: a set address always carries its set.
+        assert!(missing.is_ok(), "the last segment is the set: {missing:?}");
 
-        let twice = super::requested_store_set(
-            "restore",
-            Some(std::path::PathBuf::from("docs")),
-            Some("docs"),
-            "file:///remote",
+        let bare = super::resolve_target(
+            "backup",
+            "s3://bucket",
             Some(std::path::Path::new("/stage")),
-            None,
         )
         .unwrap_err();
-        assert_eq!(twice.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(bare.kind(), std::io::ErrorKind::InvalidInput);
 
-        let bad_url = super::requested_store_set(
+        let bad_url = super::resolve_target(
             "versions",
-            None,
-            Some("docs"),
             "ftp://host/backups",
             Some(std::path::Path::new("/stage")),
-            None,
         )
         .unwrap_err();
         assert_eq!(bad_url.kind(), std::io::ErrorKind::InvalidInput);
-
-        let both = super::requested_store_set(
-            "versions",
-            None,
-            Some("docs"),
-            "file:///remote",
-            Some(std::path::Path::new("/stage")),
-            Some("http://127.0.0.1:8480"),
-        )
-        .unwrap_err();
-        assert_eq!(both.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     /// Only `file://` connects in this build. Other schemes name their
