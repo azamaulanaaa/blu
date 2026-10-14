@@ -62,6 +62,16 @@ A full pack suits any set and creates one if there is none. A delta pack names t
 
 Each version carries its run time in UTC. `versions` shows it in local time. A new version never predates the latest one: `backup` and `merge` refuse an older stamp, and two pushes at once race the tip.
 
+## File history
+
+`versions --files` reports the versions where the named paths changed, oldest first. One line per change: the version, `created`, `modified` or `deleted`, and the path.
+
+```console
+$ blu versions docs --files src/main.rs README.md
+```
+
+A value with `*`, `?`, `[`, `\` or `{` is a glob pattern: `*` spans one path level, `**` spans nested levels, and a backslash names the next byte literally. Quote patterns so the shell does not expand them. A value naming a directory matches everything under it.
+
 ## Remote sets and serve
 
 `file://` works in every build. `sftp://`, `ftp://`, and `s3://` need `--features remote`. `https://` endpoints need `remote-tls`. Remote targets hold no local copy. A `file://` command pulls the set into staging, runs locally, and pushes back its writes. Use `--staging DIR` for the staging copy. Without it, the system cache holds the copy.
