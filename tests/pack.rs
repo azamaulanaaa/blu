@@ -24,7 +24,7 @@ use std::{
     path::Path,
 };
 
-use lepatch::{
+use blulib::{
     metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
     pack::{Pack, Range, StorageStored, hash_file},
     storage::{BlobStore, Codec, Plan, StorageGet},
@@ -45,7 +45,7 @@ async fn snapshot_of(blob: &Path) -> Snapshot {
 
 /// The BLAKE3 of a set's latest snapshot. This is what a pack of that version
 /// names.
-async fn snapshot_id(blob: &Path) -> lepatch::storage::BlobId {
+async fn snapshot_id(blob: &Path) -> blulib::storage::BlobId {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
 
     let id = store.latest().unwrap().1;
@@ -66,7 +66,7 @@ async fn plan_of(blob: &Path) -> Plan {
 }
 
 /// The chunk hashes a set's latest version names.
-async fn hashes_of(blob: &Path) -> HashSet<lepatch::storage::BlobId> {
+async fn hashes_of(blob: &Path) -> HashSet<blulib::storage::BlobId> {
     plan_of(blob).await.iter().map(|c| c.id).collect()
 }
 
@@ -343,7 +343,7 @@ async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
     // have to know that. They say nothing that the `chunks()` calls above do not.
     // The test therefore asserts them here. This is the one place that already
     // knows what a pack holds, rather than three.
-    let as_slice: &[lepatch::pack::Located] = pack.as_ref();
+    let as_slice: &[blulib::pack::Located] = pack.as_ref();
     assert_eq!(as_slice.len(), pack.len());
     assert_eq!(pack.clone().into_iter().count(), pack.len());
     assert_eq!(pack.iter().count(), pack.len());
@@ -612,14 +612,11 @@ async fn writing_a_version_twice_produces_the_same_bytes() {
 /// frame would pin half the sentence.
 struct GrowsByOne<'a, S> {
     store: &'a S,
-    chunk: lepatch::storage::BlobId,
+    chunk: blulib::storage::BlobId,
 }
 
-impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOne<'_, S> {
-    async fn stored(
-        &self,
-        id: &lepatch::storage::BlobId,
-    ) -> std::io::Result<lepatch::pack::Stored> {
+impl<S: blulib::pack::StorageStored> blulib::pack::StorageStored for GrowsByOne<'_, S> {
+    async fn stored(&self, id: &blulib::storage::BlobId) -> std::io::Result<blulib::pack::Stored> {
         let mut stored = self.store.stored(id).await?;
         if id == &self.chunk {
             stored.bytes.push(0);
@@ -630,7 +627,7 @@ impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOn
 
 /// A pack is renamed into place, so a failed run leaves the previous one alone.
 ///
-/// `lepatch pack` overwrites. The path is therefore nearly always one a previous
+/// `blu pack` overwrites. The path is therefore nearly always one a previous
 /// run wrote and somebody wants back. Writing in place destroyed that pack before
 /// the run knew it could finish. The header goes first. The header's payload
 /// length is a count of records that have not been written yet.
@@ -660,8 +657,8 @@ async fn a_record_header_that_does_not_fit_its_room_is_refused() {
     /// is where the first record's magic begins.
     const PACK_HEADER: usize = 4 + 4 + 4 + 32 + 12 + 1 + 1 + 2;
 
-    let first = lepatch::storage::BlobId::from_bytes([0x11u8; 32]);
-    let second = lepatch::storage::BlobId::from_bytes([0x22u8; 32]);
+    let first = blulib::storage::BlobId::from_bytes([0x11u8; 32]);
+    let second = blulib::storage::BlobId::from_bytes([0x22u8; 32]);
     let table = one_file(&[first, second]).to_bytes().unwrap();
 
     let mut record = Vec::new();
@@ -764,7 +761,7 @@ async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
         .unwrap();
     }
     let blob = dir.path().join("store");
-    common::run_backup_compressed(&source, &blob, lepatch::storage::Compression::zstd(1)).await;
+    common::run_backup_compressed(&source, &blob, blulib::storage::Compression::zstd(1)).await;
 
     let plan = plan_of(&blob).await;
     let built = Built {
@@ -1011,7 +1008,7 @@ fn index_entries(index: &[u8]) -> Vec<usize> {
 }
 
 fn varint_len(bytes: &[u8], at: usize) -> usize {
-    lepatch::varint::read(bytes, at)
+    blulib::varint::read(bytes, at)
         .map(|(_, used)| used)
         .expect("a varint running off the end of the buffer")
 }
@@ -1048,7 +1045,7 @@ fn record_len(bytes: &[u8], payload_start: u64, offset: u64) -> u64 {
 /// only thing wrong with the pack built around it is the claim.
 fn record_header(
     codec: u8,
-    id: &lepatch::storage::BlobId,
+    id: &blulib::storage::BlobId,
     stored_len: u64,
     raw_len: u64,
 ) -> Vec<u8> {
@@ -1056,8 +1053,8 @@ fn record_header(
     out.extend_from_slice(b"LPB1");
     out.push(0);
     out.push(codec);
-    lepatch::varint::write(&mut out, stored_len);
-    lepatch::varint::write(&mut out, raw_len);
+    blulib::varint::write(&mut out, stored_len);
+    blulib::varint::write(&mut out, raw_len);
     out.extend_from_slice(id.as_bytes());
 
     let check: [u8; 8] = blake3::hash(&out).as_bytes()[..8].try_into().unwrap();
@@ -1074,7 +1071,7 @@ fn record_header(
 fn record_claim(
     bytes: &[u8],
     payload_start: u64,
-    chunk: &lepatch::pack::Located,
+    chunk: &blulib::pack::Located,
 ) -> (usize, usize, u64, u64, u8) {
     let at = usize::try_from(payload_start + chunk.offset).unwrap();
     let stored_at = at + 6;
@@ -1098,14 +1095,14 @@ fn nudgeable<'a>(
     payload_start: u64,
     pack: &'a Pack,
     codec: u8,
-) -> &'a lepatch::pack::Located {
+) -> &'a blulib::pack::Located {
     pack.chunks()
         .iter()
         .find(|chunk| {
             let (_, _, stored_len, raw_len, held) = record_claim(bytes, payload_start, chunk);
             held == codec
-                && lepatch::varint::len(stored_len + 1) == lepatch::varint::len(stored_len)
-                && lepatch::varint::len(raw_len + 1) == lepatch::varint::len(raw_len)
+                && blulib::varint::len(stored_len + 1) == blulib::varint::len(stored_len)
+                && blulib::varint::len(raw_len + 1) == blulib::varint::len(raw_len)
         })
         .unwrap_or_else(|| panic!("the fixture should hold a record stored as codec {codec}"))
 }
@@ -1152,7 +1149,7 @@ async fn an_index_and_a_record_header_cannot_disagree() {
         )
         .unwrap();
     }
-    common::run_backup_compressed(&source, &blob, lepatch::storage::Compression::zstd(1)).await;
+    common::run_backup_compressed(&source, &blob, blulib::storage::Compression::zstd(1)).await;
 
     let store = BlobStore::open_for_reading(&blob).await.unwrap();
     let plan = plan_of(&blob).await;
@@ -1245,7 +1242,7 @@ async fn an_index_and_a_record_header_cannot_disagree() {
 /// refuse. The test was checking the pack's bytes with a reader more lenient than
 /// any reader that will ever see them. The test now uses the real one.
 fn decode_varint(bytes: &[u8], at: usize) -> u64 {
-    lepatch::varint::read(bytes, at)
+    blulib::varint::read(bytes, at)
         .map(|(value, _)| value)
         .expect("a varint running off the end of the buffer")
 }
@@ -1623,7 +1620,7 @@ async fn records_that_overlap_are_refused() {
     let chosen = pairs.iter().find(|(before, after)| {
         decode_varint(index, after + 32) > decode_varint(index, before + 32)
             && varint_len(index, after + 32) == varint_len(index, before + 32)
-            && lepatch::varint::len(decode_varint(index, before + 32).saturating_add(1))
+            && blulib::varint::len(decode_varint(index, before + 32).saturating_add(1))
                 == varint_len(index, before + 32)
     });
 
@@ -1637,7 +1634,7 @@ async fn records_that_overlap_are_refused() {
 
     let mut bytes = good.clone();
     let mut written = Vec::new();
-    lepatch::varint::write(&mut written, overlapping);
+    blulib::varint::write(&mut written, overlapping);
     assert_eq!(
         written.len(),
         width,
@@ -1931,7 +1928,7 @@ async fn a_pack_will_not_hand_out_a_chunk_it_does_not_hold() {
     let built = build(3, 100_000).await;
     let pack = built.pack(&built.dir.path().join("v1.pack")).await;
 
-    let absent = lepatch::storage::BlobId::from_bytes([0xABu8; 32]);
+    let absent = blulib::storage::BlobId::from_bytes([0xABu8; 32]);
     // Matched rather than `unwrap_err`, which would need the stream type to be
     // `Debug`. That would be a boxed trait object with no useful representation
     // either way.
@@ -1967,7 +1964,7 @@ async fn a_partial_range_records_nothing() {
     let start = pack.payload_start() + first.offset;
     let bytes = fs::read(pack.path()).unwrap();
     let whole_len = record_len(&bytes, pack.payload_start(), first.offset);
-    let half = lepatch::pack::Range {
+    let half = blulib::pack::Range {
         start,
         end: start + whole_len / 2,
     };
@@ -1977,7 +1974,7 @@ async fn a_partial_range_records_nothing() {
         "half a chunk should not be recorded as the chunk"
     );
 
-    let whole = lepatch::pack::Range {
+    let whole = blulib::pack::Range {
         start,
         end: start + whole_len,
     };
@@ -1989,13 +1986,13 @@ async fn a_partial_range_records_nothing() {
 /// These two tests are about set arithmetic on the chunk table, so where the chunks
 /// live is noise. Every placement is raw and at offset zero. That is not a real
 /// arrangement and is never read.
-fn placed() -> lepatch::storage::Placement {
-    lepatch::storage::Placement {
+fn placed() -> blulib::storage::Placement {
+    blulib::storage::Placement {
         segment: 0,
         offset: 0,
         stored_len: 10,
         raw_len: 10,
-        codec: lepatch::storage::Codec::Raw,
+        codec: blulib::storage::Codec::Raw,
     }
 }
 
@@ -2005,20 +2002,20 @@ fn placed() -> lepatch::storage::Placement {
 /// chunk that no slice reaches. A chunk table alone plans to nothing. That is
 /// correct. A version listing a chunk it never reads has nothing to read it for.
 /// That chunk table would have made both tests above vacuous.
-fn one_file(chunks: &[lepatch::storage::BlobId]) -> Snapshot {
+fn one_file(chunks: &[blulib::storage::BlobId]) -> Snapshot {
     let mut snapshot = Snapshot {
         chunks: chunks.to_vec(),
         ..Snapshot::new(Timestamp { secs: 1, nanos: 0 })
     };
 
-    snapshot.files.push(lepatch::metadata::File {
+    snapshot.files.push(blulib::metadata::File {
         path: "one.bin".into(),
         len: chunks.len() as u64 * 10,
-        attrs: lepatch::metadata::Attributes::default(),
+        attrs: blulib::metadata::Attributes::default(),
     });
 
     for (index, _) in chunks.iter().enumerate() {
-        snapshot.file_chunks.push(lepatch::metadata::FileChunk {
+        snapshot.file_chunks.push(blulib::metadata::FileChunk {
             chunk_index: u32::try_from(index).unwrap(),
             file_index: 0,
             chunk_offset: 0,
@@ -2035,9 +2032,9 @@ fn one_file(chunks: &[lepatch::storage::BlobId]) -> Snapshot {
 /// Distinct chunks are listed once, in the order they are first seen. That is the
 /// same rule a real snapshot's chunk table follows. It is the rule that
 /// `Plan::from_snapshot` assumes when it flattens slices to one entry per chunk.
-fn tree(files: &[(&str, lepatch::storage::BlobId)]) -> Snapshot {
+fn tree(files: &[(&str, blulib::storage::BlobId)]) -> Snapshot {
     let mut snapshot = Snapshot::new(Timestamp { secs: 1, nanos: 0 });
-    let mut chunks: Vec<lepatch::storage::BlobId> = Vec::new();
+    let mut chunks: Vec<blulib::storage::BlobId> = Vec::new();
 
     for (index, (path, id)) in files.iter().enumerate() {
         snapshot.files.push(File {
@@ -2080,7 +2077,7 @@ fn a_delta_plan_is_what_the_base_does_not_already_place() {
     let base = tree(&[("x.bin", a), ("y.bin", b)]);
     let target = tree(&[("x.bin", a), ("y.bin", b), ("z.bin", c)]);
 
-    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let store = |_: &blulib::storage::BlobId| Ok::<_, std::io::Error>(placed());
     let full = Plan::from_snapshot(&target, store).unwrap();
     assert_eq!(full.len(), 3, "the whole version needs all three");
 
@@ -2114,7 +2111,7 @@ fn a_chunk_the_base_holds_in_one_place_is_still_sent_for_another() {
     let base = tree(&[("old.bin", shared)]);
     let target = tree(&[("old.bin", shared), ("new.bin", shared)]);
 
-    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let store = |_: &blulib::storage::BlobId| Ok::<_, std::io::Error>(placed());
     let full = Plan::from_snapshot(&target, store).unwrap();
     assert_eq!(
         full.len(),
@@ -2140,7 +2137,7 @@ fn a_chunk_the_base_places_identically_is_left_out() {
     let shared = blake3::hash(b"same bytes in two files");
     let snapshot = tree(&[("a.bin", shared), ("b.bin", shared)]);
 
-    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let store = |_: &blulib::storage::BlobId| Ok::<_, std::io::Error>(placed());
     let full = Plan::from_snapshot(&snapshot, store).unwrap();
 
     assert!(
@@ -2159,7 +2156,7 @@ fn a_delta_from_an_unrelated_base_is_the_whole_version() {
     let y = blake3::hash(b"y");
     let z = blake3::hash(b"z");
 
-    let store = |_: &lepatch::storage::BlobId| Ok::<_, std::io::Error>(placed());
+    let store = |_: &blulib::storage::BlobId| Ok::<_, std::io::Error>(placed());
     let target = one_file(&[x, y]);
     let full = Plan::from_snapshot(&target, store).unwrap();
     let unrelated = Snapshot {
@@ -2200,13 +2197,13 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
 
     let writing = BlobStore::open_for_writing(
         &built.blob,
-        lepatch::storage::SegmentLimit::default(),
-        lepatch::storage::Compression::default(),
+        blulib::storage::SegmentLimit::default(),
+        blulib::storage::Compression::default(),
     )
     .await
     .unwrap();
 
-    let error = lepatch::command::merge(&writing, &pack, lepatch::command::MergeCompression::Keep)
+    let error = blulib::command::merge(&writing, &pack, blulib::command::MergeCompression::Keep)
         .await
         .expect_err("a pack older than the tip should be refused");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -2220,7 +2217,7 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
         "a refused merge must not have published a version"
     );
 
-    let planned = lepatch::command::merge_plan(&pack, Some(&store))
+    let planned = blulib::command::merge_plan(&pack, Some(&store))
         .await
         .expect_err("a dry run should refuse the same pack");
     assert_eq!(planned.kind(), std::io::ErrorKind::InvalidData);
@@ -2248,7 +2245,7 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
 
     // The client takes version 1, which is what leaves the record the delta will
     // be checked against.
-    lepatch::command::apply(&client, &v1_pack, lepatch::command::ApplyOptions::default())
+    blulib::command::apply(&client, &v1_pack, blulib::command::ApplyOptions::default())
         .await
         .unwrap();
 
@@ -2299,7 +2296,7 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
     );
 
     let applied =
-        lepatch::command::apply(&client, &packed, lepatch::command::ApplyOptions::default())
+        blulib::command::apply(&client, &packed, blulib::command::ApplyOptions::default())
             .await
             .unwrap();
 
@@ -2349,7 +2346,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     )
     .await
     .unwrap();
-    lepatch::command::apply(&client, &v2_pack, lepatch::command::ApplyOptions::default())
+    blulib::command::apply(&client, &v2_pack, blulib::command::ApplyOptions::default())
         .await
         .unwrap();
 
@@ -2378,7 +2375,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     .unwrap();
 
     let result =
-        lepatch::command::apply(&client, &packed, lepatch::command::ApplyOptions::default()).await;
+        blulib::command::apply(&client, &packed, blulib::command::ApplyOptions::default()).await;
 
     let error = match result {
         Err(e) => e,
@@ -2694,16 +2691,16 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
     let received = built.dir.path().join("received");
     let store = BlobStore::open_for_writing(
         &received,
-        lepatch::storage::SegmentLimit::default(),
-        lepatch::storage::Compression::default(),
+        blulib::storage::SegmentLimit::default(),
+        blulib::storage::Compression::default(),
     )
     .await
     .unwrap();
 
-    let error = lepatch::command::merge(
+    let error = blulib::command::merge(
         &store,
         &reopened,
-        lepatch::command::MergeCompression::Reencode,
+        blulib::command::MergeCompression::Reencode,
     )
     .await
     .expect_err("a merge of a pack with a flipped payload byte should be refused");
@@ -2766,16 +2763,15 @@ async fn a_flipped_payload_byte_is_refused_on_the_verbatim_path_too() {
     let received = built.dir.path().join("received-keep");
     let store = BlobStore::open_for_writing(
         &received,
-        lepatch::storage::SegmentLimit::default(),
-        lepatch::storage::Compression::default(),
+        blulib::storage::SegmentLimit::default(),
+        blulib::storage::Compression::default(),
     )
     .await
     .unwrap();
 
-    let error =
-        lepatch::command::merge(&store, &reopened, lepatch::command::MergeCompression::Keep)
-            .await
-            .expect_err("`keep` must not be a promise to believe the pack");
+    let error = blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
+        .await
+        .expect_err("`keep` must not be a promise to believe the pack");
     assert!(
         error.to_string().contains("does not hash to"),
         "the chunk hash, not the codec, must be what catches a flipped byte: {error}"
@@ -2853,8 +2849,8 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
          {frame_len} against {raw_len}"
     );
     assert_eq!(
-        lepatch::varint::len(frame_len),
-        lepatch::varint::len(stored_len),
+        blulib::varint::len(frame_len),
+        blulib::varint::len(stored_len),
         "sanity: the two stored lengths must be the same width of varint, or the \
          record header changes width and the splice below moves every byte after it"
     );
@@ -2903,13 +2899,13 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     let received = built.dir.path().join("received-grown");
     let store = BlobStore::open_for_writing(
         &received,
-        lepatch::storage::SegmentLimit::default(),
-        lepatch::storage::Compression::default(),
+        blulib::storage::SegmentLimit::default(),
+        blulib::storage::Compression::default(),
     )
     .await
     .unwrap();
 
-    lepatch::command::merge(&store, &reopened, lepatch::command::MergeCompression::Keep)
+    blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
         .await
         .expect("a merge carrying a frame that lost is not a failure");
 
@@ -3006,20 +3002,20 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
     );
 
     for (compression, expected_kept) in [
-        (lepatch::command::MergeCompression::Keep, true),
-        (lepatch::command::MergeCompression::Reencode, false),
+        (blulib::command::MergeCompression::Keep, true),
+        (blulib::command::MergeCompression::Reencode, false),
     ] {
         let name = format!("received-{expected_kept}");
         let store = BlobStore::open_for_writing(
             &dir.path().join(&name),
-            lepatch::storage::SegmentLimit::default(),
+            blulib::storage::SegmentLimit::default(),
             // Off, so a re-encode has somewhere to go: every chunk raw.
-            lepatch::storage::Compression::Off,
+            blulib::storage::Compression::Off,
         )
         .await
         .unwrap();
 
-        lepatch::command::merge(&store, &pack, compression)
+        blulib::command::merge(&store, &pack, compression)
             .await
             .unwrap();
 
@@ -3049,7 +3045,7 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
 /// of producing a pack that will not open.
 fn grown_header(bytes: &[u8], len_at: usize, payload_len: u64) -> Vec<u8> {
     let mut encoded = Vec::new();
-    lepatch::varint::write(&mut encoded, payload_len);
+    blulib::varint::write(&mut encoded, payload_len);
 
     assert_eq!(
         encoded.len(),
@@ -3070,7 +3066,7 @@ fn grown_header(bytes: &[u8], len_at: usize, payload_len: u64) -> Vec<u8> {
 /// header a reader decodes. The code reads it here rather than through a public
 /// accessor. What this test needs is a fact about the *file*. The file is what
 /// the receiving set has to reproduce.
-fn frame_codec(path: &Path, payload_start: u64, chunk: &lepatch::pack::Located) -> Codec {
+fn frame_codec(path: &Path, payload_start: u64, chunk: &blulib::pack::Located) -> Codec {
     let bytes = fs::read(path).unwrap();
     let at = usize::try_from(payload_start + chunk.offset).unwrap();
 
@@ -3088,41 +3084,41 @@ fn frame_codec(path: &Path, payload_start: u64, chunk: &lepatch::pack::Located) 
 /// product of two choices from one vocabulary. A fixture that listed a fourth case
 /// here and a different third case there would be testing two features rather than
 /// one.
-fn pack_forms() -> [(&'static str, Option<lepatch::storage::Compression>); 3] {
+fn pack_forms() -> [(&'static str, Option<blulib::storage::Compression>); 3] {
     [
         ("keep", None),
-        ("zero", Some(lepatch::storage::Compression::Off)),
-        ("level", Some(lepatch::storage::Compression::zstd(9))),
+        ("zero", Some(blulib::storage::Compression::Off)),
+        ("level", Some(blulib::storage::Compression::zstd(9))),
     ]
 }
 
 /// The same three answers, as what a merge takes.
 ///
-/// A level is not in [`lepatch::command::MergeCompression`] and cannot be. Which
+/// A level is not in [`blulib::command::MergeCompression`] and cannot be. Which
 /// frames a merge writes is the *receiving store's* policy. It is not an argument.
 /// The store's compressor is a type parameter that the command does not change.
 /// So "under a level" here is `Reencode` into a store opened at one. The two are
 /// the same run as far as anything observable is concerned.
 fn merge_forms() -> Vec<(
     &'static str,
-    lepatch::command::MergeCompression,
-    lepatch::storage::Compression,
+    blulib::command::MergeCompression,
+    blulib::storage::Compression,
 )> {
     vec![
         (
             "keep",
-            lepatch::command::MergeCompression::Keep,
-            lepatch::storage::Compression::Off,
+            blulib::command::MergeCompression::Keep,
+            blulib::storage::Compression::Off,
         ),
         (
             "zero",
-            lepatch::command::MergeCompression::Reencode,
-            lepatch::storage::Compression::Off,
+            blulib::command::MergeCompression::Reencode,
+            blulib::storage::Compression::Off,
         ),
         (
             "level",
-            lepatch::command::MergeCompression::Reencode,
-            lepatch::storage::Compression::zstd(9),
+            blulib::command::MergeCompression::Reencode,
+            blulib::storage::Compression::zstd(9),
         ),
     ]
 }
@@ -3164,14 +3160,14 @@ fn mixed_source(dir: &Path) -> std::path::PathBuf {
 /// complaint about the policy that changed under a test about codecs.
 async fn mixed_set(dir: &Path, at: &Path) {
     let source = mixed_source(dir);
-    common::run_backup_compressed(&source, at, lepatch::storage::Compression::zstd(1)).await;
+    common::run_backup_compressed(&source, at, blulib::storage::Compression::zstd(1)).await;
 }
 
 /// Pack a set's latest version under one of the three forms.
 async fn packed_with(
     blob: &Path,
     at: &Path,
-    compression: Option<lepatch::storage::Compression>,
+    compression: Option<blulib::storage::Compression>,
 ) -> Pack {
     let store = BlobStore::open_for_reading(blob).await.unwrap();
     let snapshot = snapshot_of(blob).await;
@@ -3182,16 +3178,16 @@ async fn packed_with(
             .is_empty()
     );
 
-    lepatch::command::pack(
+    blulib::command::pack(
         &store,
-        &lepatch::command::Version {
+        &blulib::command::Version {
             number: 1,
             snapshot,
         },
         |id| store.locate(id),
         None,
         at,
-        lepatch::command::PackOptions {
+        blulib::command::PackOptions {
             dry_run: false,
             compression,
         },
@@ -3249,13 +3245,13 @@ async fn every_pack_form_restores_through_every_merge_form() {
             let name = dir.path().join(format!("m-{pack_form}-{merge_form}"));
             let store = BlobStore::open_for_writing(
                 &name,
-                lepatch::storage::SegmentLimit::default(),
+                blulib::storage::SegmentLimit::default(),
                 store_policy,
             )
             .await
             .unwrap();
 
-            lepatch::command::merge(&store, &pack, merge_route)
+            blulib::command::merge(&store, &pack, merge_route)
                 .await
                 .unwrap_or_else(|e| {
                     panic!("a pack built as {pack_form} must merge as {merge_form}: {e}")
@@ -3266,7 +3262,7 @@ async fn every_pack_form_restores_through_every_merge_form() {
             // statement that what it holds is what it says it holds. That is the
             // property the verbatim paths keep while skipping the encode.
             let reopened = BlobStore::open_for_reading(&name).await.unwrap();
-            let report = lepatch::command::verify(reopened.snapshot(1).unwrap(), reopened)
+            let report = blulib::command::verify(reopened.snapshot(1).unwrap(), reopened)
                 .await
                 .unwrap_or_else(|e| panic!("{pack_form} into {merge_form} should verify: {e}"));
             assert!(
@@ -3328,8 +3324,8 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
     let mut sizes = Vec::new();
     for (form, compression, expected_frames) in [
         ("keep", None, true),
-        ("zero", Some(lepatch::storage::Compression::Off), false),
-        ("level", Some(lepatch::storage::Compression::zstd(9)), true),
+        ("zero", Some(blulib::storage::Compression::Off), false),
+        ("level", Some(blulib::storage::Compression::zstd(9)), true),
     ] {
         let pack_path = dir.path().join(format!("v-{form}.pack"));
         let pack = packed_with(&origin, &pack_path, compression).await;
@@ -3338,12 +3334,12 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
         // Off, so what is recorded is the pack's choice and not the store's.
         let store = BlobStore::open_for_writing(
             &name,
-            lepatch::storage::SegmentLimit::default(),
-            lepatch::storage::Compression::Off,
+            blulib::storage::SegmentLimit::default(),
+            blulib::storage::Compression::Off,
         )
         .await
         .unwrap();
-        lepatch::command::merge(&store, &pack, lepatch::command::MergeCompression::Keep)
+        blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)
             .await
             .unwrap();
 
@@ -3416,19 +3412,19 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
     for (form, compression) in pack_forms() {
         let store = BlobStore::open_for_reading(&origin).await.unwrap();
         let snapshot = snapshot_of(&origin).await;
-        let version = lepatch::command::Version {
+        let version = blulib::command::Version {
             number: 1,
             snapshot,
         };
         let at = dir.path().join(format!("v-{form}.pack"));
 
-        let plan = lepatch::command::pack(
+        let plan = blulib::command::pack(
             &store,
             &version,
             |id| store.locate(id),
             None,
             &at,
-            lepatch::command::PackOptions {
+            blulib::command::PackOptions {
                 dry_run: true,
                 compression,
             },
@@ -3449,13 +3445,13 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
             "a dry pack as {form} wrote the file it was asked about"
         );
 
-        let run = lepatch::command::pack(
+        let run = blulib::command::pack(
             &store,
             &version,
             |id| store.locate(id),
             None,
             &at,
-            lepatch::command::PackOptions {
+            blulib::command::PackOptions {
                 dry_run: false,
                 compression,
             },
@@ -3490,7 +3486,7 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
         );
         assert_eq!(
             run.content,
-            Some(lepatch::pack::hash_file(&at).await.unwrap()),
+            Some(blulib::pack::hash_file(&at).await.unwrap()),
             "and its content hash is the pack's own"
         );
 
@@ -3541,7 +3537,7 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
     const CEILING: u64 = (1 << 30) + 1; // one past it: the bound is "more than"
     const FRAME: &[u8] = &[0x5au8; 40];
 
-    let id = lepatch::storage::BlobId::from_bytes([0xABu8; 32]);
+    let id = blulib::storage::BlobId::from_bytes([0xABu8; 32]);
     let table = one_file(&[id]).to_bytes().unwrap();
 
     // The record: the store's own framing, with a claim no chunker makes.
@@ -3588,13 +3584,13 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
     let received = built.dir.path().join("received");
     let store = BlobStore::open_for_writing(
         &received,
-        lepatch::storage::SegmentLimit::default(),
-        lepatch::storage::Compression::default(),
+        blulib::storage::SegmentLimit::default(),
+        blulib::storage::Compression::default(),
     )
     .await
     .unwrap();
 
-    let error = lepatch::command::merge(&store, &pack, lepatch::command::MergeCompression::Keep)
+    let error = blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)
         .await
         .expect_err("a chunk claiming more content than the chunker produces must be refused");
     assert!(

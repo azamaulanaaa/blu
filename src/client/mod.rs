@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Talking to a `lepatch serve` that is somewhere else.
+//! Talking to a `blu serve` that is somewhere else.
 //!
 //! ## What this is
 //!
@@ -11,7 +11,7 @@
 //!
 //! * **What does that server hold?** [`Remote::versions`] is one `GET`, and it
 //!   answers with the same numbers and the same snapshot hashes that
-//!   `lepatch versions` reads off a local directory.
+//!   `blu versions` reads off a local directory.
 //! * **How does a tree get there?** [`Remote::begin_upload`] and [`Upload::send`]
 //!   carry the pack — four requests, of which one is the transfer —
 //!   [`Remote::start_merge`] asks a server to merge it, and [`Remote::await_job`]
@@ -55,12 +55,12 @@
 //! ## TLS
 //!
 //! **There is none, and this client refuses to pretend otherwise.** `awc` is
-//! built here with no TLS backend, `lepatch serve` offers no TLS either, and an
+//! built here with no TLS backend, `blu serve` offers no TLS either, and an
 //! `https://` address is [`io::ErrorKind::InvalidInput`] rather than a
 //! connection that fails somewhere confusing. A server reachable over TLS wants
 //! a terminator in front of it, and that terminator speaks `http://` to this.
 //!
-//! [`lepatch merge`]: crate::command::merge
+//! [`blu merge`]: crate::command::merge
 
 mod error;
 mod jobs;
@@ -86,7 +86,7 @@ pub use versions::Version;
 /// answering is an error rather than a hang.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A `lepatch serve` this client can ask.
+/// A `blu serve` this client can ask.
 ///
 /// Built from the address the server printed on its first line of stdout — the
 /// one reason that line goes to stdout rather than stderr — and held for as many
@@ -96,7 +96,7 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 ///
 /// ```no_run
 /// # async fn example() -> std::io::Result<()> {
-/// use lepatch::client::Remote;
+/// use blulib::client::Remote;
 ///
 /// let remote = Remote::new("http://127.0.0.1:8480")?;
 /// for listed in remote.versions("docs").await? {
@@ -184,7 +184,7 @@ fn base_of(address: &str) -> io::Result<String> {
     if address.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "no server address: a serve target wants the address `lepatch serve` printed, \
+            "no server address: a serve target wants the address `blu serve` printed, \
              which looks like http://127.0.0.1:8480",
         ));
     }
@@ -197,7 +197,7 @@ fn base_of(address: &str) -> io::Result<String> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{address} needs TLS, and this client has none: `lepatch serve` offers no TLS \
+                "{address} needs TLS, and this client has none: `blu serve` offers no TLS \
                  either, so use the http:// address it printed, or put a terminator in front of it"
             ),
         ));
@@ -208,7 +208,7 @@ fn base_of(address: &str) -> io::Result<String> {
             io::ErrorKind::InvalidInput,
             format!(
                 "{address:?} is not a server address: it has to begin with http://, and \
-                 lepatch serve does not speak anything else"
+                 blu serve does not speak anything else"
             ),
         ));
     };
@@ -368,7 +368,7 @@ pub fn split_serve_target(target: &str) -> io::Result<(String, String)> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{target} needs TLS, and this client has none: `lepatch serve` offers no TLS \
+                "{target} needs TLS, and this client has none: `blu serve` offers no TLS \
                  either, so use the http:// address it printed, or put a terminator in front of it"
             ),
         ));

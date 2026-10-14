@@ -23,11 +23,11 @@ use std::{
 /// `common`. See the module's own docs for why this is not `awc`.
 pub(crate) mod http;
 
-/// A `lepatch serve` running as a real process.
+/// A `blu serve` running as a real process.
 #[cfg(any(test, doc))]
 pub(crate) mod server;
 
-use lepatch::{
+use blulib::{
     command::{Committed, Options, backup, restore},
     layout::IndexSet,
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StreamReadSeeker},
@@ -224,9 +224,9 @@ pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
 /// The stamp of a set's newest version, when the set holds one.
 ///
 /// Reads the set through the open handle. A fresh set holds nothing.
-async fn latest_of<C: lepatch::storage::Compressor>(
-    storage: &BlobStore<lepatch::storage::Write, C>,
-) -> Option<lepatch::metadata::Timestamp> {
+async fn latest_of<C: blulib::storage::Compressor>(
+    storage: &BlobStore<blulib::storage::Write, C>,
+) -> Option<blulib::metadata::Timestamp> {
     let (version, _) = storage.latest()?;
     storage.version_time(version).await.ok()
 }
@@ -276,7 +276,7 @@ pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Pat
 pub(crate) async fn run_backup_compressed(
     source: &Path,
     blob: &Path,
-    compression: lepatch::storage::Compression,
+    compression: blulib::storage::Compression,
 ) -> Committed {
     let storage = BlobStore::open_for_writing(blob, SegmentLimit::default(), compression)
         .await

@@ -4,7 +4,7 @@
 
 use std::io::{Cursor, SeekFrom};
 
-use lepatch::slice::{SliceAsyncReader, SliceAsyncWriter};
+use blulib::slice::{SliceAsyncReader, SliceAsyncWriter};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 fn bytes(len: usize) -> Vec<u8> {

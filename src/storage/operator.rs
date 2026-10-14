@@ -40,18 +40,18 @@ const COPY_CHUNK: u64 = 4 * 1024 * 1024;
 ///
 /// Reads endpoints and secrets from the environment, per scheme:
 ///
-/// - `s3://bucket[/prefix]`: `LEPATCH_S3_ENDPOINT` names the endpoint and is
-///   required. `LEPATCH_S3_REGION` overrides the region.
+/// - `s3://bucket[/prefix]`: `BLU_S3_ENDPOINT` names the endpoint and is
+///   required. `BLU_S3_REGION` overrides the region.
 ///   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` name the identity and
 ///   travel together: one without the other is a typo, and fails.
 ///   `AWS_SESSION_TOKEN` extends them. Without any of the three, the request
 ///   goes unsigned: public buckets answer, private ones refuse.
 /// - `ftp://[user@]host[:port][/prefix]`: the user comes from the address or
-///   `LEPATCH_FTP_USER`, defaulting to `anonymous`. The password comes from
-///   `LEPATCH_FTP_PASSWORD` and defaults to empty.
+///   `BLU_FTP_USER`, defaulting to `anonymous`. The password comes from
+///   `BLU_FTP_PASSWORD` and defaults to empty.
 /// - `sftp://[user@]host[:port][/prefix]`: the user comes from the address or
-///   `LEPATCH_SFTP_USER` and is required. The key file comes from
-///   `LEPATCH_SFTP_KEY` and is required: this backend speaks key auth only.
+///   `BLU_SFTP_USER` and is required. The key file comes from
+///   `BLU_SFTP_KEY` and is required: this backend speaks key auth only.
 ///   Host keys stay strict.
 ///
 /// `https://` endpoints need `--features remote-tls`, and fail
@@ -121,10 +121,10 @@ fn env(name: &str) -> Option<String> {
 /// TLS transport they would fail mid-run. Refused here, they fail with the
 /// reason instead.
 fn s3_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
-    let endpoint = env("LEPATCH_S3_ENDPOINT").ok_or_else(|| {
+    let endpoint = env("BLU_S3_ENDPOINT").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "LEPATCH_S3_ENDPOINT names the S3 endpoint and is required, e.g. \
+            "BLU_S3_ENDPOINT names the S3 endpoint and is required, e.g. \
              http://127.0.0.1:9000 for a local MinIO",
         )
     })?;
@@ -152,7 +152,7 @@ fn s3_config_for(url: &RemoteUrl, endpoint: &str) -> io::Result<Vec<(String, Str
         ("root".to_string(), root_of(url.prefix())),
     ];
 
-    if let Some(region) = env("LEPATCH_S3_REGION") {
+    if let Some(region) = env("BLU_S3_REGION") {
         config.push(("region".to_string(), region));
     }
 
@@ -184,9 +184,9 @@ fn ftp_config(url: &RemoteUrl) -> Vec<(String, String)> {
 
     let user = user
         .map(str::to_string)
-        .or_else(|| env("LEPATCH_FTP_USER"))
+        .or_else(|| env("BLU_FTP_USER"))
         .unwrap_or_else(|| "anonymous".to_string());
-    let password = env("LEPATCH_FTP_PASSWORD").unwrap_or_default();
+    let password = env("BLU_FTP_PASSWORD").unwrap_or_default();
 
     vec![
         ("endpoint".to_string(), format!("ftp://{host}")),
@@ -203,18 +203,18 @@ fn sftp_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
 
     let user = user
         .map(str::to_string)
-        .or_else(|| env("LEPATCH_SFTP_USER"))
+        .or_else(|| env("BLU_SFTP_USER"))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "sftp:// names no user: put one in the address (sftp://user@host) or \
-                 in LEPATCH_SFTP_USER",
+                 in BLU_SFTP_USER",
             )
         })?;
-    let key = env("LEPATCH_SFTP_KEY").ok_or_else(|| {
+    let key = env("BLU_SFTP_KEY").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "LEPATCH_SFTP_KEY names the key file and is required: this backend speaks \
+            "BLU_SFTP_KEY names the key file and is required: this backend speaks \
              key auth only",
         )
     })?;
@@ -469,7 +469,7 @@ mod tests {
     /// directory on the way out.
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "lepatch-operator-{name}-{}-{:?}",
+            "blu-operator-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ))
@@ -541,9 +541,9 @@ mod tests {
     #[test]
     fn missing_configuration_is_refused() {
         for (address, fragment) in [
-            ("s3://bucket/a", "LEPATCH_S3_ENDPOINT"),
+            ("s3://bucket/a", "BLU_S3_ENDPOINT"),
             ("sftp://host/a", "user"),
-            ("sftp://user@host/a", "LEPATCH_SFTP_KEY"),
+            ("sftp://user@host/a", "BLU_SFTP_KEY"),
         ] {
             let url = RemoteUrl::parse(address).unwrap();
             let error = connect(&url).unwrap_err();

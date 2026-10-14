@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! `lepatch restore` of a serve set: a tree that went up over a socket comes
+//! `blu restore` of a serve set: a tree that went up over a socket comes
 //! back down one, byte for byte.
 //!
 //! The push half of a remote backup is [`tests/client_rest.rs`], and the wire
@@ -8,7 +8,7 @@
 //! had driven end to end before it: **the server packs a version, this client
 //! assembles a pack out of the ranges it is missing, and the tree that lands in
 //! the destination is the tree that was backed up.** Both ends of it go through
-//! the binary as a user runs it, over a socket to a real `lepatch serve` — so
+//! the binary as a user runs it, over a socket to a real `blu serve` — so
 //! what is asserted here is what a user gets, not what a function returns.
 //!
 //! ## What each test is for
@@ -45,7 +45,7 @@
 //! then says nothing — is exactly the case where a test would hang rather than
 //! fail, and a hung test is a suite that never finishes.
 //!
-//! Hence [`lepatch_within`]: every run in this file is killed at a deadline and
+//! Hence [`blu_within`]: every run in this file is killed at a deadline and
 //! **the test fails** if the binary is still going. A pull that cannot finish is
 //! a finding, not a slow test.
 //!
@@ -53,7 +53,7 @@
 //!
 //! Never a fixed one. [`Server`] binds `127.0.0.1:0` and prints the address it
 //! got, so nothing here can reach a server left running by an earlier build —
-//! which matters more than it sounds: a stale `lepatch serve` answers a large
+//! which matters more than it sounds: a stale `blu serve` answers a large
 //! range request with a bare `413` and looks exactly like a bug in the client.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -112,8 +112,8 @@ fn serve_target(address: &str) -> String {
 /// [`RUN`] is the deadline, and the run is `--quiet`: stdout carries the report
 /// a script reads, and `error:` lines reach stderr whatever the filter is, so
 /// nothing asserted on here is something a log line was saying instead.
-fn lepatch(dir: &Path, args: &[&str]) -> Output {
-    lepatch_within(dir, args, RUN)
+fn blu(dir: &Path, args: &[&str]) -> Output {
+    blu_within(dir, args, RUN)
 }
 
 /// Run the binary in `dir`, and kill it if it has not finished in `limit`.
@@ -133,19 +133,19 @@ fn lepatch(dir: &Path, args: &[&str]) -> Output {
 /// Panics if the binary cannot be started, if a log file cannot be written or
 /// read back, or **if the run is still going at `limit`** — in which case it is
 /// killed first, so a hung run fails the test instead of holding the suite.
-fn lepatch_within(dir: &Path, args: &[&str], limit: Duration) -> Output {
+fn blu_within(dir: &Path, args: &[&str], limit: Duration) -> Output {
     let run = RUNS.fetch_add(1, Ordering::Relaxed);
     let out = dir.join(format!("run-{run}.out"));
     let err = dir.join(format!("run-{run}.err"));
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir)
         .arg("--quiet")
         .args(args)
         .stdout(Stdio::from(File::create(&out).unwrap()))
         .stderr(Stdio::from(File::create(&err).unwrap()))
         .spawn()
-        .expect("failed to run the lepatch binary");
+        .expect("failed to run the blu binary");
 
     let deadline = Instant::now() + limit;
     let status = loop {
@@ -155,7 +155,7 @@ fn lepatch_within(dir: &Path, args: &[&str], limit: Duration) -> Output {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!(
-                    "`lepatch {}` was still running {limit:?} later and was killed; a pull that \
+                    "`blu {}` was still running {limit:?} later and was killed; a pull that \
                      does not finish is a hang, not a slow run",
                     args.join(" ")
                 );
@@ -173,11 +173,11 @@ fn lepatch_within(dir: &Path, args: &[&str], limit: Duration) -> Output {
 
 /// The stdout of a run that succeeded.
 fn ok(dir: &Path, args: &[&str]) -> String {
-    let output = lepatch(dir, args);
+    let output = blu(dir, args);
 
     assert!(
         output.status.success(),
-        "`lepatch {}` failed with {:?}\nstdout: {}\nstderr: {}",
+        "`blu {}` failed with {:?}\nstdout: {}\nstderr: {}",
         args.join(" "),
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
@@ -193,11 +193,11 @@ fn ok(dir: &Path, args: &[&str]) -> String {
 /// that let a panic through would pass a run that crashed on the way to saying
 /// nothing useful.
 fn fails(dir: &Path, args: &[&str], limit: Duration) -> String {
-    let output = lepatch_within(dir, args, limit);
+    let output = blu_within(dir, args, limit);
 
     assert!(
         !output.status.success(),
-        "`lepatch {}` unexpectedly succeeded\nstdout: {}",
+        "`blu {}` unexpectedly succeeded\nstdout: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stdout)
     );
@@ -710,7 +710,7 @@ fn the_removed_remote_and_set_flags_are_usage_errors() {
             &address,
         ],
     ] {
-        let output = lepatch(dir.path(), &args);
+        let output = blu(dir.path(), &args);
         let said = String::from_utf8_lossy(&output.stderr).into_owned();
 
         assert!(

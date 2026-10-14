@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! The span every request to `lepatch serve` is traced in.
+//! The span every request to `blu serve` is traced in.
 //!
 //! # Why not `TracingLogger`
 //!
@@ -31,7 +31,7 @@
 //! | `http.route` | on the way out | the route **template**, or nothing |
 //! | `http.status_code` | on the way out | the status actually returned |
 //! | `otel.status_code` | on the way out | `ERROR`, for a `5xx` and nothing else |
-//! | `lepatch.job` | on the way out | the kind of job this request started |
+//! | `blu.job` | on the way out | the kind of job this request started |
 //!
 //! **The two `otel.*` fields do not reach a collector as attributes.** The layer
 //! reads `otel.kind` into the span's *kind* and `otel.status_code` into its
@@ -88,14 +88,14 @@
 //!    request and the propagator turns them into an `opentelemetry::Context`.
 //!    A request with no `traceparent` extracts an empty context, which is a root
 //!    span — the correct answer for a client that is not instrumented, and the
-//!    answer this crate's own `lepatch versions` of a serve target gets, since it
+//!    answer this crate's own `blu versions` of a serve target gets, since it
 //!    sends no header at all.
 //! 2. **Parent.** `Span::set_parent` attaches that context to the span before it
 //!    is ever entered, so the server's span joins the client's trace rather than
 //!    starting a second one beside it.
 //! 3. **Instrument.** The handler's future is run under the span, so everything
 //!    the handler opens itself nests *inside* it instead of beside it — the
-//!    store it reads and the pack it resolves. **No `lepatch::command::*` span
+//!    store it reads and the pack it resolves. **No `blulib::command::*` span
 //!    is ever under it**, because the two commands this server reaches run in a
 //!    spawned job; see the cardinality table below.
 //!
@@ -105,11 +105,11 @@
 //!
 //! ```text
 //! http.server                      one per request; 17 route templates, 4 methods
-//! ├── lepatch::storage::blob::*     one per store a handler opens or reads
-//! └── lepatch::pack::*              one per chunk a handler reads out of a pack
+//! ├── blulib::storage::blob::*     one per store a handler opens or reads
+//! └── blulib::pack::*              one per chunk a handler reads out of a pack
 //!
-//! lepatch_job                      one per job, and a root span of its own trace
-//! └── lepatch::command::*          whatever the job runs
+//! blu_job                      one per job, and a root span of its own trace
+//! └── blulib::command::*          whatever the job runs
 //! ```
 //!
 //! * `http.server` is a **fixed name**, so its cardinality is its attributes':
@@ -118,24 +118,24 @@
 //!   pack id, and none may be added.
 //! * **What nests under it is the layer below the commands, not the commands.**
 //!   A handler resolves a version, a pack or a plan itself, so an `http.server`
-//!   span around `GET /v1/packs/{id}` contains the `lepatch::pack` spans that
-//!   read the chunks it served and any `lepatch::storage::blob` span that opened
+//!   span around `GET /v1/packs/{id}` contains the `blulib::pack` spans that
+//!   read the chunks it served and any `blulib::storage::blob` span that opened
 //!   a store. Every one of those is `#[instrument(skip_all)]`, so it carries no
 //!   arguments at all.
-//! * **`lepatch::command::*` never appears under it.** `merge` and the pack work
+//! * **`blulib::command::*` never appears under it.** `merge` and the pack work
 //!   behind `POST /v1/sets/{set}/packs` are the only commands this server can
-//!   reach, and both run inside a spawned job. The `lepatch::command::*` spans a
-//!   `lepatch backup` or `lepatch restore` produces are in their own trace too,
+//!   reach, and both run inside a spawned job. The `blulib::command::*` spans a
+//!   `blu backup` or `blu restore` produces are in their own trace too,
 //!   because those commands do not run inside a server at all.
-//! * **`lepatch_job` is *not* under `http.server`**, and this is the one asymmetry in the
+//! * **`blu_job` is *not* under `http.server`**, and this is the one asymmetry in the
 //!   table. `Jobs::spawn` hands the work to `tokio::spawn`, and a spawned task
 //!   does not inherit the request's span — it is a task with no parent scope at
 //!   all. So a merge started by `POST /v1/sets/{set}/merges` reports a
-//!   `lepatch_job` root span with `lepatch::command::merge` under it, in **its
+//!   `blu_job` root span with `blulib::command::merge` under it, in **its
 //!   own trace**, and the `http.server` span beside it records *which request*
 //!   started it and what it answered (`202`, with a job id).
-//!   `lepatch.job` is the join between them: it is the kind of job the request
-//!   started, and it is one of the two words `lepatch.job.kind` reports on
+//!   `blu.job` is the join between them: it is the kind of job the request
+//!   started, and it is one of the two words `blu.job.kind` reports on
 //!   [`crate::telemetry::metrics`]. **No job id is written on the request span**,
 //!   because the id does not exist until `spawn` has run, which is after this
 //!   span was created; guessing one from the response body would mean reading
@@ -150,7 +150,7 @@
 //! is installed and builds one of two apps: this middleware wrapped around the
 //! router, or the router alone. With telemetry off there is **no middleware at
 //! all** — not a middleware that checks a flag, not one that returns early. A
-//! default `lepatch serve` does not build a span, does not read a header, and
+//! default `blu serve` does not build a span, does not read a header, and
 //! does not allocate for a request, which is the same promise
 //! [`crate::telemetry`] makes for exporters and instruments and is held by
 //! `no_span_is_created_when_the_middleware_is_not_installed`.
@@ -208,7 +208,7 @@ pub(super) async fn trace<B: MessageBody>(
         http.route = tracing::field::Empty,
         http.status_code = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
-        lepatch.job = tracing::field::Empty,
+        blu.job = tracing::field::Empty,
     );
 
     // Before the span is ever entered: a span that has been entered already has
@@ -268,7 +268,7 @@ fn finish(span: &tracing::Span, route: Option<&str>, status: StatusCode) {
     if let Some(route) = route {
         span.record("http.route", route);
         if let Some(kind) = job_kind(route) {
-            span.record("lepatch.job", kind);
+            span.record("blu.job", kind);
         }
     }
 
@@ -299,7 +299,7 @@ fn finish(span: &tracing::Span, route: Option<&str>, status: StatusCode) {
 /// panel counting a merge that never ran.
 ///
 /// The words are the ones [`Jobs::spawn`](super::Jobs::spawn) is given and the
-/// ones `lepatch.job.kind` reports on a metric, so the two halves of the
+/// ones `blu.job.kind` reports on a metric, so the two halves of the
 /// telemetry agree without a reader having to learn a second vocabulary.
 fn job_kind(route: &str) -> Option<&'static str> {
     match route {
@@ -458,7 +458,7 @@ mod tests {
         (provider, recorder)
     }
 
-    /// The subscriber a `lepatch serve` run exports spans through: this crate's
+    /// The subscriber a `blu serve` run exports spans through: this crate's
     /// OpenTelemetry layer over the crate's own filter, and nothing writing to a
     /// terminal.
     fn exporting(
@@ -469,7 +469,7 @@ mod tests {
         tracing_subscriber::registry()
             .with(
                 tracing_opentelemetry::layer()
-                    .with_tracer(provider.tracer("lepatch"))
+                    .with_tracer(provider.tracer("blu"))
                     .with_filter(crate::telemetry::filter()),
             )
             .with(
@@ -787,11 +787,11 @@ mod tests {
 
     /// A request that starts a job says which kind, by the route it matched.
     ///
-    /// **`lepatch.job` is the join between a request and the work it set going**,
+    /// **`blu.job` is the join between a request and the work it set going**,
     /// and it is deliberately not the job's id: the id is created by
     /// `Jobs::spawn`, which runs inside the handler, after this span exists.
     /// Asserted here so the two words it can take cannot drift apart from the
-    /// words `lepatch.job.kind` reports.
+    /// words `blu.job.kind` reports.
     #[actix_web::test]
     async fn a_request_names_the_kind_of_job_it_started() {
         for (route, kind) in [
@@ -812,7 +812,7 @@ mod tests {
         );
 
         // And the whole table: exactly two of the seventeen routes start a job,
-        // and a route that starts none carries no `lepatch.job` at all rather
+        // and a route that starts none carries no `blu.job` at all rather
         // than an empty one.
         let starting: Vec<&str> = crate::serve::ROUTES
             .iter()
@@ -858,7 +858,7 @@ mod tests {
 
         let span = flush_and_read(&provider, &recorder);
         assert!(
-            !Recorder::attributes(&span).contains_key("lepatch.job"),
+            !Recorder::attributes(&span).contains_key("blu.job"),
             "a request that starts no job must not report one"
         );
     }
@@ -924,13 +924,13 @@ mod tests {
     /// no test here installs a global provider — `telemetry`'s own
     /// `no_exporter_is_built_when_telemetry_is_off` asserts the same slot is
     /// empty, so a test that did would break that one — so the answer in a test
-    /// run is the answer a default `lepatch serve` gets.
+    /// run is the answer a default `blu serve` gets.
     #[test]
     fn the_middleware_follows_the_installed_tracer_provider() {
         assert!(
             !crate::telemetry::is_installed(),
             "nothing has installed a provider, so the router must be built \
-             unwrapped — this is the state of every `lepatch serve` that did not \
+             unwrapped — this is the state of every `blu serve` that did not \
              ask for telemetry"
         );
     }
@@ -1008,7 +1008,7 @@ mod tests {
     /// The instrumented call nests: a handler's own span is inside the request's.
     ///
     /// The cardinality table in the module docs claims `http.server` wraps
-    /// `lepatch::command::*`, and this is that claim at the level it can be
+    /// `blulib::command::*`, and this is that claim at the level it can be
     /// checked. A handler is stood in for, because none of the server's own
     /// handlers open a set on an ordinary request and driving a real one here
     /// would need a pack to exist.
@@ -1060,7 +1060,7 @@ mod tests {
             http.route = tracing::field::Empty,
             http.status_code = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
-            lepatch.job = tracing::field::Empty,
+            blu.job = tracing::field::Empty,
         )
         .metadata()
         .expect("a callsite has static metadata even with no subscriber");
@@ -1075,7 +1075,7 @@ mod tests {
                 "http.route",
                 "http.status_code",
                 "otel.status_code",
-                "lepatch.job",
+                "blu.job",
             ],
             "the attribute list is a contract with a panel; it may not grow by \
              accident and an unbounded attribute is the failure this module exists \

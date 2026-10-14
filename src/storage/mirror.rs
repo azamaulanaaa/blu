@@ -235,7 +235,7 @@ pub async fn pull_from_remote_async(
 pub fn staging_set_path(root: &std::path::Path, url: &RemoteUrl, set: &str) -> io::Result<PathBuf> {
     crate::client::check_set(set)?;
     Ok(root
-        .join("lepatch")
+        .join("blu")
         .join("stores")
         .join(store_id(url))
         .join(set))
@@ -435,7 +435,7 @@ mod tests {
     /// directory on the way out.
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "lepatch-mirror-{name}-{}-{:?}",
+            "blu-mirror-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ))
@@ -519,7 +519,7 @@ mod tests {
     fn staging_paths_stay_under_the_root() {
         let url = RemoteUrl::parse("s3://bucket/backups").unwrap();
         let base = staging_set_path(std::path::Path::new("/cache"), &url, "docs").unwrap();
-        assert!(base.starts_with("/cache/lepatch/stores"));
+        assert!(base.starts_with("/cache/blu/stores"));
         assert!(base.ends_with("docs"));
 
         let other = staging_set_path(std::path::Path::new("/cache"), &url, "other").unwrap();

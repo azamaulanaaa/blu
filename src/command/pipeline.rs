@@ -338,7 +338,7 @@ async fn commit<S: storage::StoragePut + 'static>(
     //
     // The counters are reported first, and only now: this is the one place the
     // run's totals stop moving, and `record_run` reads a run's totals rather
-    // than its progress. See `lepatch::telemetry::metrics` for which of them
+    // than its progress. See `blulib::telemetry::metrics` for which of them
     // become instruments and which become attributes on this span.
     crate::telemetry::metrics::record_run(&progress);
 

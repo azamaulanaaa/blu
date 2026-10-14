@@ -7,7 +7,7 @@
 //!
 //! ## The count is a lower bound, and that is the answer
 //!
-//! [`Versions`] is the same list `lepatch versions` prints, from the same index
+//! [`Versions`] is the same list `blu versions` prints, from the same index
 //! files, and it carries the same caveat, because it is the same answer.
 //!
 //! A version whose index file was never written **still exists and still
@@ -49,7 +49,7 @@ pub(super) fn indexed(base: &std::path::Path) -> io::Result<Vec<Listed>> {
 
     // No segments at all is a mistyped name, not an empty set. Answering "no
     // versions" about a name that names nothing is a failure a script acts on,
-    // and `lepatch versions` refuses it for the same reason.
+    // and `blu versions` refuses it for the same reason.
     if set.segments()?.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -74,7 +74,7 @@ pub(super) fn indexed(base: &std::path::Path) -> io::Result<Vec<Listed>> {
 ///
 /// **Through the store, which checks the file against itself.** An index that is
 /// stale, foreign or edited is a reason to fall back to a scan, never a reason
-/// to name the version. `lepatch versions` makes exactly this point: an index
+/// to name the version. `blu versions` makes exactly this point: an index
 /// file checksums one file and never consults the store, so reading it directly
 /// would name a version the store cannot serve.
 #[derive(Debug, Clone)]
@@ -125,7 +125,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_name_that_is_not_a_set_is_not_an_empty_set() {
-        // The distinction `lepatch versions` draws. Answering "no versions" about
+        // The distinction `blu versions` draws. Answering "no versions" about
         // a name that names nothing is a failure a client acts on — it would
         // read as "this set is empty", which is a different claim, and one that
         // makes a client give up rather than look elsewhere.

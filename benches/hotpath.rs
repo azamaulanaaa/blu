@@ -44,11 +44,11 @@
 
 use std::{hint::black_box, io::Cursor, path::PathBuf};
 
-use criterion::{Criterion, Throughput};
-use lepatch::{
+use blulib::{
     metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
     reader::{Chunker, ChunkerConfig},
 };
+use criterion::{Criterion, Throughput};
 use tempfile::TempDir;
 
 #[path = "fixture.rs"]
@@ -233,7 +233,7 @@ fn serialisation(c: &mut Criterion) {
 /// The bounded stream adapters, which every restored byte passes through twice:
 /// once out of the store, once into the file.
 fn adapters(c: &mut Criterion) {
-    use lepatch::slice::{SliceAsyncReader, SliceAsyncWriter};
+    use blulib::slice::{SliceAsyncReader, SliceAsyncWriter};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

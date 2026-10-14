@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! The layer stack `lepatch serve` installs, and a client's view of a job through it.
+//! The layer stack `blu serve` installs, and a client's view of a job through it.
 //!
 //! # What this file is for
 //!
@@ -17,7 +17,7 @@
 //!
 //! Commit `9ab42a7`. The terminal’s `EnvFilter` was attached to the subscriber
 //! rather than to the `fmt` layer, so it answered `never` to the
-//! `lepatch::progress` callsite, the event was never emitted, the progress layer
+//! `blulib::progress` callsite, the event was never emitted, the progress layer
 //! above was never offered it, and **a client polling `GET /v1/jobs/{id}` was
 //! told a running merge had reported nothing.** No test failed, because every
 //! other part of the stack worked perfectly on the events that were not filtered
@@ -71,8 +71,7 @@ mod common;
 
 use std::{fs, path::Path, sync::OnceLock, time::Duration};
 
-use common::http::Request;
-use lepatch::{
+use blulib::{
     command::Options,
     metadata::Snapshot,
     pack::Pack,
@@ -80,6 +79,7 @@ use lepatch::{
     storage::{BlobStore, Compression, Plan, SegmentLimit, StorageGet},
     telemetry::Config,
 };
+use common::http::Request;
 use tokio::io::AsyncReadExt as _;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -88,7 +88,7 @@ use tracing_subscriber::{
 };
 
 /// The media type of every pack this server accepts.
-const PACK_MEDIA_TYPE: &str = "application/x-lepatch-pack";
+const PACK_MEDIA_TYPE: &str = "application/x-blu-pack";
 
 /// The registry the progress layer forwards into.
 ///
@@ -109,7 +109,7 @@ fn jobs() -> &'static Jobs {
 /// Multi-threaded because only a multi-threaded runtime keeps executing a spawned
 /// task once the `block_on` that spawned it has returned; a current-thread one
 /// would leave the export worker parked for the life of the test binary. This is
-/// the runtime `#[tokio::main]` gives a real `lepatch serve`, which is the same
+/// the runtime `#[tokio::main]` gives a real `blu serve`, which is the same
 /// arrangement.
 fn telemetry_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -128,7 +128,7 @@ fn telemetry_runtime() -> &'static tokio::runtime::Runtime {
 /// here needs the other's runtime.
 ///
 /// **Why current-thread is the faithful choice, and not a detail.** `Jobs::spawn`
-/// enters the job's `lepatch_job` span and then `.await`s the work with that
+/// enters the job's `blu_job` span and then `.await`s the work with that
 /// guard still held, so the span is entered on whichever thread first polls the
 /// task. Actix serves each worker on its own current-thread runtime, so a job is
 /// polled on one thread for its whole life and the span is in scope for every
@@ -138,7 +138,7 @@ fn telemetry_runtime() -> &'static tokio::runtime::Runtime {
 /// `observe` drops them and **a client watching the job is told it reported
 /// nothing, with no error anywhere**. This harness hit that before it was pinned
 /// down: run on a multi-threaded runtime beside the server test, this job
-/// reported `{}` in four runs out of six. See the report; `lepatch serve` is not
+/// reported `{}` in four runs out of six. See the report; `blu serve` is not
 /// affected, because actix workers do not migrate tasks.
 fn actix_like() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -157,9 +157,9 @@ fn actix_like() -> tokio::runtime::Runtime {
 ///
 /// ```text
 /// registry()
-///     .with(otel)      // telemetry::layer   — its own `lepatch=info` filter
+///     .with(otel)      // telemetry::layer   — its own `blu=info` filter
 ///     .with(writer)    // fmt::layer         — the terminal’s EnvFilter, attached HERE
-///     .with(progress)  // progress_layer     — its own `lepatch::serve::progress_filter`
+///     .with(progress)  // progress_layer     — its own `blulib::serve::progress_filter`
 /// ```
 ///
 /// `--quiet` is passed, so the terminal’s filter is at `warn` and **every event
@@ -179,7 +179,7 @@ fn install_the_stack_a_server_installs() {
         // tokio runtime in hand when it is built — the reason `init_tracing` is
         // called from `main` and not from a lazy initialiser.
         telemetry_runtime().block_on(async {
-            let telemetry = Config::new(true, Some(lepatch::telemetry::DEFAULT_ENDPOINT));
+            let telemetry = Config::new(true, Some(blulib::telemetry::DEFAULT_ENDPOINT));
 
             // `EnvFilter` exactly as `init_tracing` builds it, from the flags a
             // `--quiet` run passes: a `warn` default, still answerable from the
@@ -192,18 +192,18 @@ fn install_the_stack_a_server_installs() {
                 .with_writer(std::io::stderr)
                 .with_filter(terminal);
 
-            let otel = lepatch::telemetry::layer(&telemetry)
+            let otel = blulib::telemetry::layer(&telemetry)
                 .expect("the OTLP exporter builds with the default endpoint")
                 .expect("telemetry was asked for, so a layer comes back");
 
             // The meters, because `init_tracing` installs them in the same breath
             // and under the same config. Not a layer, but part of what a run
-            // starts up, and it is what a job's `lepatch.job.kind` is measured
+            // starts up, and it is what a job's `blu.job.kind` is measured
             // on.
-            lepatch::telemetry::metrics::install(&telemetry).expect("the OTLP meter builds");
+            blulib::telemetry::metrics::install(&telemetry).expect("the OTLP meter builds");
 
-            let progress = lepatch::serve::progress_layer(jobs().clone())
-                .with_filter(lepatch::serve::progress_filter());
+            let progress = blulib::serve::progress_layer(jobs().clone())
+                .with_filter(blulib::serve::progress_filter());
 
             let subscriber = tracing_subscriber::registry()
                 .with(otel)
@@ -216,7 +216,7 @@ fn install_the_stack_a_server_installs() {
     });
 }
 
-/// `lepatch --quiet serve --telemetry`, in one process: a real merge, over a
+/// `blu --quiet serve --telemetry`, in one process: a real merge, over a
 /// real socket, through the real router **with the request middleware wrapped
 /// around it**.
 ///
@@ -232,7 +232,7 @@ fn a_client_still_sees_a_running_job_through_the_whole_stack() {
     // what decides whether the router is wrapped in the request middleware at
     // all, so if this is false the test below is not testing what it claims to.
     assert!(
-        lepatch::telemetry::is_installed(),
+        blulib::telemetry::is_installed(),
         "a provider was installed by the stack, so `bind` wraps the router in \
          `serve::span`'s middleware"
     );
@@ -246,9 +246,9 @@ fn a_client_still_sees_a_running_job_through_the_whole_stack() {
 
         // **The real bind, in this process.** With a provider installed this is
         // `handlers::traced_app`: the router with `serve::span` wrapped around
-        // it. Everything else about it is what a `lepatch serve` run gets.
-        let config = lepatch::serve::Config::new(&root, "127.0.0.1:0", None);
-        let bound = lepatch::serve::bind(&config, jobs()).unwrap();
+        // it. Everything else about it is what a `blu serve` run gets.
+        let config = blulib::serve::Config::new(&root, "127.0.0.1:0", None);
+        let bound = blulib::serve::bind(&config, jobs()).unwrap();
         let address = bound.addr();
         tokio::spawn(async move {
             bound
@@ -260,7 +260,7 @@ fn a_client_still_sees_a_running_job_through_the_whole_stack() {
         // A pack in, the way a client pushes one: create an upload, fill it,
         // commit it, and ask for the merge. **Nothing here is a fixture of
         // counters** — the job that runs is `command::merge`, in its own
-        // `#[instrument]` span, writing real `lepatch::progress` events.
+        // `#[instrument]` span, writing real `blulib::progress` events.
         let begin = Request::new("POST", "/v1/uploads").send(address).await;
         assert_eq!(begin.status, 201, "body: {}", begin.text());
         let upload = begin.field("upload").unwrap().as_str().unwrap().to_string();
@@ -314,7 +314,7 @@ fn a_client_still_sees_a_running_job_through_the_whole_stack() {
 
         // **Real counters, from this crate's own list.** A server that invented a
         // key to look busy would pass an emptiness check.
-        let names = lepatch::progress::counter_names();
+        let names = blulib::progress::counter_names();
         for key in counters.as_object().expect("an object").keys() {
             assert!(
                 names.contains(&key.as_str()),
@@ -355,11 +355,11 @@ fn a_client_still_sees_a_running_job_through_the_whole_stack() {
 /// A job’s counters cross the span its command opens, and reach the registry.
 ///
 /// **The nesting is the whole of this test.** `Jobs::spawn` enters the
-/// `lepatch_job` span and the work runs inside it; `command::backup` is
+/// `blu_job` span and the work runs inside it; `command::backup` is
 /// `#[instrument(level = "info", …)]`, so the events the run emits carry
 /// *that* span and not the job’s. `observe` therefore has to walk **outwards**
 /// from the innermost span to find a job, and every span it walks through has to
-/// be one its own filter admits — which is the crate-wide `lepatch=info`, not a
+/// be one its own filter admits — which is the crate-wide `blu=info`, not a
 /// directive naming the three callsites.
 ///
 /// A layer that matched only the innermost span would find no job at all, drop
@@ -378,7 +378,7 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
         let blob = dir.path().join("local");
 
         // Spawned the way `serve` spawns, with the work running inside the job's
-        // span — and the work is a real `lepatch` command.
+        // span — and the work is a real `blu` command.
         let (done, finished) = tokio::sync::oneshot::channel();
         let id = jobs().spawn("merge", move |_handle| async move {
             let storage =
@@ -386,7 +386,7 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
                     .await
                     .expect("a fresh set opens for writing");
 
-            let committed = lepatch::command::backup(&source, Options::default(), storage, None)
+            let committed = blulib::command::backup(&source, Options::default(), storage, None)
                 .await
                 .expect("the backup should commit");
 
@@ -436,7 +436,7 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
              crossing the stack as zeroes: {recorded:?}"
         );
 
-        let names = lepatch::progress::counter_names();
+        let names = blulib::progress::counter_names();
         for key in recorded.keys() {
             assert!(
                 names.contains(&key.as_str()),

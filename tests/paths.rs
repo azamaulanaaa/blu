@@ -6,8 +6,8 @@ mod common;
 
 use std::fs;
 
+use blulib::layout::IndexSet;
 use common::assert_round_trip;
-use lepatch::layout::IndexSet;
 
 /// A filename that is not valid UTF-8 must survive the round trip rather than
 /// aborting the whole backup.
@@ -73,8 +73,8 @@ async fn round_trip_preserves_paths_that_are_not_valid_utf8() {
 async fn a_path_this_platform_cannot_represent_is_refused() {
     use std::{ffi::OsString, path::PathBuf};
 
-    use lepatch::command::{Options, backup};
-    use lepatch::storage::{BlobStore, Compression, SegmentLimit};
+    use blulib::command::{Options, backup};
+    use blulib::storage::{BlobStore, Compression, SegmentLimit};
 
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
@@ -131,7 +131,7 @@ async fn a_path_this_platform_cannot_represent_is_refused() {
 /// That is the other half of this rule, and it is tested beside it.
 #[test]
 fn a_segment_path_names_the_set_it_belongs_to() {
-    use lepatch::layout::IndexSet;
+    use blulib::layout::IndexSet;
 
     for (given, expected) in [
         ("photos.0000.bin", "photos"),

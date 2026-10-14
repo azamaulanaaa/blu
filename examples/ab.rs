@@ -87,7 +87,7 @@
 
 use std::{fmt::Write as _, time::Instant};
 
-use lepatch::{
+use blulib::{
     command::{Options, backup},
     layout::IndexSet,
     storage::{BlobStore, Compression, SegmentLimit},
@@ -427,8 +427,8 @@ fn cpu_seconds() -> f64 {
 /// Building before a runtime exists is also simply the honest order: fixture
 /// first, then measure.
 fn main() {
-    let tmp = std::env::temp_dir().join("lepatch-ab");
-    let stores = std::env::temp_dir().join("lepatch-ab-stores");
+    let tmp = std::env::temp_dir().join("blu-ab");
+    let stores = std::env::temp_dir().join("blu-ab-stores");
     let _ = std::fs::remove_dir_all(&tmp);
     let _ = std::fs::remove_dir_all(&stores);
     std::fs::create_dir_all(&tmp).expect("mkdir");

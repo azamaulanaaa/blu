@@ -127,7 +127,7 @@
 //! ## Derived, never authoritative
 //!
 //! A pack is output. The store and the snapshot alone regenerate it. Losing one
-//! loses nothing, because `lepatch pack` writes it again, byte for byte. The
+//! loses nothing, because `blu pack` writes it again, byte for byte. The
 //! store's commit records remain the record of what versions exist, which is why
 //! nothing reads a pack to answer that.
 
@@ -193,14 +193,14 @@ const MAGIC: [u8; 4] = *b"LPK1";
 /// Public because a client has to be able to ask what a server can read before it
 /// uploads anything. A pack this build cannot read is refused with a message
 /// naming the version it wanted, and the version a client wants is not in the
-/// pack — so the answer has to come from somewhere else. `lepatch serve` serves it
+/// pack — so the answer has to come from somewhere else. `blu serve` serves it
 /// at `GET /v1/version`.
 ///
 /// **Every earlier version is refused rather than guessed at**, and the error names
 /// both numbers, this build's and the pack's. A client holding a pack this build
 /// cannot read is otherwise left guessing which command produces one. That is
 /// affordable here for the same reason it was for `4`. A pack is derived output, so
-/// re-running `lepatch pack` regenerates a pack that an earlier build wrote, and
+/// re-running `blu pack` regenerates a pack that an earlier build wrote, and
 /// nothing is lost but the file.
 ///
 /// A `4` read as if its payloads were records would not fail at the header. The
@@ -508,7 +508,7 @@ impl Pack {
     ///
     /// Generic over [`StorageStored`] because that is the whole of what it needs,
     /// which is the bytes and the codec byte beside them. It was bound to a
-    /// concrete `&BlobStore<Read>`. That made `lepatch pack` the one command
+    /// concrete `&BlobStore<Read>`. That made `blu pack` the one command
     /// that could not use another backend. It could not use a read-only store
     /// over a directory. It could not use a store held in memory. A pack is
     /// derived output, so there is no reason it should care where the bytes
@@ -643,7 +643,7 @@ impl Pack {
 
         // Into place only once it is whole, so a run that fails part-way
         // leaves the pack that was already at this path alone. It does not replace
-        // that pack with a file that cannot be opened. `lepatch pack` overwrites,
+        // that pack with a file that cannot be opened. `blu pack` overwrites,
         // so the path is usually one a previous run wrote and somebody wants back.
         crate::storage::at_async(path, "rename into place", tfs::rename(&temporary, path)).await?;
         unfinished.disarm();
@@ -1186,7 +1186,7 @@ impl Pack {
 
 /// Bytes the records for `plan` will occupy, before a byte of them is read.
 ///
-/// Also what `lepatch pack --dry-run` reports, which is why it is not folded
+/// Also what `blu pack --dry-run` reports, which is why it is not folded
 /// into the writer. A figure the report gives and a figure the file carries are
 /// only the same figure if someone computes them once.
 ///
@@ -2034,10 +2034,10 @@ pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
 ///
 /// # Why this exists
 ///
-/// `lepatch serve` serves a pack over HTTP. The obvious way is to build the file
+/// `blu serve` serves a pack over HTTP. The obvious way is to build the file
 /// and hand out ranges of it. That works, and it costs disk a pack's worth per
 /// version any client has asked for. A pack is *derived output* — re-running
-/// `lepatch pack` regenerates one, and nothing is lost but the file — so storing
+/// `blu pack` regenerates one, and nothing is lost but the file — so storing
 /// derived output is the one thing this format does not need.
 ///
 /// Every byte of a pack is already determined by two things: the [`Plan`], which

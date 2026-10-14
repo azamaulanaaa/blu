@@ -525,8 +525,8 @@ impl Jobs {
             // of job to forget it: a job with no span reports no progress and
             // nothing fails.
             //
-            // `lepatch::progress` events emitted inside this span belong to this
-            // job. The same events from another process, or from a `lepatch
+            // `blulib::progress` events emitted inside this span belong to this
+            // job. The same events from another process, or from a `blu
             // restore` running in this one, are in no job span and are dropped.
             let job_span = tracing::info_span!(
                 super::observe::SPAN,

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The checked-in `OpenAPI` document, and whether it is still true.
 //!
-//! `openapi/lepatch.json` is the source of truth for this API and it is written
+//! `openapi/blu.json` is the source of truth for this API and it is written
 //! by hand. `src/serve/openapi.rs` explains why: a derive-based generator would
 //! put `#[derive(Serialize)]` on this crate's own types, and a `build.rs` emitter
 //! would make the document stop being reviewable in a diff.
@@ -37,8 +37,7 @@ fn document() -> &'static Value {
     static PARSED: OnceLock<Value> = OnceLock::new();
 
     PARSED.get_or_init(|| {
-        serde_json::from_str(lepatch::serve::DOCUMENT)
-            .expect("openapi/lepatch.json must be valid JSON")
+        serde_json::from_str(blulib::serve::DOCUMENT).expect("openapi/blu.json must be valid JSON")
     })
 }
 
@@ -98,7 +97,7 @@ fn every_route_the_server_answers_is_in_the_document() {
     // gets discovered in production.
     let declared = declared();
 
-    for (method, path) in lepatch::serve::ROUTES {
+    for (method, path) in blulib::serve::ROUTES {
         let key = ((*method).to_string(), (*path).to_string());
         assert!(
             declared.contains(&key),
@@ -111,7 +110,7 @@ fn every_route_the_server_answers_is_in_the_document() {
 fn every_path_in_the_document_is_answered_by_the_server() {
     // The other direction. A documented operation the server does not answer is
     // a client's `404`, and it is the one that looks like the document is right.
-    let answered: BTreeSet<(String, String)> = lepatch::serve::ROUTES
+    let answered: BTreeSet<(String, String)> = blulib::serve::ROUTES
         .iter()
         .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
         .collect();
@@ -163,7 +162,7 @@ fn every_defined_schema_is_referenced_and_declared() {
     }
 
     let names = defined_schemas();
-    for declared in lepatch::serve::SCHEMAS {
+    for declared in blulib::serve::SCHEMAS {
         assert!(
             names.iter().any(|name| name == declared),
             "SCHEMAS lists {declared}, which the document does not define"
@@ -182,7 +181,7 @@ fn every_schema_the_document_defines_is_in_the_code_list() {
     // the document defined it while the code list named only `VersionList`.
     // `RestorePlan` was the second one, as the request body of
     // `POST /v1/packs/{id}/plan`.
-    let mut from_code: Vec<&str> = lepatch::serve::SCHEMAS.to_vec();
+    let mut from_code: Vec<&str> = blulib::serve::SCHEMAS.to_vec();
     from_code.sort_unstable();
 
     let names = defined_schemas();
@@ -243,7 +242,7 @@ fn every_path_parameter_the_router_uses_is_declared() {
     // document and then asserted two hardcoded names appeared in it — so renaming
     // `{id}` to `{packId}` in one path left the test passing while the handler's
     // `web::Path` extraction and the documented parameter disagreed.
-    let used: BTreeSet<&str> = lepatch::serve::ROUTES
+    let used: BTreeSet<&str> = blulib::serve::ROUTES
         .iter()
         .filter_map(|(_, path)| {
             path.split('/')
@@ -284,7 +283,7 @@ fn the_events_description_names_every_event_the_stream_can_carry() {
     // client that reads `error` from that paragraph cannot handle a failing job
     // without falling back to polling. The paragraph drifted when the `error`
     // frame was added and the document was not, so it is checked against
-    // [`lepatch::serve::EVENT_NAMES`] rather than trusted.
+    // [`blulib::serve::EVENT_NAMES`] rather than trusted.
     //
     // That constant comes from the `JobEvent` declaration in `jobs.rs`, and
     // `render_event` is held to it in `handlers.rs` by
@@ -295,7 +294,7 @@ fn the_events_description_names_every_event_the_stream_can_carry() {
         .as_str()
         .expect("the events operation describes itself");
 
-    for name in lepatch::serve::EVENT_NAMES {
+    for name in blulib::serve::EVENT_NAMES {
         assert!(
             description.contains(&format!("`{name}`")),
             "the events description does not name `{name}`, so a client cannot switch on it: \
@@ -331,10 +330,10 @@ fn the_events_description_names_every_event_the_stream_can_carry() {
 
     assert_eq!(
         counted,
-        vec![lepatch::serve::EVENT_NAMES.len()],
+        vec![blulib::serve::EVENT_NAMES.len()],
         "the events description counts {counted:?} and the renderer has one set of {}: \
          {description}",
-        lepatch::serve::EVENT_NAMES.len()
+        blulib::serve::EVENT_NAMES.len()
     );
 }
 
@@ -372,10 +371,10 @@ fn the_pack_get_documents_the_whole_pack_limit() {
 fn the_pack_media_type_is_the_one_the_server_sends() {
     // `application/octet-stream` would say nothing. A client that uploads a pack
     // and a client that uploads a photograph are the same request without it.
-    let document = lepatch::serve::DOCUMENT;
+    let document = blulib::serve::DOCUMENT;
 
     assert!(
-        document.contains("application/x-lepatch-pack"),
+        document.contains("application/x-blu-pack"),
         "the document does not use the pack media type"
     );
     assert!(
@@ -512,7 +511,7 @@ fn the_declaration_helpers_find_every_schema_and_operation() {
     // A cheap sanity check on the helpers above rather than on the document: if
     // `declared` or `operation_ids` stopped finding anything, every other test
     // in this file would pass vacuously.
-    assert_eq!(declared().len(), lepatch::serve::ROUTES.len());
+    assert_eq!(declared().len(), blulib::serve::ROUTES.len());
     assert_eq!(operation_ids().len(), declared().len());
     assert!(
         !declared().is_empty(),

@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! End-to-end tests that drive the `lepatch` binary as a subprocess.
+//! End-to-end tests that drive the `blu` binary as a subprocess.
 //!
 //! The library integration tests call `backup` and `restore` directly. That left
 //! the binary itself at zero coverage. Version selection, the cross-process write
@@ -18,21 +18,21 @@ use std::{
     process::{Command, Output},
 };
 
-use common::noisy;
-use lepatch::{
+use blulib::{
     command::{PARTIAL_SUFFIX, load_snapshot},
     layout::IndexSet,
     metadata::Timestamp,
     storage::{BlobId, BlobStore, Codec, VersionIndex},
 };
+use common::noisy;
 
 /// Run the binary in `dir` and return its output.
-fn lepatch(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lepatch"))
+fn blu(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir)
         .args(args)
         .output()
-        .expect("failed to run the lepatch binary")
+        .expect("failed to run the blu binary")
 }
 
 fn stdout(output: &Output) -> String {
@@ -44,10 +44,10 @@ fn stderr(output: &Output) -> String {
 }
 
 fn ok(dir: &Path, args: &[&str]) -> String {
-    let output = lepatch(dir, args);
+    let output = blu(dir, args);
     assert!(
         output.status.success(),
-        "`lepatch {}` failed with {:?}\nstdout: {}\nstderr: {}",
+        "`blu {}` failed with {:?}\nstdout: {}\nstderr: {}",
         args.join(" "),
         output.status.code(),
         stdout(&output),
@@ -62,10 +62,10 @@ fn ok(dir: &Path, args: &[&str]) -> String {
 /// command produces. Tests about what a run *said* want this. Tests about what
 /// it *produced* want [`ok`].
 fn ok_logs(dir: &Path, args: &[&str]) -> String {
-    let output = lepatch(dir, args);
+    let output = blu(dir, args);
     assert!(
         output.status.success(),
-        "`lepatch {}` failed with {:?}\nstdout: {}\nstderr: {}",
+        "`blu {}` failed with {:?}\nstdout: {}\nstderr: {}",
         args.join(" "),
         output.status.code(),
         stdout(&output),
@@ -75,10 +75,10 @@ fn ok_logs(dir: &Path, args: &[&str]) -> String {
 }
 
 fn fails(dir: &Path, args: &[&str]) -> String {
-    let output = lepatch(dir, args);
+    let output = blu(dir, args);
     assert!(
         !output.status.success(),
-        "`lepatch {}` unexpectedly succeeded\nstdout: {}",
+        "`blu {}` unexpectedly succeeded\nstdout: {}",
         args.join(" "),
         stdout(&output)
     );
@@ -142,7 +142,7 @@ fn a_local_restore_takes_a_path_and_no_other_spelling() {
     // And the refusal, which is what keeps a removed flag from meaning
     // anything here. Exit 2: clap refusing an argument is a usage error, not
     // a run that failed while working.
-    let output = lepatch(dir.path(), &["restore", "out2", "--set", "snap"]);
+    let output = blu(dir.path(), &["restore", "out2", "--set", "snap"]);
     assert!(!output.status.success(), "a removed flag should be refused");
     assert_eq!(
         output.status.code(),
@@ -360,7 +360,7 @@ fn verify_exits_non_zero_and_says_so_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
     damaged_store(dir.path());
 
-    let verify = lepatch(dir.path(), &["verify", "snap"]);
+    let verify = blu(dir.path(), &["verify", "snap"]);
     assert!(
         !verify.status.success(),
         "a damaged store must not verify: exit {:?}",
@@ -386,7 +386,7 @@ fn verify_names_the_chunk_and_what_it_really_hashed_to() {
     let dir = tempfile::tempdir().unwrap();
     damaged_store(dir.path());
 
-    let detail = stderr(&lepatch(dir.path(), &["verify", "snap"]));
+    let detail = stderr(&blu(dir.path(), &["verify", "snap"]));
 
     let hashes: Vec<&str> = detail
         .split_whitespace()
@@ -504,7 +504,7 @@ fn an_unfinished_run_leaves_the_previous_version_intact() {
     );
 }
 
-/// `lepatch versions` answers from the index files, and reindex puts them back.
+/// `blu versions` answers from the index files, and reindex puts them back.
 ///
 /// The files exist so listing a set costs a file name per version rather than a
 /// scan of every record in it. What matters for a user is that deleting them costs
@@ -593,7 +593,7 @@ fn a_second_backup_is_refused_while_the_lock_is_held() {
 
     let error = fails(dir.path(), &["backup", "src", "snap"]);
     assert!(
-        error.contains("locked by another lepatch process") && error.contains("remove it"),
+        error.contains("locked by another blu process") && error.contains("remove it"),
         "the error should say how to recover: {error}"
     );
 }
@@ -713,7 +713,7 @@ fn quiet_suppresses_progress_and_verbose_adds_detail() {
 #[test]
 fn quiet_and_verbose_conflict() {
     let dir = tempfile::tempdir().unwrap();
-    let output = lepatch(
+    let output = blu(
         dir.path(),
         &["--quiet", "--verbose", "backup", "src", "snap"],
     );
@@ -726,7 +726,7 @@ fn the_binary_reports_its_version_and_help() {
 
     let version = ok(dir.path(), &["--version"]);
     assert!(
-        version.contains("lepatch") && version.contains(env!("CARGO_PKG_VERSION")),
+        version.contains("blu") && version.contains(env!("CARGO_PKG_VERSION")),
         "unexpected --version output: {version}"
     );
 
@@ -739,7 +739,7 @@ fn the_binary_reports_its_version_and_help() {
 #[test]
 fn an_unknown_subcommand_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
-    let output = lepatch(dir.path(), &["frobnicate"]);
+    let output = blu(dir.path(), &["frobnicate"]);
     assert!(!output.status.success());
 }
 
@@ -756,7 +756,7 @@ async fn a_compression_level_outside_zero_to_nine_is_refused() {
     fs::write(dir.path().join("a.bin"), noisy(30_000)).unwrap();
 
     for level in ["10", "22", "255"] {
-        let output = lepatch(
+        let output = blu(
             dir.path(),
             &["backup", ".", "store", "--compression-level", level],
         );
@@ -822,7 +822,7 @@ fn a_chunk_profile_that_does_not_exist_is_refused() {
         // Not `fails`, which insists on exit 1. A flag that does not parse is a
         // usage error, and clap exits 2 for those. The distinction is the one a
         // script sees. Exit 1 is a run that was asked for and could not be had.
-        let output = lepatch(
+        let output = blu(
             dir.path(),
             &["backup", ".", "store", "--chunk-profile", name],
         );
@@ -950,7 +950,7 @@ async fn chunk_count(base: &Path) -> usize {
 /// Two runs stamp different times, so two snapshots of one tree differ.
 /// Comparing the recorded tree rather than the hash says whether the runs
 /// cut the tree the same way.
-async fn recorded_snapshot(base: &Path) -> lepatch::metadata::Snapshot {
+async fn recorded_snapshot(base: &Path) -> blulib::metadata::Snapshot {
     let store = BlobStore::open_for_reading(base).await.unwrap();
     load_snapshot(&store, store.latest().unwrap().1)
         .await
@@ -1041,12 +1041,12 @@ fn progress_reporting_can_be_turned_off() {
     let source = common::source(dir.path());
     fs::write(source.join("a.bin"), noisy(100_000)).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let output = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
-        .env("RUST_LOG", "lepatch=info,lepatch::progress=warn")
+        .env("RUST_LOG", "blu=info,blulib::progress=warn")
         .args(["backup", "source", "store"])
         .output()
-        .expect("failed to run the lepatch binary");
+        .expect("failed to run the blu binary");
 
     let text = stderr(&output);
     assert!(
@@ -1125,7 +1125,7 @@ fn clean_refuses_a_destination_holding_the_backup_set() {
 
     // The set is `store.bin` beside the source, so restoring it into its own
     // directory is the mistake.
-    let output = lepatch(dir.path(), &["restore", ".", "store", "--clean"]);
+    let output = blu(dir.path(), &["restore", ".", "store", "--clean"]);
     assert!(
         !output.status.success(),
         "cleaning a directory holding the backup set should fail"
@@ -1153,7 +1153,7 @@ fn a_second_restore_into_one_destination_is_refused() {
     let destination = dir.path().join("out");
     fs::create_dir_all(&destination).unwrap();
 
-    let mut first = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let mut first = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["restore", "out", "store"])
         .spawn()
@@ -1161,16 +1161,14 @@ fn a_second_restore_into_one_destination_is_refused() {
 
     // Give it long enough to have taken the claim, then try a second.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let second = lepatch(dir.path(), &["restore", "out", "store"]);
+    let second = blu(dir.path(), &["restore", "out", "store"]);
 
     let _ = first.wait();
 
     // Whichever order they actually ran in, the second one must not have been
     // allowed to write. If the first finished before the second started there is
     // nothing to assert. The check is therefore on the lock file's existence.
-    let lock_present = destination
-        .with_file_name("out.lepatch-restore.lock")
-        .exists();
+    let lock_present = destination.with_file_name("out.blu-restore.lock").exists();
 
     if lock_present {
         assert!(
@@ -1178,7 +1176,7 @@ fn a_second_restore_into_one_destination_is_refused() {
             "a second restore into a claimed destination should fail"
         );
         assert!(
-            stderr(&second).contains("another lepatch process"),
+            stderr(&second).contains("another blu process"),
             "unhelpful error: {}",
             stderr(&second)
         );
@@ -1216,7 +1214,7 @@ fn a_restore_creates_a_destination_whose_parent_is_missing() {
 
     // And the claim must not be left inside the restored tree.
     assert!(
-        !destination.join("nested.lepatch-restore.lock").exists(),
+        !destination.join("nested.blu-restore.lock").exists(),
         "the restore claim ended up inside the restored output"
     );
 }
@@ -1224,7 +1222,7 @@ fn a_restore_creates_a_destination_whose_parent_is_missing() {
 /// The claim a restore takes sits beside the destination, named for it.
 fn claim_path(destination: &Path) -> std::path::PathBuf {
     destination.with_file_name(format!(
-        "{}.lepatch-restore.lock",
+        "{}.blu-restore.lock",
         destination
             .file_name()
             .expect("a destination name")
@@ -1237,7 +1235,7 @@ fn a_restore_claim_is_released_when_it_goes_out_of_scope() {
     let dir = tempfile::tempdir().unwrap();
     let destination = dir.path().join("out");
 
-    let claim = lepatch::command::lock_destination(&destination).expect("claim");
+    let claim = blulib::command::lock_destination(&destination).expect("claim");
     let path = claim_path(&destination);
     assert!(path.exists(), "the claim file was not created");
 
@@ -1270,7 +1268,7 @@ fn being_asked_to_stop_does_not_leave_a_claim_behind() {
         let _ = fs::remove_dir_all(&destination);
         let _ = fs::remove_file(claim_path(&destination));
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_blu"))
             .current_dir(dir.path())
             .args(["restore", "out", "store"])
             .stdout(std::process::Stdio::null())
@@ -1351,7 +1349,7 @@ fn a_failing_clean_restore_leaves_the_destination_alone() {
     bytes[middle] ^= 0xff;
     fs::write(&blob, &bytes).unwrap();
 
-    let output = lepatch(dir.path(), &["restore", "out", "store", "--clean"]);
+    let output = blu(dir.path(), &["restore", "out", "store", "--clean"]);
     assert!(
         !output.status.success(),
         "a damaged store should be refused"
@@ -1397,7 +1395,7 @@ fn a_clean_restore_is_never_left_partly_written() {
     fs::create_dir_all(&destination).unwrap();
     fs::write(destination.join("marker.txt"), b"the old contents").unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["restore", "out", "store", "--clean"])
         .stdout(std::process::Stdio::null())
@@ -1459,7 +1457,7 @@ fn a_clean_restore_is_never_left_partly_written() {
         .unwrap()
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.contains("lepatch-restore-"))
+        .filter(|n| n.contains("blu-restore-"))
         .collect();
     assert!(
         leftovers.is_empty(),
@@ -1467,7 +1465,7 @@ fn a_clean_restore_is_never_left_partly_written() {
     );
 }
 
-/// `lepatch pack` writes a file a client can fetch in one range.
+/// `blu pack` writes a file a client can fetch in one range.
 ///
 /// The three properties that make a pack usable as a distributed artifact are
 /// checked here. The check runs through the command line rather than the library,
@@ -1547,7 +1545,7 @@ fn packing_a_version_that_does_not_exist_is_refused() {
     fs::write(dir.path().join("a.bin"), noisy(50_000)).unwrap();
     ok(dir.path(), &["backup", ".", "set"]);
 
-    let output = lepatch(dir.path(), &["pack", "set", "out.pack", "--version", "9"]);
+    let output = blu(dir.path(), &["pack", "set", "out.pack", "--version", "9"]);
     assert!(
         !output.status.success(),
         "packing a version that does not exist should fail"
@@ -1698,7 +1696,7 @@ fn an_unprivileged_restore_finishes_and_reports_its_owners() {
 
     let output = std::os::unix::process::CommandExt::uid(
         std::os::unix::process::CommandExt::gid(
-            Command::new(env!("CARGO_BIN_EXE_lepatch"))
+            Command::new(env!("CARGO_BIN_EXE_blu"))
                 .current_dir(dir.path())
                 .args(["restore", "out", "set"]),
             65534,
@@ -1827,7 +1825,7 @@ fn a_delta_pack_is_refused_for_a_client_on_another_version() {
         &["pack", "set", "v3.delta", "--version", "3", "--from", "1"],
     );
 
-    let output = lepatch(dir.path(), &["apply", "v3.delta", "target"]);
+    let output = blu(dir.path(), &["apply", "v3.delta", "target"]);
     assert!(
         !output.status.success(),
         "a delta for the wrong base version should be refused"
@@ -1947,7 +1945,7 @@ fn a_full_flag_overrides_a_from_and_says_it_did() {
     fs::write(source.join("f0.bin"), noisy(170_000)).unwrap();
     ok(dir.path(), &["backup", "source", "set"]);
 
-    let output = lepatch(
+    let output = blu(
         dir.path(),
         &[
             "pack",
@@ -1982,7 +1980,7 @@ fn a_delta_from_a_version_that_does_not_exist_is_refused() {
     fs::write(source.join("a.bin"), noisy(40_000)).unwrap();
     ok(dir.path(), &["backup", "source", "set"]);
 
-    let output = lepatch(dir.path(), &["pack", "set", "out.delta", "--from", "9"]);
+    let output = blu(dir.path(), &["pack", "set", "out.delta", "--from", "9"]);
     assert!(
         !output.status.success(),
         "a delta against a version the set does not hold should fail"
@@ -2032,7 +2030,7 @@ fn applying_something_that_is_not_a_pack_is_refused() {
 
     fs::write(dir.path().join("garbage.pack"), b"not a pack at all").unwrap();
 
-    let output = lepatch(dir.path(), &["apply", "garbage.pack", "target"]);
+    let output = blu(dir.path(), &["apply", "garbage.pack", "target"]);
     assert!(
         !output.status.success(),
         "applying a file that is not a pack should fail"
@@ -2069,7 +2067,7 @@ fn a_probe_is_not_a_subcommand() {
     ok(dir.path(), &["backup", "source", "set"]);
     ok(dir.path(), &["pack", "set", "v1.pack"]);
 
-    let output = lepatch(dir.path(), &["probe", "v1.pack", "target"]);
+    let output = blu(dir.path(), &["probe", "v1.pack", "target"]);
     assert!(
         !output.status.success(),
         "`probe` should no longer be a subcommand"
@@ -2080,7 +2078,7 @@ fn a_probe_is_not_a_subcommand() {
     );
 
     // The list a user reads should not offer it either.
-    let help = lepatch(dir.path(), &["--help"]);
+    let help = blu(dir.path(), &["--help"]);
     assert!(help.status.success());
     assert!(
         !stdout(&help).contains("probe"),
@@ -2108,7 +2106,7 @@ fn an_unrecorded_entry_is_named_and_kept_until_prune_is_asked_for() {
 
     fs::write(target.join("scratch.txt"), b"mine").unwrap();
 
-    let output = lepatch(dir.path(), &["apply", "v1.pack", "target"]);
+    let output = blu(dir.path(), &["apply", "v1.pack", "target"]);
     assert!(output.status.success());
     assert!(
         stderr(&output).contains("--prune"),
@@ -2120,7 +2118,7 @@ fn an_unrecorded_entry_is_named_and_kept_until_prune_is_asked_for() {
         "an unrecorded file must not be deleted on a guess"
     );
 
-    let pruned = lepatch(dir.path(), &["apply", "v1.pack", "target", "--prune"]);
+    let pruned = blu(dir.path(), &["apply", "v1.pack", "target", "--prune"]);
     assert!(pruned.status.success());
     assert!(
         !target.join("scratch.txt").exists(),
@@ -2137,7 +2135,7 @@ fn an_unrecorded_entry_is_named_and_kept_until_prune_is_asked_for() {
 fn a_mistyped_set_name_is_an_error_not_an_empty_listing() {
     let dir = tempfile::tempdir().unwrap();
 
-    let listed = lepatch(dir.path(), &["versions", "nosuchset"]);
+    let listed = blu(dir.path(), &["versions", "nosuchset"]);
     assert_eq!(
         listed.status.code(),
         Some(1),
@@ -2149,7 +2147,7 @@ fn a_mistyped_set_name_is_an_error_not_an_empty_listing() {
     // The worse of the two. Opening for writing *creates* a set. A repair command
     // given a mistyped name therefore used to manufacture an empty one. It used to
     // report a successful repair of it.
-    let reindexed = lepatch(dir.path(), &["reindex", "nosuchset"]);
+    let reindexed = blu(dir.path(), &["reindex", "nosuchset"]);
     assert_eq!(
         reindexed.status.code(),
         Some(1),
@@ -2174,20 +2172,20 @@ fn a_set_with_no_committed_version_lists_as_empty() {
     fs::write(dir.path().join("a.bin"), noisy(40_000)).unwrap();
 
     // A backup that never commits: killed before its commit record.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["backup", ".", "store"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("failed to run the lepatch binary");
+        .expect("failed to run the blu binary");
     let _ = child.kill();
     let _ = child.wait();
 
     // Whatever state the kill left, the store is either absent or present and
     // listing as empty. A store that is absent leaves nothing to assert.
     if dir.path().join("store.0000.bin").exists() {
-        let listed = lepatch(dir.path(), &["versions", "store"]);
+        let listed = blu(dir.path(), &["versions", "store"]);
         assert_eq!(
             listed.status.code(),
             Some(0),
@@ -2221,13 +2219,13 @@ fn a_named_pipe_is_skipped_rather_than_read() {
     );
     let _listener = UnixListener::bind(dir.path().join("sock")).expect("bind a socket");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["backup", ".", "store"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("failed to run the lepatch binary");
+        .expect("failed to run the blu binary");
 
     // Polled rather than slept on, so a slow machine does not fail the test and a
     // hung one does not hang it. Ten seconds is far longer than this backup takes
@@ -2267,7 +2265,7 @@ fn a_named_pipe_is_skipped_rather_than_read() {
 
 /// Piping a command into something that stops reading is not a failure.
 ///
-/// `lepatch versions set | head -1` used to print a line and then panic. Rust
+/// `blu versions set | head -1` used to print a line and then panic. Rust
 /// ignores `SIGPIPE`, and the print macros turn the resulting `EPIPE` into a
 /// panic. A reader that stops early is what `head` does on purpose. The command
 /// should therefore exit as the run otherwise would, with nothing on stderr.
@@ -2294,7 +2292,7 @@ fn a_command_piped_into_something_that_stops_early_does_not_panic() {
         .arg("-c")
         .arg(format!(
             "{} versions store 2>pipe-err.log | head -1 > /dev/null; echo $?",
-            env!("CARGO_BIN_EXE_lepatch")
+            env!("CARGO_BIN_EXE_blu")
         ))
         .output()
         .expect("failed to run the pipeline");
@@ -2364,7 +2362,7 @@ fn a_failed_verify_reports_and_exits_one() {
     bytes[in_payload] ^= 0xff;
     fs::write(&paths[0], &bytes).unwrap();
 
-    let output = lepatch(dir.path(), &["verify", "store"]);
+    let output = blu(dir.path(), &["verify", "store"]);
     let noise = String::from_utf8_lossy(&output.stderr);
 
     assert!(
@@ -2456,7 +2454,7 @@ fn both_listing_modes_name_the_same_versions() {
 /// `--numbers-only` carries no time.
 #[test]
 fn versions_lines_carry_local_time() {
-    use lepatch::metadata::Timestamp;
+    use blulib::metadata::Timestamp;
 
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.bin"), noisy(40_000)).unwrap();
@@ -2500,8 +2498,8 @@ fn versions_lines_carry_local_time() {
 ///
 /// ```text
 /// destination      /tmp/out/link  ->  /tmp/real
-/// staging tree     /tmp/out/link.lepatch-restore-partial     (the binary's rule)
-/// claim's cleanup  /tmp/real.lepatch-restore-partial          (the library's rule)
+/// staging tree     /tmp/out/link.blu-restore-partial     (the binary's rule)
+/// claim's cleanup  /tmp/real.blu-restore-partial          (the library's rule)
 /// ```
 ///
 /// Testing the cleanup through the CLI means arranging a restore that fails
@@ -2512,7 +2510,7 @@ fn versions_lines_carry_local_time() {
 #[cfg(unix)]
 #[test]
 fn a_restore_claim_cleans_up_beside_the_resolved_destination() {
-    use lepatch::command::{PARTIAL_SUFFIX, PREVIOUS_SUFFIX, lock_destination};
+    use blulib::command::{PARTIAL_SUFFIX, PREVIOUS_SUFFIX, lock_destination};
 
     let dir = tempfile::tempdir().unwrap();
     let real = dir.path().join("real");
@@ -2562,7 +2560,7 @@ fn a_restore_claim_cleans_up_beside_the_resolved_destination() {
         );
     }
     assert!(
-        !dir.path().join("link.lepatch-restore-partial").exists(),
+        !dir.path().join("link.blu-restore-partial").exists(),
         "and nothing should be left beside the link either"
     );
 }
@@ -2576,7 +2574,7 @@ fn a_restore_claim_cleans_up_beside_the_resolved_destination() {
 ///
 /// ```text
 /// before: link -> /tmp/real,  real empty
-/// $ lepatch restore link store --clean
+/// $ blu restore link store --clean
 ///   restore complete  files=1
 /// after:  link is a plain directory holding the snapshot,  real still empty
 /// ```
@@ -2621,11 +2619,11 @@ fn a_clean_restore_through_a_symlink_lands_in_the_destination() {
     }
 
     for name in [
-        "link.lepatch-restore-partial",
-        "real.lepatch-restore-partial",
-        "link.lepatch-restore-previous",
-        "real.lepatch-restore-previous",
-        "link.lepatch-restore-lock",
+        "link.blu-restore-partial",
+        "real.blu-restore-partial",
+        "link.blu-restore-previous",
+        "real.blu-restore-previous",
+        "link.blu-restore-lock",
     ] {
         assert!(
             !dir.path().join(name).exists(),
@@ -2923,7 +2921,7 @@ fn a_dry_restore_writes_no_file_no_directory_and_no_claim() {
         "a dry restore took a claim beside the destination"
     );
     assert!(
-        !dir.path().join("out.lepatch-restore-partial").exists(),
+        !dir.path().join("out.blu-restore-partial").exists(),
         "a dry restore staged a tree beside the destination"
     );
 
@@ -2988,11 +2986,11 @@ fn a_dry_clean_restore_does_not_empty_the_destination() {
         "a dry clean restore changed the destination"
     );
     assert!(
-        !dir.path().join("out.lepatch-restore-partial").exists(),
+        !dir.path().join("out.blu-restore-partial").exists(),
         "a dry clean restore staged a tree beside the destination"
     );
     assert!(
-        !dir.path().join("out.lepatch-restore-previous").exists(),
+        !dir.path().join("out.blu-restore-previous").exists(),
         "a dry clean restore moved the destination aside"
     );
 }
@@ -3138,7 +3136,7 @@ fn a_dry_apply_writes_nothing_and_records_no_manifest() {
     assert!(
         !listing(dir.path())
             .iter()
-            .any(|name| name.contains(lepatch::command::MANIFEST_SUFFIX)),
+            .any(|name| name.contains(blulib::command::MANIFEST_SUFFIX)),
         "a dry apply recorded a manifest beside the destination"
     );
 
@@ -3313,11 +3311,11 @@ fn versions_and_verify_refuse_a_dry_run_rather_than_pretending_to_have_one() {
         &["versions", "snap", "--dry-run"][..],
         &["verify", "snap", "--dry-run"][..],
     ] {
-        let output = lepatch(dir.path(), args);
+        let output = blu(dir.path(), args);
         assert_eq!(
             output.status.code(),
             Some(2),
-            "`lepatch {}` is a usage error, not a failure of the command: {args:?}",
+            "`blu {}` is a usage error, not a failure of the command: {args:?}",
             args.join(" ")
         );
         assert!(
@@ -3354,21 +3352,21 @@ fn every_writing_subcommand_documents_its_dry_run() {
         let help = ok(dir.path(), &[command, "--help"]);
         assert!(
             help.contains("--dry-run"),
-            "`lepatch {command} --help` should offer --dry-run"
+            "`blu {command} --help` should offer --dry-run"
         );
         assert!(
             help.contains(affects),
-            "`lepatch {command} --help` should say what a dry run still does: {help}"
+            "`blu {command} --help` should say what a dry run still does: {help}"
         );
         assert!(
             help.contains(does_not),
-            "`lepatch {command} --help` should say what a dry run does not do: {help}"
+            "`blu {command} --help` should say what a dry run does not do: {help}"
         );
     }
 }
 
 // ---------------------------------------------------------------------------
-// `lepatch merge`, the receiving half of a pack.
+// `blu merge`, the receiving half of a pack.
 // ---------------------------------------------------------------------------
 
 /// A source tree with several files, big enough that a delta is a real fraction
@@ -3408,7 +3406,7 @@ fn set_contents(
     common::describe(&out)
 }
 
-/// `lepatch merge` is the other half of `pack`, and the two must compose.
+/// `blu merge` is the other half of `pack`, and the two must compose.
 ///
 /// The property that decides whether merge is a real operation rather than a
 /// write that happens to succeed. A set built by merging a pack restores to the
@@ -4109,7 +4107,7 @@ fn a_delta_is_refused_for_a_set_that_does_not_hold_its_base() {
     );
 
     // Into a name with no set behind it.
-    let output = lepatch(dir.path(), &["merge", "v2.delta", "absent"]);
+    let output = blu(dir.path(), &["merge", "v2.delta", "absent"]);
     assert!(
         !output.status.success(),
         "a delta into a set that does not exist should be refused"
@@ -4284,7 +4282,7 @@ fn a_damaged_pack_is_refused_and_publishes_no_version() {
 
     // Nothing was published. The segment may exist, because the open created it.
     // The records it holds are unreferenced. There is no version.
-    let output = lepatch(dir.path(), &["versions", "received"]);
+    let output = blu(dir.path(), &["versions", "received"]);
     assert!(
         output.status.success(),
         "the set exists, so listing it should work: {}",
@@ -4506,7 +4504,7 @@ fn a_merge_of_a_damaged_pack_is_refused_even_when_the_set_already_holds_it() {
     // it would need to answer, and answers for a pack that cannot be merged.
     let bytes = fs::read(dir.path().join("v1.pack")).unwrap();
     let mut damaged = bytes;
-    let start = lepatch::pack::Pack::open(&dir.path().join("v1.pack"))
+    let start = blulib::pack::Pack::open(&dir.path().join("v1.pack"))
         .unwrap()
         .snapshot_start();
     damaged[usize::try_from(start).unwrap() as usize] ^= 0xff;
@@ -4562,7 +4560,7 @@ fn a_second_merge_is_refused_while_the_lock_is_held() {
     fs::write(dir.path().join("received.lock"), b"").unwrap();
     let refused = fails(dir.path(), &["merge", "v1.pack", "received"]);
     assert!(
-        refused.contains("locked by another lepatch process"),
+        refused.contains("locked by another blu process"),
         "a second merge should be refused while the set is claimed: {refused}"
     );
     fs::remove_file(dir.path().join("received.lock")).unwrap();
@@ -4790,7 +4788,7 @@ fn a_merge_compression_outside_its_vocabulary_is_refused() {
     // `-1` is not here. Clap reads it as a flag rather than as this flag's value,
     // so it never reaches the parser. That refusal says so on its own.
     for bad in ["banana", "10", "1.5", ""] {
-        let output = lepatch(
+        let output = blu(
             dir.path(),
             &["merge", "v1.pack", "nowhere", "--compression", bad],
         );
@@ -4834,7 +4832,7 @@ fn a_pack_compression_outside_its_vocabulary_is_refused() {
 
     // `-1` is not here for the reason `merge`'s is not: clap reads it as a flag.
     for bad in ["banana", "10", "1.5", ""] {
-        let output = lepatch(
+        let output = blu(
             dir.path(),
             &["pack", "origin", "v1.pack", "--compression", bad],
         );
@@ -5039,12 +5037,12 @@ fn removed_remote_store_and_set_flags_are_usage_errors() {
         vec!["verify", "snap", "--set", "docs"],
         vec!["reindex", "snap", "--set", "docs"],
     ] {
-        let output = lepatch(dir, &args);
+        let output = blu(dir, &args);
         let stderr = stderr(&output);
 
         assert!(
             !output.status.success(),
-            "`lepatch {}` with a removed flag should be refused",
+            "`blu {}` with a removed flag should be refused",
             args.join(" ")
         );
         assert_eq!(

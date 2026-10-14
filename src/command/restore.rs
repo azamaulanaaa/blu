@@ -365,15 +365,15 @@ pub(crate) fn check_paths(snapshot: &Snapshot) -> io::Result<()> {
 }
 
 /// Suffix of the file that marks a destination as being restored into.
-const DESTINATION_LOCK: &str = "lepatch-restore.lock";
+const DESTINATION_LOCK: &str = "blu-restore.lock";
 
 /// Suffix of the directory a clean restore is assembled in before being swapped
 /// into place.
-pub const PARTIAL_SUFFIX: &str = "lepatch-restore-partial";
+pub const PARTIAL_SUFFIX: &str = "blu-restore-partial";
 
 /// Suffix of the directory the previous contents are moved aside to during a
 /// swap.
-pub const PREVIOUS_SUFFIX: &str = "lepatch-restore-previous";
+pub const PREVIOUS_SUFFIX: &str = "blu-restore-previous";
 
 /// Held for as long as a destination is being written to.
 ///
@@ -509,7 +509,7 @@ pub fn lock_destination(destination: &Path) -> io::Result<DestinationLock> {
                 io::Error::new(
                     e.kind(),
                     format!(
-                        "{} is being restored into by another lepatch process; \
+                        "{} is being restored into by another blu process; \
                          if none is running, remove it",
                         path.display()
                     ),

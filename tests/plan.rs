@@ -16,7 +16,7 @@ mod common;
 
 use std::fs;
 
-use lepatch::{
+use blulib::{
     metadata::Snapshot,
     storage::{BlobId, BlobStore, Plan, Read, StorageGet},
 };

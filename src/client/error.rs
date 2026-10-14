@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! What a `lepatch serve` said, and what it refused.
+//! What a `blu serve` said, and what it refused.
 //!
 //! ## Why the refusals live in one module
 //!
@@ -35,7 +35,7 @@
 //!
 //! ## The message is the server's own sentence
 //!
-//! `lepatch serve` answers every refusal with an RFC 9457 problem document whose
+//! `blu serve` answers every refusal with an RFC 9457 problem document whose
 //! `title` and `detail` are the same `Display` of an [`io::Error`] this crate
 //! would have printed locally. So a client shows that sentence verbatim: a set
 //! that is not on the server reads like a set that is not on the disk, which is
@@ -158,8 +158,8 @@ pub(crate) fn drift(url: &str, what: &str, reason: &str) -> io::Error {
         io::ErrorKind::InvalidData,
         format!(
             "{url} answered with {what} this client does not understand: {reason}. This client \
-             reports nothing rather than an empty value. `lepatch serve` documents the shape in \
-             openapi/lepatch.json"
+             reports nothing rather than an empty value. `blu serve` documents the shape in \
+             openapi/blu.json"
         ),
     )
 }

@@ -26,7 +26,7 @@ mod common;
 
 use std::{borrow::Cow, fs, path::Path};
 
-use lepatch::{
+use blulib::{
     command::load_snapshot,
     storage::{
         BlobStore, Codec, Compression, Compressor, Plan, Read, SegmentLimit, StorageGet,
@@ -139,7 +139,7 @@ async fn writable(blob: &Path, compression: Compression) -> BlobStore<Write> {
         .unwrap()
 }
 
-async fn put<C: Compressor>(store: &BlobStore<Write, C>, bytes: &[u8]) -> lepatch::storage::BlobId {
+async fn put<C: Compressor>(store: &BlobStore<Write, C>, bytes: &[u8]) -> blulib::storage::BlobId {
     let id = common::id_of(bytes);
     store
         .put(&id, common::reader(bytes.to_vec()), common::len_of(bytes))
@@ -148,7 +148,7 @@ async fn put<C: Compressor>(store: &BlobStore<Write, C>, bytes: &[u8]) -> lepatc
     id
 }
 
-async fn read(store: &BlobStore<Read>, id: &lepatch::storage::BlobId) -> Vec<u8> {
+async fn read(store: &BlobStore<Read>, id: &blulib::storage::BlobId) -> Vec<u8> {
     use tokio::io::AsyncReadExt as _;
     let mut reader = store.get(id).await.unwrap();
     let mut out = Vec::new();
@@ -213,7 +213,7 @@ async fn a_payload_that_does_not_compress_is_stored_raw() {
 
 /// A caller outside this crate brings its own write policy, and the store takes it.
 ///
-/// This test covers the point of the seam, end to end. Nothing in `lepatch` knows
+/// This test covers the point of the seam, end to end. Nothing in `blu` knows
 /// `BigPayloadsOnly` exists. Nothing in the store changed to accommodate it. The
 /// default type parameter lets every other call site keep naming `Compression`.
 ///
@@ -748,7 +748,7 @@ async fn a_pack_of_a_compressed_version_is_smaller_than_the_content() {
 /// the library is ever reached.
 #[test]
 fn the_level_a_user_types_is_the_policy_applied() {
-    use lepatch::storage::MAX_COMPRESSION_LEVEL;
+    use blulib::storage::MAX_COMPRESSION_LEVEL;
 
     // 0 is not zstd level 0. zstd itself treats that level as "use the default".
     // Here 0 means "do not compress". That is the only reading which makes the

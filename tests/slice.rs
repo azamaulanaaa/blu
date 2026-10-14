@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The decompressing reader that a compressed blob is handed out through.
 //!
-//! It exists because [`lepatch::storage::StorageGet`] returns something seekable,
+//! It exists because [`blulib::storage::StorageGet`] returns something seekable,
 //! and a streaming zstd frame cannot seek backwards without an index.
 //! Buffering the decompressed payload makes a seek a slice.
 //! That is what callers expect, and a restore needs it when it assembles a file
@@ -20,7 +20,7 @@
 
 use std::io::SeekFrom;
 
-use lepatch::slice::DecompressReader;
+use blulib::slice::DecompressReader;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
 /// Bytes that compress, so there is something to decompress.
@@ -147,7 +147,7 @@ async fn seeking_before_the_start_is_refused() {
 ///
 /// The sibling type in the same module bounds its seek by its limit, and this one
 /// has to match.
-/// Both are handed out by [`lepatch::storage::StorageGet`] as the reader for a
+/// Both are handed out by [`blulib::storage::StorageGet`] as the reader for a
 /// blob.
 /// `StorageGet::get` promises the stream is "bounded to the blob, so a blob cannot
 /// be used to read past itself".

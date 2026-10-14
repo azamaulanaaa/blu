@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use lepatch::{
+use blulib::{
     command::restore,
     metadata::{Attributes, Dir, File, FileChunk, Link, Snapshot, Timestamp},
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StoragePut},
@@ -157,7 +157,7 @@ async fn a_dot_dot_buried_mid_path_is_refused() {
 async fn an_absolute_file_path_is_refused() {
     // A path no test run can collide with, and removed first so the test does not
     // depend on what a previous one left lying around.
-    let outside = std::env::temp_dir().join("lepatch-absolute-path-should-not-exist");
+    let outside = std::env::temp_dir().join("blu-absolute-path-should-not-exist");
     let _ = fs::remove_file(&outside);
 
     let forged = Forged::new(snapshot_with_file(&outside.display().to_string())).await;

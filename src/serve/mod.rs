@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Serving a backup set over HTTP.
 //!
-//! `lepatch serve` runs this. It exposes the two directions a backup has over a
+//! `blu serve` runs this. It exposes the two directions a backup has over a
 //! network, and it does it through the crate's own pack format rather than
 //! through a new wire format for chunks.
 //!
@@ -17,15 +17,15 @@
 //!
 //! The four commands map onto the wire like this.
 //!
-//! **Push — remote backup.** The client runs [`lepatch backup`] to snapshot a
-//! tree into a local set, and [`lepatch pack`] to write one version out as a
-//! pack. It uploads the pack. The server [`lepatch merge`]s it into the set it
+//! **Push — remote backup.** The client runs [`blu backup`] to snapshot a
+//! tree into a local set, and [`blu pack`] to write one version out as a
+//! pack. It uploads the pack. The server [`blu merge`]s it into the set it
 //! keeps. The chunks are verified on the way in, one at a time, against the
 //! hash they are addressed by — the same check a local merge does.
 //!
-//! **Pull — remote restore.** The server [`lepatch pack`]s a version out of a
+//! **Pull — remote restore.** The server [`blu pack`]s a version out of a
 //! set it keeps. The client fetches the bytes it does not already hold and
-//! [`lepatch merge`]s or [`lepatch apply`]s the result into a local set, then
+//! [`blu merge`]s or [`blu apply`]s the result into a local set, then
 //! restores from that.
 //!
 //! ## What the server is not
@@ -62,14 +62,14 @@
 //! ## Wire format
 //!
 //! JSON, encoded by hand in [`Json`], and described by the checked-in
-//! `openapi/lepatch.json`. Pack *bytes* are not JSON at all — they are a pack,
+//! `openapi/blu.json`. Pack *bytes* are not JSON at all — they are a pack,
 //! verbatim, which is what makes a client able to `Pack::open` what it fetched
 //! and hand it straight to the local merge.
 //!
-//! [`lepatch backup`]: https://docs.rs/lepatch
-//! [`lepatch merge`]: https://docs.rs/lepatch
-//! [`lepatch pack`]: https://docs.rs/lepatch
-//! [`lepatch apply`]: https://docs.rs/lepatch
+//! [`blu backup`]: https://docs.rs/blu
+//! [`blu merge`]: https://docs.rs/blu
+//! [`blu pack`]: https://docs.rs/blu
+//! [`blu apply`]: https://docs.rs/blu
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -95,7 +95,7 @@ pub use observe::filter as progress_filter;
 /// registry, for `main.rs` to install on the subscriber.
 ///
 /// **The library does not install it.** A subscriber is process-global and this
-/// crate is a library first: a caller embedding `lepatch` owns its own tracing
+/// crate is a library first: a caller embedding `blu` owns its own tracing
 /// setup and would not find one of these under it. So this hands back a layer and
 /// leaves installation to the caller, who is the only one who knows where the
 /// subscriber lives.
@@ -171,7 +171,7 @@ impl Config {
 }
 
 /// The directory a scratch path defaults to, under the root.
-const SCRATCH_NAME: &str = ".lepatch-serve";
+const SCRATCH_NAME: &str = ".blu-serve";
 
 /// Every route this server answers, as `(method, path)`.
 ///

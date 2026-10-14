@@ -51,7 +51,7 @@
 //! anything. If the two conflict, the store wins and the index is rebuilt. The
 //! commit record is the commit, a single append to a single file. The index is
 //! written after it, best-effort. So losing one costs a scan rather than a
-//! backup. `lepatch reindex` rebuilds them from the store.
+//! backup. `blu reindex` rebuilds them from the store.
 //!
 //! The `v` in `photos.v0001.idx` separates the two kinds of file. Without it,
 //! `photos.0001.idx` and `photos.0001.bin` would name different things in the
@@ -114,7 +114,7 @@ pub const MAX_SEGMENT: u32 = 9_999;
 ///
 /// ```
 /// # fn main() -> std::io::Result<()> {
-/// use lepatch::layout::IndexSet;
+/// use blulib::layout::IndexSet;
 ///
 /// let set = IndexSet::new("/data/photos.tar");
 ///
@@ -527,7 +527,7 @@ impl IndexSet {
     /// `to_str` answers `None` for a name that is not UTF-8. The set's own name
     /// is not required to be. A set at a non-UTF-8 base path used to be written
     /// by [`IndexSet::suffixed`], which keeps the bytes. The same set was then
-    /// invisible to the scan, which decoded those bytes. So `lepatch` wrote a
+    /// invisible to the scan, which decoded those bytes. So `blu` wrote a
     /// store that it could not read back. A second run then failed with `File
     /// exists` against the segment it had already made. The two ends disagreed
     /// about a name they had both just agreed on.
@@ -582,7 +582,7 @@ impl IndexSet {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(io::Error::new(
                 e.kind(),
                 format!(
-                    "{} is locked by another lepatch process. If none is running, remove it",
+                    "{} is locked by another blu process. If none is running, remove it",
                     path.display()
                 ),
             )),

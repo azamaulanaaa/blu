@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Tests for the snapshot encoding: framing, versioning and error reporting.
 
-use lepatch::{
+use blulib::{
     metadata::{self, Attributes, Error, Malformed, Snapshot, Timestamp},
     storage::BlobId,
 };
@@ -195,15 +195,15 @@ fn an_extreme_timestamp_does_not_wrap_into_the_opposite_of_itself() {
 #[test]
 fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
     let mut encoded = sample().to_bytes().expect("encodes");
-    let header = lepatch::metadata::MAGIC.len();
+    let header = blulib::metadata::MAGIC.len();
 
     // Claim to be version 1, with a body that is not a version 1 body.
     encoded[header..header + 4].copy_from_slice(&1u32.to_le_bytes());
 
-    match lepatch::metadata::Snapshot::try_from(encoded.as_slice()) {
-        Err(lepatch::metadata::Error::UnsupportedVersion { found, supported }) => {
+    match blulib::metadata::Snapshot::try_from(encoded.as_slice()) {
+        Err(blulib::metadata::Error::UnsupportedVersion { found, supported }) => {
             assert_eq!(found, 1);
-            assert_eq!(supported, lepatch::metadata::FORMAT_VERSION);
+            assert_eq!(supported, blulib::metadata::FORMAT_VERSION);
         }
         other => panic!("expected an unsupported-version error, got {other:?}"),
     }

@@ -61,11 +61,11 @@ use crate::{metadata::Timestamp, storage::BlobId};
 
 /// The media type a pack travels as.
 ///
-/// **The pack is not JSON and this says so.** `lepatch serve` documents one media
+/// **The pack is not JSON and this says so.** `blu serve` documents one media
 /// type for the body of a `PUT /v1/uploads/{id}`, and this is it, so the server
 /// and every client agree on what arrived without either of them sniffing a
 /// header.
-pub const PACK_MEDIA_TYPE: &str = "application/x-lepatch-pack";
+pub const PACK_MEDIA_TYPE: &str = "application/x-blu-pack";
 
 /// An upload this server is holding.
 ///
@@ -349,7 +349,7 @@ mod tests {
     fn the_media_type_is_the_one_the_server_documents() {
         // A literal at each end is how a pack arrives as something else, and the
         // server does not sniff.
-        assert_eq!(PACK_MEDIA_TYPE, "application/x-lepatch-pack");
+        assert_eq!(PACK_MEDIA_TYPE, "application/x-blu-pack");
     }
 
     #[test]

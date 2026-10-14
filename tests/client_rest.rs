@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The client's REST surface: a backup pushed to a server, end to end.
 //!
-//! Everything here goes through [`lepatch::client::Remote`] — the same type
-//! `lepatch versions` of a serve target uses — against a real `lepatch serve`
+//! Everything here goes through [`blulib::client::Remote`] — the same type
+//! `blu versions` of a serve target uses — against a real `blu serve`
 //! a user starts it, reached over a socket. Nothing reaches into `src/serve`
 //! and nothing parses a response by hand, because a client tested against
 //! something other than the server a client really talks to is a client tested
@@ -18,7 +18,7 @@
 //! * **A push that is not a version.** `a_merge_the_client_starts_publishes_a
 //!   version_the_set_then_holds` asserts the whole chain: the upload lands, the
 //!   merge job succeeds, and `versions` on the same server now names a version —
-//!   which is the claim `lepatch backup` to a serve target would make.
+//!   which is the claim `blu backup` to a serve target would make.
 //! * **A failed job reported as a success.** This is the bug `9ab42a7` fixed on
 //!   the server side, and the client half of it is the one a caller would not
 //!   catch: `a_failed_job_is_an_error_carrying_the_servers_own_sentence` drives a
@@ -46,20 +46,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use common::server::Server;
-use lepatch::{
+use blulib::{
     client::{Kind, MergeCompression, Merged, Outcome, Remote, State},
     pack::Pack,
     storage::{BlobId, BlobStore, Compression, Plan, StorageGet as _},
 };
+use common::server::Server;
 use tokio::io::AsyncReadExt as _;
 
-/// The directory a `lepatch serve` writes uploaded packs into, under its root.
+/// The directory a `blu serve` writes uploaded packs into, under its root.
 ///
 /// A private constant in `src/serve/mod.rs`, and the tests are on the other side
 /// of a socket from it — so it is written down here rather than imported, and a
 /// server that moved it would fail these tests rather than quietly pass them.
-const SCRATCH: &str = ".lepatch-serve";
+const SCRATCH: &str = ".blu-serve";
 
 /// A client for `server`, as a serve target would build one.
 fn remote_of(server: &Server) -> Remote {
@@ -120,12 +120,12 @@ async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
     let blob = dir.join("local");
     let store = BlobStore::open_for_writing(
         &blob,
-        lepatch::storage::SegmentLimit::default(),
+        blulib::storage::SegmentLimit::default(),
         Compression::default(),
     )
     .await
     .unwrap();
-    lepatch::command::backup(&source, lepatch::command::Options::default(), store, None)
+    blulib::command::backup(&source, blulib::command::Options::default(), store, None)
         .await
         .unwrap();
 
@@ -140,7 +140,7 @@ async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
         .read_to_end(&mut buffer)
         .await
         .unwrap();
-    let snapshot = lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(reader.locate(id).unwrap())).unwrap();
 
     let pack_path = dir.join("local.pack");
@@ -409,7 +409,7 @@ async fn progress_is_observable_while_a_job_is_awaited() {
     // **The names are this crate's, not the client's.** A counter the tool can
     // produce and a client that cannot render it is a gap with nothing failing,
     // and this is the client end of that check.
-    let known = lepatch::progress::counter_names();
+    let known = blulib::progress::counter_names();
     for (name, _) in &finished.progress {
         assert!(
             known.contains(&name.as_str()),
@@ -436,7 +436,7 @@ async fn bytes_that_are_not_a_pack_are_refused_at_the_upload() {
     // **The `PUT` is where this is caught, and this client says so.** The server
     // runs `Pack::open` on every upload rather than only at commit, so a caller
     // learns at the transfer that what it sent is not a pack — and the sentence
-    // it learns is the one a local `lepatch merge` would have printed.
+    // it learns is the one a local `blu merge` would have printed.
     let dir = tempfile::tempdir().unwrap();
     let root = served_root(dir.path());
     let server = Server::start(&root);

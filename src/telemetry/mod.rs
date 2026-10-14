@@ -10,7 +10,7 @@
 //! The tests `telemetry_is_off_unless_it_is_asked_for` and
 //! `no_exporter_is_built_when_telemetry_is_off` hold that down.
 //!
-//! The reason is not politeness. `lepatch` is a command-line backup tool: it is
+//! The reason is not politeness. `blu` is a command-line backup tool: it is
 //! run by a person, over a shell, on their own machine, and a backup run that
 //! phones a collector it was never told about is a surprise with a socket in
 //! it. So the cost of the default build is the cost of *this module compiling*,
@@ -19,14 +19,14 @@
 //! # The library hands back a layer; `main` installs it
 //!
 //! A `tracing` subscriber is process-global, and this crate is a library first:
-//! a caller embedding `lepatch` owns its own subscriber and would not find one
+//! a caller embedding `blu` owns its own subscriber and would not find one
 //! installed under it. So [`layer`] builds the layer and returns it, and
 //! `init_tracing` in `main.rs` puts it on the subscriber. That is the same
 //! arrangement as [`crate::serve::progress_layer`].
 //!
 //! # Shutdown is not optional
 //!
-//! **An OTLP exporter is asynchronous and batched. A `lepatch` run that emits a
+//! **An OTLP exporter is asynchronous and batched. A `blu` run that emits a
 //! span and exits without [`shutdown`] drops it, and looks like it succeeded.**
 //! There is no error, no warning and no non-zero exit: the span is sitting in a
 //! queue on a thread the process has already decided to end. A backup tool that
@@ -82,20 +82,20 @@
 //!   nothing else: no endpoint, no span and no flag behaves differently. Without
 //!   it an `https://` endpoint fails to connect rather than quietly
 //!   downgrading, which is the same refusal
-//!   [`lepatch versions`](crate::client) of an `https://` serve target makes. See
+//!   [`blu versions`](crate::client) of an `https://` serve target makes. See
 //!   the `opentelemetry-otlp` entry in `Cargo.toml`.
 //! * **No logs signal.** `opentelemetry`'s `logs` feature is off on every crate
 //!   in this graph and nothing bridges a `tracing` *event* into an OpenTelemetry
 //!   log record. Diagnostics stay on stderr, filtered by `RUST_LOG`, `--verbose`
 //!   and `--quiet`; only spans and metrics cross the wire.
 //! * **No instrumentation of anything but this crate's own targets.** The layer
-//!   is filtered with `lepatch=info` (see [`filter`]), so a span from actix,
+//!   is filtered with `blu=info` (see [`filter`]), so a span from actix,
 //!   tokio, `reqwest` or from a library caller embedding this crate is never
 //!   exported. An instrumented dependency is therefore invisible here rather
 //!   than reported twice.
 //! * **No metrics for the HTTP surface.** `http.server` is a span; there is no
 //!   request counter, no request-duration histogram and no uploaded-byte
-//!   counter. Job outcomes are counted (`lepatch.job.count`), and that is the
+//!   counter. Job outcomes are counted (`blu.job.count`), and that is the
 //!   whole of the server's metric story. See `crate::telemetry::metrics` for
 //!   the full list, which is deliberately short.
 
@@ -141,7 +141,7 @@ pub const ENDPOINT_VARIABLE: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 /// **The OTLP exporter's own default, spelled the way it spells it.** The
 /// fallback lives in `opentelemetry-otlp` as `http://localhost:4318` — the name
 /// `localhost`, not the address `127.0.0.1` — and this constant says the same
-/// thing, so the line `lepatch --telemetry` prints is where the exporter will
+/// thing, so the line `blu --telemetry` prints is where the exporter will
 /// actually go rather than a loopback address that looks equivalent. A host
 /// whose `localhost` does not resolve is a host this fallback fails on, and
 /// saying so in advance is cheaper than discovering it from a missing export.
@@ -266,7 +266,7 @@ static PROVIDER: Mutex<Option<SdkTracerProvider>> = Mutex::new(None);
 /// function in the module: a caller asking whether telemetry is on would consume
 /// the provider, and the export that follows would find nothing to flush — **every
 /// span the process recorded, silently discarded, on a run that asked for
-/// telemetry and reported no error**. `lepatch serve` asks this once, when it
+/// telemetry and reported no error**. `blu serve` asks this once, when it
 /// binds, to decide whether to wrap the router in request spans; that one call
 /// is enough to lose the whole run. See
 /// `asking_whether_a_provider_is_installed_leaves_it_where_it_was`.
@@ -394,7 +394,7 @@ const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 /// **The same two facts `GET /v1/version` reports**, because they answer the
 /// same question from opposite ends: which build produced this trace, and can
 /// the thing reading it understand what the thing that wrote it meant. A
-/// dashboard that cannot tell two versions of `lepatch` apart cannot tell a
+/// dashboard that cannot tell two versions of `blu` apart cannot tell a
 /// regression from a rollout.
 ///
 /// `service.name` rather than `process.executable.name`, and that is not a
@@ -436,16 +436,16 @@ fn crate_version() -> &'static str {
 /// reason.** `RUST_LOG`, `--verbose` and `--quiet` answer one question: what
 /// goes to stderr. If they were attached to the subscriber, a callsite they
 /// answer `never` to would not be emitted at all, so this layer would never be
-/// offered the span — and an operator who ran `lepatch --quiet` would silently
+/// offered the span — and an operator who ran `blu --quiet` would silently
 /// export nothing at all, which is the failure mode `9ab42a7` fixed for a
 /// client's view of a job and is worth exactly as much care here.
 ///
-/// `lepatch=info` rather than a list of spans: the layer reads spans by
+/// `blu=info` rather than a list of spans: the layer reads spans by
 /// *target*, and a new `#[instrument]` on a new command is then covered without
 /// anybody editing a filter. `info` is the level every `#[instrument]`ed command
 /// entry point in this crate is declared at. Spans from outside the crate —
 /// actix's, tokio's, a library caller embedding this one — are not exported.
-const DIRECTIVE: &str = "lepatch=info";
+const DIRECTIVE: &str = "blu=info";
 
 /// The filter the OpenTelemetry layer is installed with.
 ///
@@ -648,7 +648,7 @@ mod tests {
     /// `is_installed` was written as `installed().is_some()`, and `installed`
     /// *takes* the handle out of the slot so that `shutdown` cannot run it
     /// twice. So the first question anybody asked took the provider with it, and
-    /// `lepatch serve` asks exactly once — when it binds, to decide whether to
+    /// `blu serve` asks exactly once — when it binds, to decide whether to
     /// wrap the router in request spans. **The run then flushed an empty slot:**
     /// every span it recorded, including the request spans the question was about
     /// to switch on, discarded on exit, with no error and a clean exit code.
@@ -702,7 +702,7 @@ mod tests {
         // A simple processor, deliberately: this test is about the *layer*, and
         // the batching behaviour — the thing that makes shutdown matter — is
         // what `a_span_emitted_before_shutdown_is_received` is for.
-        let tracer = provider.tracer("lepatch");
+        let tracer = provider.tracer("blu");
         let layer = tracing_opentelemetry::layer()
             .with_tracer(tracer)
             .with_filter(super::filter());
@@ -731,7 +731,7 @@ mod tests {
         // **The test this module exists for.**
         //
         // A batching exporter queues a finished span and exports it later, on a
-        // task of its own. A `lepatch` run is a command that finishes and then
+        // task of its own. A `blu` run is a command that finishes and then
         // exits, so the run of a second is the *normal* case, not the unusual
         // one: the export timer is five seconds by default and a backup of a
         // small tree is over before it fires. The span is still sitting in the
@@ -751,7 +751,7 @@ mod tests {
         // the global provider, which is what keeps these tests independent of
         // each other: `cargo test` runs them on parallel threads in one process,
         // and a global would be whichever one installed last.
-        let tracer = provider.tracer("lepatch");
+        let tracer = provider.tracer("blu");
         let layer = tracing_opentelemetry::layer()
             .with_tracer(tracer)
             .with_filter(super::filter());
@@ -789,9 +789,9 @@ mod tests {
         use tracing_subscriber::layer::Filter;
 
         let filter = super::filter();
-        assert_eq!(DIRECTIVE, "lepatch=info");
+        assert_eq!(DIRECTIVE, "blu=info");
 
-        let ours = tracing::info_span!(target: "lepatch::command::merge", "merge");
+        let ours = tracing::info_span!(target: "blulib::command::merge", "merge");
         assert!(
             Filter::<tracing_subscriber::Registry>::callsite_enabled(
                 &filter,
@@ -828,7 +828,7 @@ mod tests {
             resource.get(&opentelemetry::Key::from_static_str("service.version")),
             Some(env!("CARGO_PKG_VERSION").into()),
             "a trace has to say which build produced it, or two versions of \\
-             `lepatch` are one line on a dashboard"
+             `blu` are one line on a dashboard"
         );
         // And the SDK's own defaults survive, so `OTEL_SERVICE_NAME` and
         // `OTEL_RESOURCE_ATTRIBUTES` still work.

@@ -304,7 +304,7 @@ pub(crate) async fn check<S: StorageGet + 'static>(snapshot: &Snapshot, storage:
 
     // The totals stop moving here, and only here, so this is where a run's
     // instruments and span attributes are read from. See
-    // `lepatch::telemetry::metrics`.
+    // `blulib::telemetry::metrics`.
     crate::telemetry::metrics::record_run(&progress);
 
     report

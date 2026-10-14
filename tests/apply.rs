@@ -31,7 +31,7 @@ mod common;
 
 use std::{collections::HashSet, fs, path::Path};
 
-use lepatch::{
+use blulib::{
     command::{ApplyOptions, Manifest, apply},
     metadata::Snapshot,
     pack::Pack,
@@ -99,7 +99,7 @@ impl Versions {
     }
 }
 
-async fn read_snapshot(store: &BlobStore<lepatch::storage::Read>, id: BlobId) -> Snapshot {
+async fn read_snapshot(store: &BlobStore<blulib::storage::Read>, id: BlobId) -> Snapshot {
     let mut reader = store.get(&id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
@@ -265,7 +265,7 @@ async fn a_missing_file_is_created_even_where_its_chunks_are_held_elsewhere() {
     // The shared chunks are genuinely held.
     let store = BlobStore::open_for_reading(&versions.blob).await.unwrap();
     let snapshot = read_snapshot(&store, store.latest().unwrap().1).await;
-    let probed = lepatch::command::probe(&target, &snapshot, store)
+    let probed = blulib::command::probe(&target, &snapshot, store)
         .await
         .unwrap();
     assert!(

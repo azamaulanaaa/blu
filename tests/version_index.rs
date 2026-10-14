@@ -15,7 +15,7 @@
 //! Locating those is the blob index, and only a scan builds that.
 //! So a caller wanting one version still pays for the scan.
 //! What the file removes is the scan for the *version list*.
-//! That is what `lepatch versions` and "how far does this set go" are.
+//! That is what `blu versions` and "how far does this set go" are.
 //! Both are O(versions) in file names rather than O(records) in the whole set.
 //!
 //! So the tests below are about safety, not speed, and the one that matters most
@@ -27,7 +27,7 @@ mod common;
 
 use std::fs;
 
-use lepatch::{
+use blulib::{
     layout::IndexSet,
     metadata::Timestamp,
     storage::{
@@ -320,7 +320,7 @@ async fn an_index_naming_a_missing_segment_is_refused() {
 #[tokio::test]
 async fn an_index_names_the_segment_the_snapshot_is_in() {
     let dir = tempfile::tempdir().unwrap();
-    let small = lepatch::storage::SegmentLimit::new(256 * 1024);
+    let small = blulib::storage::SegmentLimit::new(256 * 1024);
 
     // A set with a small limit, so the segments genuinely differ.
     //
@@ -439,7 +439,7 @@ async fn a_rebuilt_index_resolves_to_the_right_commit() {
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     let blob = dir.path().join("store");
-    let small = lepatch::storage::SegmentLimit::new(256 * 1024);
+    let small = blulib::storage::SegmentLimit::new(256 * 1024);
 
     // A set that has genuinely rolled over, so the ordinals are not all zero and
     // an off-by-one in the per-segment counting would show.

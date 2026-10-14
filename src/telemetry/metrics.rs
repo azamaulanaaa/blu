@@ -7,7 +7,7 @@
 //! [`install`] returns before it constructs anything when [`Config`] is off: no
 //! exporter, no reader, no thread, no socket, and no instrument handle of any
 //! kind. Every instrument recording below asks [`installed`] first, and answers a
-//! run of a default `lepatch` in a single atomic load; the one function that also
+//! run of a default `blu` in a single atomic load; the one function that also
 //! writes span attributes reaches `tracing` instead, and a subscriber with no
 //! OpenTelemetry layer on it drops them. This is the same default-off promise
 //! [`super::layer`] makes for spans, and it is held by
@@ -26,13 +26,13 @@
 //! | `merge` | the chunks **this run stored** — `progress.add(Counter::Distinct, 1)` in `command/merge.rs`, once per new chunk |
 //!
 //! One is a per-version total, the other is an accumulating count, and an
-//! instrument called `lepatch.distinct` would be right in whichever command
+//! instrument called `blu.distinct` would be right in whichever command
 //! somebody had read and wrong in the other. So **every instrument carries its
-//! phase**, and the two above are `lepatch.backup.distinct_chunks_in_version`
-//! and `lepatch.merge.distinct_chunks_stored` — a reader can tell which is
+//! phase**, and the two above are `blu.backup.distinct_chunks_in_version`
+//! and `blu.merge.distinct_chunks_stored` — a reader can tell which is
 //! which without opening the source.
 //!
-//! The wire names in [`crate::progress`] are a contract with `lepatch serve` and are
+//! The wire names in [`crate::progress`] are a contract with `blu serve` and are
 //! **not** renamed to match. `Counter::name` still answers `"distinct"` for both
 //! phases; that is what `progress::counter_names` promises a client. Where an
 //! instrument needs a longer word than the wire field, the instrument gets the
@@ -66,38 +66,38 @@
 //!
 //! | phase | span attributes (a `set` total) | counters (an `add` total) |
 //! |---|---|---|
-//! | `backup` | `lepatch.backup.files_walked` `{file}`, `lepatch.backup.distinct_chunks_in_version` `{chunk}` | `lepatch.backup.chunks_produced` `{chunk}`, `lepatch.backup.bytes_read` `By` |
-//! | `merge` | `lepatch.merge.chunks_in_plan` `{chunk}` | `lepatch.merge.distinct_chunks_stored` `{chunk}` |
-//! | `verify` | `lepatch.verify.chunks_in_version` `{chunk}` | `lepatch.verify.chunks_checked` `{chunk}`, `lepatch.verify.bytes_read` `By` |
-//! | `restore` | `lepatch.restore.files_in_version` `{file}` | `lepatch.restore.files_written` `{file}`, `lepatch.restore.bytes_written` `By` |
-//! | `apply` | `lepatch.apply.files_in_pack` `{file}` | `lepatch.apply.files_written` `{file}`, `lepatch.apply.bytes_written` `By` |
+//! | `backup` | `blu.backup.files_walked` `{file}`, `blu.backup.distinct_chunks_in_version` `{chunk}` | `blu.backup.chunks_produced` `{chunk}`, `blu.backup.bytes_read` `By` |
+//! | `merge` | `blu.merge.chunks_in_plan` `{chunk}` | `blu.merge.distinct_chunks_stored` `{chunk}` |
+//! | `verify` | `blu.verify.chunks_in_version` `{chunk}` | `blu.verify.chunks_checked` `{chunk}`, `blu.verify.bytes_read` `By` |
+//! | `restore` | `blu.restore.files_in_version` `{file}` | `blu.restore.files_written` `{file}`, `blu.restore.bytes_written` `By` |
+//! | `apply` | `blu.apply.files_in_pack` `{file}` | `blu.apply.files_written` `{file}`, `blu.apply.bytes_written` `By` |
 //!
 //! Two instruments are not a phase's total and so are not in that table:
-//! `lepatch.command.duration` (a histogram in `s`, carrying `lepatch.command`)
-//! and `lepatch.job.count` (`{job}`, carrying `lepatch.job.kind` and
-//! `lepatch.job.state`). Both are recorded through their own entry points — see
+//! `blu.command.duration` (a histogram in `s`, carrying `blu.command`)
+//! and `blu.job.count` (`{job}`, carrying `blu.job.kind` and
+//! `blu.job.state`). Both are recorded through their own entry points — see
 //! [`record_command_duration`] and [`record_job`].
 //!
 //! **The attributes are recorded on whatever span is current when the run
 //! finishes**, which is the innermost span the run is inside: a command run on
 //! the command line reports onto that command's own span, and a merge the
-//! server started as a job reports onto its `lepatch::command::merge` span
-//! inside the job's `lepatch_job` span — the job span is entered first and so is
+//! server started as a job reports onto its `blulib::command::merge` span
+//! inside the job's `blu_job` span — the job span is entered first and so is
 //! the parent, never the one the attributes land on.
 //!
 //! # Semantic conventions
 //!
 //! Where they apply, they are followed: units are UCUM (`By` for bytes, `s` for
 //! seconds, `{chunk}` / `{file}` / `{job}` for counts), names are dotted
-//! lower-case under the `lepatch.` namespace, and counters deliberately **omit**
+//! lower-case under the `blu.` namespace, and counters deliberately **omit**
 //! a `.total` suffix — the specification asks backends to add that where they
 //! want it, and an instrument that already has it gets `_total_total`.
 //!
 //! Where they do not apply, this is said rather than pretended: the semantic
 //! conventions describe HTTP, RPC, databases and runtimes, and none of them
-//! describes content-defined chunking. `lepatch.command.duration` is not
+//! describes content-defined chunking. `blu.command.duration` is not
 //! `http.server.request.duration` and does not pretend to be — there is no HTTP
-//! server in a `lepatch backup`, and borrowing the name would make a dashboard
+//! server in a `blu backup`, and borrowing the name would make a dashboard
 //! group a local disk backup under web traffic. Nothing here claims a
 //! `*_duration` semantic either; the only convention-shaped decision is the unit.
 //!
@@ -109,7 +109,7 @@
 //!   rate wearing the name of a disk rate.
 //! * **`backup`'s commit busy time.** It is a `Duration` in
 //!   `command/pipeline.rs`, folded into a log field. It is a fraction of one run,
-//!   and `lepatch.command.duration` already carries the whole.
+//!   and `blu.command.duration` already carries the whole.
 //! * **Per-chunk updates.** Nothing is recorded from `Progress::add` or
 //!   `Progress::report`. A backup calls `add` once per chunk, several thousand
 //!   times a second; the instrument is added **once per run**, from the final
@@ -119,14 +119,14 @@
 //!   that do counted work are `backup`, `merge`, `verify`, `restore` and
 //!   `apply` — so the probe an apply takes internally reports nothing beyond
 //!   what that apply already reports.
-//! * **A job's duration.** `lepatch.job.count` counts terminal states and there
-//!   is no `lepatch.job.duration`. The span says how long the work took; a second
+//! * **A job's duration.** `blu.job.count` counts terminal states and there
+//!   is no `blu.job.duration`. The span says how long the work took; a second
 //!   instrument carrying the same number would be two copies of one fact.
 //!
 //! # Attributes
 //!
-//! `lepatch.command.duration` carries `lepatch.command`, and `lepatch.job.count`
-//! carries `lepatch.job.kind` and `lepatch.job.state`. Nothing else carries
+//! `blu.command.duration` carries `blu.command`, and `blu.job.count`
+//! carries `blu.job.kind` and `blu.job.state`. Nothing else carries
 //! attributes: every other instrument is already qualified by name, and a set
 //! name or a path would be unbounded cardinality on a tool that is given paths
 //! on its command line.
@@ -186,66 +186,66 @@ const BYTES: &str = "By";
 const SECONDS: &str = "s";
 
 /// How long one command took.
-const COMMAND_DURATION: &str = "lepatch.command.duration";
+const COMMAND_DURATION: &str = "blu.command.duration";
 
 /// The command a duration belongs to.
-const COMMAND_ATTRIBUTE: &str = "lepatch.command";
+const COMMAND_ATTRIBUTE: &str = "blu.command";
 
 /// Jobs that reached a terminal state.
-const JOB_COUNT: &str = "lepatch.job.count";
+const JOB_COUNT: &str = "blu.job.count";
 
 /// What kind of job a count belongs to.
-const JOB_KIND_ATTRIBUTE: &str = "lepatch.job.kind";
+const JOB_KIND_ATTRIBUTE: &str = "blu.job.kind";
 
 /// The terminal state a job reached.
-const JOB_STATE_ATTRIBUTE: &str = "lepatch.job.state";
+const JOB_STATE_ATTRIBUTE: &str = "blu.job.state";
 
 /// Chunks a backup cut from the tree. `add`.
-const BACKUP_CHUNKS_PRODUCED: &str = "lepatch.backup.chunks_produced";
+const BACKUP_CHUNKS_PRODUCED: &str = "blu.backup.chunks_produced";
 
 /// Bytes a backup read out of the tree. `add`.
-const BACKUP_BYTES_READ: &str = "lepatch.backup.bytes_read";
+const BACKUP_BYTES_READ: &str = "blu.backup.bytes_read";
 
 /// Files a backup's walk found. `set`, so an attribute.
-const BACKUP_FILES_WALKED: &str = "lepatch.backup.files_walked";
+const BACKUP_FILES_WALKED: &str = "blu.backup.files_walked";
 
 /// Distinct chunks in the version a backup committed. `set`, so an attribute.
-const BACKUP_DISTINCT_CHUNKS_IN_VERSION: &str = "lepatch.backup.distinct_chunks_in_version";
+const BACKUP_DISTINCT_CHUNKS_IN_VERSION: &str = "blu.backup.distinct_chunks_in_version";
 
 /// Chunks a merge newly stored. `add`, and **not** the same measurement as the
 /// one above — see the module docs.
-const MERGE_DISTINCT_CHUNKS_STORED: &str = "lepatch.merge.distinct_chunks_stored";
+const MERGE_DISTINCT_CHUNKS_STORED: &str = "blu.merge.distinct_chunks_stored";
 
 /// Chunks the merged version reads, stored or already held. `set`, so an
 /// attribute.
-const MERGE_CHUNKS_IN_PLAN: &str = "lepatch.merge.chunks_in_plan";
+const MERGE_CHUNKS_IN_PLAN: &str = "blu.merge.chunks_in_plan";
 
 /// Chunks a verify checked against their hashes. `add`.
-const VERIFY_CHUNKS_CHECKED: &str = "lepatch.verify.chunks_checked";
+const VERIFY_CHUNKS_CHECKED: &str = "blu.verify.chunks_checked";
 
 /// Bytes a verify read back out of the store. `add`.
-const VERIFY_BYTES_READ: &str = "lepatch.verify.bytes_read";
+const VERIFY_BYTES_READ: &str = "blu.verify.bytes_read";
 
 /// Chunks in the version a verify was asked about. `set`, so an attribute.
-const VERIFY_CHUNKS_IN_VERSION: &str = "lepatch.verify.chunks_in_version";
+const VERIFY_CHUNKS_IN_VERSION: &str = "blu.verify.chunks_in_version";
 
 /// Files a restore wrote. `add`.
-const RESTORE_FILES_WRITTEN: &str = "lepatch.restore.files_written";
+const RESTORE_FILES_WRITTEN: &str = "blu.restore.files_written";
 
 /// Bytes a restore wrote to the destination. `add`.
-const RESTORE_BYTES_WRITTEN: &str = "lepatch.restore.bytes_written";
+const RESTORE_BYTES_WRITTEN: &str = "blu.restore.bytes_written";
 
 /// Files in the version a restore was asked for. `set`, so an attribute.
-const RESTORE_FILES_IN_VERSION: &str = "lepatch.restore.files_in_version";
+const RESTORE_FILES_IN_VERSION: &str = "blu.restore.files_in_version";
 
 /// Files an apply wrote. `add`.
-const APPLY_FILES_WRITTEN: &str = "lepatch.apply.files_written";
+const APPLY_FILES_WRITTEN: &str = "blu.apply.files_written";
 
 /// Bytes an apply wrote to the destination. `add`.
-const APPLY_BYTES_WRITTEN: &str = "lepatch.apply.bytes_written";
+const APPLY_BYTES_WRITTEN: &str = "blu.apply.bytes_written";
 
 /// Files in the pack's file table. `set`, so an attribute.
-const APPLY_FILES_IN_PACK: &str = "lepatch.apply.files_in_pack";
+const APPLY_FILES_IN_PACK: &str = "blu.apply.files_in_pack";
 
 /// Every counter this module records, with the unit it reports.
 ///
@@ -392,7 +392,7 @@ static METER_PROVIDER: Mutex<Option<SdkMeterProvider>> = Mutex::new(None);
 ///
 /// * **the OTLP metric exporter and a [`PeriodicReader`] over it.** The reader
 ///   spawns the task that collects and exports, and it is the reason the
-///   interval is left at the SDK's default: a `lepatch backup` is over in under
+///   interval is left at the SDK's default: a `blu backup` is over in under
 ///   a minute and its one export is the [`super::shutdown`] flush, exactly as
 ///   its spans are. **"Left at the default" is not "fixed"**: the reader reads
 ///   `OTEL_METRIC_EXPORT_INTERVAL`, so an operator exporting from a long-running
@@ -804,7 +804,7 @@ mod tests {
     /// Add a phase's totals to a recorder-backed meter and collect them.
     fn collect(phase: Phase) -> Vec<Collected> {
         let (provider, recorder) = reader();
-        let instruments = super::Instruments::build(&provider.meter("lepatch"));
+        let instruments = super::Instruments::build(&provider.meter("blu"));
         instruments.record_run(phase, &progress_with_every_counter(phase).totals());
         provider.force_flush().expect("a flush of one run");
         recorder.points()
@@ -833,7 +833,7 @@ mod tests {
         // own entry points rather than through a phase, so they are added here
         // rather than above.
         let (provider, recorder) = reader();
-        let instruments = super::Instruments::build(&provider.meter("lepatch"));
+        let instruments = super::Instruments::build(&provider.meter("blu"));
         instruments
             .command_duration
             .record(2.5, &[KeyValue::new(COMMAND_ATTRIBUTE, "backup")]);
@@ -923,7 +923,7 @@ mod tests {
             MERGE_DISTINCT_CHUNKS_STORED,
         ] {
             assert!(
-                name.starts_with("lepatch."),
+                name.starts_with("blu."),
                 "an instrument belongs to this crate's namespace: {name}"
             );
             assert!(
@@ -961,7 +961,7 @@ mod tests {
     fn every_instrument_name_carries_its_phase() {
         for (name, unit) in COUNTERS.iter().chain(HISTOGRAMS.iter()) {
             assert!(
-                name.starts_with("lepatch."),
+                name.starts_with("blu."),
                 "every instrument is under this crate's namespace: {name}"
             );
             assert!(
@@ -983,7 +983,7 @@ mod tests {
             APPLY_FILES_WRITTEN,
             APPLY_BYTES_WRITTEN,
         ] {
-            let phase = name.strip_prefix("lepatch.").expect("namespaced");
+            let phase = name.strip_prefix("blu.").expect("namespaced");
             assert!(
                 ["backup", "merge", "verify", "restore", "apply"]
                     .contains(&phase.split('.').next().unwrap_or_default()),
@@ -1003,7 +1003,7 @@ mod tests {
         // The global meter, deliberately: nothing here records through these
         // instruments, it only asks which pairs they answer for. A provider with
         // no reader would do the same and cost a thread this does not need.
-        let instruments = super::Instruments::build(&opentelemetry::global::meter("lepatch"));
+        let instruments = super::Instruments::build(&opentelemetry::global::meter("blu"));
 
         for phase in [
             Phase::Backup,
@@ -1032,7 +1032,7 @@ mod tests {
 
     /// The on-wire counter names are not renamed to suit an instrument.
     ///
-    /// `progress::counter_names` is a contract with `lepatch serve`, and an
+    /// `progress::counter_names` is a contract with `blu serve`, and an
     /// instrument name that reads better is not a reason to change it. The
     /// instrument names are longer and say which phase they belong to; these are
     /// the seven fields a client is told to expect, and they are unchanged.
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn a_command_duration_is_recorded_per_command() {
         let (provider, recorder) = reader();
-        let instruments = super::Instruments::build(&provider.meter("lepatch"));
+        let instruments = super::Instruments::build(&provider.meter("blu"));
 
         for command in ["backup", "merge"] {
             instruments.command_duration.record(
@@ -1091,7 +1091,7 @@ mod tests {
     #[test]
     fn a_job_is_counted_by_kind_and_terminal_state() {
         let (provider, recorder) = reader();
-        let instruments = super::Instruments::build(&provider.meter("lepatch"));
+        let instruments = super::Instruments::build(&provider.meter("blu"));
 
         for (kind, state) in [
             ("merge", "succeeded"),
@@ -1180,11 +1180,11 @@ mod tests {
             .with_simple_exporter(recorder.clone())
             .build();
         let layer = tracing_opentelemetry::layer()
-            .with_tracer(provider.tracer("lepatch"))
+            .with_tracer(provider.tracer("blu"))
             .with_filter(super::super::filter());
 
         tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
-            let span = tracing::info_span!(target: "lepatch::test", "a_backup");
+            let span = tracing::info_span!(target: "blulib::test", "a_backup");
             let _entered = span.enter();
             body();
         });
@@ -1241,7 +1241,7 @@ mod tests {
     /// thing being checked and a table that checks itself proves nothing.
     #[test]
     fn the_mapping_covers_every_pair_a_command_reports() {
-        let instruments = super::Instruments::build(&opentelemetry::global::meter("lepatch"));
+        let instruments = super::Instruments::build(&opentelemetry::global::meter("blu"));
 
         for (phase, counter, attribute) in [
             (Phase::Backup, RunCounter::Files, Some(BACKUP_FILES_WALKED)),
@@ -1271,7 +1271,7 @@ mod tests {
             (
                 Phase::Apply,
                 RunCounter::Files,
-                Some("lepatch.apply.files_in_pack"),
+                Some("blu.apply.files_in_pack"),
             ),
             (Phase::Apply, RunCounter::Done, None),
             (Phase::Apply, RunCounter::Written, None),

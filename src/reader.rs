@@ -331,7 +331,7 @@ pub enum ChunkerProfile {
     Small,
     /// The default: 8 KiB minimum, 16 KiB average, 64 KiB maximum.
     ///
-    /// What every `lepatch backup` has used so far, and the safest thing to leave
+    /// What every `blu backup` has used so far, and the safest thing to leave
     /// a set on. A profile nobody chose beats a profile chosen once and forgotten.
     Default,
     /// Coarse cuts: 32 KiB minimum, 64 KiB average, 256 KiB maximum.

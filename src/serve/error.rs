@@ -17,7 +17,7 @@
 //! refusal that explains what was refused and why.
 //!
 //! So the server does not translate them and does not invent a second vocabulary
-//! beside them. `lepatch merge` would have said *"refusing to clean your home
+//! beside them. `blu merge` would have said *"refusing to clean your home
 //! directory (/home/ann)"*, and the HTTP body says the same. A client shows the
 //! `detail` and the user reads the error the tool would have printed, rather
 //! than a paraphrase that lost the reason.

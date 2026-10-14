@@ -69,7 +69,7 @@ pub(super) const RECORD_MAGIC: [u8; 4] = *b"LPB1";
 ///
 /// Public for the same reason [`crate::pack::FORMAT_VERSION`] is: a client cannot
 /// work the version out of a set it has not been sent, and a refusal to read one
-/// arrives after the upload. `lepatch serve` serves it at `GET /v1/version`.
+/// arrives after the upload. `blu serve` serves it at `GET /v1/version`.
 pub const FORMAT_VERSION: u32 = 2;
 
 /// Bytes of store header: magic, version, and this segment's own number.
@@ -732,7 +732,7 @@ mod tests {
         const RECORD: u64 = 524_263;
 
         let file = std::env::temp_dir().join(format!(
-            "lepatch-scan-{}-{:?}.bin",
+            "blu-scan-{}-{:?}.bin",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -779,7 +779,7 @@ mod tests {
     #[test]
     fn a_scan_that_skips_the_index_finds_the_same_records() {
         let file = std::env::temp_dir().join(format!(
-            "lepatch-discard-{}-{:?}.bin",
+            "blu-discard-{}-{:?}.bin",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1139,7 +1139,7 @@ fn a_scan_read_size_measurement_reports_the_same_records() {
     const PAYLOAD: usize = 1024;
 
     let file = std::env::temp_dir().join(format!(
-        "lepatch-bench-{}-{:?}.bin",
+        "blu-bench-{}-{:?}.bin",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -1297,7 +1297,7 @@ fn a_torn_tail_is_never_taken_for_a_record() {
 
     for (what, tail) in tails {
         let file = std::env::temp_dir().join(format!(
-            "lepatch-tail-{}-{:?}.bin",
+            "blu-tail-{}-{:?}.bin",
             std::process::id(),
             std::thread::current().id()
         ));

@@ -1,8 +1,11 @@
 # cargo-dist configuration: https://axodotdev.github.io/cargo-dist/
 #
-# Builds one archive per target below, each containing the `lepatch` binary plus
+# Builds one archive per target below, each containing the `blu` binary plus
 # the LICENSE and README, with a sha256 per archive and a combined `sha256.sum`.
 # `mise run dist-plan` prints exactly what a release would produce.
+#
+# This file ships the `blu` binary to the GitHub Release. The `crates` workflow
+# ships the `blulib` library to crates.io. A tag runs both.
 #
 # The target list is the single source of truth. dist resolves it into a build
 # matrix at plan time, so the triples never appear in the release workflow and

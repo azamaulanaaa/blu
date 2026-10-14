@@ -17,7 +17,7 @@
 //!
 //! So writes take an in-process async mutex **first**, and the file lock second.
 //! The file lock still does its job against another process and against
-//! `lepatch merge` on the same set; the async mutex serialises this process's
+//! `blu merge` on the same set; the async mutex serialises this process's
 //! own jobs.
 //!
 //! **Reading does not need a mutex, but it does need invalidation.**
@@ -272,7 +272,7 @@ impl Sets {
             let segments = set.segments()?;
 
             // No segments at all is a mistyped name, not an empty set. This is
-            // the distinction `lepatch versions` draws, for the same reason:
+            // the distinction `blu versions` draws, for the same reason:
             // answering "no versions" about a name that names nothing is a failure
             // a client acts on.
             if segments.is_empty() {
@@ -280,7 +280,7 @@ impl Sets {
             }
 
             // The index files, which is a lower bound — the caveat
-            // `lepatch versions` carries, for the same reason. A version whose
+            // `blu versions` carries, for the same reason. A version whose
             // index was never written still exists and still restores.
             let versions = set.indexed_versions()?.len();
 
@@ -556,7 +556,7 @@ mod tests {
     fn a_root_that_does_not_exist_yet_holds_no_sets() {
         // The state a server starts in. It is not an error and not a `404`, and
         // treating it as either would make a fresh `--root` unusable.
-        let sets = Sets::new(PathBuf::from("/nonexistent/lepatch-root"));
+        let sets = Sets::new(PathBuf::from("/nonexistent/blu-root"));
 
         assert_eq!(sets.list().unwrap().len(), 0);
     }

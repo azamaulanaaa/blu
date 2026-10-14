@@ -18,7 +18,7 @@
 use std::io::Cursor;
 use std::time::Instant;
 
-use lepatch::{
+use blulib::{
     layout::IndexSet,
     storage::{BlobStore, Compression, SegmentLimit, StoragePut, Write},
 };
@@ -47,7 +47,7 @@ async fn put_all(store: std::sync::Arc<BlobStore<Write>>) -> f64 {
                 store
                     .put(
                         &id,
-                        Box::new(Cursor::new(data)) as lepatch::storage::StreamReadSeeker,
+                        Box::new(Cursor::new(data)) as blulib::storage::StreamReadSeeker,
                         CHUNK as u64,
                     )
                     .await
@@ -158,7 +158,7 @@ async fn main() {
     };
 
     println!("same bytes, same filesystem, back to back:");
-    let store_min = report("lepatch put (4 tasks)", &store_times);
+    let store_min = report("blu put (4 tasks)", &store_times);
     let plain_min = report("std::fs, 1 MiB writes", &plain_times);
 
     println!();

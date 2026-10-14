@@ -7,7 +7,7 @@ SPDX-FileCopyrightText = "Copyright (C) 2025-2026 Aza Maulana"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
 [[annotations]]
-path = ["Cargo.toml", "Cargo.lock", "deny.toml", "mise.toml", "dist-workspace.toml", "openapi/lepatch.json", "README.md", "LICENSE"]
+path = ["Cargo.toml", "Cargo.lock", "deny.toml", "mise.toml", "dist-workspace.toml", "openapi/blu.json", "README.md", "LICENSE"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Copyright (C) 2025-2026 Aza Maulana"
 SPDX-License-Identifier = "GPL-2.0-or-later"

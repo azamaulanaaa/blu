@@ -765,7 +765,7 @@ mod tests {
     /// out the other side.
     #[test]
     fn a_walk_failure_keeps_its_kind_and_its_error() {
-        let missing = std::path::Path::new("/nonexistent-lepatch-walk-test");
+        let missing = std::path::Path::new("/nonexistent-blu-walk-test");
 
         let failure = WalkDir::new(missing)
             .into_iter()
@@ -788,7 +788,7 @@ mod tests {
             "the walkdir error should still be reachable: {error}"
         );
         assert!(
-            error.to_string().contains("nonexistent-lepatch-walk-test"),
+            error.to_string().contains("nonexistent-blu-walk-test"),
             "and the path should still be in the message: {error}"
         );
         assert!(

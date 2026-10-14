@@ -74,7 +74,7 @@ use crate::{fsattr, metadata::Snapshot, storage::BlobId};
 /// [`super::restore`]'s lock and scratch directories.
 /// It must not appear in the tree it describes.
 /// Otherwise it would be backed up as part of that tree.
-pub const MANIFEST_SUFFIX: &str = "lepatch-state";
+pub const MANIFEST_SUFFIX: &str = "blu-state";
 
 /// What a filesystem reported about one file when a manifest was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

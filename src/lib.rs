@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! `lepatch`: content-defined-chunking backup with deduplicated versions.
+//! `blu`: content-defined-chunking backup with deduplicated versions.
 //!
 //! A backup is a *snapshot*. A snapshot describes a directory tree, the distinct
 //! chunks its files are made of, and how those chunks map back onto the files.
@@ -22,7 +22,7 @@
 //! snapshot. Listing a set then costs one file name per version. Listing a set
 //! does not scan every record in the set. The store derives the index files from
 //! its commit records. Deleting every one of them loses nothing. The
-//! `lepatch reindex` command rebuilds them.
+//! `blu reindex` command rebuilds them.
 //!
 //! The store records its own versions. Publishing one version is a single append
 //! to a single file. No second file has contents that must stay in step with
@@ -32,7 +32,7 @@
 //!
 //! ```no_run
 //! # async fn example() -> std::io::Result<()> {
-//! use lepatch::{
+//! use blulib::{
 //!     command::{Options, backup, lock_destination, restore},
 //!     storage::{BlobStore, Compression, SegmentLimit},
 //! };

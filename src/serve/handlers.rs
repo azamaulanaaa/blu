@@ -534,8 +534,8 @@ async fn request_pack(
     {
         return error(&ApiError::unprocessable(format!(
             "compression {policy:?} cannot be served from a set. The set holds no bytes for \
-             a re-encode. `keep` is the only policy a pack resource supports. `lepatch pack` \
-             and `lepatch merge` both default to `keep`"
+             a re-encode. `keep` is the only policy a pack resource supports. `blu pack` \
+             and `blu merge` both default to `keep`"
         )));
     }
 
@@ -805,7 +805,7 @@ async fn merge_pack(
 /// The verbatim path does not compress a chunk; the only record it writes through
 /// the store's own policy is the snapshot, and a set opened for writing has to be
 /// opened with something. The default is what every other command opens a set
-/// with, and it is what `lepatch merge` opens one at when the flag says `keep`.
+/// with, and it is what `blu merge` opens one at when the flag says `keep`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MergeSpec {
     /// Store what the pack carries, frame and all.
@@ -827,7 +827,7 @@ impl MergeSpec {
     ///
     /// **The user's `0`, which means as-is.** `Compression::zstd` would clamp it
     /// to 1, which is not what a command line's 0 means, so this goes through
-    /// `from_level`. This is the same function `lepatch merge --compression 0`
+    /// `from_level`. This is the same function `blu merge --compression 0`
     /// reaches through `KeepOrLevel::policy`.
     fn policy(self) -> crate::storage::Compression {
         match self {
@@ -870,7 +870,7 @@ fn merge_compression(value: Option<&str>) -> Result<MergeSpec, ApiError> {
 ///    open. `BlobStore` takes its append reservation when it opens, so two
 ///    handles onto one set would each believe they owned the next offset.
 /// 2. **Take the set's own file lock.** Inside the in-process one, because it is
-///    the one that keeps other processes out — including a `lepatch merge` on the
+///    the one that keeps other processes out — including a `blu merge` on the
 ///    same set, which this server knows nothing about.
 /// 3. **Merge, then evict the read handle.** The eviction is not optional. A
 ///    cached reader's `contents` map was built before this merge, so without it
@@ -1429,7 +1429,7 @@ mod tests {
     #[test]
     fn a_merge_under_keep_stores_the_packs_own_records() {
         // The other answer, and the default: no re-encode, and the default write
-        // policy — which is what `lepatch merge --compression keep` opens the
+        // policy — which is what `blu merge --compression keep` opens the
         // local set with, so a push and a local merge agree.
         for wire in [None, Some("keep"), Some("KEEP")] {
             let spec = merge_compression(wire).unwrap();

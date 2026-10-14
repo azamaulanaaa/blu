@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! A `lepatch serve` running as a real process, for a test to talk to.
+//! A `blu serve` running as a real process, for a test to talk to.
 //!
 //! ## Why a subprocess
 //!
@@ -19,7 +19,7 @@
 //! `--bind 127.0.0.1:0`, and the server prints its address on **stdout** as its
 //! first line. So the test reads the line and learns the port. That is also why
 //! the address goes to stdout rather than stderr: it is data a script needs, and
-//! the same reason `lepatch pack` prints a content hash there.
+//! the same reason `blu pack` prints a content hash there.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -45,7 +45,7 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    /// Start `lepatch serve` on `root`, and wait for it to report its address.
+    /// Start `blu serve` on `root`, and wait for it to report its address.
     ///
     /// Runs under `--quiet`, so **the terminal prints nothing**. A test that
     /// asserts on what a *client* received under this constructor is asserting on
@@ -61,7 +61,7 @@ impl Server {
         Self::spawn(root, &[])
     }
 
-    /// Start `lepatch serve` with the terminal turned all the way down, **and the
+    /// Start `blu serve` with the terminal turned all the way down, **and the
     /// progress layer left working anyway**.
     ///
     /// **`--quiet` and `RUST_LOG=warn` together.** Both say the terminal prints
@@ -93,10 +93,10 @@ impl Server {
     ///
     /// Panics if the process will not start or does not report an address.
     fn spawn(root: &Path, env: &[(&str, &str)]) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_lepatch"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_blu"));
         command
             // Before the subcommand, because `--quiet` is a global flag on `Args`
-            // rather than one of `serve`'s own. `lepatch serve <root> --quiet` is
+            // rather than one of `serve`'s own. `blu serve <root> --quiet` is
             // a parse error, and a parse error prints nothing to stdout — which
             // here looks exactly like a server that never came up.
             .arg("--quiet")
@@ -112,7 +112,7 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("lepatch serve should start");
+            .expect("blu serve should start");
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let mut reader = BufReader::new(stdout);
@@ -161,13 +161,13 @@ impl Drop for Server {
 /// ## Why this exists
 ///
 /// **A client has to be tested against a server that has changed, and this
-/// build cannot produce one.** The shape `lepatch versions` of a serve target
-/// the shape `lepatch serve` writes, so every response the real server can send
+/// build cannot produce one.** The shape `blu versions` of a serve target
+/// the shape `blu serve` writes, so every response the real server can send
 /// is a response the client understands — and a parser that read permissively
 /// would pass against it forever. The only way to ask what a client does with
 /// an answer it does not understand is to answer with one.
 ///
-/// So this is not a `lepatch serve` and does not pretend to be: it reads a
+/// So this is not a `blu serve` and does not pretend to be: it reads a
 /// request head, ignores what it says, and writes back bytes the test wrote
 /// down. Enough HTTP/1.1 to satisfy `awc`, and nothing else — no `Server` above
 /// has a second path through this file because only the remote tests need it.

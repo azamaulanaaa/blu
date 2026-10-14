@@ -6,7 +6,7 @@
 //! A pack brings a directory up to a version, and this brings a *set* up to a
 //! version.
 //! This is the receiving side of a future push protocol.
-//! It is built first and tested entirely with the packs `lepatch pack` already
+//! It is built first and tested entirely with the packs `blu pack` already
 //! writes, so the protocol has something real to be designed around rather than
 //! a guess about it.
 //!
@@ -72,7 +72,7 @@
 //! Merging a full pack into a name with no set behind it **creates the set**.
 //! A full pack carries its snapshot and every chunk that snapshot reads.
 //! There is then nothing to check it against and nothing that could be missing.
-//! Refusing would mean merge could only ever add to a set `lepatch backup` had
+//! Refusing would mean merge could only ever add to a set `blu backup` had
 //! made.
 //! This command exists to receive a version into a set that need not have one.
 //! Such a set is a new machine, a new location, or a set rebuilt from packs
@@ -540,7 +540,7 @@ pub async fn merge<C: storage::Compressor>(
     // the right answer: there was no version.
     //
     // `Distinct` here means the chunks **this run stored**, which is not what
-    // the same counter means in a backup. See `lepatch::telemetry::metrics`.
+    // the same counter means in a backup. See `blulib::telemetry::metrics`.
     crate::telemetry::metrics::record_run(&progress);
 
     // The snapshot is a blob like any other, addressed by the hash of its own
@@ -761,7 +761,7 @@ pub fn establish_base<W: storage::WriteMode, C: storage::Compressor>(
 /// by the version that has it.
 /// The index files are not consulted either.
 /// They are a cache of the same answer.
-/// `lepatch versions` already treats a stale or missing one as a scan rather
+/// `blu versions` already treats a stale or missing one as a scan rather
 /// than as a fact.
 ///
 /// Public because a caller has to answer this *before* deciding what the run is.

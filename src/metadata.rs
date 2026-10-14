@@ -24,8 +24,8 @@ use std::{fmt, io, path::PathBuf};
 
 use crate::storage;
 
-/// Magic prefix identifying a lepatch snapshot blob.
-pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
+/// Magic prefix identifying a blu snapshot blob.
+pub const MAGIC: &[u8; 8] = b"BLU\x00\x00\x00\x00\x00";
 
 /// Snapshot layout version written by this build.
 ///
@@ -60,7 +60,7 @@ impl fmt::Display for Error {
             Self::Decode(e) => write!(f, "the snapshot is malformed: {e}"),
             Self::BadMagic(found) => write!(
                 f,
-                "not a lepatch snapshot: expected magic {MAGIC:?}, found {found:?}"
+                "not a blu snapshot: expected magic {MAGIC:?}, found {found:?}"
             ),
             Self::UnsupportedVersion { found, supported } => write!(
                 f,

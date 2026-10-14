@@ -11,7 +11,7 @@
 //!
 //! An OTLP exporter is asynchronous and batched. A finished span is handed to a
 //! processor, which queues it and exports it later on a task of its own. A
-//! `lepatch` run is a command that finishes and then exits — so the export
+//! `blu` run is a command that finishes and then exits — so the export
 //! timer (five seconds by default) almost never fires, and *the only* thing that
 //! ever flushes a run's spans is the shutdown call on the exit path. Drop that
 //! call, or move it into the success arm of the match instead of after it, and
@@ -71,15 +71,15 @@ const READ_SPAN: &[u8] = b"open_for_reading";
 /// The counter a backup's cut tree is reported through.
 ///
 /// **An instrument name, and instrument names do not appear in a trace.** No
-/// span in this crate carries `lepatch.backup.chunks_produced` — a backup's
+/// span in this crate carries `blu.backup.chunks_produced` — a backup's
 /// `chunks` total is an `add` total, so it is a counter and specifically not a
 /// span attribute (see `telemetry::metrics`) — so a body containing these bytes
 /// is a body a collector received measurements through, and not a trace that
 /// happened to contain the same words.
-const BACKUP_CHUNKS_PRODUCED: &[u8] = b"lepatch.backup.chunks_produced";
+const BACKUP_CHUNKS_PRODUCED: &[u8] = b"blu.backup.chunks_produced";
 
 /// The histogram every command's duration is reported on, successful or not.
-const COMMAND_DURATION: &[u8] = b"lepatch.command.duration";
+const COMMAND_DURATION: &[u8] = b"blu.command.duration";
 
 /// Where the exporter posts spans, and where it posts measurements.
 const TRACES: &str = "/v1/traces";
@@ -278,7 +278,7 @@ fn scratch() -> tempfile::TempDir {
 /// into something shorter and let the metrics arrive on a timer instead of on
 /// the exit path, which is the thing under test.
 fn run_with_telemetry(dir: &Path, collector: &Collector, args: &[&str]) {
-    let output = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let output = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir)
         .args(["--telemetry"])
         .args(args)
@@ -288,11 +288,11 @@ fn run_with_telemetry(dir: &Path, collector: &Collector, args: &[&str]) {
         .env_remove("OTEL_SERVICE_NAME")
         .env_remove("OTEL_METRIC_EXPORT_INTERVAL")
         .output()
-        .expect("the lepatch binary should run");
+        .expect("the blu binary should run");
 
     assert!(
         output.status.success(),
-        "`lepatch {}` failed with {:?}\nstdout: {}\nstderr: {}",
+        "`blu {}` failed with {:?}\nstdout: {}\nstderr: {}",
         args.join(" "),
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
@@ -347,13 +347,13 @@ fn a_span_survives_a_failed_run() {
     let collector = Collector::start();
     let dir = scratch();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let output = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["--telemetry", "verify", "no-such-set"])
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", collector.endpoint())
         .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .output()
-        .expect("the lepatch binary should run");
+        .expect("the blu binary should run");
 
     assert!(
         !output.status.success(),
@@ -397,20 +397,20 @@ fn a_span_survives_a_stopped_server() {
     // /v1/sets` on an empty root answers 404 without opening a store, so a
     // server asked to stop right after it would have no span to flush and the
     // test would be asserting about an empty export.
-    let prepared = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let prepared = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["backup", "src", "photos"])
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
         .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .output()
-        .expect("the lepatch binary should run");
+        .expect("the blu binary should run");
     assert!(
         prepared.status.success(),
         "the set the server serves should exist: {}",
         String::from_utf8_lossy(&prepared.stderr)
     );
 
-    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["--telemetry", "serve", ".", "--bind", "127.0.0.1:0"])
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", collector.endpoint())
@@ -418,7 +418,7 @@ fn a_span_survives_a_stopped_server() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("lepatch serve should start");
+        .expect("blu serve should start");
 
     // The address, which the server prints on stdout as its first line.
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -505,8 +505,8 @@ fn a_metric_survives_a_successful_run() {
     // is the failure this crate's telemetry design exists to prevent, and
     // nothing here would have noticed.
     //
-    // The assertion names **instruments**, not spans. `lepatch.backup.
-    // chunks_produced` is a counter and `lepatch.command.duration` is the
+    // The assertion names **instruments**, not spans. `blu.backup.
+    // chunks_produced` is a counter and `blu.command.duration` is the
     // duration histogram, both built in `telemetry::metrics`; neither string
     // appears anywhere in a span this crate emits, so a body carrying them is a
     // body that arrived as a *metrics* export. The search is scoped to
@@ -556,13 +556,13 @@ fn nothing_leaves_the_machine_when_telemetry_is_off() {
     let collector = Collector::start();
     let dir = scratch();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_lepatch"))
+    let output = Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir.path())
         .args(["backup", "src", "photos"])
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
         .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .output()
-        .expect("the lepatch binary should run");
+        .expect("the blu binary should run");
     assert!(
         output.status.success(),
         "a backup with no telemetry must still work: {}",

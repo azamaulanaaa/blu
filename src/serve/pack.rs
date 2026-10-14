@@ -19,7 +19,7 @@
 //! have to happen, rather than quietly answered with the `keep` bytes.
 //!
 //! Serving `keep` is not a limitation in practice. It is the default on both
-//! `lepatch pack` and `lepatch merge`, and it is the mode that makes a push
+//! `blu pack` and `blu merge`, and it is the mode that makes a push
 //! cheap: a chunk the source deduplicated as a frame arrives as that frame rather
 //! than being decoded and compressed again.
 //!

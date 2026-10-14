@@ -26,14 +26,14 @@
 //!
 //! So [`Remote::await_job`] returns [`io::ErrorKind::Other`] carrying the
 //! server's own `error` sentence — the `Err` the work returned, verbatim, which
-//! is the sentence a local `lepatch merge` would have printed — and a
+//! is the sentence a local `blu merge` would have printed — and a
 //! `cancelled` job is refused the same way, because a cancelled merge published
 //! nothing either.
 //!
 //! ## How progress reaches a caller
 //!
 //! **A poller reads the same counters the server's event stream carries**, as
-//! running totals under the names `lepatch progress` prints them under: `files`,
+//! running totals under the names `blu progress` prints them under: `files`,
 //! `chunks`, `distinct`, `checked`, `done`, `read`, `written`.
 //! [`Remote::await_job_with`] is handed each poll's counters *when they have
 //! moved since the last one*, so a caller can print one line per change rather
@@ -502,7 +502,7 @@ impl Remote {
     /// # Errors
     ///
     /// Returns an error if any of the four steps fails — the server's own
-    /// sentence, mapped to a kind as `lepatch::client`'s documentation says — or
+    /// sentence, mapped to a kind as `blulib::client`'s documentation says — or
     /// if `compression` names a level this crate does not use.
     pub async fn merge_pack(
         &self,

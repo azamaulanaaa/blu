@@ -75,7 +75,7 @@ pub async fn load_snapshot<S: storage::StorageGet>(
     // All four keep their meaning.
     // The `Display` is the one a person reads, and it names which of the four
     // it is.
-    // The strings are "not a lepatch snapshot: expected magic", "unsupported
+    // The strings are "not a blu snapshot: expected magic", "unsupported
     // snapshot format version N, this build supports M", and "snapshot is
     // truncated".
     // A caller that wants to *match* on them calls `Snapshot::try_from`, where

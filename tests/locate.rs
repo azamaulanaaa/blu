@@ -29,7 +29,7 @@ mod common;
 
 use std::fs;
 
-use lepatch::{
+use blulib::{
     layout::IndexSet,
     metadata::Timestamp,
     storage::{BlobStore, Resolved, SegmentLimit, VersionIndex, resolve},

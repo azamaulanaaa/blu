@@ -27,7 +27,7 @@ const INTERVAL: Duration = Duration::from_millis(300);
 /// drifted from the reader's would mean no progress ever reaches a client, with
 /// nothing failing — so the reader names this one, and
 /// `every_callsite_the_layer_reads_is_admitted` checks the two against each other.
-pub(crate) const TARGET: &str = "lepatch::progress";
+pub(crate) const TARGET: &str = "blulib::progress";
 
 /// What is being reported on.
 ///
@@ -137,7 +137,7 @@ impl Counter {
 
 /// Every counter's wire name, for a reader that is not this module.
 ///
-/// **This is the contract between the emitter and `lepatch serve`**, which
+/// **This is the contract between the emitter and `blu serve`**, which
 /// forwards these as `tracing` fields and matches on the names. A counter added to
 /// [`Counter`] without appearing here reaches no client, and nothing fails — so
 /// the sink compares the two lists rather than trusting either.
@@ -254,9 +254,9 @@ impl Progress {
     /// The return value says whether anything was emitted. That answer distinguishes
     /// a quiet run from a stalled one.
     ///
-    /// The line goes to the `lepatch::progress` target, not the default one. So a
+    /// The line goes to the `blulib::progress` target, not the default one. So a
     /// user who wants the summary lines without the running commentary can turn
-    /// it off with `RUST_LOG=lepatch=info,lepatch::progress=warn`.
+    /// it off with `RUST_LOG=blu=info,blulib::progress=warn`.
     pub fn report(&mut self) -> bool {
         if !self.due() {
             return false;
@@ -266,11 +266,11 @@ impl Progress {
 
         // **The counters go on the event as structured fields as well as into the
         // message.** The message is for a person and its shape is free to change;
-        // the fields are for a program, and `lepatch serve` needs the numbers
+        // the fields are for a program, and `blu serve` needs the numbers
         // without parsing prose.
         //
         // The message is byte-identical to what it was before the fields were
-        // added, so `RUST_LOG=lepatch=info,lepatch::progress=warn` keeps working
+        // added, so `RUST_LOG=blu=info,blulib::progress=warn` keeps working
         // and every assertion on log text is unaffected. The fields are named
         // after `Counter::name`, which is what a client is told to expect.
         //

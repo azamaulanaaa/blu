@@ -19,7 +19,7 @@ mod common;
 
 use std::{fs, path::Path};
 
-use lepatch::{
+use blulib::{
     layout::IndexSet,
     storage::{
         BlobId, BlobStore, Compression, Resolved, SegmentLimit, StorageGet, StoragePut, resolve,
@@ -528,7 +528,7 @@ fn a_limit_too_small_to_hold_a_record_is_raised() {
 /// The store refuses to roll over past `MAX_SEGMENT` for exactly this reason.
 #[test]
 fn the_naming_scheme_names_exactly_its_own_width() {
-    use lepatch::layout::{MAX_SEGMENT, SEGMENT_DIGITS};
+    use blulib::layout::{MAX_SEGMENT, SEGMENT_DIGITS};
 
     let dir = tempfile::tempdir().unwrap();
     let set = IndexSet::new(dir.path().join("photos"));

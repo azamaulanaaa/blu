@@ -65,12 +65,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use criterion::{Criterion, Throughput};
-use lepatch::{
+use blulib::{
     command::{Options, backup, restore},
     layout::IndexSet,
     storage::{BlobStore, Compression, SegmentLimit},
 };
+use criterion::{Criterion, Throughput};
 use tempfile::TempDir;
 
 #[path = "fixture.rs"]

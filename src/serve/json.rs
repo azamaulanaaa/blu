@@ -8,7 +8,7 @@
 //! cadence or security policy can decide whether a backup set is still readable.
 //! That argument is about the *on-disk format*. A response body is not read by a
 //! future version of this binary. It is read by a client, and it is versioned by
-//! its own contract — the `OpenAPI` document in `openapi/lepatch.json` says what
+//! its own contract — the `OpenAPI` document in `openapi/blu.json` says what
 //! each field is and what each status means.
 //!
 //! So the boundary is exempt from the rule, and the rule is kept anyway. Two
@@ -16,7 +16,7 @@
 //!
 //! First, a derive-based approach puts `#[derive(Serialize)]` on this crate's own
 //! types. The types are the *library's* contract — `Job`, `Plan`, a set name.
-//! They are what `lepatch`'s other callers reason about. A JSON concern on them
+//! They are what `blu`'s other callers reason about. A JSON concern on them
 //! is a second thing to keep in step with the first.
 //!
 //! Second, and more plainly: what a response contains here is eleven small

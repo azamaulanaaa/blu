@@ -3,14 +3,14 @@
 //! The `OpenAPI` document this server serves, and the schema names it must define.
 //!
 //! **The document is the source of truth, and it is checked in.** It is written
-//! by hand, in `openapi/lepatch.json`, and `GET /openapi.json` serves it with
+//! by hand, in `openapi/blu.json`, and `GET /openapi.json` serves it with
 //! [`include_str!`]. Nothing generates it, and that is the decision.
 //!
 //! ## Why not `utoipa`
 //!
 //! Because it puts `#[derive(Serialize)]` and `#[derive(ToSchema)]` on **this
 //! crate's own types** — on [`Job`](super::Job), on a set name, on a version.
-//! Those types are the library's contract. `lepatch`'s other callers reason
+//! Those types are the library's contract. `blu`'s other callers reason
 //! about them, and a JSON concern on them is a second thing to keep in step with
 //! the first, in a crate that has gone out of its way to have one encoding.
 //!
@@ -42,7 +42,7 @@
 /// `include_str!` rather than a file read so that a missing or renamed document is
 /// a **compile error** rather than a `500` at runtime. A spec that a deploy can
 /// lose is not a contract.
-pub const DOCUMENT: &str = include_str!("../../openapi/lepatch.json");
+pub const DOCUMENT: &str = include_str!("../../openapi/blu.json");
 
 /// Every schema name in `components.schemas`, mirrored from the code side.
 ///
@@ -87,7 +87,7 @@ pub const SCHEMAS: &[&str] = &[
 /// that uploads a photograph are the same request without it, and the difference
 /// is the one thing a client cannot check for itself. It is also what makes a
 /// request log readable.
-pub(super) const PACK_MEDIA_TYPE: &str = "application/x-lepatch-pack";
+pub(super) const PACK_MEDIA_TYPE: &str = "application/x-blu-pack";
 
 /// The media type errors are sent as.
 ///

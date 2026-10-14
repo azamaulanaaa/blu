@@ -10,7 +10,7 @@
 //! The module covers where the files go, how they are numbered, and how two
 //! writers are kept apart.
 
-use lepatch::layout::{IndexSet, SEGMENT_DIGITS, SEGMENT_EXTENSION};
+use blulib::layout::{IndexSet, SEGMENT_DIGITS, SEGMENT_EXTENSION};
 
 #[test]
 fn derived_paths_do_not_clobber_an_extension_in_the_base_name() {
@@ -267,11 +267,11 @@ fn taking_the_lock_creates_the_containing_directory() {
 /// Both ends had just agreed on a name, and then one of them forgot it:
 ///
 /// ```text
-/// $ lepatch backup src $'sto\xffre'
+/// $ blu backup src $'sto\xffre'
 ///   backup complete  segments=1
-/// $ lepatch versions $'sto\xffre'
+/// $ blu versions $'sto\xffre'
 ///   error: no backup set at sto?re (looked in .)
-/// $ lepatch backup src $'sto\xffre'
+/// $ blu backup src $'sto\xffre'
 ///   error: File exists (os error 17)
 /// ```
 ///

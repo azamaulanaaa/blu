@@ -1,9 +1,9 @@
 {
   "openapi": "3.0.3",
   "info": {
-    "title": "lepatch",
+    "title": "blu",
     "version": "0.7.0",
-    "description": "Serve a backup set over HTTP.\n\nThe server moves packs and nothing else. It never takes a path on its own disk: there is no endpoint that snapshots a server-local tree and none that restores into one. The client runs `lepatch backup` and `lepatch pack` locally, uploads the pack, and the server merges it. For a restore the server packs a version and the client fetches the chunks it lacks and merges or applies it locally.\n\n**There is no authentication.** Anyone who can reach the port can read every set this server keeps and can append versions to them. That is a decision, not an oversight. The bind address defaults to 127.0.0.1.\n\nA pack's bytes are a pack, verbatim: `GET /v1/packs/{id}` serves them under `application/x-lepatch-pack`, and a client can hand what it fetched straight to `Pack::open` and then to `lepatch merge` or `lepatch apply`.",
+    "description": "Serve a backup set over HTTP.\n\nThe server moves packs and nothing else. It accepts no path on its own disk. No endpoint snapshots a tree on the server. No endpoint restores into one.\n\nTo push, the client runs `blu backup` and `blu pack`. The client uploads the pack. The server merges it. To restore, the server packs a version. The client fetches the chunks it lacks. The client merges or applies them locally.\n\nThere is no authentication. Anyone who reaches the port can read every set the server keeps and append versions to them. This is deliberate. The bind address defaults to 127.0.0.1.\n\n`GET /v1/packs/{id}` serves the pack bytes unchanged as `application/x-blu-pack`. A client passes those bytes to `Pack::open` and then runs `blu merge` or `blu apply`.",
     "license": {
       "name": "GPL-2.0-or-later",
       "url": "https://www.gnu.org/licenses/old-licenses/gpl-2.0.html"
@@ -324,7 +324,7 @@
               }
             },
             "content": {
-              "application/x-lepatch-pack": {
+              "application/x-blu-pack": {
                 "schema": {
                   "type": "string",
                   "format": "binary"
@@ -350,7 +350,7 @@
               }
             },
             "content": {
-              "application/x-lepatch-pack": {
+              "application/x-blu-pack": {
                 "schema": {
                   "type": "string",
                   "format": "binary"
@@ -541,7 +541,7 @@
         "requestBody": {
           "required": true,
           "content": {
-            "application/x-lepatch-pack": {
+            "application/x-blu-pack": {
               "schema": {
                 "type": "string",
                 "format": "binary"
@@ -677,7 +677,7 @@
         ],
         "operationId": "mergePack",
         "summary": "Merge an uploaded pack into a set, as a new version.",
-        "description": "The receiving half of `lepatch pack`, and the one a remote push uses.\n\nA full pack suits any set and creates one if there is none. A delta names a version its reader already holds and is refused unless some committed version of the set is that version.\n\n**Merging the same pack twice is not an error.** The second run reports which version of the set already holds it and writes nothing, so a retried transfer is answerable.\n\nConcurrent merges into one set are serialised: the store takes its append reservation when it opens, so two handles onto one set would each believe they own the next offset. This endpoint takes a per-set lock before opening, and the set's own file lock inside it.",
+        "description": "The receiving half of `blu pack`, and the one a remote push uses.\n\nA full pack suits any set and creates one if there is none. A delta names a version its reader already holds and is refused unless some committed version of the set is that version.\n\n**Merging the same pack twice is not an error.** The second run reports which version of the set already holds it and writes nothing, so a retried transfer is answerable.\n\nConcurrent merges into one set are serialised: the store takes its append reservation when it opens, so two handles onto one set would each believe they own the next offset. This endpoint takes a per-set lock before opening, and the set's own file lock inside it.",
         "requestBody": {
           "required": true,
           "content": {

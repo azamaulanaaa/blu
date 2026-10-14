@@ -109,11 +109,11 @@ run = "cargo doc --no-deps --all-features"
 env = { RUSTDOCFLAGS = "-D warnings" }
 
 [tasks.check]
-depends = ["lint", "test", "deps", "msrv", "doc", "dist-check"]
+depends = ["lint", "test", "deps", "msrv", "doc", "dist-check", "publish-check"]
 description = "Run every check CI runs"
 
 # ---------------------------------------------------------------------------
-# Releases, via cargo-dist.
+# Releases, via cargo-dist plus crates.io.
 # ---------------------------------------------------------------------------
 
 [tasks.dist-plan]
@@ -125,13 +125,18 @@ run = "dist plan --output-format=human > /dev/null"
 description = "Check that the release plan resolves and the release workflow still gates on CI"
 
 [tasks.dist-generate]
-run = "dist generate"
+run = "dist generate --mode ci"
 description = """
 Regenerate .github/workflows/release.yml from dist-workspace.toml.
 
-Then re-apply the two local edits the header of that file describes: the
-`checks` job, and `checks` in the `needs:` of `build-local-artifacts`.
+Remove `allow-dirty` from dist-workspace.toml first. The generator refuses to
+write while it is present. Then restore it and re-apply the two local edits
+the header of that file describes.
 """
+
+[tasks.publish-check]
+run = "cargo publish --dry-run --locked"
+description = "Dry run of `cargo publish` for `blulib`"
 
 [tasks.dist-build]
 run = "dist build --artifacts=local --target=\"$(rustc -vV | sed -n 's/^host: //p')\""

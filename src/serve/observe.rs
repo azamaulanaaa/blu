@@ -11,15 +11,15 @@
 //!
 //! The alternative already exists.
 //! [`crate::progress::Progress::report`] emits a `tracing` event on the
-//! `lepatch::progress` target carrying the counters as structured fields. So a
+//! `blulib::progress` target carrying the counters as structured fields. So a
 //! **layer** reads those events and forwards them. The library gains nothing, and
 //! the coupling sits at the one place that already knows the counters have names.
 //!
 //! # How a job's events are told apart from anyone else's
 //!
-//! By the span. A job runs inside `tracing::info_span!("lepatch_job", …)`, and this
-//! layer forwards a `lepatch::progress` event only when a job span is in scope
-//! where it was emitted. A `lepatch restore` in another process emits the same
+//! By the span. A job runs inside `tracing::info_span!("blu_job", …)`, and this
+//! layer forwards a `blulib::progress` event only when a job span is in scope
+//! where it was emitted. A `blu restore` in another process emits the same
 //! target with no such span and is ignored.
 //!
 //! **The whole scope, not just the innermost span.** Every command entry point is
@@ -83,18 +83,18 @@ const COUNTERS: [&str; 7] = [
 /// `handlers.rs` and matched here, and two spellings of one name is a **silent**
 /// failure — no event would ever match, progress would never arrive, and nothing
 /// would fail.
-pub(crate) const SPAN: &str = "lepatch_job";
+pub(crate) const SPAN: &str = "blu_job";
 
 /// The event target this layer reads, next to the span name above it.
 ///
 /// The same reasoning applies to both: two spellings of one name is a **silent**
 /// failure, so both are constants and both are checked against the callsites
 /// that write them.
-pub(crate) const TARGET: &str = "lepatch::progress";
+pub(crate) const TARGET: &str = "blulib::progress";
 
 /// The directive [`filter`] is built from.
 ///
-/// **`lepatch=info`, and the level matters as much as the target.** The job span
+/// **`blu=info`, and the level matters as much as the target.** The job span
 /// is `info_span!`, every command entry point is `#[instrument(level = "info")]`,
 /// and the progress event is `tracing::info!` — all three verified against real
 /// metadata by `every_callsite_the_layer_reads_is_admitted`.
@@ -103,15 +103,15 @@ pub(crate) const TARGET: &str = "lepatch::progress";
 /// the layer reads them by *scope* and not by name alone: an event carries only
 /// the innermost span, and this one walks outwards until it finds a job span. A
 /// command span nested between the two has to be admitted as well, because the
-/// walk passes through it — and a directive naming only `lepatch::progress` and
-/// `lepatch_job` would drop the event at the span-walk, for exactly the reason
+/// walk passes through it — and a directive naming only `blulib::progress` and
+/// `blu_job` would drop the event at the span-walk, for exactly the reason
 /// the terminal's filter used to drop it.
 ///
-/// `info` and not `trace` because a `lepatch=trace` filter would make the
+/// `info` and not `trace` because a `blu=trace` filter would make the
 /// registry create every per-chunk span in the crate, which `--quiet` exists to
 /// avoid. The callsites above are all at `info`, and the ones at `trace` carry
 /// nothing this layer reads.
-const DIRECTIVE: &str = "lepatch=info";
+const DIRECTIVE: &str = "blu=info";
 
 /// The filter the progress layer is installed with.
 ///
@@ -399,7 +399,7 @@ mod tests {
     fn a_progress_event_in_a_job_span_lands_in_the_registry() {
         // **The behaviour this layer exists for**, driven through every part of
         // it: a real `info_span!` in the shape `Jobs::spawn` writes one, a real
-        // `Progress::report` event on the `lepatch::progress` target inside it,
+        // `Progress::report` event on the `blulib::progress` target inside it,
         // and the numbers read back out of the registry.
         //
         // The structural tests here compare constants to constants. This one
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn a_progress_event_outside_a_job_span_reaches_nobody() {
-        // **The isolation claim.** Another process's `lepatch restore` — or this
+        // **The isolation claim.** Another process's `blu restore` — or this
         // one, outside a job — emits the same target with no job span, and its
         // numbers are not any job's.
         let jobs = Jobs::new();
@@ -540,7 +540,7 @@ mod tests {
         // Two spellings of one span name would mean no event ever matches, and
         // progress would never arrive — with nothing failing. So the constant is
         // compared against the literal the handler uses.
-        assert_eq!(SPAN, "lepatch_job");
+        assert_eq!(SPAN, "blu_job");
     }
 
     #[test]
@@ -750,7 +750,7 @@ mod tests {
 
         // **The names and targets, read off the real callsites.** Asserted
         // because a crate-wide directive is only correct for as long as every
-        // callsite it has to cover still lives under `lepatch`. Were one of these
+        // callsite it has to cover still lives under `blu`. Were one of these
         // to move out of the crate, the directive would stop covering it, the
         // event would be dropped at the span-walk, and progress would go quiet
         // for every client again — with nothing failing.
@@ -759,7 +759,7 @@ mod tests {
             "the job span must be named as the layer matches on: {names:?}"
         );
         assert!(
-            targets.contains(&"lepatch::serve::jobs"),
+            targets.contains(&"blulib::serve::jobs"),
             "the job span must carry the module path of `jobs.rs`: {targets:?}"
         );
 
@@ -775,7 +775,7 @@ mod tests {
         assert!(
             targets
                 .iter()
-                .any(|target| target.starts_with("lepatch::storage::")),
+                .any(|target| target.starts_with("blulib::storage::")),
             "an `#[instrument]`ed function must carry its module path, which is \
              what the command spans do too: {targets:?}"
         );
@@ -799,7 +799,7 @@ mod tests {
         // **Every event the job emitted is admitted, not only the progress one.**
         // The instrumented call fails, and `err` reports that, so there is a
         // second event on a different target in here. That is the crate-wide
-        // directive earning its keep: a narrow one naming only `lepatch::progress`
+        // directive earning its keep: a narrow one naming only `blulib::progress`
         // would be cheaper and wrong, because the layer walks *through* the spans
         // the report was emitted inside and those spans' own events come with it.
         let events = recorded.events();
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn a_quiet_terminal_filter_does_not_stop_a_job_from_reporting() {
         // **The defect, at the layer level.** The subscriber here is the one
-        // `init_tracing` builds for `lepatch --quiet serve`: a writer layer whose
+        // `init_tracing` builds for `blu --quiet serve`: a writer layer whose
         // `EnvFilter` is at `warn`, and this layer with its own filter. A
         // progress event is `info`, so the writer's filter refuses it — and the
         // point is that refusing it stops at the writer.
@@ -880,11 +880,12 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             // The targets are spelled as `jobs.rs` and `merge.rs` declare them,
             // so this exercises the production shapes rather than this module's.
-            let job_span = tracing::info_span!(target: "lepatch::serve::jobs", SPAN, job = %id, kind = "merge");
+            let job_span =
+                tracing::info_span!(target: "blulib::serve::jobs", SPAN, job = %id, kind = "merge");
             let _job = job_span.enter();
 
             let command_span =
-                tracing::info_span!(target: "lepatch::command::merge", "merge", set = "docs");
+                tracing::info_span!(target: "blulib::command::merge", "merge", set = "docs");
             let _command = command_span.enter();
 
             report_chunks_and_bytes(7, 4096);
@@ -907,7 +908,7 @@ mod tests {
     #[test]
     fn a_progress_event_outside_a_job_span_reaches_nobody_even_when_admitted() {
         // **The isolation claim, under the real filter.** The filter admits
-        // `lepatch::progress` from anywhere in the crate — it cannot tell a
+        // `blulib::progress` from anywhere in the crate — it cannot tell a
         // server's own progress from a library caller's, and does not try. The
         // span is what tells them apart, so this asserts that having admitted
         // the event is not on its own enough to record it.
@@ -925,7 +926,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             report_chunks_and_bytes(7, 4096);
 
-            let other = tracing::info_span!(target: "lepatch::serve::handlers", "request");
+            let other = tracing::info_span!(target: "blulib::serve::handlers", "request");
             let _other = other.enter();
             report_chunks_and_bytes(9, 8192);
         });
@@ -945,7 +946,7 @@ mod tests {
         // of a job does not move when the terminal is turned down. If this ever
         // fails, something has made progress negotiable from `RUST_LOG` again.
         let job_span =
-            tracing::info_span!(target: "lepatch::serve::jobs", SPAN, job = "x", kind = "merge");
+            tracing::info_span!(target: "blulib::serve::jobs", SPAN, job = "x", kind = "merge");
         assert!(
             admits(job_span.metadata()),
             "the progress filter must not be negotiable from RUST_LOG"
@@ -953,7 +954,7 @@ mod tests {
 
         // And its own directive is a crate-wide one rather than a list, which is
         // what keeps a new command from needing to be added to it.
-        assert_eq!(DIRECTIVE, "lepatch=info");
+        assert_eq!(DIRECTIVE, "blu=info");
     }
 
     #[test]
@@ -976,7 +977,8 @@ mod tests {
             .with(Handle::new(jobs.clone()).with_filter(filter()));
 
         tracing::subscriber::with_default(subscriber, || {
-            let job_span = tracing::info_span!(target: "lepatch::serve::jobs", SPAN, job = %id, kind = "merge");
+            let job_span =
+                tracing::info_span!(target: "blulib::serve::jobs", SPAN, job = %id, kind = "merge");
             let _job = job_span.enter();
             report_chunks_and_bytes(7, 4096);
         });

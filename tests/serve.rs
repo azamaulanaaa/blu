@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! `lepatch serve` over HTTP: the whole push and pull flows, end to end.
+//! `blu serve` over HTTP: the whole push and pull flows, end to end.
 //!
 //! The two directions a backup has over a network, driven through a real socket
 //! to a real process:
@@ -9,7 +9,7 @@
 //!   the server merges it into a set it keeps. The set then holds the version.
 //! * **pull** — the server packs a version out of a set, and a client fetches only
 //!   the chunks it lacks, assembles a file from the byte ranges it is given, and
-//!   `Pack::open`s it. The file is byte-identical to one `lepatch pack` would
+//!   `Pack::open`s it. The file is byte-identical to one `blu pack` would
 //!   have written.
 //!
 //! These are the tests that would catch the two ways this feature could be wrong
@@ -36,18 +36,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{http::Request, server::Server};
-use lepatch::{
+use blulib::{
     metadata::Timestamp,
     pack::Pack,
     storage::{BlobStore, Compression, Plan, StorageGet},
 };
+use common::{http::Request, server::Server};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 
-const PACK_MEDIA_TYPE: &str = "application/x-lepatch-pack";
+const PACK_MEDIA_TYPE: &str = "application/x-blu-pack";
 
 /// A pack big enough that merging it outlasts the reporting interval.
 ///
@@ -152,10 +152,10 @@ fn compressible_tree(dir: &Path, files: usize, size: usize) -> PathBuf {
 }
 
 /// Back a tree up into a set at `blob`, and return the set.
-async fn backup(source: &Path, blob: &Path) -> lepatch::storage::BlobId {
+async fn backup(source: &Path, blob: &Path) -> blulib::storage::BlobId {
     let storage = BlobStore::open_for_writing(
         blob,
-        lepatch::storage::SegmentLimit::default(),
+        blulib::storage::SegmentLimit::default(),
         Compression::default(),
     )
     .await
@@ -166,15 +166,10 @@ async fn backup(source: &Path, blob: &Path) -> lepatch::storage::BlobId {
         Some((version, _)) => storage.version_time(version).await.ok(),
     };
 
-    lepatch::command::backup(
-        source,
-        lepatch::command::Options::default(),
-        storage,
-        latest,
-    )
-    .await
-    .unwrap()
-    .snapshot
+    blulib::command::backup(source, blulib::command::Options::default(), storage, latest)
+        .await
+        .unwrap()
+        .snapshot
 }
 
 /// Pack a set's latest version, into `at`, recorded as the pack's own version.
@@ -189,7 +184,7 @@ async fn pack(blob: &Path, at: &Path) -> Pack {
     let mut reader = store.get(&snapshot_id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
 
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap();
 
@@ -527,17 +522,17 @@ async fn the_server_reports_its_version_and_formats() {
     // check that would have caught it was on the one field nobody bumped.
     assert_eq!(
         document["snapshot_format"],
-        serde_json::json!(lepatch::metadata::FORMAT_VERSION),
+        serde_json::json!(blulib::metadata::FORMAT_VERSION),
         "a client asks this to decide whether it can read a snapshot"
     );
     assert_eq!(
         document["record_format"],
-        serde_json::json!(lepatch::storage::FORMAT_VERSION),
+        serde_json::json!(blulib::storage::FORMAT_VERSION),
         "a client asks this to decide whether it can read a store"
     );
     assert_eq!(
         document["pack_format"],
-        serde_json::json!(lepatch::pack::FORMAT_VERSION),
+        serde_json::json!(blulib::pack::FORMAT_VERSION),
         "a client asks this to decide whether it can read a pack"
     );
 
@@ -797,7 +792,7 @@ async fn pushing_the_same_pack_twice_reports_which_version_holds_it() {
 #[tokio::test]
 async fn a_pulled_pack_is_byte_identical_to_one_packed_locally() {
     // **The pull flow, whole.** A pack is requested, the whole file is fetched
-    // with no `Range` header, and it must be the same file `lepatch pack` wrote —
+    // with no `Range` header, and it must be the same file `blu pack` wrote —
     // which is what makes a client able to `Pack::open` it and merge it locally
     // without knowing it came off a wire.
     let dir = tempfile::tempdir().unwrap();
@@ -863,7 +858,7 @@ async fn a_client_fetches_only_the_chunks_it_is_missing() {
     let mut reader = store.get(&snapshot_id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap();
 
     let every: Vec<_> = plan
@@ -951,7 +946,7 @@ async fn the_plan_covers_the_fixed_regions_a_client_needs() {
     let mut reader = store.get(&snapshot_id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap();
     let every: Vec<String> = plan.iter().map(|c| c.id.to_hex().to_string()).collect();
 
@@ -1134,7 +1129,7 @@ async fn the_fixed_regions_alone_are_enough_to_open_a_pack() {
     let mut reader = store.get(&snapshot_id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap();
     let every: Vec<String> = plan.iter().map(|c| c.id.to_hex().to_string()).collect();
 
@@ -1352,11 +1347,11 @@ async fn the_level_a_client_names_is_the_level_the_records_are_written_at() {
     // `POST /v1/sets/{set}/merges` took a `compression` of `"1"` or `"9"`,
     // range-checked it against the range its own 400 named, and then opened the
     // set under `Compression::default()`. The number reached nothing: `--compression
-    // 1` and `--compression 9` were the same run, and `lepatch merge` on this
+    // 1` and `--compression 9` were the same run, and `blu merge` on this
     // server said so without anybody noticing.
     //
     // Refusing the number was the other option, and it is not the right one
-    // here. `lepatch merge --compression N` opens the receiving set at `N`
+    // here. `blu merge --compression N` opens the receiving set at `N`
     // locally, the pack endpoint's refusal exists because a re-encode cannot be
     // *served from* a set's bytes rather than because a level is meaningless,
     // and this endpoint already has the set in hand. So the level is honoured:
@@ -1748,7 +1743,7 @@ async fn a_merge_reports_progress_to_a_client() {
     // a counter no `Counter` can produce, which is exactly the silent gap the
     // layer's own test guards against — checked here from the client side as
     // well, because this is the document a client is written against.
-    let names = lepatch::progress::counter_names();
+    let names = blulib::progress::counter_names();
     for key in counters.keys() {
         assert!(
             names.contains(&key.as_str()),
@@ -1803,10 +1798,10 @@ async fn a_merge_reports_progress_to_a_client() {
 
 #[tokio::test]
 async fn a_quiet_server_still_reports_progress_to_a_client() {
-    // **The defect, end to end through a real process.** `lepatch --quiet serve`
+    // **The defect, end to end through a real process.** `blu --quiet serve`
     // used to reach every client with an empty `progress` object: the terminal's
     // `EnvFilter` was attached to the subscriber rather than to the writer layer,
-    // so it refused the `lepatch::progress` *callsite* outright and the progress
+    // so it refused the `blulib::progress` *callsite* outright and the progress
     // layer above it was never offered the event. `RUST_LOG=info` restored it,
     // which is what made this look like a filter bug rather than one of
     // architecture.
@@ -1874,7 +1869,7 @@ async fn a_quiet_server_still_reports_progress_to_a_client() {
         document.text()
     );
 
-    let names = lepatch::progress::counter_names();
+    let names = blulib::progress::counter_names();
     for key in counters.keys() {
         assert!(
             names.contains(&key.as_str()),
@@ -2027,21 +2022,21 @@ async fn a_push_then_a_pull_round_trips_into_a_second_set() {
     let mirror = dir.path().join("mirror");
     let storage = BlobStore::open_for_writing(
         &mirror,
-        lepatch::storage::SegmentLimit::default(),
+        blulib::storage::SegmentLimit::default(),
         Compression::default(),
     )
     .await
     .unwrap();
 
-    let merged = lepatch::command::merge(
+    let merged = blulib::command::merge(
         &storage,
         &Pack::open(&fetched).unwrap(),
-        lepatch::command::MergeCompression::Keep,
+        blulib::command::MergeCompression::Keep,
     )
     .await
     .unwrap();
 
-    let lepatch::command::Merged::Committed { version, .. } = merged else {
+    let blulib::command::Merged::Committed { version, .. } = merged else {
         panic!("the mirror set had nothing, so this must be a commit");
     };
     assert_eq!(version, 1);
@@ -2050,7 +2045,7 @@ async fn a_push_then_a_pull_round_trips_into_a_second_set() {
     let restored = dir.path().join("restored");
     let store = BlobStore::open_for_reading(&mirror).await.unwrap();
     let snapshot = store.snapshot_via_index(1).unwrap();
-    lepatch::command::restore(&restored, snapshot, store)
+    blulib::command::restore(&restored, snapshot, store)
         .await
         .unwrap();
 
@@ -2065,7 +2060,7 @@ async fn a_set_that_holds_nothing_is_not_a_set() {
     let root = dir.path().join("served");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("notes.txt"), b"not a set").unwrap();
-    fs::create_dir_all(root.join(".lepatch-serve")).unwrap();
+    fs::create_dir_all(root.join(".blu-serve")).unwrap();
 
     let server = Server::start(&root);
 
@@ -2095,7 +2090,7 @@ async fn chunk_hashes_round_trip_through_the_plan() {
     let mut reader = store.get(&snapshot_id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap();
     let every: Vec<String> = plan.iter().map(|c| c.id.to_hex().to_string()).collect();
 
@@ -2145,8 +2140,8 @@ async fn an_unresolvable_version_is_not_listed_as_one() {
     // that committed without writing one looks like.
     let root = dir.path().join("served");
     fs::create_dir_all(&root).unwrap();
-    let segment = lepatch::layout::IndexSet::new(root.join("docs")).segment_path(0);
-    let from = lepatch::layout::IndexSet::new(&blob).segment_path(0);
+    let segment = blulib::layout::IndexSet::new(root.join("docs")).segment_path(0);
+    let from = blulib::layout::IndexSet::new(&blob).segment_path(0);
     fs::write(&segment, fs::read(from).unwrap()).unwrap();
 
     let server = Server::start(&root);
@@ -2404,7 +2399,7 @@ async fn a_dropped_upload_leaves_nothing_on_disk() {
     .send(server.address())
     .await;
 
-    let scratch = root.join(".lepatch-serve");
+    let scratch = root.join(".blu-serve");
     assert_eq!(
         std::fs::read_dir(&scratch).unwrap().count(),
         1,
@@ -2508,7 +2503,7 @@ async fn holding_more_chunks_means_fetching_fewer_bytes() {
     let mut reader = store.get(&snapshot_id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    let snapshot = lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap();
 
     let every: Vec<String> = plan.iter().map(|c| c.id.to_hex().to_string()).collect();
@@ -2571,7 +2566,7 @@ async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
     fs::write(source.join("f0.bin"), common::noisy(60_000)).unwrap();
     let storage = BlobStore::open_for_writing(
         &blob,
-        lepatch::storage::SegmentLimit::default(),
+        blulib::storage::SegmentLimit::default(),
         Compression::default(),
     )
     .await
@@ -2580,9 +2575,9 @@ async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
         None => None,
         Some((version, _)) => storage.version_time(version).await.ok(),
     };
-    lepatch::command::backup(
+    blulib::command::backup(
         &source,
-        lepatch::command::Options::default(),
+        blulib::command::Options::default(),
         storage,
         latest,
     )
@@ -2678,16 +2673,16 @@ async fn progress_events_carry_the_counters_that_moved() {
     // This is the assertion that would have failed before: a `JobHandle` given
     // counters must have them in the job document a poller reads AND on the event
     // stream a watcher reads, because those two are the same registry.
-    let jobs = lepatch::serve::Jobs::new();
+    let jobs = blulib::serve::Jobs::new();
     let id = jobs.spawn("pack", |handle| async move {
         handle.progress(&[("files", 3), ("written", 4096)]);
-        Ok(lepatch::serve::Json::object(vec![]))
+        Ok(blulib::serve::Json::object(vec![]))
     });
 
     for _ in 0..200 {
         if jobs
             .get(id)
-            .is_some_and(|job| job.state == lepatch::serve::State::Succeeded)
+            .is_some_and(|job| job.state == blulib::serve::State::Succeeded)
         {
             break;
         }
@@ -2709,7 +2704,7 @@ async fn progress_events_carry_the_counters_that_moved() {
     assert!(
         replay
             .iter()
-            .any(|event| matches!(event, lepatch::serve::JobEvent::Progress(_))),
+            .any(|event| matches!(event, blulib::serve::JobEvent::Progress(_))),
         "a watcher must see the counters too"
     );
 }

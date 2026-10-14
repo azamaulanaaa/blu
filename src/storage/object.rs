@@ -641,7 +641,7 @@ mod tests {
     /// out, so a failed run leaves nothing behind.
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "lepatch-object-{name}-{}-{:?}",
+            "blu-object-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ))

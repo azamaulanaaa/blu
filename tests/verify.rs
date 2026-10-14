@@ -6,12 +6,12 @@ mod common;
 
 use std::fs;
 
-use common::noisy;
-use lepatch::{
+use blulib::{
     command::{Reason, Report, restore, verify},
     layout::IndexSet,
     storage::{BlobId, BlobStore},
 };
+use common::noisy;
 
 #[tokio::test]
 async fn an_intact_snapshot_verifies_clean() {
@@ -163,7 +163,7 @@ fn a_report_with_failures_summarises_them() {
         chunks: 10,
         bytes: 100,
         failures: (0..7)
-            .map(|i| lepatch::command::Failure {
+            .map(|i| blulib::command::Failure {
                 location: BlobId::from_bytes([u8::try_from(i).unwrap_or(0); 32]),
                 reason: Reason::Corrupt {
                     actual: BlobId::from_bytes([u8::try_from(i + 1).unwrap_or(0); 32]),

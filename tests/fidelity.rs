@@ -80,7 +80,7 @@ async fn round_trip_recreates_hard_links() {
 /// Refusing up front is the only point at which this is cheap to report.
 #[tokio::test]
 async fn a_backup_root_that_is_a_file_is_refused() {
-    use lepatch::{
+    use blulib::{
         command::{Options, backup},
         storage::{BlobStore, Compression, SegmentLimit},
     };
@@ -113,7 +113,7 @@ async fn a_backup_root_that_is_a_file_is_refused() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_backup_root_that_is_a_symlink_to_a_directory_is_followed() {
-    use lepatch::{
+    use blulib::{
         command::{Options, backup},
         storage::{BlobStore, Compression, SegmentLimit},
     };
@@ -447,7 +447,7 @@ fn an_owner_is_read_from_the_file() {
     let file = dir.path().join("f");
     fs::write(&file, b"x").unwrap();
 
-    let read = lepatch::fsattr::owner_of(&fs::metadata(&file).unwrap()).unwrap();
+    let read = blulib::fsattr::owner_of(&fs::metadata(&file).unwrap()).unwrap();
     assert_eq!(
         read,
         owner_and_group(&file),
@@ -469,7 +469,7 @@ fn an_owner_is_applied_to_a_file() {
         // Root can change the answer, which is the only way to check the call
         // actually does something rather than merely not failing.
         let (uid, gid) = (12_345, 23_456);
-        lepatch::fsattr::set_owner(&file, Some((uid, gid))).unwrap();
+        blulib::fsattr::set_owner(&file, Some((uid, gid))).unwrap();
 
         let after = fs::metadata(&file).unwrap();
         assert_eq!(
@@ -486,7 +486,7 @@ fn an_owner_is_applied_to_a_file() {
     // That call is what makes an unprivileged restore of an unchanged tree work
     // at all.
     let before = owner_and_group(&file);
-    lepatch::fsattr::set_owner(&file, Some(before)).unwrap();
+    blulib::fsattr::set_owner(&file, Some(before)).unwrap();
 
     assert_eq!(
         owner_and_group(&file),
@@ -505,7 +505,7 @@ fn an_absent_owner_is_a_no_op() {
     #[cfg(unix)]
     let before = owner_and_group(&file);
 
-    lepatch::fsattr::set_owner(&file, None).unwrap();
+    blulib::fsattr::set_owner(&file, None).unwrap();
 
     #[cfg(unix)]
     assert_eq!(
@@ -534,7 +534,7 @@ fn an_owners_target_is_not_followed_for_a_symbolic_link() {
 
     // An owner the link itself could not have, so applying it to the target would be
     // visible. `set_owner` skips the link either way.
-    lepatch::fsattr::set_owner(&link, Some((target_before.0 + 1, target_before.1))).unwrap();
+    blulib::fsattr::set_owner(&link, Some((target_before.0 + 1, target_before.1))).unwrap();
 
     assert_eq!(
         owner_and_group(&target),

@@ -79,7 +79,7 @@ impl Resolved {
 /// **That last part is the expensive half.** A caller that already has the commit
 /// log should not pay for it again. Reading a segment's commits walks every record
 /// header in it. Resolving N versions against one segment reads that segment N
-/// times. `lepatch versions` resolves one version at a time through this
+/// times. `blu versions` resolves one version at a time through this
 /// function. [`BlobStore`](crate::storage::BlobStore) holds the whole log in
 /// memory already, because its own open scans for it. That store uses
 /// [`resolve_with`] and skips the file entirely.

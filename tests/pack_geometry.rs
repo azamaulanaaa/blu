@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! The keystone: a [`VirtualPack`]'s bytes are the file [`Pack::write`] writes.
 //!
-//! `lepatch serve` answers a range request for a pack it has never written, by
+//! `blu serve` answers a range request for a pack it has never written, by
 //! computing the bytes out of the set's own segments. That is only safe if the
 //! computed bytes and the written bytes are the same bytes. Not equivalent —
 //! the same. A client may fetch some ranges from one and the rest from the other
@@ -22,7 +22,7 @@
 //! [`VirtualPack::source`], one range at a time, against the real segment files —
 //! and assembles the file the same way a client would. That file must open.
 //!
-//! [`Placement::segment`]: lepatch::storage::Placement::segment
+//! [`Placement::segment`]: blulib::storage::Placement::segment
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // the helpers below are not `#[test]`s
 
@@ -34,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use lepatch::{
+use blulib::{
     command::Options,
     metadata::Snapshot,
     pack::{Pack, Range, Source, VirtualPack},
@@ -43,7 +43,7 @@ use lepatch::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Read a version's snapshot out of a set.
-async fn snapshot_of(store: &BlobStore<lepatch::storage::Read, Compression>) -> Snapshot {
+async fn snapshot_of(store: &BlobStore<blulib::storage::Read, Compression>) -> Snapshot {
     let id = store.latest().unwrap().1;
     let mut reader = store.get(&id).await.unwrap();
     let mut buffer = Vec::new();
@@ -53,7 +53,7 @@ async fn snapshot_of(store: &BlobStore<lepatch::storage::Read, Compression>) -> 
 }
 
 /// The plan for a set's latest version, resolved against its own placements.
-async fn plan_of(store: &BlobStore<lepatch::storage::Read, Compression>) -> Plan {
+async fn plan_of(store: &BlobStore<blulib::storage::Read, Compression>) -> Plan {
     let snapshot = snapshot_of(store).await;
     Plan::from_snapshot(&snapshot, |id| Ok(store.locate(id).unwrap())).unwrap()
 }
@@ -77,7 +77,7 @@ async fn built(dir: &Path, files: usize, size: usize) -> (PathBuf, PathBuf) {
 
 /// The segments of a set, so a resolver can name them.
 fn segments(base: &Path) -> Vec<PathBuf> {
-    lepatch::layout::IndexSet::new(base).segments().unwrap()
+    blulib::layout::IndexSet::new(base).segments().unwrap()
 }
 
 /// Serve `virtual_pack`'s whole length the way the server does, and write it to
@@ -222,7 +222,7 @@ async fn a_delta_virtual_pack_is_the_written_delta() {
         None => None,
         Some((version, _)) => storage.version_time(version).await.ok(),
     };
-    lepatch::command::backup(&source, Options::default(), storage, latest)
+    blulib::command::backup(&source, Options::default(), storage, latest)
         .await
         .unwrap();
 
@@ -320,7 +320,7 @@ async fn a_set_that_rolled_over_a_segment_produces_the_same_bytes() {
         BlobStore::open_for_writing(&blob, SegmentLimit::new(50_000), Compression::default())
             .await
             .unwrap();
-    lepatch::command::backup(&source, Options::default(), storage, None)
+    blulib::command::backup(&source, Options::default(), storage, None)
         .await
         .unwrap();
 

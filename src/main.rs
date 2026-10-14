@@ -1,11 +1,10 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! The `lepatch` command line interface.
+//! The `blu` command line interface.
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
-use lepatch::{
+use blulib::{
     command::{
         ApplyOptions, BackupPlan, MergePlan, Merged, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX,
         Planned, RestorePlan, apply, backup, backup_plan, load_snapshot, lock_destination, merge,
@@ -16,6 +15,7 @@ use lepatch::{
     pack::Pack,
     reader, storage,
 };
+use clap::{Parser, Subcommand};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
     EnvFilter, fmt,
@@ -24,7 +24,7 @@ use tracing_subscriber::{
 };
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "lepatch", version, about, long_about = None)]
+#[command(name = "blu", version, about, long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -48,11 +48,11 @@ struct Args {
     /// thing on — asking twice is asking once — and the environment spelling is
     /// what a systemd unit or a container image sets. Without either, no
     /// exporter is built, no thread is started for one, no socket is opened, and
-    /// `lepatch serve` does not even wrap its router in a request span.
+    /// `blu serve` does not even wrap its router in a request span.
     ///
     /// What is sent is what the crate already records: one span per `#[instrument]`ed
     /// command, one `http.server` span per request while `serve` is running, one
-    /// `lepatch_job` span per server-side job, the run's totals as attributes and
+    /// `blu_job` span per server-side job, the run's totals as attributes and
     /// counters, and a duration per command. Turning this on adds a collector to
     /// the picture and nothing else.
     ///
@@ -67,7 +67,7 @@ struct Args {
     /// **This build has no TLS backend unless it was compiled with
     /// `--features telemetry-tls`.** Without it, an `https://` endpoint fails to
     /// connect rather than being downgraded — the same refusal
-    /// `versions` of an `https://` serve target makes. That matches `lepatch serve`, which offers no
+    /// `versions` of an `https://` serve target makes. That matches `blu serve`, which offers no
     /// TLS either: a telemetry backend is expected to sit on the same trust
     /// boundary as the thing it is describing. A build that does speak `https`
     /// reads the operating system's trust store, not one compiled in.
@@ -230,8 +230,8 @@ enum Command {
     ///
     /// **The server moves packs and nothing else.** It never takes a path on its
     /// own disk: there is no endpoint that snapshots a server-local tree and none
-    /// that restores into one. A remote backup is a client running `lepatch
-    /// backup` and `lepatch pack` locally, uploading the pack, and this server
+    /// that restores into one. A remote backup is a client running `blu
+    /// backup` and `blu pack` locally, uploading the pack, and this server
     /// merging it. A remote restore is this server packing a version and the
     /// client fetching the chunks it lacks.
     ///
@@ -249,8 +249,8 @@ enum Command {
     /// says otherwise out loud and the server does not check. Put it behind
     /// something that does, if it needs it.
     ///
-    /// The API is described by `openapi/lepatch.json`, served at
-    /// `/openapi.json`. `lepatch serve` is a `pack` on one end and a `merge` on
+    /// The API is described by `openapi/blu.json`, served at
+    /// `/openapi.json`. `blu serve` is a `pack` on one end and a `merge` on
     /// the other, so anything that can run those can be a client.
     Serve {
         /// Directory holding the backup sets to serve.
@@ -266,7 +266,7 @@ enum Command {
         ///
         /// A merge reads a pack **twice** — once to read the file table and once
         /// per chunk — so an upload has to land on a seekable file rather than be
-        /// streamed. Defaults to `.lepatch-serve` under the root, rather than a
+        /// streamed. Defaults to `.blu-serve` under the root, rather than a
         /// system temporary directory: a pack can be larger than one is sized for,
         /// and these files exist to move data the sets hold.
         #[arg(long, value_name = "DIR")]
@@ -343,7 +343,7 @@ enum Command {
     /// ## What the pack records about where it came from
     ///
     /// A pack records the number of the version it was built from — *that set's*
-    /// number, the one `lepatch versions` would print beside it. So `pack set
+    /// number, the one `blu versions` would print beside it. So `pack set
     /// v2.pack --version 2` writes a pack whose header says version 2.
     ///
     /// It buys one thing: `merge` can see that a pack arrived from behind and
@@ -495,12 +495,12 @@ async fn main() -> ExitCode {
     // conditional build made every command carry an `Option` that one arm of a
     // match could not use. Which commands install the layer is `init_tracing`'s
     // business, and it still installs it only for `serve`.
-    let jobs = lepatch::serve::Jobs::new();
+    let jobs = blulib::serve::Jobs::new();
     let serving = matches!(args.command, Command::Serve { .. });
 
     // Telemetry is read once, here, and everything downstream asks this value
-    // rather than the environment. See `lepatch::telemetry`.
-    let telemetry = lepatch::telemetry::Config::from_environment(args.telemetry);
+    // rather than the environment. See `blulib::telemetry`.
+    let telemetry = blulib::telemetry::Config::from_environment(args.telemetry);
 
     init_tracing(
         args.verbose,
@@ -528,7 +528,7 @@ async fn main() -> ExitCode {
         Err(e) => {
             // The message, not the `Debug` form.
             //
-            // There is no cause chain to walk. `lepatch` has one error type,
+            // There is no cause chain to walk. `blu` has one error type,
             // `io::Error`, at all ninety-odd sites where it fails. Each of those
             // messages is a complete sentence. Each one names the file, the
             // offset, and the expectation, because that is what a user has to act
@@ -582,7 +582,7 @@ async fn main() -> ExitCode {
 /// Safe to call when telemetry was never turned on: the module holds no
 /// provider in that case and this is one uncontended lock.
 fn flush_telemetry() {
-    if let Err(e) = lepatch::telemetry::shutdown() {
+    if let Err(e) = blulib::telemetry::shutdown() {
         tracing::warn!(error = %e, "telemetry could not be flushed at exit");
     }
 }
@@ -591,11 +591,11 @@ fn flush_telemetry() {
 /// the OpenTelemetry layer installed when telemetry was asked for.
 ///
 /// **The OpenTelemetry layer is built here and installed here, and the library
-/// builds it without installing it** (`lepatch::telemetry::layer`), because the
+/// builds it without installing it** (`blulib::telemetry::layer`), because the
 /// subscriber is process-global and this binary owns the only one there is.
 ///
 /// **When telemetry is off there is no layer at all**, not a layer that does
-/// nothing: `lepatch::telemetry::layer` returns `Ok(None)` before it constructs
+/// nothing: `blulib::telemetry::layer` returns `Ok(None)` before it constructs
 /// an exporter, so the default build has no exporter, no exporter thread and no
 /// socket. That is the whole of the cost of a build that carries the feature.
 ///
@@ -612,7 +612,7 @@ fn flush_telemetry() {
 /// only in whether the progress layer is present.
 ///
 /// **The progress layer is only installed for `serve`.** It reads
-/// `lepatch::progress` events out of the span a job runs in and forwards the
+/// `blulib::progress` events out of the span a job runs in and forwards the
 /// counters into the job registry, which only `serve` has. Installing it
 /// elsewhere would cost every event a hash lookup for a registry nothing reads.
 ///
@@ -624,14 +624,14 @@ fn flush_telemetry() {
 /// They used to be attached to the subscriber, which is a global filter: a
 /// callsite it answers `never` to is not emitted at all, so a decision made for
 /// stderr was also a decision made for everything stacked above it. A
-/// `lepatch::progress` event is an `INFO` event, so `lepatch --quiet serve`
+/// `blulib::progress` event is an `INFO` event, so `blu --quiet serve`
 /// answered `never` to it, the event was never emitted, the progress layer above
 /// was never offered it, and a client polling `GET /v1/jobs/{id}` was told the
 /// merge had reported nothing. Adding `RUST_LOG=info` restored it, which is what
 /// made this look like a filter bug rather than an architectural one.
 ///
 /// A filter attached to the writer layer answers only the writer's question. The
-/// progress layer carries its own — [`lepatch::serve::progress_filter`] — so a
+/// progress layer carries its own — [`blulib::serve::progress_filter`] — so a
 /// client's view of a running job does not move when the operator turns the
 /// terminal down. The two are asked the same question and are allowed to answer
 /// it differently, which is the point.
@@ -644,8 +644,8 @@ fn flush_telemetry() {
 fn init_tracing(
     verbose: bool,
     quiet: bool,
-    jobs: Option<&lepatch::serve::Jobs>,
-    telemetry: &lepatch::telemetry::Config,
+    jobs: Option<&blulib::serve::Jobs>,
+    telemetry: &blulib::telemetry::Config,
 ) {
     let default = if verbose {
         LevelFilter::TRACE
@@ -665,7 +665,7 @@ fn init_tracing(
         .with_writer(std::io::stderr)
         .with_filter(filter);
 
-    let otel = match lepatch::telemetry::layer(telemetry) {
+    let otel = match blulib::telemetry::layer(telemetry) {
         Ok(layer) => layer,
         Err(e) => {
             // `eprintln!` and not `tracing::warn!`: the subscriber does not exist
@@ -684,7 +684,7 @@ fn init_tracing(
     // exporter. A collector that cannot take metrics has not made the backup
     // wrong, and refusing to take the backup because of it would make this
     // feature into a way to lose backups.
-    if let Err(e) = lepatch::telemetry::metrics::install(telemetry) {
+    if let Err(e) = blulib::telemetry::metrics::install(telemetry) {
         eprintln!("warning: {e}");
     }
 
@@ -703,8 +703,8 @@ fn init_tracing(
             // layer's says which callsites carry a client's counters, and
             // refuses the rest of the process. The OpenTelemetry layer's filter
             // is a third such filter, and `RUST_LOG` does not reach it either.
-            let layer = lepatch::serve::progress_layer(jobs.clone())
-                .with_filter(lepatch::serve::progress_filter());
+            let layer = blulib::serve::progress_layer(jobs.clone())
+                .with_filter(blulib::serve::progress_filter());
 
             let _ = tracing_subscriber::registry()
                 .with(otel)
@@ -720,7 +720,7 @@ fn init_tracing(
         tracing::info!(
             endpoint = telemetry
                 .endpoint()
-                .unwrap_or(lepatch::telemetry::DEFAULT_ENDPOINT),
+                .unwrap_or(blulib::telemetry::DEFAULT_ENDPOINT),
             "telemetry is on"
         );
     }
@@ -741,7 +741,7 @@ static STOP_SIGNAL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::n
 /// This deliberately does not decide the exit code. The macro used to call
 /// `process::exit` directly. That meant a command could print its summary before
 /// computing its result, then exit 0 with a result that it had not looked at
-/// yet. `lepatch verify set | true` reported success on a store that had failed
+/// yet. `blu verify set | true` reported success on a store that had failed
 /// verification, because the write failed before `into_result` was ever called.
 /// The macro also skipped every `Drop` in scope. A `Drop` is how a `Lock` or a
 /// `DestinationLock` releases its claim file. So any command that both held a
@@ -764,7 +764,7 @@ macro_rules! say {
 ///
 /// The claims a run holds are released by `Drop`, so stopping is a matter of
 /// letting the work future drop rather than resuming it.
-async fn run(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Result<()> {
+async fn run(command: Command, jobs: blulib::serve::Jobs) -> std::io::Result<()> {
     tokio::select! {
         result = dispatch(command, jobs) => result,
         signal = stop_signal() => Err(signal),
@@ -795,7 +795,7 @@ fn parse_size(raw: &str) -> std::result::Result<u64, String> {
         "t" | "tb" | "tib" => 1024_u64 * 1024 * 1024 * 1024,
         other => {
             return Err(format!(
-                "`{other}` is not a size lepatch knows. Use B, KiB, MiB, GiB or TiB"
+                "`{other}` is not a size blu knows. Use B, KiB, MiB, GiB or TiB"
             ));
         }
     };
@@ -811,7 +811,7 @@ fn parse_size(raw: &str) -> std::result::Result<u64, String> {
 /// when it prints a content hash. stdout is data; diagnostics are stderr. The
 /// address is data a script needs — it wants to connect, and under `--bind
 /// 127.0.0.1:0` it is the only way to learn the port. Diagnostics stay on
-/// stderr, so `lepatch serve --bind 127.0.0.1:0 | head -1` is a working way to
+/// stderr, so `blu serve --bind 127.0.0.1:0 | head -1` is a working way to
 /// get the address.
 ///
 /// The server shuts down on the same [`stop_signal`] every other command uses, so
@@ -821,9 +821,9 @@ async fn run_serve(
     root: &std::path::Path,
     bind: Option<&str>,
     scratch: Option<&std::path::Path>,
-    jobs: &lepatch::serve::Jobs,
+    jobs: &blulib::serve::Jobs,
 ) -> std::io::Result<()> {
-    let config = lepatch::serve::Config::new(root, bind.unwrap_or(DEFAULT_BIND), scratch);
+    let config = blulib::serve::Config::new(root, bind.unwrap_or(DEFAULT_BIND), scratch);
 
     // Reported before the listener is up, and to stdout, so a caller reading one
     // line knows the port. The address is resolved by actix, which is what makes
@@ -835,7 +835,7 @@ async fn run_serve(
         "serving"
     );
 
-    let running = lepatch::serve::bind(&config, jobs)?;
+    let running = blulib::serve::bind(&config, jobs)?;
     say!("http://{}", running.addr())?;
 
     running.run().await
@@ -850,7 +850,7 @@ const DEFAULT_BIND: &str = "127.0.0.1:8480";
 
 /// The word a command is reported and measured under.
 ///
-/// **The name `lepatch --help` already prints**, so `lepatch.command.duration`
+/// **The name `blu --help` already prints**, so `blu.command.duration`
 /// carries the same word the user typed. A second spelling would be a dashboard
 /// split in two by nothing at all.
 fn command_name(command: &Command) -> &'static str {
@@ -876,11 +876,11 @@ fn command_name(command: &Command) -> &'static str {
 /// `serve` is timed too: a server that runs for a day and is then told to stop
 /// has a duration, and a histogram of one very large sample is a true answer
 /// rather than a wrong one.
-async fn dispatch(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Result<()> {
+async fn dispatch(command: Command, jobs: blulib::serve::Jobs) -> std::io::Result<()> {
     let name = command_name(&command);
     let started = std::time::Instant::now();
     let outcome = dispatch_inner(command, jobs).await;
-    lepatch::telemetry::metrics::record_command_duration(name, started.elapsed());
+    blulib::telemetry::metrics::record_command_duration(name, started.elapsed());
     outcome
 }
 
@@ -986,7 +986,7 @@ impl BackupArgs {
                 if self.dry_run {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "`lepatch backup --dry-run` to an `http://` target plans against \
+                        "`blu backup --dry-run` to an `http://` target plans against \
                          empty staging rather than the server's set, so its figures would \
                          be wrong. Plan against a local path or a `file://` store instead",
                     ));
@@ -1006,7 +1006,7 @@ impl BackupArgs {
 }
 
 /// The commands themselves.
-async fn dispatch_inner(command: Command, jobs: lepatch::serve::Jobs) -> std::io::Result<()> {
+async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io::Result<()> {
     match command {
         Command::Backup(args) => args.run().await,
         Command::Restore {
@@ -1115,7 +1115,7 @@ async fn dispatch_verify(target: Target, version: Option<u32>) -> std::io::Resul
         Target::Store(target) => run_verify_stored(&target, version).await,
         Target::Serve { .. } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "`lepatch verify` takes a local path or a `file://` target: the server exposes \
+            "`blu verify` takes a local path or a `file://` target: the server exposes \
              versions and packs, not chunk verification",
         )),
     }
@@ -1167,7 +1167,7 @@ async fn dispatch_merge_command(
             if dry_run {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "`lepatch merge --dry-run` to an `http://` target plans against nothing \
+                    "`blu merge --dry-run` to an `http://` target plans against nothing \
                      this machine holds: the server has no plan-only merge. Plan against a \
                      local path or a `file://` store instead",
                 ));
@@ -1187,7 +1187,7 @@ async fn dispatch_reindex(target: Target, dry_run: bool) -> std::io::Result<()> 
         Target::Store(target) => run_reindex_stored(&target, dry_run).await,
         Target::Serve { .. } => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "`lepatch reindex` takes a local path or a `file://` target: the index lives on \
+            "`blu reindex` takes a local path or a `file://` target: the index lives on \
              the server, where no endpoint rebuilds it",
         )),
     }
@@ -1388,7 +1388,7 @@ fn plural_versions(count: usize) -> String {
 /// The count is a **lower bound**. A version whose index file was never
 /// written still exists and still restores. So this may report fewer than the set
 /// holds, and never more. A set with no index files lists nothing rather than
-/// failing. The command `lepatch reindex` rebuilds the index of such a set. A real
+/// failing. The command `blu reindex` rebuilds the index of such a set. A real
 /// set with no committed version lists empty. A name that is not a set is an
 /// error.
 async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Result<()> {
@@ -1423,7 +1423,7 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     // makes the open report `NotFound`. So the arm never fired on the case it was
     // written for. The other job is the problem. `NotFound` is what the operating
     // system returns for a file that has gone. So a segment removed between that
-    // check and the open would have been swallowed too. Then `lepatch versions`
+    // check and the open would have been swallowed too. Then `blu versions`
     // would exit 0 having printed nothing about a set that was being deleted.
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
 
@@ -1477,15 +1477,15 @@ fn print_version(
     }
 }
 
-/// List a set held by a `lepatch serve`, printing exactly what a local listing
+/// List a set held by a `blu serve`, printing exactly what a local listing
 /// of the same set would.
 ///
-/// The fetch is [`lepatch::client::Remote`]'s. Everything here is printing what
+/// The fetch is [`blulib::client::Remote`]'s. Everything here is printing what
 /// came back; [`resolve_target`] decided what text is a set name — the last
 /// segment of the `http://` target — and neither it nor anything else here is
 /// a path on this machine.
 async fn run_versions_remote(set: &str, numbers_only: bool, address: &str) -> std::io::Result<()> {
-    let remote = lepatch::client::Remote::new(address)?;
+    let remote = blulib::client::Remote::new(address)?;
 
     for listed in remote.versions(set).await? {
         print_version(
@@ -1555,10 +1555,10 @@ impl KeepOrLevel {
     }
 
     /// Which write path the merge takes per chunk.
-    fn route(self) -> lepatch::command::MergeCompression {
+    fn route(self) -> blulib::command::MergeCompression {
         match self {
-            Self::Keep => lepatch::command::MergeCompression::Keep,
-            Self::Level(_) => lepatch::command::MergeCompression::Reencode,
+            Self::Keep => blulib::command::MergeCompression::Keep,
+            Self::Level(_) => blulib::command::MergeCompression::Reencode,
         }
     }
 
@@ -1770,13 +1770,13 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
     Ok(())
 }
 
-/// Rebuild a tree from a set on a `lepatch serve`, into `destination`.
+/// Rebuild a tree from a set on a `blu serve`, into `destination`.
 ///
 /// **The local path's work, unchanged, behind a download.** A local restore
 /// reads a version out of a set and writes every chunk of it. This one asks the
 /// server to pack the version, fetches the ranges it does not already have into
 /// a sparse file, and hands that file to [`apply`] — which is the same call
-/// `lepatch apply` makes, with the same options, and reports through the same
+/// `blu apply` makes, with the same options, and reports through the same
 /// [`report_applied`]. There is no second applier here and no second report.
 ///
 /// ## Where `have` comes from
@@ -1786,7 +1786,7 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
 /// read. The one place a pulled tree keeps the chunks of a version is the tree
 /// itself, and the one record that says which version a tree is — and that its
 /// files are still where that record left them — is the apply manifest beside
-/// [`Manifest::path_for`]. So [`have_for`] is the whole of it: every chunk of the
+/// [`blulib::command::Manifest::path_for`]. So [`have_for`] is the whole of it: every chunk of the
 /// version when the destination already is that version, and none of them
 /// otherwise.
 ///
@@ -1812,7 +1812,7 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
 /// the run succeeded or failed, and nothing outside this run ever looks at it.
 /// A pull that fails part-way leaves the destination as it was rather than a
 /// tree of zeroes: the bytes are written into the file first and applied after,
-/// and [`Pull::open`] refuses a file whose missing records are not the ones
+/// and [`blulib::client::Pull::open`] refuses a file whose missing records are not the ones
 /// [`have_for`] named.
 async fn run_restore_remote(
     destination: &std::path::Path,
@@ -1822,14 +1822,14 @@ async fn run_restore_remote(
     dry_run: bool,
     address: &str,
 ) -> std::io::Result<()> {
-    use lepatch::client::Outcome;
+    use blulib::client::Outcome;
 
-    let remote = lepatch::client::Remote::new(address)?;
-    lepatch::client::check_set(set)?;
+    let remote = blulib::client::Remote::new(address)?;
+    blulib::client::check_set(set)?;
 
     // The manifest, once. It is what `have` is built from, and reading it twice
     // would be two chances to answer differently.
-    let manifest = lepatch::command::Manifest::load(destination)?;
+    let manifest = blulib::command::Manifest::load(destination)?;
 
     let started = remote.start_pack(set, version, None).await?;
 
@@ -1865,7 +1865,7 @@ async fn run_restore_remote(
     );
 
     let pack_path = std::env::temp_dir().join(format!(
-        "lepatch-pull-{}-{}.pack",
+        "blu-pull-{}-{}.pack",
         std::process::id(),
         &summary.snapshot.to_hex().to_string()[..16]
     ));
@@ -1918,17 +1918,17 @@ async fn run_restore_remote(
     reason = "a restore's own arguments, plus the pack"
 )]
 async fn pull_and_apply(
-    remote: &lepatch::client::Remote,
+    remote: &blulib::client::Remote,
     set: &str,
     destination: &std::path::Path,
-    manifest: Option<&lepatch::command::Manifest>,
-    summary: &lepatch::client::PackSummary,
+    manifest: Option<&blulib::command::Manifest>,
+    summary: &blulib::client::PackSummary,
     pack_path: &std::path::Path,
     clean: bool,
     dry_run: bool,
 ) -> std::io::Result<()> {
     let fixed = fixed_regions(summary);
-    let scratch = lepatch::client::Pull::new(
+    let scratch = blulib::client::Pull::new(
         remote,
         set,
         summary.version,
@@ -1940,7 +1940,7 @@ async fn pull_and_apply(
     // The file table, and with it the chunk hashes `have` is built from — but
     // only where the destination's own record says there is something to save.
     let reads = manifest.filter(|m| m.version == summary.snapshot);
-    let mut fetched = lepatch::client::Fetched {
+    let mut fetched = blulib::client::Fetched {
         ranges: 0,
         bytes: 0,
         total: 0,
@@ -1959,7 +1959,7 @@ async fn pull_and_apply(
         }
     };
 
-    let listed: Vec<lepatch::storage::BlobId> = have.iter().copied().collect();
+    let listed: Vec<blulib::storage::BlobId> = have.iter().copied().collect();
     tracing::info!(
         held = listed.len(),
         of = summary.chunks,
@@ -1970,7 +1970,7 @@ async fn pull_and_apply(
     // destination gave no reason to read the file table first, nothing was
     // fetched and the plan has to bring all of it.
     let pull =
-        lepatch::client::Pull::new(remote, set, summary.version, have).already_fetched(prefetched);
+        blulib::client::Pull::new(remote, set, summary.version, have).already_fetched(prefetched);
     let plan = remote.plan_pack(set, summary.version, &listed).await?;
 
     if plan.length != summary.length {
@@ -2003,7 +2003,7 @@ async fn pull_and_apply(
 
     let pack = pull.open(&plan, pack_path)?;
 
-    // Held for the whole run, as `lepatch apply` holds it, so two pulls into one
+    // Held for the whole run, as `blu apply` holds it, so two pulls into one
     // destination cannot interleave writes into the same tree.
     let _claim = if dry_run {
         None
@@ -2066,9 +2066,9 @@ async fn pull_and_apply(
 /// cannot survive.
 fn have_for(
     destination: &std::path::Path,
-    manifest: &lepatch::command::Manifest,
-    snapshot: &lepatch::metadata::Snapshot,
-) -> std::collections::HashSet<lepatch::storage::BlobId> {
+    manifest: &blulib::command::Manifest,
+    snapshot: &blulib::metadata::Snapshot,
+) -> std::collections::HashSet<blulib::storage::BlobId> {
     let moved = manifest.untrusted(destination, snapshot);
 
     if !moved.is_empty() {
@@ -2089,8 +2089,8 @@ fn have_for(
 /// what a client fetching nothing at all is sent — and they are enough on their
 /// own to open the file, which is what a client that only wants the version's
 /// file table needs.
-fn fixed_regions(summary: &lepatch::client::PackSummary) -> Vec<lepatch::pack::Range> {
-    use lepatch::pack::Range;
+fn fixed_regions(summary: &blulib::client::PackSummary) -> Vec<blulib::pack::Range> {
+    use blulib::pack::Range;
 
     let head = Range {
         start: 0,
@@ -2186,7 +2186,7 @@ async fn run_restore(
 /// half-written tree behind that the claim could not reach. There is now one
 /// definition, and it is the claim's.
 async fn restore_atomically<S: storage::StorageGet + 'static>(
-    claim: &lepatch::command::DestinationLock,
+    claim: &blulib::command::DestinationLock,
     snapshot: storage::BlobId,
     store: S,
 ) -> std::io::Result<()> {
@@ -2311,7 +2311,7 @@ fn report_restore_plan(
 }
 
 /// Log what a restore put into the destination.
-fn report_restored(restored: &lepatch::command::Restored) {
+fn report_restored(restored: &blulib::command::Restored) {
     tracing::info!(
         files = restored.files,
         dirs = restored.dirs,
@@ -2563,7 +2563,7 @@ async fn run_pack(
 fn report_pack(
     version: u32,
     out: &std::path::Path,
-    packed: &lepatch::command::Packed,
+    packed: &blulib::command::Packed,
 ) -> std::io::Result<()> {
     let held = match packed.base {
         Some(base_version) => format!(
@@ -2604,7 +2604,7 @@ fn report_pack(
 enum Target {
     /// A path on this machine.
     Local(std::path::PathBuf),
-    /// A set on a `lepatch serve`.
+    /// A set on a `blu serve`.
     Serve {
         /// The server's address, without the set.
         address: String,
@@ -2633,12 +2633,12 @@ fn resolve_target(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "`lepatch {command} --staging` needs a store target: an `http://` \
+                        "`blu {command} --staging` needs a store target: an `http://` \
                          target works on the server and stages nothing here"
                     ),
                 ));
             }
-            let (address, set) = lepatch::client::split_serve_target(raw)?;
+            let (address, set) = blulib::client::split_serve_target(raw)?;
             return Ok(Target::Serve { address, set });
         }
         let (url, set) = storage::RemoteUrl::split_set(raw)?;
@@ -2658,7 +2658,7 @@ fn resolve_target(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "`lepatch {command} --staging` needs a store target: a local path stages \
+                "`blu {command} --staging` needs a store target: a local path stages \
                  nothing, so there is no copy to select a directory for"
             ),
         ));
@@ -2850,10 +2850,10 @@ static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// A scratch directory for one pure-remote run, removed afterwards.
 fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("lepatch-{prefix}-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!("blu-{prefix}-{}-{n}", std::process::id()))
 }
 
-/// Back up into a `lepatch serve` set, holding no local copy.
+/// Back up into a `blu serve` set, holding no local copy.
 ///
 /// Backs the tree up into temporary staging with exactly the code a local
 /// run uses, packs the committed version, and has the server merge it. The
@@ -2956,7 +2956,7 @@ async fn run_pack_stored(
     run_pack(&target.staging, out, version, from, compression, dry_run).await
 }
 
-/// Pack a version of a `lepatch serve` set into `out`.
+/// Pack a version of a `blu serve` set into `out`.
 ///
 /// The pack is computed on the server and fetched whole: a pack is the one
 /// artifact a client fetches in full, so the destination's record saves
@@ -2973,8 +2973,8 @@ async fn run_pack_serve(
     from: Option<u32>,
     dry_run: bool,
 ) -> std::io::Result<()> {
-    let remote = lepatch::client::Remote::new(address)?;
-    lepatch::client::check_set(set)?;
+    let remote = blulib::client::Remote::new(address)?;
+    blulib::client::check_set(set)?;
 
     let started = remote.start_pack(set, version, from).await?;
     let packed = remote
@@ -2988,7 +2988,7 @@ async fn run_pack_serve(
         })
         .await?;
 
-    let Some(lepatch::client::Outcome::Packed(summary)) = &packed.result else {
+    let Some(blulib::client::Outcome::Packed(summary)) = &packed.result else {
         return Err(std::io::Error::other(format!(
             "job {} finished without saying what it packed",
             packed.id
@@ -3030,13 +3030,13 @@ async fn run_pack_serve(
 /// plan is checked against the summary before a byte is trusted, exactly as
 /// [`pull_and_apply`] checks its own.
 async fn fetch_pack_serve(
-    remote: &lepatch::client::Remote,
+    remote: &blulib::client::Remote,
     set: &str,
     out: &std::path::Path,
-    summary: &lepatch::client::PackSummary,
+    summary: &blulib::client::PackSummary,
     from: Option<u32>,
 ) -> std::io::Result<()> {
-    let pull = lepatch::client::Pull::new(
+    let pull = blulib::client::Pull::new(
         remote,
         set,
         summary.version,
@@ -3070,8 +3070,8 @@ async fn fetch_pack_serve(
     drop(fetched);
 
     let pack = Pack::open(out)?;
-    let content = lepatch::pack::hash_file(out).await?;
-    let packed = lepatch::command::Packed {
+    let content = blulib::pack::hash_file(out).await?;
+    let packed = blulib::command::Packed {
         chunks: summary.chunks,
         of: summary.chunks,
         payload: pack.payload_len(),
@@ -3165,7 +3165,7 @@ async fn run_reindex_stored(target: &StoreTarget, dry_run: bool) -> std::io::Res
     Ok(())
 }
 
-/// A `lepatch serve` this run is pushing a pack to, and the set to put it in.
+/// A `blu serve` this run is pushing a pack to, and the set to put it in.
 ///
 /// Upload, ask the server to merge it into one set, wait, and report. The
 /// reporting lives here too, so a pushed pack and a merged one cannot say
@@ -3176,11 +3176,11 @@ async fn run_reindex_stored(target: &StoreTarget, dry_run: bool) -> std::io::Res
 /// **A server holds many sets and this run cannot know which one was meant.**
 /// The set arrives as the last segment of the `http://` target, so a target
 /// with no set is refused rather than guessed at. The name is checked with
-/// [`lepatch::client::check_set`] before the first byte moves, so a name that
+/// [`blulib::client::check_set`] before the first byte moves, so a name that
 /// is really a path is refused here rather than after a transfer.
 struct Push {
     /// The client, which has already refused an address it cannot speak to.
-    remote: lepatch::client::Remote,
+    remote: blulib::client::Remote,
     /// The set on that server, checked to be one path component.
     set: String,
 }
@@ -3195,9 +3195,9 @@ impl Push {
     /// before the caller does any work — a mistyped address or set name should
     /// not be discovered after a transfer.
     fn open(address: &str, set: &str) -> std::io::Result<Self> {
-        let remote = lepatch::client::Remote::new(address)?;
+        let remote = blulib::client::Remote::new(address)?;
 
-        lepatch::client::check_set(set)?;
+        blulib::client::check_set(set)?;
 
         Ok(Self {
             remote,
@@ -3212,10 +3212,10 @@ impl Push {
     /// and a level is a level. The two policies are different types because they
     /// answer different questions (what is on the wire versus what a set is
     /// opened with), and this is the one place the answer crosses.
-    fn compression(compression: KeepOrLevel) -> lepatch::client::MergeCompression {
+    fn compression(compression: KeepOrLevel) -> blulib::client::MergeCompression {
         match compression {
-            KeepOrLevel::Keep => lepatch::client::MergeCompression::Keep,
-            KeepOrLevel::Level(level) => lepatch::client::MergeCompression::Reencode(level),
+            KeepOrLevel::Keep => blulib::client::MergeCompression::Keep,
+            KeepOrLevel::Level(level) => blulib::client::MergeCompression::Reencode(level),
         }
     }
 
@@ -3281,8 +3281,8 @@ impl Push {
     /// a name on a server rather than a path here, and the server is named because
     /// a push is a thing done *to* somewhere and a report that did not say where
     /// would be about a set on no machine in particular.
-    fn report(&self, job: &lepatch::client::Job, pack: &std::path::Path) -> std::io::Result<()> {
-        use lepatch::client::{Merged as RemoteMerged, Outcome};
+    fn report(&self, job: &blulib::client::Job, pack: &std::path::Path) -> std::io::Result<()> {
+        use blulib::client::{Merged as RemoteMerged, Outcome};
 
         let Some(Outcome::Merged(merged)) = &job.result else {
             return Err(std::io::Error::other(format!(
@@ -3349,7 +3349,7 @@ impl Push {
 
 /// Pack a version of the set at `name` into `out`, and report what the pack holds.
 ///
-/// **The one place a pack is written locally**, so `lepatch pack` and the pack
+/// **The one place a pack is written locally**, so `blu pack` and the pack
 /// a backup to a serve target pushes are the same file built by the same code.
 /// The run it is taken from does not matter: a serve backup hands the version
 /// it just staged to this, and a `pack` hands the version its own `--version`
@@ -3366,7 +3366,7 @@ async fn write_pack(
     from: Option<u32>,
     compression: KeepOrLevel,
     dry_run: bool,
-) -> std::io::Result<(u32, lepatch::command::Packed)> {
+) -> std::io::Result<(u32, blulib::command::Packed)> {
     let set = IndexSet::new(name);
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
     let (version, snapshot_id) = select_version(&set, &store, version)?;
@@ -3394,7 +3394,7 @@ async fn write_pack(
         None => None,
         Some(base_version) => {
             let (base_version, base_id) = select_version(&set, &store, Some(base_version))?;
-            Some(lepatch::command::Base {
+            Some(blulib::command::Base {
                 version: base_version,
                 id: base_id,
                 snapshot: load_snapshot(&store, base_id).await?,
@@ -3402,16 +3402,16 @@ async fn write_pack(
         }
     };
 
-    let packed = lepatch::command::pack(
+    let packed = blulib::command::pack(
         &store,
-        &lepatch::command::Version {
+        &blulib::command::Version {
             number: version,
             snapshot,
         },
         |id| store.locate(id),
         base,
         out,
-        lepatch::command::PackOptions {
+        blulib::command::PackOptions {
             dry_run,
             compression: compression.pack_policy(),
         },
@@ -3498,7 +3498,7 @@ async fn run_merge(
     if let Some(base) = pack.base()
         && set.segments()?.is_empty()
     {
-        lepatch::command::establish_base::<storage::Write, storage::Compression>(
+        blulib::command::establish_base::<storage::Write, storage::Compression>(
             None,
             base,
             pack.path(),
@@ -3790,7 +3790,7 @@ async fn run_apply(
 /// line is what a script parses. Interpolating into that line would change bytes
 /// that nobody asked to change.
 fn report_applied(
-    applied: &lepatch::command::Applied,
+    applied: &blulib::command::Applied,
     pack: &Pack,
     destination: &std::path::Path,
     dry_run: bool,
@@ -3882,8 +3882,8 @@ mod tests {
     //! # Why this regressed once already
     //!
     //! Commit `9ab42a7`. `--quiet` and `RUST_LOG` were attached to the *subscriber*
-    //! rather than to the `fmt` layer, so a `lepatch --quiet serve` answered
-    //! `never` to `lepatch::progress`, the event was never emitted, the progress
+    //! rather than to the `fmt` layer, so a `blu --quiet serve` answered
+    //! `never` to `blulib::progress`, the event was never emitted, the progress
     //! layer above was never offered it, and **a client polling
     //! `GET /v1/jobs/{id}` was told a running merge had reported nothing.** No test
     //! failed, because every other part of the layer worked perfectly on the events
@@ -3910,16 +3910,16 @@ mod tests {
 
     use super::*;
 
-    use lepatch::{
+    use blulib::{
         progress::{Counter, Phase, Progress},
         serve::{JobId, Jobs},
     };
 
     /// Spawn a job, let it report one progress event, and wait for it to finish.
     ///
-    /// `Jobs::spawn` puts the work on a tokio task with a `lepatch_job` span
+    /// `Jobs::spawn` puts the work on a tokio task with a `blu_job` span
     /// around it, which is the span `observe` matches on; the `Progress::report`
-    /// below writes the real `lepatch::progress` event that layer reads. The
+    /// below writes the real `blulib::progress` event that layer reads. The
     /// oneshot is how the test learns the work has run — `spawn` returns before
     /// the task is first polled, so reading the registry immediately would be a
     /// race the test would lose half the time.
@@ -3938,7 +3938,7 @@ mod tests {
                 assert!(progress.report(), "a run's first report is always due");
 
                 let _ = done.send(());
-                Ok(lepatch::serve::Json::Null)
+                Ok(blulib::serve::Json::Null)
             });
 
             let _ = finished.await;
@@ -3959,7 +3959,7 @@ mod tests {
     /// progress into the registry.**
     ///
     /// `init_tracing` is called rather than reconstructed: this is the stack a
-    /// `lepatch serve` run installs, the three layers and three filters in the
+    /// `blu serve` run installs, the three layers and three filters in the
     /// order `init_tracing` puts them, read off the same code. `--quiet` is on
     /// deliberately — the terminal's filter is at `warn`, so every event under it
     /// is refused, and the only question is whether that refusal stops where the
@@ -3975,12 +3975,12 @@ mod tests {
         let jobs = Jobs::new();
 
         // Telemetry off, so nothing tries to build an exporter and the stack is
-        // exactly the one a `lepatch serve` run that never asked for spans has.
+        // exactly the one a `blu serve` run that never asked for spans has.
         init_tracing(
             false,
             true,
             Some(&jobs),
-            &lepatch::telemetry::Config::new(false, None),
+            &blulib::telemetry::Config::new(false, None),
         );
 
         let id = report_progress(&jobs);
@@ -4016,7 +4016,7 @@ mod tests {
         };
         assert_eq!(target.set, "docs");
         assert_eq!(target.url.to_string(), "file:///remote");
-        assert!(target.staging.starts_with("/stage/lepatch/stores"));
+        assert!(target.staging.starts_with("/stage/blu/stores"));
         assert!(target.staging.ends_with("docs"));
     }
 
@@ -4087,10 +4087,10 @@ mod tests {
     /// No network either way.
     #[test]
     fn remote_schemes_connect_only_behind_the_feature() {
-        let file = lepatch::storage::RemoteUrl::parse("file:///remote").unwrap();
+        let file = blulib::storage::RemoteUrl::parse("file:///remote").unwrap();
         assert!(super::connect_store(&file).is_ok());
 
-        let s3 = lepatch::storage::RemoteUrl::parse("s3://bucket/backups").unwrap();
+        let s3 = blulib::storage::RemoteUrl::parse("s3://bucket/backups").unwrap();
         match super::connect_store(&s3) {
             Ok(_) => panic!("an s3 store must not connect in this test: no network"),
             Err(refused) => {

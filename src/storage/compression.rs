@@ -234,7 +234,7 @@ impl Decompressor for Zstd {
 ///
 /// ```no_run
 /// # async fn example() -> std::io::Result<()> {
-/// use lepatch::storage::{BlobStore, Compression, SegmentLimit};
+/// use blulib::storage::{BlobStore, Compression, SegmentLimit};
 ///
 /// // The defaults: zstd level 1, four gibibytes per segment.
 /// let store = BlobStore::open_for_writing(

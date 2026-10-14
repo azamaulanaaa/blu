@@ -7,7 +7,7 @@
 
 mod common;
 
-use lepatch::{
+use blulib::{
     command::load_snapshot,
     layout::IndexSet,
     pack::StorageStored,
@@ -19,7 +19,7 @@ use tokio::io::AsyncReadExt;
 /// `StreamReadSeeker` is not `Debug`, so `unwrap_err` is not available on
 /// `StorageGet::get`.
 fn expect_get_error(
-    error: Result<lepatch::storage::StreamReadSeeker, std::io::Error>,
+    error: Result<blulib::storage::StreamReadSeeker, std::io::Error>,
 ) -> std::io::Error {
     match error {
         Ok(_) => panic!("expected get to fail, but it succeeded"),
@@ -790,7 +790,7 @@ async fn a_store_does_not_print_its_index() {
 /// file is a real one. A missing file needs no special anything.
 #[test]
 fn a_filesystem_failure_names_the_path_and_keeps_its_kind() {
-    let missing = std::path::Path::new("/nonexistent-lepatch/store.0000.bin");
+    let missing = std::path::Path::new("/nonexistent-blu/store.0000.bin");
 
     // The bare form, for comparison. This is what the crate used to hand back.
     let bare = std::fs::File::open(missing).unwrap_err();
@@ -800,7 +800,7 @@ fn a_filesystem_failure_names_the_path_and_keeps_its_kind() {
         "the bare message is what this is fixing: {bare}"
     );
 
-    let wrapped = lepatch::storage::at(missing, "open", std::fs::File::open(missing)).unwrap_err();
+    let wrapped = blulib::storage::at(missing, "open", std::fs::File::open(missing)).unwrap_err();
 
     assert_eq!(
         wrapped.kind(),
@@ -824,9 +824,9 @@ fn a_filesystem_failure_names_the_path_and_keeps_its_kind() {
 /// The async wrapper is the same wrapper, awaited.
 #[tokio::test]
 async fn the_async_wrapper_names_the_path_and_keeps_its_kind() {
-    let missing = std::path::Path::new("/nonexistent-lepatch/segment.bin");
+    let missing = std::path::Path::new("/nonexistent-blu/segment.bin");
 
-    let error = lepatch::storage::at_async(missing, "open", tokio::fs::File::open(missing))
+    let error = blulib::storage::at_async(missing, "open", tokio::fs::File::open(missing))
         .await
         .expect_err("a missing file is still missing");
 

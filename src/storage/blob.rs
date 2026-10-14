@@ -419,7 +419,7 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
     /// this method removes is the scan for the *version list*. It also removes the
     /// read of the named segment, because the check takes that data from
     /// [`BlobStore::segment_commits`]. Resolving N versions against one segment
-    /// used to read that segment N times. `lepatch versions` resolves one version
+    /// used to read that segment N times. `blu versions` resolves one version
     /// at a time.
     ///
     /// The code logs the fallback. A caller that asks this is trying to avoid a
@@ -1618,7 +1618,7 @@ fn check_store_header(file: &mut (impl io::Read + io::Seek), path: &Path) -> io:
     record::decode_store_header(&header).map_err(|fault| {
         let why = match fault {
             record::HeaderFault::NotAStore => {
-                "it does not begin with a lepatch store header, so it was not written by this format"
+                "it does not begin with a blu store header, so it was not written by this format"
             }
             record::HeaderFault::UnsupportedVersion => {
                 "it is a store format this build does not read"

@@ -28,7 +28,7 @@ use super::record;
 ///
 /// ```
 /// # fn main() -> std::io::Result<()> {
-/// use lepatch::storage::SegmentLimit;
+/// use blulib::storage::SegmentLimit;
 ///
 /// assert_eq!(SegmentLimit::default().bytes(), 4 * 1024 * 1024 * 1024);
 ///

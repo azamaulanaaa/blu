@@ -27,7 +27,7 @@ use std::{
     path::Path,
 };
 
-use lepatch::{
+use blulib::{
     command::{Mislength, Unheld, probe},
     metadata::Snapshot,
     pack::Pack,
@@ -103,7 +103,7 @@ impl Built {
     }
 
     /// Probe `root` against this version, reading chunks from the store.
-    async fn probe(&self, root: &Path) -> lepatch::command::Probed {
+    async fn probe(&self, root: &Path) -> blulib::command::Probed {
         let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
         probe(root, &self.snapshot, store).await.unwrap()
     }
@@ -116,15 +116,15 @@ impl Built {
     async fn probe_skipping_counting(
         &self,
         root: &Path,
-        established: &lepatch::command::Established<'_>,
-    ) -> (lepatch::command::Probed, usize) {
+        established: &blulib::command::Established<'_>,
+    ) -> (blulib::command::Probed, usize) {
         let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
         let counting = Counting {
             inner: store,
             reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let reads = std::sync::Arc::clone(&counting.reads);
-        let probed = lepatch::command::probe_skipping(root, &self.snapshot, counting, established)
+        let probed = blulib::command::probe_skipping(root, &self.snapshot, counting, established)
             .await
             .unwrap();
         (probed, reads.load(std::sync::atomic::Ordering::SeqCst))
@@ -140,16 +140,16 @@ impl Built {
     }
 
     /// Every file accounted for, so nothing is read at all.
-    fn all_skipped(&self) -> lepatch::command::Established<'_> {
-        lepatch::command::Established {
+    fn all_skipped(&self) -> blulib::command::Established<'_> {
+        blulib::command::Established {
             files: self.paths(),
             ..Default::default()
         }
     }
 
     /// Every file accounted for but `keep`, which is then read.
-    fn all_skipped_but(&self, keep: &Path) -> lepatch::command::Established<'_> {
-        lepatch::command::Established {
+    fn all_skipped_but(&self, keep: &Path) -> blulib::command::Established<'_> {
+        blulib::command::Established {
             files: self
                 .snapshot
                 .files
@@ -164,7 +164,7 @@ impl Built {
     /// Probe `root` against this version, reading chunks from `pack`.
     ///
     /// The path a real client takes: everything it needs is in the one file.
-    async fn probe_with_pack(&self, root: &Path, pack: &Pack) -> lepatch::command::Probed {
+    async fn probe_with_pack(&self, root: &Path, pack: &Pack) -> blulib::command::Probed {
         probe(root, &self.snapshot, pack.clone()).await.unwrap()
     }
 }
@@ -212,7 +212,7 @@ async fn a_chunk_spanning_a_skipped_and_an_unskipped_file_is_still_read() {
 
     // The baseline: account for nothing and every chunk is read.
     let (_, every_chunk_read) = built
-        .probe_skipping_counting(&client, &lepatch::command::Established::default())
+        .probe_skipping_counting(&client, &blulib::command::Established::default())
         .await;
 
     // Account for all of them, and nothing is read at all.
@@ -306,7 +306,7 @@ async fn a_chunk_the_source_lacks_is_held_when_accounted_for() {
     // does not copy. `Established::chunks` holds a borrowing set.
     let missing: HashSet<&BlobId> = built.snapshot.chunks[..2].iter().collect();
 
-    let established = lepatch::command::Established {
+    let established = blulib::command::Established {
         files: all,
         chunks: missing.iter().copied().collect(),
     };
@@ -346,7 +346,7 @@ impl<S: StorageGet> StorageGet for Counting<S> {
     fn get(
         &self,
         id: &BlobId,
-    ) -> impl std::future::Future<Output = std::io::Result<lepatch::storage::StreamReadSeeker>> + Send
+    ) -> impl std::future::Future<Output = std::io::Result<blulib::storage::StreamReadSeeker>> + Send
     {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.get(id)

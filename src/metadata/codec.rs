@@ -5,7 +5,7 @@
 //! behind that decision is in the README.
 //!
 //! ```text
-//! magic     8 bytes,  b"LEPATCH\0"
+//! magic     8 bytes,  b"BLU\0\0\0\0\0"
 //! version   u32, little endian
 //! body:
 //!   i64      UTC seconds of the snapshot stamp

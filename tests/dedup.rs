@@ -16,14 +16,14 @@ mod common;
 
 use std::fs;
 
-use lepatch::{
+use blulib::{
     command::{Options, backup},
     metadata::Timestamp,
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet},
 };
 
 /// Read a snapshot back out of a store.
-async fn snapshot(blob: &std::path::Path, id: &BlobId) -> lepatch::metadata::Snapshot {
+async fn snapshot(blob: &std::path::Path, id: &BlobId) -> blulib::metadata::Snapshot {
     use tokio::io::AsyncReadExt;
 
     let storage = BlobStore::open_for_reading(blob).await.unwrap();
@@ -31,7 +31,7 @@ async fn snapshot(blob: &std::path::Path, id: &BlobId) -> lepatch::metadata::Sna
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
 
-    lepatch::metadata::Snapshot::try_from(buffer.as_slice()).unwrap()
+    blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap()
 }
 
 #[tokio::test]

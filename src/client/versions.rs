@@ -6,7 +6,7 @@
 //!
 //! The server lists a set from its index files and resolves every snapshot hash
 //! through the store, skipping a version it cannot serve — the same
-//! lower-bound answer, with the same skips, that `lepatch versions` gives for a
+//! lower-bound answer, with the same skips, that `blu versions` gives for a
 //! directory. So this parses into the same [`Version`] values a local listing
 //! produces, in the same order, and the caller prints them with the same code.
 //!
@@ -31,7 +31,7 @@
 //!
 //! ## Why a refusal is the server's own sentence
 //!
-//! `lepatch serve` sends RFC 9457 problem documents, and `detail` is the
+//! `blu serve` sends RFC 9457 problem documents, and `detail` is the
 //! [`std::io::Error`] the command line would have printed — the crate's errors
 //! are flat and complete by design, and the server does not translate them. A
 //! `404` therefore arrives here as a [`io::ErrorKind::NotFound`] carrying that

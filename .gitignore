@@ -4,7 +4,7 @@
 /.cargo/registry
 /.cargo/git
 
-# Store files. `lepatch backup <dir> <base>` writes `<base>.NNNN.bin` and
+# Store files. `blu backup <dir> <base>` writes `<base>.NNNN.bin` and
 # `<base>.vNNNN.idx` into the *current directory* when the base is a bare name,
 # and a test that runs the binary without setting a working directory leaves one
 # here. `git add -A` will otherwise commit one, and a committed

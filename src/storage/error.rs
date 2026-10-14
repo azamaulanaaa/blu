@@ -34,7 +34,7 @@ use std::{io, path::Path};
 /// ```no_run
 /// # fn main() -> std::io::Result<()> {
 /// # let path = std::path::Path::new("photos.0000.bin");
-/// let file = lepatch::storage::at(path, "open", std::fs::File::open(path))?;
+/// let file = blulib::storage::at(path, "open", std::fs::File::open(path))?;
 /// # let _ = file;
 /// # Ok(())
 /// # }
@@ -68,7 +68,7 @@ pub fn at<T>(path: &Path, doing: &str, result: io::Result<T>) -> io::Result<T> {
 /// ```no_run
 /// # async fn example() -> std::io::Result<()> {
 /// # let path = std::path::Path::new("photos.0000.bin");
-/// let file = lepatch::storage::at_async(
+/// let file = blulib::storage::at_async(
 ///     path,
 ///     "open",
 ///     tokio::fs::File::open(path),

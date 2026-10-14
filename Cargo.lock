@@ -428,6 +428,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "blulib"
+version = "0.7.0"
+dependencies = [
+ "actix-web",
+ "awc",
+ "blake3",
+ "bytes",
+ "clap",
+ "criterion",
+ "fastcdc",
+ "filetime",
+ "futures-util",
+ "http 1.5.0",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
+ "jiff",
+ "opendal",
+ "opendal-http-transport-reqwest",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "rustls",
+ "rustls-native-certs",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "walkdir",
+ "zstd",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1552,43 +1589,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "lepatch"
-version = "0.7.0"
-dependencies = [
- "actix-web",
- "awc",
- "blake3",
- "bytes",
- "clap",
- "criterion",
- "fastcdc",
- "filetime",
- "futures-util",
- "http 1.5.0",
- "http-body-util",
- "hyper-rustls",
- "hyper-util",
- "jiff",
- "opendal",
- "opendal-http-transport-reqwest",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
- "rustls",
- "rustls-native-certs",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "walkdir",
- "zstd",
-]
 
 [[package]]
 name = "libc"

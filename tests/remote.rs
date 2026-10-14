@@ -1,6 +1,6 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! `lepatch versions` of a serve set: the same listing a local set gives, from a
+//! `blu versions` of a serve set: the same listing a local set gives, from a
 //! server somewhere else.
 //!
 //! The claim this file exists to hold is one line long — **a script written
@@ -28,7 +28,7 @@
 //! ## Why a subprocess and a real server
 //!
 //! Same reasoning as `tests/serve.rs`, and the same helpers: a real
-//! `lepatch serve` started as a user starts it, reached over a socket. The
+//! `blu serve` started as a user starts it, reached over a socket. The
 //! byte comparison is only worth anything if both sides of it are the bytes a
 //! user gets.
 
@@ -55,21 +55,21 @@ fn serve_target(address: &str) -> String {
 }
 
 /// Run the binary and hand back its output.
-fn lepatch(dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_lepatch"))
+fn blu(dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_blu"))
         .current_dir(dir)
         .args(args)
         .output()
-        .expect("failed to run the lepatch binary")
+        .expect("failed to run the blu binary")
 }
 
 /// The stdout of a run that succeeded.
 fn ok(dir: &Path, args: &[&str]) -> Vec<u8> {
-    let output = lepatch(dir, args);
+    let output = blu(dir, args);
 
     assert!(
         output.status.success(),
-        "`lepatch {}` failed with {:?}\nstdout: {}\nstderr: {}",
+        "`blu {}` failed with {:?}\nstdout: {}\nstderr: {}",
         args.join(" "),
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
@@ -81,11 +81,11 @@ fn ok(dir: &Path, args: &[&str]) -> Vec<u8> {
 
 /// The stderr of a run that failed, with the run asserted to have exited 1.
 fn fails(dir: &Path, args: &[&str]) -> String {
-    let output = lepatch(dir, args);
+    let output = blu(dir, args);
 
     assert!(
         !output.status.success(),
-        "`lepatch {}` unexpectedly succeeded\nstdout: {}",
+        "`blu {}` unexpectedly succeeded\nstdout: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stdout)
     );
@@ -241,7 +241,7 @@ async fn a_set_name_holding_a_space_is_the_same_set() {
 #[tokio::test]
 async fn a_set_the_server_does_not_hold_carries_its_own_sentence() {
     // **The server's words, not a paraphrase of them.** Read the problem
-    // document over HTTP and compare: `detail` is the sentence `lepatch versions`
+    // document over HTTP and compare: `detail` is the sentence `blu versions`
     // on the server's own disk would have printed, so a remote miss reads like
     // the local one and there is no second vocabulary to learn. Asserting the
     // string contains "no backup set" would pass for any paraphrase of it.
@@ -291,7 +291,7 @@ async fn a_set_the_server_does_not_hold_prints_nothing() {
     let (root, _set) = served_three_versions(dir.path()).await;
     let server = Server::start(&root);
 
-    let output = lepatch(
+    let output = blu(
         &root,
         &["versions", &format!("{}/nosuch", remote_of(&server))],
     );
@@ -444,7 +444,7 @@ async fn a_response_this_client_cannot_read_fails_loudly() {
         let stub = Stub::answering_200(body);
         let address = format!("http://{}", stub.address());
 
-        let output = lepatch(dir.path(), &["versions", &serve_target(&address)]);
+        let output = blu(dir.path(), &["versions", &serve_target(&address)]);
 
         assert_eq!(
             output.status.code(),
@@ -483,7 +483,7 @@ async fn an_empty_listing_is_an_empty_list_and_not_a_failure() {
     let stub = Stub::answering_200(r#"{"versions":[]}"#);
     let address = format!("http://{}", stub.address());
 
-    let output = lepatch(dir.path(), &["versions", &serve_target(&address)]);
+    let output = blu(dir.path(), &["versions", &serve_target(&address)]);
 
     assert!(
         output.status.success(),
@@ -511,7 +511,7 @@ async fn a_listing_of_a_set_that_exists_holds_every_version_the_server_names() {
     let dir = tempfile::tempdir().unwrap();
     let (root, set) = served_three_versions(dir.path()).await;
 
-    let storage = lepatch::storage::BlobStore::open_for_reading(&set)
+    let storage = blulib::storage::BlobStore::open_for_reading(&set)
         .await
         .unwrap();
 
@@ -570,7 +570,7 @@ async fn a_serve_target_lists_what_the_local_path_lists_and_old_flags_fail() {
         vec!["versions", "docs", "--remote", address.as_str()],
         vec!["versions", "--remote", address.as_str(), "--set", "docs"],
     ] {
-        let output = lepatch(&root, &args);
+        let output = blu(&root, &args);
         let said = String::from_utf8_lossy(&output.stderr).into_owned();
 
         assert!(
