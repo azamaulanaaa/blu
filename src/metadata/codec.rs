@@ -614,10 +614,7 @@ mod tests {
     fn a_body_with_trailing_bytes_is_refused() {
         let mut bytes = encode_body(&sample()).expect("encodes");
         bytes.push(0);
-        assert!(
-            decode_body(&bytes).is_err(),
-            "trailing bytes were accepted"
-        );
+        assert!(decode_body(&bytes).is_err(), "trailing bytes were accepted");
     }
 
     #[test]
@@ -685,8 +682,7 @@ mod tests {
                 },
             });
 
-            let decoded =
-                decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
+            let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
             assert_eq!(decoded.files[0].path, snapshot.files[0].path);
         }
     }
@@ -716,8 +712,7 @@ mod tests {
             },
         });
 
-        let decoded =
-            decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
+        let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
 
         assert_eq!(
             decoded.files[0].attrs.owner,
@@ -796,10 +791,18 @@ mod tests {
     ///
     /// The zone changes the spelling, never the instant.
     /// Parsing the local form returns the same stamp.
+    /// The form carries an offset and no zone name.
     #[test]
     fn local_text_names_the_same_instant() {
         let taken_at = stamped();
-        let parsed = Timestamp::parse_utc(&taken_at.to_local_string()).expect("parses");
+        let text = taken_at.to_local_string();
+
+        assert!(
+            !text.contains('['),
+            "local text should carry an offset, not a zone name: {text}"
+        );
+
+        let parsed = Timestamp::parse_utc(&text).expect("parses");
 
         assert_eq!(parsed, taken_at);
     }

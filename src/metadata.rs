@@ -118,17 +118,32 @@ impl Timestamp {
     /// Local text for display with the system offset.
     ///
     /// Reads the system zone once per call.
+    /// Renders the date, the time and the offset in RFC 3339 form.
     /// Uses UTC text where the zone or the value is out of range.
     #[must_use]
     pub fn to_local_string(self) -> String {
-        let zoned = jiff::Timestamp::from_second(self.secs)
+        let rendered = jiff::Timestamp::from_second(self.secs)
             .ok()
             .and_then(|base| {
                 base.checked_add(jiff::SignedDuration::from_nanos(i64::from(self.nanos)))
                     .ok()
             })
-            .map(|instant| instant.to_zoned(jiff::tz::TimeZone::system()));
-        zoned.map_or_else(|| self.to_utc_string(), |zoned| zoned.to_string())
+            .map(|instant| {
+                let zoned = instant.to_zoned(jiff::tz::TimeZone::system());
+                let offset = zoned.offset().seconds();
+                let (sign, abs) = if offset < 0 {
+                    ('-', offset.unsigned_abs())
+                } else {
+                    ('+', u32::try_from(offset).unwrap_or(0))
+                };
+                format!(
+                    "{}{sign}{:02}:{:02}",
+                    zoned.datetime(),
+                    abs / 3_600,
+                    abs % 3_600 / 60
+                )
+            });
+        rendered.unwrap_or_else(|| self.to_utc_string())
     }
 
     /// Parse RFC 3339 text into a stamp.
