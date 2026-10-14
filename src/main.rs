@@ -210,14 +210,31 @@ enum Command {
     /// `{version}` under `--numbers-only`. The time is local time in RFC 3339 form.
     /// The store keeps UTC. A script written against a local set
     /// works unchanged against a remote one.
+    ///
+    /// With `--files`, this reports a different listing instead: the versions
+    /// where the named paths changed, oldest first, one line per change as
+    /// `{version}  {status}  {path}` where the status is `created`, `modified`
+    /// or `deleted`. Versions where none of them changed are skipped.
     Versions {
         /// The backup set to inspect: a local path (`photos`), a serve set
         /// (`http://127.0.0.1:8480/docs`), or a keyed store
         /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy.
         target: String,
         /// Print just the version numbers, one per line, and nothing else.
+        ///
+        /// With `--files`, only the versions where a named path changed.
         #[arg(long)]
         numbers_only: bool,
+        /// Only report the versions where these paths changed.
+        ///
+        /// Paths are relative to the backup root, as the snapshot records them
+        /// (`src/main.rs`). A value holding `*`, `?`, `[`, `\` or `{` is a glob
+        /// pattern: `*` spans one path level, `**` spans nested levels, and a
+        /// backslash names the next byte literally. Quote patterns so the shell
+        /// does not expand them first. A value naming a directory matches
+        /// everything under it. A backslash escapes a literal metacharacter.
+        #[arg(long, value_name = "PATH")]
+        files: Vec<std::path::PathBuf>,
         /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
@@ -1070,10 +1087,11 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
         Command::Versions {
             target,
             numbers_only,
+            files,
             staging,
         } => {
             let target = resolve_target("versions", &target, staging.as_deref())?;
-            dispatch_versions(target, numbers_only).await
+            dispatch_versions(target, numbers_only, files).await
         }
         Command::Serve {
             root,
@@ -1196,12 +1214,35 @@ async fn dispatch_reindex(target: Target, dry_run: bool) -> std::io::Result<()> 
 /// Run `versions` against a local path, a keyed store, or a server.
 ///
 /// Split out of [`dispatch_inner`] only to keep that match readable; the store
-/// route pulls into staging first.
-async fn dispatch_versions(target: Target, numbers_only: bool) -> std::io::Result<()> {
+/// route pulls into staging first. With `files` this reports file history
+/// rather than the version listing, on every target alike.
+async fn dispatch_versions(
+    target: Target,
+    numbers_only: bool,
+    files: Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
     match target {
-        Target::Local(name) => run_versions(&name, numbers_only).await,
-        Target::Serve { address, set } => run_versions_remote(&set, numbers_only, &address).await,
-        Target::Store(target) => run_versions_stored(&target, numbers_only).await,
+        Target::Local(name) => {
+            if files.is_empty() {
+                run_versions(&name, numbers_only).await
+            } else {
+                run_history(&name, &files, numbers_only).await
+            }
+        }
+        Target::Serve { address, set } => {
+            if files.is_empty() {
+                run_versions_remote(&set, numbers_only, &address).await
+            } else {
+                run_history_remote(&set, &files, numbers_only, &address).await
+            }
+        }
+        Target::Store(target) => {
+            if files.is_empty() {
+                run_versions_stored(&target, numbers_only).await
+            } else {
+                run_history_stored(&target, &files, numbers_only).await
+            }
+        }
     }
 }
 
@@ -1493,6 +1534,125 @@ async fn run_versions_remote(set: &str, numbers_only: bool, address: &str) -> st
             &listed.snapshot,
             listed.taken_at,
             numbers_only,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Report the versions where the requested paths changed, oldest first.
+///
+/// Reads the numbering off the store's own commit records rather than the
+/// index files, so a version whose index was never written still reports. A
+/// version where none of the paths changed is skipped.
+async fn run_history(
+    name: &std::path::Path,
+    files: &[std::path::PathBuf],
+    numbers_only: bool,
+) -> std::io::Result<()> {
+    let set = IndexSet::new(name);
+
+    // A mistyped name, not an empty set. Answering no events about a name that
+    // names nothing would be a failure a script acts on.
+    if set.segments()?.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no backup set at {} (looked in {})",
+                set.base().display(),
+                set.directory().display()
+            ),
+        ));
+    }
+
+    let store = storage::BlobStore::open_for_reading(set.base()).await?;
+    let versions = store.versions()?;
+    let mut named = Vec::with_capacity(versions.len());
+    for version in versions {
+        named.push((version, store.snapshot(version)?));
+    }
+
+    let events = blulib::command::report(&store, &named, files).await?;
+
+    print_history(&events, numbers_only)
+}
+
+/// Report a keyed store's file history through staging.
+///
+/// Pulls the set into staging and reports with exactly the code a local run
+/// uses, so the lines match a local report field for field. Reads never push
+/// back.
+async fn run_history_stored(
+    target: &StoreTarget,
+    files: &[std::path::PathBuf],
+    numbers_only: bool,
+) -> std::io::Result<()> {
+    let backend = connect_store(&target.url)?;
+    let staging = IndexSet::new(&target.staging);
+    storage::pull_from_remote_async(&backend, &staging).await?;
+    require_staged_set(&staging, target)?;
+
+    run_history(&target.staging, files, numbers_only).await
+}
+
+/// Report a `blu serve` set's file history, printing what a local report of
+/// the same set would.
+///
+/// The server diffs in one pass and answers the events. Everything here is
+/// printing what came back; [`resolve_target`] decided what text is a set name.
+async fn run_history_remote(
+    set: &str,
+    files: &[std::path::PathBuf],
+    numbers_only: bool,
+    address: &str,
+) -> std::io::Result<()> {
+    let remote = blulib::client::Remote::new(address)?;
+    blulib::client::check_set(set)?;
+
+    let mut named = Vec::with_capacity(files.len());
+    for file in files {
+        let Some(text) = file.to_str() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not valid UTF-8. A serve request carries paths as text, so such a \
+                     path cannot travel. Report it against a local path or a `file://` store",
+                    file.display()
+                ),
+            ));
+        };
+        named.push(text);
+    }
+
+    let events = remote.history(set, &named).await?;
+
+    print_history(&events, numbers_only)
+}
+
+/// One file-history report, on whichever side the set is.
+///
+/// **One function, so the listings cannot drift.** A remote report prints this
+/// and prints nothing else, which is what makes a script that reads a local
+/// set work unchanged against a remote one. Under `--numbers-only` each
+/// touching version is named once.
+fn print_history(events: &[blulib::command::Event], numbers_only: bool) -> std::io::Result<()> {
+    if numbers_only {
+        let mut shown: Option<u32> = None;
+        for event in events {
+            if shown != Some(event.version) {
+                say!("{}", event.version)?;
+                shown = Some(event.version);
+            }
+        }
+        return Ok(());
+    }
+
+    for event in events {
+        say!(
+            "{}  {}  {}",
+            event.version,
+            event.status.word(),
+            event.path.display()
         )?;
     }
 
