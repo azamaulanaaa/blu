@@ -62,7 +62,10 @@ use super::{
     segment, set_path,
     uploads::Upload,
 };
-use crate::storage::{BlobId, MAX_COMPRESSION_LEVEL};
+use crate::{
+    metadata::Timestamp,
+    storage::{BlobId, MAX_COMPRESSION_LEVEL},
+};
 
 /// How long to wait between two polls of a job.
 ///
@@ -344,6 +347,8 @@ pub struct PackSummary {
     pub chunks: u64,
     /// The snapshot it holds, which is what names it.
     pub snapshot: BlobId,
+    /// Time the packed version ran, in UTC seconds and nanos.
+    pub taken_at: Timestamp,
 }
 
 impl Remote {
@@ -758,6 +763,7 @@ fn packed(result: &Document) -> io::Result<PackSummary> {
         payload_bytes: result.count("payload_bytes")?,
         chunks: result.count("chunks")?,
         snapshot: result.hash("snapshot")?,
+        taken_at: Timestamp::parse_utc(result.text("taken_at")?)?,
     })
 }
 
@@ -767,7 +773,7 @@ mod tests {
         Document, Job, Kind, MAX_COMPRESSION_LEVEL, MergeCompression, Merged, Outcome, PackSummary,
         State, failure, merged, packed,
     };
-    use crate::storage::BlobId;
+    use crate::{metadata::Timestamp, storage::BlobId};
 
     /// A job document, as the server writes one for a merge that has published
     /// a version.
@@ -841,7 +847,8 @@ mod tests {
             "error":null,
             "result":{"set":"docs","version":3,"length":8192,"payload_start":64,
                 "payload_bytes":8000,"chunks":12,
-                "snapshot":"0202020202020202020202020202020202020202020202020202020202020202"},
+                "snapshot":"0202020202020202020202020202020202020202020202020202020202020202",
+                "taken_at":"2023-11-14T22:13:20Z"},
             "progress":{}}"#;
 
         let job = read(body);
@@ -860,6 +867,7 @@ mod tests {
                 payload_bytes: 8000,
                 chunks: 12,
                 snapshot: BlobId::from_hex("02".repeat(32)).unwrap(),
+                taken_at: Timestamp::parse_utc("2023-11-14T22:13:20Z").unwrap(),
             }
         );
     }

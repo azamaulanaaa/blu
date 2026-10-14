@@ -46,7 +46,7 @@
 use std::io;
 
 use super::{Remote, error::Document, set_path};
-use crate::storage::BlobId;
+use crate::{metadata::Timestamp, storage::BlobId};
 
 /// One version, as the server named it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,8 @@ pub struct Version {
     pub version: u32,
     /// The snapshot's hash.
     pub snapshot: BlobId,
+    /// Time the version ran, in UTC seconds and nanos.
+    pub taken_at: Timestamp,
 }
 
 impl Remote {
@@ -127,9 +129,18 @@ fn parse(url: &str, body: &[u8]) -> io::Result<Vec<Version>> {
     for at in 0..listed {
         let entry = document.element("versions", at)?;
 
+        // The stamp parses through UTC text. A stamp the server wrote wrongly
+        // is drift, and the error names the server it came from.
+        let taken_at = entry.text("taken_at").and_then(|text| {
+            Timestamp::parse_utc(text).map_err(|e| {
+                io::Error::new(e.kind(), format!("{url}: {e}"))
+            })
+        })?;
+
         out.push(Version {
             version: entry.version("version")?,
             snapshot: entry.hash("snapshot")?,
+            taken_at,
         });
     }
 
@@ -138,13 +149,13 @@ fn parse(url: &str, body: &[u8]) -> io::Result<Vec<Version>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Version, parse};
+    use super::{Timestamp, Version, parse};
     use crate::storage::BlobId;
 
     /// The listing a server sends for a set holding two versions.
     const LISTING: &str = r#"{"versions":[
-        {"version":1,"snapshot":"0101010101010101010101010101010101010101010101010101010101010101"},
-        {"version":2,"snapshot":"0202020202020202020202020202020202020202020202020202020202020202"}
+        {"version":1,"snapshot":"0101010101010101010101010101010101010101010101010101010101010101","taken_at":"2023-11-14T22:13:20Z"},
+        {"version":2,"snapshot":"0202020202020202020202020202020202020202020202020202020202020202","taken_at":"2023-11-15T22:13:20Z"}
     ]}"#;
 
     fn one() -> BlobId {
@@ -157,8 +168,16 @@ mod tests {
             .unwrap()
     }
 
+    fn first_time() -> Timestamp {
+        Timestamp::parse_utc("2023-11-14T22:13:20Z").unwrap()
+    }
+
+    fn second_time() -> Timestamp {
+        Timestamp::parse_utc("2023-11-15T22:13:20Z").unwrap()
+    }
+
     #[test]
-    fn a_listing_is_read_in_order_with_both_fields() {
+    fn a_listing_is_read_in_order_with_all_fields() {
         // Field presence is asserted, not assumed: a parser that read `version`
         // and dropped `snapshot` would still produce a list, and this catches
         // it only if the value is compared.
@@ -168,7 +187,7 @@ mod tests {
         // the same value twice, and that is exactly the parser this is meant to
         // reject: one that read `snapshot` off the first object and copied it
         // for the rest. The two entries differ here so that reading it wrongly
-        // is visible.
+        // is visible. The two stamps differ for the same reason.
         let listed = parse("http://s/v1/sets/docs/versions", LISTING.as_bytes()).unwrap();
 
         assert_eq!(
@@ -176,11 +195,13 @@ mod tests {
             vec![
                 Version {
                     version: 1,
-                    snapshot: one()
+                    snapshot: one(),
+                    taken_at: first_time(),
                 },
                 Version {
                     version: 2,
-                    snapshot: two()
+                    snapshot: two(),
+                    taken_at: second_time(),
                 }
             ]
         );
@@ -210,6 +231,9 @@ mod tests {
             &br#"{"versions":[{"version":"1","snapshot":"0101010101010101010101010101010101010101010101010101010101010101"}]}"#[..],
             &br#"{"versions":[{"version":1,"snapshot":10101}]}"#[..],
             &br#"{"versions":[{"version":1,"snapshot":"not a hash"}]}"#[..],
+            &br#"{"versions":[{"version":1,"snapshot":"0101010101010101010101010101010101010101010101010101010101010101"}]}"#[..],
+            &br#"{"versions":[{"version":1,"snapshot":"0101010101010101010101010101010101010101010101010101010101010101","taken_at":"yesterday"}]}"#[..],
+            &br#"{"versions":[{"version":1,"snapshot":"0101010101010101010101010101010101010101010101010101010101010101","taken_at":1700000000}]}"#[..],
         ] {
             let error = parse("http://s/v1/sets/docs/versions", body).unwrap_err();
 

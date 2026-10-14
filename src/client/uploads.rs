@@ -55,7 +55,7 @@ use super::{
     error::{Document, read, refusal},
     segment,
 };
-use crate::storage::BlobId;
+use crate::{metadata::Timestamp, storage::BlobId};
 
 /// The media type a pack travels as.
 ///
@@ -209,6 +209,7 @@ impl Upload {
             chunks: document.count("chunks")?,
             version: document.version("version")?,
             snapshot: document.hash("snapshot")?,
+            taken_at: Timestamp::parse_utc(document.text("taken_at")?)?,
             base: document.optional_hash("base")?,
         })
     }
@@ -281,6 +282,8 @@ pub struct UploadCommit {
     pub version: u32,
     /// The snapshot the pack holds.
     pub snapshot: BlobId,
+    /// Time the packed version ran, in UTC seconds and nanos.
+    pub taken_at: Timestamp,
     /// The snapshot a delta assumes its reader holds, or `None` for a full pack.
     pub base: Option<BlobId>,
 }
@@ -334,7 +337,7 @@ impl Remote {
 #[cfg(test)]
 mod tests {
     use super::{PACK_MEDIA_TYPE, UploadCommit};
-    use crate::storage::BlobId;
+    use crate::{metadata::Timestamp, storage::BlobId};
 
     fn hash(byte: char) -> BlobId {
         BlobId::from_hex(byte.to_string().repeat(64)).unwrap()
@@ -359,6 +362,7 @@ mod tests {
             chunks: 12,
             version: 3,
             snapshot: hash('a'),
+            taken_at: Timestamp::parse_utc("2023-11-14T22:13:20Z").unwrap(),
             base: Some(hash('b')),
         };
 
@@ -368,6 +372,10 @@ mod tests {
         assert_eq!(commit.chunks, 12);
         assert_eq!(commit.version, 3);
         assert_eq!(commit.snapshot, hash('a'));
+        assert_eq!(
+            commit.taken_at,
+            Timestamp::parse_utc("2023-11-14T22:13:20Z").unwrap()
+        );
         assert_eq!(commit.base, Some(hash('b')));
     }
 }
