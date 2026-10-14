@@ -35,13 +35,17 @@
 //! ## The index is at the end
 //!
 //! ```text
-//! magic (4) | format version (4) | version (4) | snapshot hash (32) | chunks (varint) |
+//! magic (4) | format version (4) | version (4) | snapshot hash (32) |
+//! UTC seconds (8) | nanos (4) | chunks (varint) |
 //! payload bytes (varint) [| base flag (1) | base hash (32)]
 //! ...records, end to end, in plan order: a store record per chunk...
 //! ...snapshot: the encoded snapshot this version is, verbatim...
 //! ...index: per chunk, hash (32) | offset (varint) | content length (varint)...
 //! index length (8) | snapshot length (8) | magic (4)
 //! ```
+//!
+//! The header repeats the snapshot stamp, so a listing reads no snapshot
+//! section. The stamp matches the one inside the carried snapshot.
 //!
 //! `offset` is where a chunk's *record* starts. The record's own header already
 //! says how long the record is. The header is the first thing in the record, and
@@ -142,6 +146,7 @@ use crate::storage::{
     BlobId, Codec, Decompressor, MAX_RECORD_HEADER, Plan, PlannedChunk, RecordKind, StorageGet,
     StreamReadSeeker, Zstd,
 };
+use crate::metadata::Timestamp;
 
 /// Largest chunk the chunker can produce, and so the most a pack will decode into
 /// memory in one piece.
@@ -170,8 +175,11 @@ const MAGIC: [u8; 4] = *b"LPK1";
 
 /// Layout version, so a pack this build does not understand is reported as such.
 ///
-/// `6` is a pack whose index does not repeat the record length each chunk's own
-/// header already carries. `5` is the same payload region with that length
+/// `7` is a pack whose header records the version time in UTC.
+/// `6` is the same file without that stamp, so its header is twelve bytes
+/// shorter. It would decode here as a version time that is really the base
+/// flag and the counts. `6` is also a pack whose index does not repeat the
+/// record length each chunk's own header already carries. `5` is the same payload region with that length
 /// duplicated in the index, so its index entries are wider. They would decode here
 /// as offsets that are really something else. `4` is a pack whose payload region
 /// is the chunks' content end to end with nothing between them. `3` recorded the
@@ -197,13 +205,14 @@ const MAGIC: [u8; 4] = *b"LPK1";
 /// first chunk's bytes would be read as a record header and refused for a magic
 /// that is not there, so the damage is loud. It is refused by name anyway, because
 /// the alternative is a reader that works out what a file is by trying.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Set in the header when a base snapshot hash follows it, making this a delta.
 const BASE_FLAG: u8 = 0x01;
 
 /// Bytes of fixed header, before any base hash and the two varint counts.
 ///
+/// The stamp is fixed width, so the base flag sits at a fixed offset too.
 /// The base is variable because a delta carries one and a full pack does not, so
 /// the base cannot be part of this. That is why [`open`] reads the byte after it
 /// to learn how long the header is, rather than assuming.
@@ -215,7 +224,7 @@ const BASE_FLAG: u8 = 0x01;
 /// walks the base flag to learn the version must parse the pack to learn what
 /// the pack *is*. Four bytes say it at a fixed offset. The version becomes
 /// usable by anything holding the header without holding a [`Pack`].
-const HEADER: usize = 4 + 4 + 4 + 32;
+const HEADER: usize = 4 + 4 + 4 + 32 + 8 + 4;
 
 /// Bytes of trailer: the two section lengths and the trailing magic.
 const TRAILER: usize = 8 + 8 + 4;
@@ -407,6 +416,11 @@ pub struct Pack {
     version: u32,
     /// The snapshot this pack holds.
     snapshot: BlobId,
+    /// Time the packed version ran, in UTC seconds and nanos.
+    ///
+    /// The value matches the stamp inside the carried snapshot.
+    /// A listing reads the header rather than the snapshot section.
+    taken_at: Timestamp,
     /// The version this pack is a delta against, if it is one.
     base: Option<BlobId>,
     /// Where the snapshot's own bytes start, relative to the file.
@@ -585,6 +599,7 @@ impl Pack {
         // starts.
         let header = encode_header(&Header {
             snapshot: snapshot_id,
+            taken_at: snapshot.taken_at,
             version,
             base,
             chunks: planned_count,
@@ -651,6 +666,7 @@ impl Pack {
             payload_len: offset,
             version,
             snapshot: snapshot_id,
+            taken_at: snapshot.taken_at,
             base,
             snapshot_start,
             snapshot_len: u64::try_from(snapshot_bytes.len()).unwrap_or(0),
@@ -748,6 +764,7 @@ impl Pack {
         let mut snapshot_raw = [0u8; 32];
         snapshot_raw.copy_from_slice(&header[12..44]);
         let snapshot = BlobId::from_bytes(snapshot_raw);
+        let taken_at = header_taken_at(&header);
 
         // A base hash, when this is a delta. Read before the counts, because its
         // presence is what decides where they start. Inferred rather than declared
@@ -814,6 +831,7 @@ impl Pack {
             payload_len,
             version,
             snapshot,
+            taken_at,
             base,
             snapshot_start,
             snapshot_len,
@@ -857,6 +875,14 @@ impl Pack {
     #[must_use]
     pub fn snapshot_id(&self) -> BlobId {
         self.snapshot
+    }
+
+    /// Time the packed version ran, in UTC seconds and nanos.
+    ///
+    /// The value matches the stamp inside the carried snapshot.
+    #[must_use]
+    pub fn taken_at(&self) -> Timestamp {
+        self.taken_at
     }
 
     /// The version this pack assumes its reader already holds, if it is a delta.
@@ -1366,9 +1392,24 @@ fn read_base(
     Ok((Some(BlobId::from_bytes(raw)), after_flag + 32))
 }
 
+/// The version time in a pack header, read from its fixed offsets.
+///
+/// Twelve bytes after the snapshot hash: eight of seconds, four of nanos.
+/// The caller passes the full fixed header. [`Pack::open`] always holds it.
+fn header_taken_at(header: &[u8]) -> Timestamp {
+    let mut secs = [0u8; 8];
+    secs.copy_from_slice(&header[44..52]);
+    let mut nanos = [0u8; 4];
+    nanos.copy_from_slice(&header[52..56]);
+    Timestamp {
+        secs: i64::from_le_bytes(secs),
+        nanos: u32::from_le_bytes(nanos),
+    }
+}
+
 /// A header's fixed part. It holds the magic and the format version. It holds
 /// the version the pack was built from. It holds the snapshot hash. It holds
-/// the base flag and hash if there is one.
+/// the version time in UTC. It holds the base flag and hash if there is one.
 /// Then come the two counts as varints.
 fn encode_header(header: &Header) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + COUNTS_MAX);
@@ -1376,6 +1417,8 @@ fn encode_header(header: &Header) -> Vec<u8> {
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&header.version.to_le_bytes());
     out.extend_from_slice(header.snapshot.as_bytes());
+    out.extend_from_slice(&header.taken_at.secs.to_le_bytes());
+    out.extend_from_slice(&header.taken_at.nanos.to_le_bytes());
     // Always written, so the counts start at a fixed distance from the
     // front for both kinds of pack. A reader that had to infer this would infer
     // it from a payload length, which a small full pack and a delta cannot be
@@ -1400,6 +1443,7 @@ fn encode_header(header: &Header) -> Vec<u8> {
 /// read the geometry without decoding the counts first.
 struct Header {
     snapshot: BlobId,
+    taken_at: Timestamp,
     version: u32,
     base: Option<BlobId>,
     chunks: u64,
@@ -2144,6 +2188,7 @@ impl VirtualPack {
         // it carries, so the header's own length is only known once it is built.
         let header = encode_header(&Header {
             snapshot: snapshot_id,
+            taken_at: snapshot.taken_at,
             version,
             base,
             chunks: u64::try_from(plan.len()).unwrap_or(0),

@@ -541,19 +541,21 @@ async fn recording_a_fetch_makes_the_next_ask_empty() {
     );
 }
 
-/// A pack is byte-identical for the same tree.
+/// A pack is byte-identical for one version.
 ///
 /// That property makes a pack nameable by its own hash. It therefore makes a pack
 /// immutable and cacheable forever. It follows from the plan being ordered by the
 /// snapshot rather than by write order. The test asserts it through the whole
 /// stack rather than at the plan.
+///
+/// Two backups of one tree pack to different bytes on purpose. Each backup
+/// stamps its own run time, so their snapshots differ. The determinism holds
+/// per version: one version packs to one file, every time.
 #[tokio::test]
 async fn the_same_tree_packs_to_the_same_bytes() {
-    // One tree, two independent stores. The two stores lay their chunks out
-    // differently. A second store has no reason to put a chunk where the first
-    // store did. Identical packs therefore prove the output depends on the tree.
-    // They prove the output does not depend on how the store happened to be
-    // written.
+    // One tree, one store, one version, two packs. Identical files prove the
+    // output depends on the version alone. They prove no clock reading or
+    // run counter leaks into the file beyond the snapshot stamp.
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     for i in 0..5 {
@@ -564,18 +566,16 @@ async fn the_same_tree_packs_to_the_same_bytes() {
         .unwrap();
     }
 
-    let first = dir.path().join("store-a");
-    let second = dir.path().join("store-b");
-    common::run_backup(&source, &first).await;
-    common::run_backup(&source, &second).await;
+    let store = dir.path().join("store");
+    common::run_backup(&source, &store).await;
 
-    let a = pack(&first, &dir.path().join("a.pack")).await;
-    let b = pack(&second, &dir.path().join("b.pack")).await;
+    let a = pack(&store, &dir.path().join("a.pack")).await;
+    let b = pack(&store, &dir.path().join("b.pack")).await;
 
     assert_eq!(
         fs::read(a.path()).unwrap(),
         fs::read(b.path()).unwrap(),
-        "two backups of one tree produced different packs"
+        "two packs of one version produced different files"
     );
     assert_eq!(
         hash_file(a.path()).await.unwrap(),
@@ -653,10 +653,10 @@ impl<S: lepatch::pack::StorageStored> lepatch::pack::StorageStored for GrowsByOn
 async fn a_record_header_that_does_not_fit_its_room_is_refused() {
     const PAYLOAD: u64 = 200;
     const HEADER: usize = 50; // 6 + two two-byte lengths + 32 + 8
-    /// Magic, format, version, snapshot hash, the delta flag, a one-byte chunk
+    /// Magic, format, version, snapshot hash, stamp, the delta flag, a one-byte chunk
     /// count and a two-byte payload length. That is where the payload begins. That
     /// is where the first record's magic begins.
-    const PACK_HEADER: usize = 4 + 4 + 4 + 32 + 1 + 1 + 2;
+    const PACK_HEADER: usize = 4 + 4 + 4 + 32 + 12 + 1 + 1 + 2;
 
     let first = lepatch::storage::BlobId::from_bytes([0x11u8; 32]);
     let second = lepatch::storage::BlobId::from_bytes([0x22u8; 32]);
@@ -688,9 +688,12 @@ async fn a_record_header_that_does_not_fit_its_room_is_refused() {
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"LPK1");
-    bytes.extend_from_slice(&6u32.to_le_bytes());
+    bytes.extend_from_slice(&7u32.to_le_bytes());
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(blake3::hash(&table).as_bytes());
+    // The stamp one_file carries: seconds 1, no nanos.
+    bytes.extend_from_slice(&1i64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.push(0);
     push_varint(&mut bytes, 2);
     push_varint(&mut bytes, u64::try_from(record.len()).unwrap());
@@ -888,10 +891,11 @@ async fn a_header_that_contradicts_its_index_is_refused() {
     // them. The test does not assume byte offsets. A test that hardcodes a layout
     // breaks when the layout changes. Such a test breaks by being unreadable
     // rather than by failing usefully. The flag byte sits between the snapshot
-    // hash and the counts. That byte is clear for a full pack. The counts start
-    // there. The `+ 4` is the version field that the header now carries. That is
-    // why this offset is written out rather than imported from the module.
-    let count_at = 4 + 4 + 4 + 32 + 1;
+    // stamp and the counts. That byte is clear for a full pack. The counts start
+    // there. The `+ 12` is the stamp and the `+ 4` is the version field that the
+    // header now carries. That is why this offset is written out rather than
+    // imported from the module.
+    let count_at = 4 + 4 + 4 + 32 + 12 + 1;
     assert_eq!(
         good[count_at - 1],
         0,
@@ -1333,20 +1337,40 @@ async fn a_pack_records_the_version_it_was_packed_from() {
     );
 }
 
-/// A pack in format `5` is refused by name, before a byte of it is believed.
+/// A pack records the version time, and hands it back.
 ///
-/// `5` is the previous format. It holds the same run of records for a payload. Each
-/// record's length is repeated in the index beside the length its own header
-/// already carries. The two differ in the index alone. An index whose entries are
-/// wider than this build reads them is not something a reader can notice by
-/// looking. The offsets that reader would decode are numbers of the right shape,
-/// pointing at the wrong bytes.
+/// The header repeats the stamp inside the carried snapshot.
+/// A reader learns the time without decoding the file table.
+#[tokio::test]
+async fn a_pack_records_the_version_time() {
+    let built = build(3, 100_000).await;
+    let snapshot = snapshot_of(&built.blob).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+
+    assert_eq!(
+        pack.taken_at(),
+        snapshot.taken_at,
+        "the pack should report the stamp its snapshot carries"
+    );
+    assert_eq!(
+        Pack::open(pack.path()).unwrap().taken_at(),
+        snapshot.taken_at,
+        "and the stamp should survive the file"
+    );
+}
+
+/// A pack in format `6` is refused by name, before a byte of it is believed.
+///
+/// `6` is the previous format. It holds the same run of records for a payload.
+/// Its header carries no version time. A reader that decoded it as a `7` would
+/// read the base flag and the counts as a stamp. The numbers that reader would
+/// decode are numbers of the right shape, pointing at the wrong bytes.
 ///
 /// What this pins is *where* the refusal happens. The code reads the trailer and
 /// the index before the header. That order is what makes opening a pack cheap. The
 /// format check then has to come before any field of the header is trusted. The
-/// recorded version and the snapshot hash are read after it. Otherwise a `5` would
-/// be reported with this build's numbers. A `6` field would be read out of a file
+/// recorded version and the snapshot hash are read after it. Otherwise a `6` would
+/// be reported with this build's numbers. A `7` field would be read out of a file
 /// that has none.
 #[tokio::test]
 async fn a_pack_in_the_previous_format_is_refused_by_name() {
@@ -1354,20 +1378,20 @@ async fn a_pack_in_the_previous_format_is_refused_by_name() {
     let path = built.dir.path().join("v1.pack");
     built.pack(&path).await;
 
-    // Patched rather than built. A real `5` pack is a file this build cannot
+    // Patched rather than built. A real `6` pack is a file this build cannot
     // produce. Patching the four format bytes is therefore the only honest way to
-    // hold one. The rest of the file is a valid `6` pack's. That is the point. The
+    // hold one. The rest of the file is a valid `7` pack's. That is the point. The
     // only thing wrong with the file is the format it claims.
     let mut bytes = fs::read(&path).unwrap();
-    bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
-    let at = built.dir.path().join("v5.pack");
+    bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+    let at = built.dir.path().join("v6.pack");
     fs::write(&at, &bytes).unwrap();
 
     let err = Pack::open(&at).unwrap_err();
     let said = err.to_string();
     assert!(
-        said.contains("pack format 5") && said.contains("reads 6"),
-        "a format 5 pack should be refused naming both formats, got: {said}"
+        said.contains("pack format 6") && said.contains("reads 7"),
+        "a format 6 pack should be refused naming both formats, got: {said}"
     );
     assert!(
         said.contains("not a pack this build can read"),
@@ -1376,7 +1400,7 @@ async fn a_pack_in_the_previous_format_is_refused_by_name() {
 
     // The same file with the format byte put back is a perfectly good pack again.
     // That is what shows the refusal was about the format and nothing else.
-    bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&7u32.to_le_bytes());
     let at = built.dir.path().join("restored.pack");
     fs::write(&at, &bytes).unwrap();
     assert_eq!(
@@ -1769,8 +1793,8 @@ async fn a_pack_of_an_empty_version_opens() {
 #[tokio::test]
 async fn an_empty_index_over_a_payload_is_refused() {
     /// The header's chunk count: the first of the two varints after the magic, the
-    /// format, the version, the snapshot hash and the delta flag.
-    const COUNT_AT: usize = 4 + 4 + 4 + 32 + 1;
+    /// format, the version, the snapshot hash, the stamp and the delta flag.
+    const COUNT_AT: usize = 4 + 4 + 4 + 32 + 12 + 1;
 
     let built = build(3, 100_000).await;
     let path = built.dir.path().join("v1.pack");
@@ -2423,11 +2447,11 @@ async fn the_layout_is_the_one_this_test_writes_out() {
     let bytes = fs::read(&path).unwrap();
 
     // magic (4) | format version (4) | version (4) | snapshot hash (32) |
-    // base flag (1), then the two counts as varints.
+    // stamp (12) | base flag (1), then the two counts as varints.
     assert_eq!(&bytes[..4], b"LPK1", "a pack begins with its magic");
     assert_eq!(
         &bytes[4..8],
-        &6u32.to_le_bytes(),
+        &7u32.to_le_bytes(),
         "and names the format this build writes"
     );
     assert_eq!(
@@ -2440,9 +2464,19 @@ async fn the_layout_is_the_one_this_test_writes_out() {
         pack.snapshot_id().as_bytes(),
         "and the snapshot it carries, at offset twelve"
     );
-    assert_eq!(bytes[44], 0, "and a clear base flag for a full pack");
+    assert_eq!(
+        &bytes[44..52],
+        &pack.taken_at().secs.to_le_bytes(),
+        "and the stamp seconds at offset forty-four"
+    );
+    assert_eq!(
+        &bytes[52..56],
+        &pack.taken_at().nanos.to_le_bytes(),
+        "and the stamp nanos at offset fifty-two"
+    );
+    assert_eq!(bytes[56], 0, "and a clear base flag for a full pack");
 
-    let count_at = 45;
+    let count_at = 57;
     let count_len = varint_len(&bytes, count_at);
     let len_at = count_at + count_len;
     let len_len = varint_len(&bytes, len_at);
@@ -2769,7 +2803,7 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
 
     // The header's payload length, grown by the difference between the two records
     // and patched where it already is.
-    let count_at = 4 + 4 + 4 + 32 + 1;
+    let count_at = 4 + 4 + 4 + 32 + 12 + 1;
     let len_at = count_at + varint_len(&bytes, count_at);
     let old_record_len = u64::try_from(header_len).unwrap() + stored_len;
     let header = grown_header(
@@ -3469,9 +3503,12 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"LPK1");
-    bytes.extend_from_slice(&6u32.to_le_bytes()); // the pack format this build reads
+    bytes.extend_from_slice(&7u32.to_le_bytes()); // the pack format this build reads
     bytes.extend_from_slice(&1u32.to_le_bytes()); // version 1 of the set it came from
     bytes.extend_from_slice(blake3::hash(&table).as_bytes());
+    // The stamp one_file carries: seconds 1, no nanos.
+    bytes.extend_from_slice(&1i64.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.push(0); // not a delta
     push_varint(&mut bytes, 1); // one chunk
     push_varint(&mut bytes, payload_len);
