@@ -8,7 +8,7 @@ use blulib::{
     command::{
         ApplyOptions, BackupPlan, MergePlan, Merged, Options, PARTIAL_SUFFIX, PREVIOUS_SUFFIX,
         Planned, RestorePlan, apply, backup, backup_plan, load_snapshot, lock_destination, merge,
-        merge_plan, restore, restore_plan, verify, version_holding,
+        merge_plan, restore, restore_filtered, restore_plan_filtered, verify, version_holding,
     },
     layout::IndexSet,
     metadata::Timestamp,
@@ -325,6 +325,15 @@ enum Command {
         /// reads the pack.
         #[arg(long)]
         dry_run: bool,
+        /// Only restore these paths, leaving everything else alone.
+        ///
+        /// Paths are relative to the backup root, as the snapshot records them.
+        /// The same dialect `versions --files` reads: exact paths, directory
+        /// prefixes, and glob patterns with `*`, `**`, `?`, `[...]` and
+        /// backslash escapes. Parent directories are created as scaffolding.
+        /// Refused with `--clean`, which promises exactly the snapshot.
+        #[arg(long, value_name = "PATH")]
+        files: Vec<std::path::PathBuf>,
         /// Directory holding the staging copy for a store target.
         ///
         /// One subdirectory per store address; the set name selects the set
@@ -498,6 +507,15 @@ enum Command {
         /// manifest recorded beside the destination — and no claim is taken there.
         #[arg(long)]
         dry_run: bool,
+        /// Only bring these paths up to the version, writing only what is missing.
+        ///
+        /// Paths are relative to the backup root, as the pack records them.
+        /// The same dialect `versions --files` reads: exact paths, directory
+        /// prefixes, and glob patterns with `*`, `**`, `?`, `[...]`
+        /// and backslash escapes. With `--prune`, only the entries the filter
+        /// keeps are eligible for removal.
+        #[arg(long, value_name = "PATH")]
+        files: Vec<std::path::PathBuf>,
     },
 }
 
@@ -1032,10 +1050,11 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             version,
             clean,
             dry_run,
+            files,
             staging,
         } => {
             let target = resolve_target("restore", &target, staging.as_deref())?;
-            dispatch_restore(&destination, target, version, clean, dry_run).await
+            dispatch_restore(&destination, target, version, clean, dry_run, files).await
         }
         Command::Verify {
             target,
@@ -1065,7 +1084,8 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             prune,
             recheck,
             dry_run,
-        } => run_apply(&pack, &destination, prune, recheck, dry_run).await,
+            files,
+        } => run_apply(&pack, &destination, prune, recheck, dry_run, files).await,
         Command::Merge {
             pack,
             target,
@@ -1104,21 +1124,34 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
 /// Run `restore` against a local path, a keyed store, or a server.
 ///
 /// Split out of [`dispatch_inner`] only to keep that match readable; it holds
-/// no work of its own.
+/// no work of its own. A `--clean` restore promises exactly the snapshot, so
+/// it cannot also restore only part of it: that combination is refused here,
+/// before any target is touched.
 async fn dispatch_restore(
     destination: &std::path::Path,
     target: Target,
     version: Option<u32>,
     clean: bool,
     dry_run: bool,
+    files: Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
+    if clean && !files.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`blu restore --clean` writes exactly the snapshot into the destination, and \
+             `--files` restores only part of it. Run without `--clean` to merge the named \
+             files in, or without `--files` for an exact copy",
+        ));
+    }
     match target {
-        Target::Local(name) => run_restore(destination, &name, version, clean, dry_run).await,
+        Target::Local(name) => {
+            run_restore(destination, &name, version, clean, dry_run, &files).await
+        }
         Target::Serve { address, set } => {
-            run_restore_remote(destination, &set, version, clean, dry_run, &address).await
+            run_restore_remote(destination, &set, version, clean, dry_run, &files, &address).await
         }
         Target::Store(target) => {
-            run_restore_stored(destination, &target, version, clean, dry_run).await
+            run_restore_stored(destination, &target, version, clean, dry_run, &files).await
         }
     }
 }
@@ -1974,12 +2007,17 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
 /// tree of zeroes: the bytes are written into the file first and applied after,
 /// and [`blulib::client::Pull::open`] refuses a file whose missing records are not the ones
 /// [`have_for`] named.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a restore's own arguments, plus the address"
+)]
 async fn run_restore_remote(
     destination: &std::path::Path,
     set: &str,
     version: Option<u32>,
     clean: bool,
     dry_run: bool,
+    files: &[std::path::PathBuf],
     address: &str,
 ) -> std::io::Result<()> {
     use blulib::client::Outcome;
@@ -2042,6 +2080,7 @@ async fn run_restore_remote(
         &pack_path,
         clean,
         dry_run,
+        files,
     )
     .await;
 
@@ -2086,6 +2125,7 @@ async fn pull_and_apply(
     pack_path: &std::path::Path,
     clean: bool,
     dry_run: bool,
+    files: &[std::path::PathBuf],
 ) -> std::io::Result<()> {
     let fixed = fixed_regions(summary);
     let scratch = blulib::client::Pull::new(
@@ -2107,7 +2147,7 @@ async fn pull_and_apply(
     };
     let mut prefetched = Vec::new();
 
-    let have = match reads {
+    let mut have = match reads {
         None => std::collections::HashSet::new(),
         Some(manifest) => {
             let table = scratch.write(&fixed, pack_path, |_| {}).await?;
@@ -2119,11 +2159,28 @@ async fn pull_and_apply(
         }
     };
 
+    // With `--files`, the chunks no selected file needs join `have`: the plan
+    // then omits their ranges, and the assembled pack holds holes where they
+    // would sit. The apply below reads only the selection through the same
+    // filter, so those holes are never touched. Where no selection was named
+    // this changes nothing.
+    have.extend(
+        skippable_chunks(
+            &scratch,
+            pack_path,
+            summary,
+            !prefetched.is_empty(),
+            &mut fetched,
+            files,
+        )
+        .await?,
+    );
+
     let listed: Vec<blulib::storage::BlobId> = have.iter().copied().collect();
     tracing::info!(
         held = listed.len(),
         of = summary.chunks,
-        "the destination already holds these chunks, so they are not fetched"
+        "these chunks are not fetched: the destination holds them or no selected file needs them"
     );
 
     // Only the ranges actually written count as already there. Where the
@@ -2163,6 +2220,45 @@ async fn pull_and_apply(
 
     let pack = pull.open(&plan, pack_path)?;
 
+    apply_pulled(
+        destination,
+        &pack,
+        summary,
+        set,
+        remote.address(),
+        &fetched,
+        clean,
+        dry_run,
+        files,
+    )
+    .await
+}
+
+/// Applies the pack a pull assembled, with the restore's own options.
+///
+/// Reads only the selection, then reports what moved and what the applier
+/// did. Split out of [`pull_and_apply`] so each half reads as one job:
+/// fetching the bytes, then writing the tree.
+///
+/// # Errors
+///
+/// Returns an error if the destination claim cannot be taken, if the apply
+/// refuses the destination, or if the report cannot be written.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a restore's own arguments, plus the fetch figures"
+)]
+async fn apply_pulled(
+    destination: &std::path::Path,
+    pack: &Pack,
+    summary: &blulib::client::PackSummary,
+    set: &str,
+    address: &str,
+    fetched: &blulib::client::Fetched,
+    clean: bool,
+    dry_run: bool,
+    files: &[std::path::PathBuf],
+) -> std::io::Result<()> {
     // Held for the whole run, as `blu apply` holds it, so two pulls into one
     // destination cannot interleave writes into the same tree.
     let _claim = if dry_run {
@@ -2173,11 +2269,12 @@ async fn pull_and_apply(
 
     let applied = apply(
         destination,
-        &pack,
+        pack,
         ApplyOptions {
             prune: clean,
             recheck: false,
             dry_run,
+            files: files.to_vec(),
         },
     )
     .await?;
@@ -2200,13 +2297,59 @@ async fn pull_and_apply(
         "version {} of {} on {}: fetched {} of {} bytes in {} range(s)",
         summary.version,
         set,
-        remote.address(),
+        address,
         fetched.bytes,
         summary.length,
         fetched.ranges,
     )?;
 
-    report_applied(&applied, &pack, destination, dry_run)
+    report_applied(&applied, pack, destination, dry_run)
+}
+
+/// The chunks of the pack no selected file needs, for the fetch to skip.
+///
+/// Reads the file table out of the fixed regions — fetching them first where
+/// the destination gave no reason to — and selects the same view the apply
+/// below reads. Empty where no selection was named, so a full pull fetches as
+/// before.
+///
+/// # Errors
+///
+/// Returns an error if the fixed regions cannot be fetched, if the pack does
+/// not open, or if a `--files` value is empty, absolute, or holds `..`.
+async fn skippable_chunks(
+    scratch: &blulib::client::Pull<'_>,
+    pack_path: &std::path::Path,
+    summary: &blulib::client::PackSummary,
+    table_present: bool,
+    fetched: &mut blulib::client::Fetched,
+    files: &[std::path::PathBuf],
+) -> std::io::Result<std::collections::HashSet<blulib::storage::BlobId>> {
+    let mut skipped = std::collections::HashSet::new();
+    if files.is_empty() {
+        return Ok(skipped);
+    }
+
+    if !table_present {
+        let fixed = fixed_regions(summary);
+        let table = scratch.write(&fixed, pack_path, |_| {}).await?;
+        fetched.bytes = fetched.bytes.saturating_add(table.bytes);
+        fetched.ranges = fetched.ranges.saturating_add(table.ranges);
+    }
+
+    let table = Pack::open(pack_path)?.snapshot()?;
+    let filter = blulib::command::Filter::for_snapshot(files, &table)?;
+    let view = filter.select(&table);
+    let needed: std::collections::HashSet<blulib::storage::BlobId> =
+        view.chunks.iter().copied().collect();
+    skipped.extend(
+        table
+            .chunks
+            .iter()
+            .copied()
+            .filter(|id| !needed.contains(id)),
+    );
+    Ok(skipped)
 }
 
 /// The chunks a destination holds of `snapshot`, or none of them.
@@ -2280,6 +2423,7 @@ async fn run_restore(
     version: Option<u32>,
     clean: bool,
     dry_run: bool,
+    files: &[std::path::PathBuf],
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
     let store = storage::BlobStore::open_for_reading(set.base()).await?;
@@ -2308,7 +2452,7 @@ async fn run_restore(
             version,
             destination,
             clean,
-            restore_plan(snapshot, store).await?,
+            restore_plan_filtered(snapshot, store, files).await?,
         );
     }
 
@@ -2319,7 +2463,7 @@ async fn run_restore(
     if clean {
         restore_atomically(&claim, snapshot, store).await?;
     } else {
-        let restored = restore(destination, snapshot, store).await?;
+        let restored = restore_filtered(destination, snapshot, store, files).await?;
         report_restored(&restored);
 
         // A merging restore cannot say which extra files are there. The snapshot
@@ -3074,13 +3218,14 @@ async fn run_restore_stored(
     version: Option<u32>,
     clean: bool,
     dry_run: bool,
+    files: &[std::path::PathBuf],
 ) -> std::io::Result<()> {
     let backend = connect_store(&target.url)?;
     let staging = IndexSet::new(&target.staging);
     storage::pull_from_remote_async(&backend, &staging).await?;
     require_staged_set(&staging, target)?;
 
-    run_restore(destination, &target.staging, version, clean, dry_run).await
+    run_restore(destination, &target.staging, version, clean, dry_run, files).await
 }
 
 /// List a keyed store through staging.
@@ -3904,6 +4049,7 @@ async fn run_apply(
     prune: bool,
     recheck: bool,
     dry_run: bool,
+    files: Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
     let _claim = if dry_run {
         None
@@ -3927,6 +4073,7 @@ async fn run_apply(
             prune,
             recheck,
             dry_run,
+            files,
         },
     )
     .await?;
