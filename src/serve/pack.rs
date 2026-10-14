@@ -33,6 +33,7 @@
 use std::{collections::HashSet, io, path::Path, sync::Arc};
 
 use crate::{
+    metadata::Timestamp,
     pack::{Range, VirtualPack},
     storage::{BlobId, BlobStore, Compression, Read},
 };
@@ -91,6 +92,8 @@ pub struct Resolved {
     pub version: u32,
     /// The pack's snapshot hash, which is its name.
     pub snapshot: BlobId,
+    /// Time the packed version ran, in UTC seconds and nanos.
+    pub taken_at: Timestamp,
 }
 
 impl Resolved {
@@ -166,6 +169,7 @@ pub(super) async fn resolve(sets: &Sets, request: &Requested) -> io::Result<Reso
         pack: virtual_pack,
         version,
         snapshot: snapshot_id,
+        taken_at: snapshot.taken_at,
     })
 }
 

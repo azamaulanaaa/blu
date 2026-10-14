@@ -22,7 +22,10 @@
 
 use std::io;
 
-use crate::storage::{BlobId, BlobStore, Compression, Read};
+use crate::{
+    metadata::Timestamp,
+    storage::{BlobId, BlobStore, Compression, Read},
+};
 
 /// One version, as listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +81,8 @@ pub(super) struct Resolved {
     pub version: u32,
     /// Its snapshot's hash.
     pub snapshot: BlobId,
+    /// Time the version ran, in UTC seconds and nanos.
+    pub taken_at: Timestamp,
     /// How many chunks it needs.
     pub chunks: usize,
     /// Bytes of content those chunks hold.
@@ -106,6 +111,7 @@ pub(super) async fn resolve(
     Ok(Resolved {
         version,
         snapshot: snapshot_id,
+        taken_at: snapshot.taken_at,
         chunks: plan.len(),
         content_bytes: plan.total_bytes(),
     })

@@ -1089,7 +1089,8 @@
         "type": "object",
         "required": [
           "version",
-          "snapshot"
+          "snapshot",
+          "taken_at"
         ],
         "properties": {
           "version": {
@@ -1101,6 +1102,10 @@
             "type": "string",
             "description": "Its snapshot's hash, which is what the version is known by. 64 hexadecimal characters.",
             "pattern": "^[0-9a-f]{64}$"
+          },
+          "taken_at": {
+            "type": "string",
+            "description": "Time the version ran, in UTC RFC 3339 form with a Z suffix."
           }
         }
       },
@@ -1125,6 +1130,7 @@
         "required": [
           "version",
           "snapshot",
+          "taken_at",
           "chunks",
           "content_bytes"
         ],
@@ -1136,6 +1142,10 @@
           "snapshot": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
+          },
+          "taken_at": {
+            "type": "string",
+            "description": "Time the version ran, in UTC RFC 3339 form with a Z suffix."
           },
           "chunks": {
             "type": "integer",
@@ -1254,7 +1264,8 @@
           "payload_start",
           "payload_bytes",
           "chunks",
-          "snapshot"
+          "snapshot",
+          "taken_at"
         ],
         "properties": {
           "set": {
@@ -1286,6 +1297,10 @@
           "snapshot": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
+          },
+          "taken_at": {
+            "type": "string",
+            "description": "Time the packed version ran, in UTC RFC 3339 form with a Z suffix."
           }
         }
       },
@@ -1310,7 +1325,8 @@
           "payload_bytes",
           "chunks",
           "version",
-          "snapshot"
+          "snapshot",
+          "taken_at"
         ],
         "properties": {
           "upload": {
@@ -1337,6 +1353,10 @@
           "snapshot": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
+          },
+          "taken_at": {
+            "type": "string",
+            "description": "Time the packed version ran, in UTC RFC 3339 form with a Z suffix."
           },
           "base": {
             "type": "string",

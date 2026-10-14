@@ -446,15 +446,20 @@ async fn list_versions(sets: web::Data<Sets>, path: web::Path<String>) -> HttpRe
             // Every snapshot hash comes through the store rather than off the
             // index file, for the reason `versions::indexed` gives. A version
             // the store cannot serve is skipped rather than named.
+            // The stamp comes with the hash, from the same resolution.
             let mut out = Vec::new();
             for listed in listed {
                 let Ok(snapshot) = store.snapshot_via_index(listed.version) else {
+                    continue;
+                };
+                let Ok(taken_at) = store.version_time(listed.version).await else {
                     continue;
                 };
 
                 out.push(Json::object(vec![
                     ("version", Json::int(u64::from(listed.version))),
                     ("snapshot", Json::string(snapshot.to_hex().to_string())),
+                    ("taken_at", Json::string(taken_at.to_utc_string())),
                 ]));
             }
 
@@ -493,6 +498,7 @@ async fn show_version(sets: web::Data<Sets>, path: web::Path<(String, u32)>) -> 
                     "snapshot",
                     Json::string(found.snapshot.to_hex().to_string()),
                 ),
+                ("taken_at", Json::string(found.taken_at.to_utc_string())),
                 ("chunks", Json::int(found.chunks as u64)),
                 ("content_bytes", Json::int(found.content_bytes)),
                 ("pack", Json::opt(id_for(&requested).map(Json::string))),
@@ -561,6 +567,7 @@ async fn request_pack(
                 "snapshot",
                 Json::string(resolved.snapshot.to_hex().to_string()),
             ),
+            ("taken_at", Json::string(resolved.taken_at.to_utc_string())),
         ]))
     });
 
@@ -720,6 +727,7 @@ async fn commit_upload(uploads: web::Data<Uploads>, path: web::Path<String>) -> 
             "snapshot",
             Json::string(pack.snapshot_id().to_hex().to_string()),
         ),
+        ("taken_at", Json::string(pack.taken_at().to_utc_string())),
         (
             "base",
             Json::opt(pack.base().map(|b| Json::string(b.to_hex().to_string()))),
