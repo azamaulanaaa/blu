@@ -499,7 +499,7 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
         ));
     }
 
-    let mut snapshot = metadata::Snapshot::new();
+    let mut snapshot = metadata::Snapshot::new(metadata::Timestamp::now());
     let mut inode_map: HashMap<FileId, PathBuf> = HashMap::new();
 
     // `io::Error::from(WalkFailure(..))` rather than a `?` on an `io::Result`

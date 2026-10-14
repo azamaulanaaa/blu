@@ -41,7 +41,7 @@ const IMPOSED: i64 = 1_600_000_000;
 /// A snapshot with no modification time yields no record at all.
 /// That is the case `a_version_that_records_no_time_produces_no_record` pins.
 fn snapshot(files: &[(&str, u64)]) -> Snapshot {
-    let mut snapshot = Snapshot::new();
+    let mut snapshot = Snapshot::new(Timestamp { secs: IMPOSED, nanos: 0 });
     for (path, len) in files {
         snapshot.files.push(File {
             path: path.into(),
@@ -61,7 +61,7 @@ fn snapshot(files: &[(&str, u64)]) -> Snapshot {
 
 /// A snapshot whose files record no modification time at all.
 fn timeless(files: &[(&str, u64)]) -> Snapshot {
-    let mut snapshot = Snapshot::new();
+    let mut snapshot = Snapshot::new(Timestamp { secs: IMPOSED, nanos: 0 });
     for (path, len) in files {
         snapshot.files.push(File {
             path: path.into(),
@@ -362,7 +362,7 @@ fn saving_leaves_no_partial_file_behind() {
     fs::create_dir_all(&destination).unwrap();
 
     let version = common::id_of(&[5u8; 32]);
-    let manifest = Manifest::record(&destination, version, &Snapshot::new()).unwrap();
+    let manifest = Manifest::record(&destination, version, &Snapshot::new(Timestamp { secs: IMPOSED, nanos: 0 })).unwrap();
     let saved = manifest.save(&destination).unwrap();
 
     assert!(saved.exists(), "the manifest should be in place");
@@ -382,7 +382,7 @@ fn removing_an_absent_manifest_does_nothing() {
     Manifest::remove(&destination).unwrap();
 
     let version = common::id_of(&[6u8; 32]);
-    let manifest = Manifest::record(&destination, version, &Snapshot::new()).unwrap();
+    let manifest = Manifest::record(&destination, version, &Snapshot::new(Timestamp { secs: IMPOSED, nanos: 0 })).unwrap();
     manifest.save(&destination).unwrap();
     assert!(Manifest::load(&destination).unwrap().is_some());
 

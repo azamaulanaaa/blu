@@ -23,7 +23,7 @@ use std::{
 };
 
 use lepatch::{
-    metadata::{Attributes, File, FileChunk, Snapshot},
+    metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
     pack::{Pack, Range, StorageStored, hash_file},
     storage::{BlobStore, Codec, Plan, StorageGet},
 };
@@ -1982,7 +1982,7 @@ fn placed() -> lepatch::storage::Placement {
 fn one_file(chunks: &[lepatch::storage::BlobId]) -> Snapshot {
     let mut snapshot = Snapshot {
         chunks: chunks.to_vec(),
-        ..Snapshot::new()
+        ..Snapshot::new(Timestamp { secs: 1, nanos: 0 })
     };
 
     snapshot.files.push(lepatch::metadata::File {
@@ -2010,7 +2010,7 @@ fn one_file(chunks: &[lepatch::storage::BlobId]) -> Snapshot {
 /// same rule a real snapshot's chunk table follows. It is the rule that
 /// `Plan::from_snapshot` assumes when it flattens slices to one entry per chunk.
 fn tree(files: &[(&str, lepatch::storage::BlobId)]) -> Snapshot {
-    let mut snapshot = Snapshot::new();
+    let mut snapshot = Snapshot::new(Timestamp { secs: 1, nanos: 0 });
     let mut chunks: Vec<lepatch::storage::BlobId> = Vec::new();
 
     for (index, (path, id)) in files.iter().enumerate() {
@@ -2064,7 +2064,7 @@ fn a_delta_plan_is_what_the_base_does_not_already_place() {
     assert_eq!(delta.chunks()[0].id, c);
 
     // From nothing, everything.
-    assert_eq!(full.since(&target, &Snapshot::new()).len(), 3);
+    assert_eq!(full.since(&target, &Snapshot::new(Timestamp { secs: 1, nanos: 0 })).len(), 3);
 }
 
 /// A chunk the base holds in one file is still sent for another.
@@ -2134,7 +2134,7 @@ fn a_delta_from_an_unrelated_base_is_the_whole_version() {
     let full = Plan::from_snapshot(&target, store).unwrap();
     let unrelated = Snapshot {
         chunks: vec![z],
-        ..Snapshot::new()
+        ..Snapshot::new(Timestamp { secs: 1, nanos: 0 })
     };
 
     assert_eq!(full.since(&target, &unrelated).len(), 2);

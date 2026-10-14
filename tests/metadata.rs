@@ -1,12 +1,12 @@
 //! Tests for the snapshot encoding: framing, versioning and error reporting.
 
 use lepatch::{
-    metadata::{self, Attributes, Error, Malformed, Snapshot},
+    metadata::{self, Attributes, Error, Malformed, Snapshot, Timestamp},
     storage::BlobId,
 };
 
 fn sample() -> Snapshot {
-    let mut snapshot = Snapshot::new();
+    let mut snapshot = Snapshot::new(Timestamp { secs: 1, nanos: 0 });
     snapshot.files.push(metadata::File {
         path: "a/b.bin".into(),
         len: 10,

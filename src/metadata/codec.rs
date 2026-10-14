@@ -6,10 +6,12 @@
 //! magic     8 bytes,  b"LEPATCH\0"
 //! version   u32, little endian
 //! body:
+//!   i64      UTC seconds of the snapshot stamp
+//!   u32      nanos past the second
 //!   varint   count of files
-//!     per file:   path, u64 len, u32 mode, optional timestamp
+//!     per file:   path, u64 len, u32 mode, optional timestamp, owner
 //!   varint   count of directories
-//!     per dir:    path, u32 mode, optional timestamp
+//!     per dir:    path, u32 mode, optional timestamp, owner
 //!   varint   count of distinct chunks
 //!     per chunk:  32 raw bytes of hash
 //!   varint   count of chunk slices
@@ -193,18 +195,19 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Read an owner written by [`Writer::owner`], or `None` for a layout that had
-    /// no such field.
-    ///
-    /// The `recorded` flag is the snapshot's version, not the reader's ability.
-    /// Before an owner was recorded there was nothing on the wire to read. Reading
-    /// a `u32` from the mode that follows would put every later field out by four
-    /// bytes. The result would be a snapshot that decodes into nonsense.
-    fn owner(&mut self, recorded: bool) -> Result<Option<super::Owner>> {
-        if !recorded {
-            return Ok(None);
-        }
+    /// The snapshot stamp, as fixed i64 seconds and u32 nanos.
+    fn timestamp(&mut self) -> Result<Timestamp> {
+        Ok(Timestamp {
+            secs: self.i64()?,
+            nanos: self.u32()?,
+        })
+    }
 
+    /// Read an owner written by [`Writer::owner`].
+    ///
+    /// Every snapshot records an owner tag per entry.
+    /// A missing tag is malformed input rather than an old layout.
+    fn owner(&mut self) -> Result<Option<super::Owner>> {
         match self.u8()? {
             0 => Ok(None),
             1 => Ok(Some(super::Owner {
@@ -329,6 +332,14 @@ impl Writer {
         }
     }
 
+    /// Record the snapshot stamp as fixed seconds and nanos.
+    ///
+    /// Fixed width rather than tagged. Every snapshot carries a stamp.
+    fn timestamp(&mut self, taken_at: Timestamp) {
+        self.i64(taken_at.secs);
+        self.u32(taken_at.nanos);
+    }
+
     /// Write an owner, tagged for presence.
     ///
     /// A tag rather than `0` for absent, which is how a mode is written. `0` is
@@ -359,6 +370,8 @@ impl Writer {
 /// Encode a snapshot's body, without the magic or version header.
 pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
     let mut out = Writer::new();
+
+    out.timestamp(snapshot.taken_at);
 
     out.count(snapshot.files.len());
     for file in &snapshot.files {
@@ -410,14 +423,11 @@ pub(crate) fn encode_body(snapshot: &Snapshot) -> Result<Vec<u8>> {
 
 /// Decode a snapshot's body, which must be the whole of `bytes`.
 ///
-/// `version` is the layout the bytes were written in, not the one this build
-/// prefers. The decoder needs it because the owner was added partway through the
-/// format's life. Every entry is variable width. A reader that guessed would read
-/// the mode of the next file as an owner's user id. The same reader would read
-/// every field after it from the wrong place.
-pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
+/// One layout only. The stamp leads the body at a fixed width.
+/// Every entry carries an owner tag at a fixed position.
+pub(crate) fn decode_body(bytes: &[u8]) -> Result<Snapshot> {
     let mut reader = Reader::new(bytes);
-    let with_owner = version >= super::OWNER_SINCE;
+    let taken_at = reader.timestamp()?;
 
     let files = (0..reader.count()?)
         .map(|_| {
@@ -429,7 +439,7 @@ pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
             // The bytes are unchanged.
             let mode = reader.u32()?;
             let mtime = reader.optional_timestamp()?;
-            let owner = reader.owner(with_owner)?;
+            let owner = reader.owner()?;
 
             Ok(File {
                 path,
@@ -448,7 +458,7 @@ pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
             let path = reader.path()?;
             let mode = reader.u32()?;
             let mtime = reader.optional_timestamp()?;
-            let owner = reader.owner(with_owner)?;
+            let owner = reader.owner()?;
 
             Ok(Dir {
                 path,
@@ -512,6 +522,7 @@ pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
     }
 
     Ok(Snapshot {
+        taken_at,
         files,
         dirs,
         chunks,
@@ -524,8 +535,16 @@ pub(crate) fn decode_body(bytes: &[u8], version: u32) -> Result<Snapshot> {
 mod tests {
     use super::*;
 
+    /// Fixed stamp for deterministic tests. Real runs stamp the run time.
+    fn stamped() -> Timestamp {
+        Timestamp {
+            secs: 1_700_000_000,
+            nanos: 123_456_789,
+        }
+    }
+
     fn sample() -> Snapshot {
-        let mut snapshot = Snapshot::new();
+        let mut snapshot = Snapshot::new(stamped());
         snapshot.dirs.push(Dir {
             path: PathBuf::from("a/b"),
             attrs: Attributes {
@@ -566,24 +585,17 @@ mod tests {
     #[test]
     fn a_snapshot_survives_a_round_trip() {
         let snapshot = sample();
-        let decoded = decode_body(
-            &encode_body(&snapshot).expect("encodes"),
-            super::super::FORMAT_VERSION,
-        )
-        .expect("decodes");
+        let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
         assert_eq!(decoded, snapshot);
     }
 
     #[test]
     fn an_empty_snapshot_survives_a_round_trip() {
-        let snapshot = Snapshot::new();
-        let decoded = decode_body(
-            &encode_body(&snapshot).expect("encodes"),
-            super::super::FORMAT_VERSION,
-        )
-        .expect("decodes");
+        let snapshot = Snapshot::new(stamped());
+        let decoded = decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
         assert_eq!(decoded.files, []);
         assert_eq!(decoded.links, []);
+        assert_eq!(decoded.taken_at, stamped());
     }
 
     #[test]
@@ -591,7 +603,7 @@ mod tests {
         let bytes = encode_body(&sample()).expect("encodes");
         for cut in 0..bytes.len() {
             assert!(
-                decode_body(&bytes[..cut], super::super::FORMAT_VERSION).is_err(),
+                decode_body(&bytes[..cut]).is_err(),
                 "a body truncated to {cut} of {} bytes decoded",
                 bytes.len()
             );
@@ -603,35 +615,43 @@ mod tests {
         let mut bytes = encode_body(&sample()).expect("encodes");
         bytes.push(0);
         assert!(
-            decode_body(&bytes, super::super::FORMAT_VERSION).is_err(),
+            decode_body(&bytes).is_err(),
             "trailing bytes were accepted"
         );
     }
 
     #[test]
     fn an_absurd_count_cannot_allocate() {
-        // 2^40 files claimed in a nine-byte body.
-        let mut body = Vec::new();
-        Writer::new().varint(0);
+        // Twelve stamp bytes lead every body, then 2^40 files in five bytes.
+        let mut body = Vec::with_capacity(12 + 5);
+        body.extend_from_slice(&stamped().secs.to_le_bytes());
+        body.extend_from_slice(&stamped().nanos.to_le_bytes());
         body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
 
-        let decoded = decode_body(&body, super::super::FORMAT_VERSION);
+        let decoded = decode_body(&body);
         assert!(decoded.is_err(), "an impossible count decoded");
     }
 
     #[test]
     fn an_overlong_varint_is_refused() {
         // Eleven continuation bytes: more than any u64 needs.
-        let body = vec![0x80u8; 11];
-        assert!(decode_body(&body, super::super::FORMAT_VERSION).is_err());
+        let mut body = Vec::with_capacity(12 + 11);
+        body.extend_from_slice(&stamped().secs.to_le_bytes());
+        body.extend_from_slice(&stamped().nanos.to_le_bytes());
+        body.extend_from_slice(&[0x80u8; 11]);
+        assert!(decode_body(&body).is_err());
     }
 
     #[test]
     fn a_varint_that_overflows_a_u64_is_refused() {
         // The tenth byte carries more than the one bit a u64 has left.
-        let mut body = vec![0x80u8; 9];
-        body.push(0x02);
-        assert!(decode_body(&body, super::super::FORMAT_VERSION).is_err());
+        let mut count = vec![0x80u8; 9];
+        count.push(0x02);
+        let mut body = Vec::with_capacity(12 + count.len());
+        body.extend_from_slice(&stamped().secs.to_le_bytes());
+        body.extend_from_slice(&stamped().nanos.to_le_bytes());
+        body.extend_from_slice(&count);
+        assert!(decode_body(&body).is_err());
     }
 
     #[test]
@@ -642,7 +662,7 @@ mod tests {
         let last = body.len() - 1;
         body[last] = 9;
         assert!(
-            decode_body(&body, super::super::FORMAT_VERSION).is_err(),
+            decode_body(&body).is_err(),
             "an unknown link kind was accepted"
         );
     }
@@ -654,7 +674,7 @@ mod tests {
             use std::ffi::OsString;
             use std::os::unix::ffi::OsStringExt;
 
-            let mut snapshot = Snapshot::new();
+            let mut snapshot = Snapshot::new(stamped());
             snapshot.files.push(File {
                 path: PathBuf::from(OsString::from_vec(vec![0xff, 0xfe, b'/'])),
                 len: 1,
@@ -665,11 +685,8 @@ mod tests {
                 },
             });
 
-            let decoded = decode_body(
-                &encode_body(&snapshot).expect("encodes"),
-                super::super::FORMAT_VERSION,
-            )
-            .expect("decodes");
+            let decoded =
+                decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
             assert_eq!(decoded.files[0].path, snapshot.files[0].path);
         }
     }
@@ -680,7 +697,7 @@ mod tests {
     /// decoding cleanly to a platform with no users at all.
     #[test]
     fn root_is_an_owner_and_not_an_absence() {
-        let mut snapshot = Snapshot::new();
+        let mut snapshot = Snapshot::new(stamped());
         snapshot.files.push(File {
             path: PathBuf::from("owned-by-root"),
             len: 1,
@@ -699,11 +716,8 @@ mod tests {
             },
         });
 
-        let decoded = decode_body(
-            &encode_body(&snapshot).expect("encodes"),
-            super::super::FORMAT_VERSION,
-        )
-        .expect("decodes");
+        let decoded =
+            decode_body(&encode_body(&snapshot).expect("encodes")).expect("decodes");
 
         assert_eq!(
             decoded.files[0].attrs.owner,
@@ -716,132 +730,129 @@ mod tests {
         );
     }
 
-    /// A version-3 snapshot has no owner field at all, and reads back with none.
+    /// The stamp leads the body at a fixed width.
     ///
-    /// Not a compat shim, but an exact reading. A snapshot that recorded nothing
-    /// about ownership had none to record. So `None` is the truth, not a gap.
-    ///
-    /// What this pins is the *reading*. That is the part that can go wrong
-    /// silently. The field is not self-describing. A decoder that read one from a
-    /// version 3 body would take the next entry's length as a uid. The same
-    /// decoder would read everything after it from the wrong offset. That decoder
-    /// would still decode, because a wrong uid is a valid uid.
+    /// The first twelve bytes hold seconds and nanos in little endian.
+    /// A reader that skips them reads the file count as a time.
     #[test]
-    fn a_version_3_body_reads_with_no_owner() {
-        let snapshot = sample();
-        let body = encode_body_v3(&snapshot);
+    fn a_snapshot_records_taken_at_first_in_the_body() {
+        let bytes = encode_body(&sample()).expect("encodes");
 
-        let decoded = decode_body(&body, super::super::MIN_READABLE_VERSION).expect("decodes");
-
-        assert!(
-            decoded.files.iter().all(|f| f.attrs.owner.is_none()),
-            "a version 3 snapshot recorded no owner, so none should be invented"
-        );
-        assert!(
-            decoded.dirs.iter().all(|d| d.attrs.owner.is_none()),
-            "for directories either"
+        assert_eq!(
+            i64::from_le_bytes(bytes[..8].try_into().expect("eight stamp bytes")),
+            stamped().secs
         );
         assert_eq!(
-            decoded.files[0].attrs.mode, snapshot.files[0].attrs.mode,
-            "and the rest of the entry must still decode to the right values"
-        );
-        assert_eq!(
-            decoded.files[0].len, snapshot.files[0].len,
-            "including the length, which is the field a wrong offset would corrupt"
-        );
-        assert_eq!(
-            decoded.dirs[0].attrs.mtime, snapshot.dirs[0].attrs.mtime,
-            "and a timestamp, which sits after where the owner now does"
-        );
-        assert_eq!(
-            decoded.files[0].path, snapshot.files[0].path,
-            "and the path itself"
-        );
-        assert_eq!(
-            decoded.chunks, snapshot.chunks,
-            "and the chunk table, which is further along again"
+            u32::from_le_bytes(bytes[8..12].try_into().expect("four stamp bytes")),
+            stamped().nanos
         );
     }
 
-    /// A version-4 body is nine bytes longer per owned entry. So a decoder that
-    /// reads one as version 3 must produce a different answer.
+    /// UTC text names the same instant the stamp holds.
     ///
-    /// This test is the negative of the test above. It is what makes that test
-    /// meaningful. If reading the wrong version happened to agree, then pinning
-    /// the right answer would prove nothing.
+    /// The text round-trips through the parser for times on both sides
+    /// of the epoch, with and without nanos.
     #[test]
-    fn reading_a_version_4_body_as_version_3_does_not_agree() {
-        let snapshot = sample();
-        let modern = encode_body(&snapshot).expect("encodes");
-        let older = encode_body_v3(&snapshot);
+    fn a_stamp_round_trips_through_utc_text() {
+        for taken_at in [
+            Timestamp { secs: 0, nanos: 0 },
+            Timestamp {
+                secs: 1_700_000_000,
+                nanos: 123_456_789,
+            },
+            Timestamp { secs: -5, nanos: 7 },
+            Timestamp {
+                secs: 1_700_000_000,
+                nanos: 0,
+            },
+        ] {
+            let text = taken_at.to_utc_string();
+            let parsed = Timestamp::parse_utc(&text).expect("parses");
 
-        assert_ne!(
-            modern, older,
-            "the two layouts must actually differ for this to be testing anything"
-        );
-
-        let wrong = decode_body(&modern, super::super::MIN_READABLE_VERSION);
-        assert!(
-            wrong.is_err() || wrong.as_ref().expect("decoded") != &snapshot,
-            "reading a version 4 body as version 3 produced the same snapshot, which \
-             means the version is not being consulted"
-        );
+            assert_eq!(parsed, taken_at, "{text:?} did not parse back");
+        }
     }
 
-    /// Encode a snapshot the way version 3 did, with every field except the owner.
+    /// UTC text has the RFC 3339 shape with a Z suffix.
     ///
-    /// The code builds this from the same [`Writer`] primitives the real encoder
-    /// uses. So the field widths are the encoder's, not something restated here. A
-    /// hand-rolled copy is how a test ends up agreeing with a layout change that it
-    /// should have caught.
-    fn encode_body_v3(snapshot: &Snapshot) -> Vec<u8> {
-        let mut out = Writer::new();
-
-        out.count(snapshot.files.len());
-        for file in &snapshot.files {
-            out.path(&file.path).expect("a path this platform can hold");
-            out.u64(file.len);
-            out.u32(file.attrs.mode.unwrap_or(0));
-            out.optional_timestamp(file.attrs.mtime);
-        }
-
-        out.count(snapshot.dirs.len());
-        for dir in &snapshot.dirs {
-            out.path(&dir.path).expect("a path this platform can hold");
-            out.u32(dir.attrs.mode.unwrap_or(0));
-            out.optional_timestamp(dir.attrs.mtime);
-        }
-
-        out.count(snapshot.chunks.len());
-        for chunk in &snapshot.chunks {
-            out.hash(chunk);
-        }
-
-        out.count(snapshot.file_chunks.len());
-        for slice in &snapshot.file_chunks {
-            out.varint(u64::from(slice.chunk_index));
-            out.varint(u64::from(slice.file_index));
-            out.varint(u64::from(slice.chunk_offset));
-            out.varint(slice.file_offset);
-            out.varint(u64::from(slice.length));
-        }
-
-        out.count(snapshot.links.len());
-        for link in &snapshot.links {
-            match link {
-                Link::Hard { path, shares } => {
-                    out.path(path).expect("a path this platform can hold");
-                    out.path(shares).expect("a path this platform can hold");
-                    out.u8(0);
-                }
-                Link::Symbolic { path, target } => {
-                    out.path(path).expect("a path this platform can hold");
-                    out.path(target).expect("a path this platform can hold");
-                    out.u8(1);
-                }
+    /// The shape is pinned so the CLI and the server print one form.
+    #[test]
+    fn utc_text_has_the_rfc_3339_shape() {
+        assert_eq!(
+            Timestamp { secs: 0, nanos: 0 }.to_utc_string(),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            Timestamp {
+                secs: 1_700_000_000,
+                nanos: 500_000_000,
             }
-        }
+            .to_utc_string(),
+            "2023-11-14T22:13:20.5Z"
+        );
+    }
 
-        out.bytes
+    /// Local text names the same instant as UTC text.
+    ///
+    /// The zone changes the spelling, never the instant.
+    /// Parsing the local form returns the same stamp.
+    #[test]
+    fn local_text_names_the_same_instant() {
+        let taken_at = stamped();
+        let parsed = Timestamp::parse_utc(&taken_at.to_local_string()).expect("parses");
+
+        assert_eq!(parsed, taken_at);
+    }
+
+    /// Text that is not RFC 3339 time text is refused.
+    #[test]
+    fn non_time_text_is_refused() {
+        for text in ["", "yesterday", "2023-13-45T99:99:99Z", "1700000000"] {
+            assert!(
+                Timestamp::parse_utc(text).is_err(),
+                "{text:?} parsed as a stamp"
+            );
+        }
+    }
+
+    /// An older stamp is refused against a newer latest stamp.
+    ///
+    /// The refusal names both stamps in UTC.
+    #[test]
+    fn an_older_stamp_is_refused() {
+        let latest = Timestamp {
+            secs: 1_700_000_000,
+            nanos: 0,
+        };
+        let next = Timestamp {
+            secs: 1_699_999_999,
+            nanos: 999_999_999,
+        };
+
+        let error =
+            super::super::refuse_older_taken_at(Some(latest), next).expect_err("older decoded");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(&next.to_utc_string()));
+        assert!(error.to_string().contains(&latest.to_utc_string()));
+    }
+
+    /// An equal stamp passes, and a first version passes with no latest.
+    #[test]
+    fn an_equal_stamp_and_a_first_version_pass() {
+        let taken_at = stamped();
+
+        assert!(super::super::refuse_older_taken_at(Some(taken_at), taken_at).is_ok());
+        assert!(super::super::refuse_older_taken_at(None, taken_at).is_ok());
+        assert!(
+            super::super::refuse_older_taken_at(
+                Some(taken_at),
+                Timestamp {
+                    secs: taken_at.secs,
+                    nanos: taken_at.nanos + 1
+                }
+            )
+            .is_ok()
+        );
     }
 }

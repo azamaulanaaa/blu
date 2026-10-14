@@ -44,7 +44,7 @@ use std::{hint::black_box, io::Cursor, path::PathBuf};
 
 use criterion::{Criterion, Throughput};
 use lepatch::{
-    metadata::{Attributes, File, FileChunk, Snapshot},
+    metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
     reader::{Chunker, ChunkerConfig},
 };
 use tempfile::TempDir;
@@ -89,7 +89,7 @@ fn config() -> ChunkerConfig {
 
 /// A snapshot shaped like a real one, for the serialisation benchmarks.
 fn sample_snapshot(chunks: usize) -> Snapshot {
-    let mut snapshot = Snapshot::new();
+    let mut snapshot = Snapshot::new(Timestamp { secs: 1, nanos: 0 });
     snapshot.files.push(File {
         path: PathBuf::from("dir/file.bin"),
         len: u64::try_from(FILE_BYTES).unwrap_or(0),

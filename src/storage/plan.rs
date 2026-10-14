@@ -296,8 +296,12 @@ fn placement_of<'a>(snapshot: &'a Snapshot, slice: &FileChunk) -> Option<Site<'a
 #[cfg(test)]
 mod tests {
     use super::Plan;
-    use crate::metadata::{Attributes, File, FileChunk, Snapshot};
+    use crate::metadata::{Attributes, File, FileChunk, Snapshot, Timestamp};
     use crate::storage::{BlobId, Codec, Placement};
+
+    fn stamped() -> Timestamp {
+        Timestamp { secs: 1, nanos: 0 }
+    }
 
     fn chunk() -> BlobId {
         BlobId::from_bytes([7u8; 32])
@@ -318,7 +322,7 @@ mod tests {
 
     /// A snapshot of one file of 100 bytes made of two 50-byte chunks.
     fn two_chunks() -> Snapshot {
-        let mut s = Snapshot::new();
+        let mut s = Snapshot::new(stamped());
         s.files.push(File {
             path: "a.bin".into(),
             len: 100,
@@ -377,7 +381,7 @@ mod tests {
     #[test]
     fn a_chunk_used_partly_is_counted_to_its_furthest_byte() {
         // One chunk, stored 1000 bytes long, of which the version reads 40.
-        let mut s = Snapshot::new();
+        let mut s = Snapshot::new(stamped());
         s.files.push(File {
             path: "a.bin".into(),
             len: 40,
@@ -460,7 +464,7 @@ mod tests {
 
     #[test]
     fn an_empty_snapshot_plans_to_nothing() {
-        let plan = Plan::from_snapshot(&Snapshot::new(), |_| Ok(at(0, 0))).unwrap();
+        let plan = Plan::from_snapshot(&Snapshot::new(stamped()), |_| Ok(at(0, 0))).unwrap();
 
         assert!(plan.is_empty());
         assert_eq!(plan.total_bytes(), 0);

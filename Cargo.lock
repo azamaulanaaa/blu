@@ -1570,6 +1570,7 @@ dependencies = [
  "http-body-util",
  "hyper-rustls",
  "hyper-util",
+ "jiff",
  "opendal",
  "opendal-http-transport-reqwest",
  "opentelemetry",

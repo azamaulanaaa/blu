@@ -27,34 +27,11 @@ pub const MAGIC: &[u8; 8] = b"LEPATCH\x00";
 
 /// Snapshot layout version written by this build.
 ///
-/// Bump this whenever the shape of [`Snapshot`], or the encoding in `codec`,
-/// changes in a way that makes previously written blobs undecodable.
-///
-/// This is 4. Version 3 recorded a permission mode and a modification time for
-/// each entry. Version 4 adds the owning user and group. So every entry is nine
-/// bytes larger on a platform that has them. Version 2 recorded both the content
-/// hash and the storage key of each chunk. The storage key named a byte offset.
-/// The store's own index now answers "where is this content". So a chunk is a
-/// bare hash.
-pub const FORMAT_VERSION: u32 = 4;
-
-/// The first layout version that recorded an owner on every file and directory.
-///
-/// A decoder branches on this, not on a try. The field's width is not
-/// self-describing. A version 4 reader would read an entry laid out for version 3
-/// the wrong way. The reader would take the next entry's length as a uid. The
-/// reader would take every field after it from the wrong offset. The result is a
-/// snapshot that decodes cleanly into nonsense. A version 3 snapshot has
-/// no owner to read. That is a fact about the snapshot, not a gap in what this
-/// build knows.
-pub const OWNER_SINCE: u32 = 4;
-
-/// The oldest layout version this build can still read.
-///
-/// Version 3 and later. Refusing the versions below is not leniency. Those
-/// versions are layouts that this code cannot decode. A decoder that guessed at
-/// them would read a field from the wrong place rather than fail.
-pub const MIN_READABLE_VERSION: u32 = 3;
+/// Bump this when the shape of [`Snapshot`] changes.
+/// This build writes 5 and reads 5 only.
+/// Version 5 records one UTC stamp per snapshot.
+/// Older layouts carry no snapshot stamp.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Reasons a snapshot blob could not be decoded. No encode variant, because
 /// encoding cannot fail: every field is a number, a byte string or a byte array.
@@ -94,14 +71,152 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A point in time, stored explicitly so that the encoding does not depend on
-/// the platform representation of `SystemTime`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A point in time in UTC.
+///
+/// The store keeps seconds and nanos.
+/// The form never depends on the platform form of `SystemTime`.
+/// Display converts the value to local time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timestamp {
-    /// Seconds since the Unix epoch.
+    /// Seconds since the Unix epoch. It is negative before the epoch.
     pub secs: i64,
-    /// Sub-second component in nanoseconds.
+    /// Nanos past the second, from 0 to `999_999_999`.
     pub nanos: u32,
+}
+
+impl Timestamp {
+    /// Current time from the system clock.
+    ///
+    /// Reads the clock once and converts the reading.
+    #[must_use]
+    pub fn now() -> Self {
+        std::time::SystemTime::now().into()
+    }
+
+    /// UTC text in RFC 3339 form with a Z suffix.
+    ///
+    /// Hand-rolled date math renders the value.
+    /// Rendering never fails and never reads the zone.
+    #[must_use]
+    pub fn to_utc_string(self) -> String {
+        let days = self.secs.div_euclid(86_400);
+        let day_secs = self.secs.rem_euclid(86_400);
+        let (year, month, day) = civil_from_days(days);
+        let hour = day_secs / 3_600;
+        let minute = day_secs % 3_600 / 60;
+        let second = day_secs % 60;
+        let mut out = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
+        if self.nanos != 0 {
+            let frac = format!("{:09}", self.nanos);
+            out.push('.');
+            out.push_str(frac.trim_end_matches('0'));
+        }
+        out.push('Z');
+        out
+    }
+
+    /// Local text for display with the system offset.
+    ///
+    /// Reads the system zone once per call.
+    /// Uses UTC text where the zone or the value is out of range.
+    #[must_use]
+    pub fn to_local_string(self) -> String {
+        let zoned = jiff::Timestamp::from_second(self.secs)
+            .ok()
+            .and_then(|base| {
+                base.checked_add(jiff::SignedDuration::from_nanos(i64::from(self.nanos)))
+                    .ok()
+            })
+            .map(|instant| instant.to_zoned(jiff::tz::TimeZone::system()));
+        zoned.map_or_else(|| self.to_utc_string(), |zoned| zoned.to_string())
+    }
+
+    /// Parse RFC 3339 text into a stamp.
+    ///
+    /// Accepts the UTC form that [`Timestamp::to_utc_string`] renders.
+    /// Accepts an explicit offset form as the same instant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the text is not RFC 3339 time text.
+    pub fn parse_utc(text: &str) -> io::Result<Self> {
+        text.parse::<jiff::Timestamp>()
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{text:?} is not RFC 3339 time text: {e}"),
+                )
+            })
+            .map(|instant| {
+                // `as_second` truncates toward zero, so a pre-epoch fraction
+                // arrives with a negative sub-second part. Floor the seconds
+                // instead, keeping nanos non-negative like the encoder does.
+                let mut secs = instant.as_second();
+                let mut nanos = instant.subsec_nanosecond();
+                if nanos < 0 {
+                    secs -= 1;
+                    nanos += 1_000_000_000;
+                }
+                Self {
+                    secs,
+                    nanos: u32::try_from(nanos).unwrap_or(0),
+                }
+            })
+    }
+}
+
+/// Days since the Unix epoch into year, month and day.
+///
+/// Proleptic Gregorian calendar math.
+/// The caller splits the seconds into days and time of day.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Shift to the civil epoch of 0000-03-01 before the era math.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_part + 2) / 5 + 1;
+    let month = if month_part < 10 {
+        month_part + 3
+    } else {
+        month_part - 9
+    };
+    let full_year = if month <= 2 { year + 1 } else { year };
+    (
+        full_year,
+        u32::try_from(month).unwrap_or(0),
+        u32::try_from(day).unwrap_or(0),
+    )
+}
+
+/// Refuse a stamp older than the latest committed stamp.
+///
+/// Takes the latest committed stamp, when the set holds one.
+/// Takes the stamp the new version carries.
+/// Returns an error naming both stamps when the new one is older.
+/// Equal stamps pass. A first version always passes.
+///
+/// # Errors
+///
+/// Returns an error when `next` predates `latest`.
+pub fn refuse_older_taken_at(latest: Option<Timestamp>, next: Timestamp) -> io::Result<()> {
+    if let Some(latest) = latest
+        && next < latest
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "refusing to commit: the new version is {} but the latest version is {}. A new version never predates the latest one",
+                next.to_utc_string(),
+                latest.to_utc_string()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 impl From<std::time::SystemTime> for Timestamp {
@@ -134,10 +249,15 @@ impl From<Timestamp> for std::time::SystemTime {
     }
 }
 
-/// A complete description of one backup: the directory tree, the set of
-/// distinct chunk contents, and how the chunks map back onto the files.
+/// A complete description of one backup: the time it ran, the directory tree,
+/// the set of distinct chunk contents, and how the chunks map back onto files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Time the backup ran, in UTC seconds and nanos.
+    ///
+    /// The store keeps UTC. Display converts to local time.
+    /// The value orders versions. A new version never predates the latest one.
+    pub taken_at: Timestamp,
     /// Regular files, in the order they were chunked.
     pub files: Vec<File>,
     /// Directories, including ones that contain no files.
@@ -247,15 +367,14 @@ impl Snapshot {
         Ok(())
     }
 
-    /// An empty snapshot.
+    /// An empty snapshot stamped with `taken_at`.
     ///
-    /// There is no version field to stamp, and that is the point. The layout
-    /// version is a property of the encoder, not of any one snapshot. A caller
-    /// could set a field to a value that this build then refuses to read back.
-    /// Nothing would catch that until the blob was decoded.
+    /// Takes the stamp the backup ran at.
+    /// The caller stamps every snapshot with the run time.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(taken_at: Timestamp) -> Self {
         Self {
+            taken_at,
             files: Vec::new(),
             dirs: Vec::new(),
             chunks: Vec::new(),
@@ -311,19 +430,16 @@ impl Snapshot {
         version.copy_from_slice(&bytes[MAGIC.len()..header]);
         let version = u32::from_le_bytes(version);
 
-        // A range rather than an equality. A version this build can read is not a
-        // version this build would have written. Version 3 is readable and it
-        // predates the owner field. That is exactly the case worth reading. A
-        // set taken before this build existed is still a set. Refusing it would
-        // cost a user every backup they had rather than their ownership.
-        if !(MIN_READABLE_VERSION..=FORMAT_VERSION).contains(&version) {
+        // Exact match. This build writes one layout and reads one layout.
+        // A range would invite a reader that decodes a layout it never wrote.
+        if version != FORMAT_VERSION {
             return Err(Error::UnsupportedVersion {
                 found: version,
                 supported: FORMAT_VERSION,
             });
         }
 
-        codec::decode_body(&bytes[header..], version).map_err(Error::Decode)
+        codec::decode_body(&bytes[header..]).map_err(Error::Decode)
     }
 }
 
@@ -347,13 +463,6 @@ impl TryFrom<&[u8]> for Snapshot {
     /// shape.
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Self::parse(bytes)
-    }
-}
-
-/// A snapshot of a tree with nothing in it.
-impl Default for Snapshot {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

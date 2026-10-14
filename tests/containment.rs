@@ -22,7 +22,7 @@ use std::{
 
 use lepatch::{
     command::restore,
-    metadata::{Attributes, Dir, File, FileChunk, Link, Snapshot},
+    metadata::{Attributes, Dir, File, FileChunk, Link, Snapshot, Timestamp},
     storage::{BlobId, BlobStore, Compression, SegmentLimit, StoragePut},
 };
 
@@ -44,7 +44,7 @@ impl Forged {
                 .await
                 .unwrap();
 
-        let mut snapshot = Snapshot::new();
+        let mut snapshot = Snapshot::new(Timestamp { secs: 1, nanos: 0 });
         mutate(&mut snapshot);
 
         // Give every referenced chunk real content.
