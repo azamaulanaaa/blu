@@ -5632,3 +5632,37 @@ fn restore_with_files_from_a_store_target() {
         "a file outside the selection must not be written"
     );
 }
+
+/// `versions --files` from a `file://` target reports through staging.
+///
+/// The staged run reports with the same code a local run uses, so the subset
+/// is the same subset.
+#[test]
+fn history_with_files_from_a_store_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::create_dir_all(dir.path().join("remote")).unwrap();
+    let target = format!("file://{}/snap", dir.path().join("remote").display());
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", &target]);
+    fs::write(source.join("a.txt"), b"two\n").unwrap();
+    ok(dir.path(), &["backup", "src", &target]);
+
+    assert_eq!(
+        ok(
+            dir.path(),
+            &[
+                "versions",
+                &target,
+                "--staging",
+                "staging",
+                "--files",
+                "a.txt"
+            ]
+        ),
+        "1  created  a.txt\n2  modified  a.txt\n"
+    );
+}

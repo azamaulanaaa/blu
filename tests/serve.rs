@@ -2811,3 +2811,48 @@ async fn history_endpoint_refuses_a_request_with_no_files() {
         response.text()
     );
 }
+
+/// The history endpoint reads glob patterns and directory prefixes.
+///
+/// The same dialect the command line reads, answered from the same code. A
+/// star stays within one level, and a directory matches everything under it.
+#[tokio::test]
+async fn history_endpoint_answers_globs_and_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(source.join("sub")).unwrap();
+
+    fs::write(source.join("top.txt"), b"top\n").unwrap();
+    fs::write(source.join("sub").join("d.txt"), b"deep\n").unwrap();
+    backup(&source, &root.join("docs")).await;
+
+    let server = Server::start(&root);
+
+    let starred = Request::new("GET", "/v1/sets/docs/history?files=*.txt")
+        .send(server.address())
+        .await;
+    assert_eq!(starred.status, 200, "body: {}", starred.text());
+    let parsed: serde_json::Value = serde_json::from_slice(&starred.body).unwrap();
+    let paths: Vec<&str> = parsed["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events in {}", starred.text()))
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["top.txt"]);
+
+    let prefixed = Request::new("GET", "/v1/sets/docs/history?files=sub")
+        .send(server.address())
+        .await;
+    assert_eq!(prefixed.status, 200, "body: {}", prefixed.text());
+    let parsed: serde_json::Value = serde_json::from_slice(&prefixed.body).unwrap();
+    let paths: Vec<&str> = parsed["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events in {}", prefixed.text()))
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, vec!["sub", "sub/d.txt"]);
+}

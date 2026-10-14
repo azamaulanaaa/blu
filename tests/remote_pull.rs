@@ -730,3 +730,48 @@ fn the_removed_remote_and_set_flags_are_usage_errors() {
     }
     assert!(!out.exists(), "nothing was fetched, so nothing was written");
 }
+
+/// A remote restore with `--files` fetches the selection and writes the selection.
+///
+/// The pull skips the chunks no selected file needs, so the byte count on the
+/// report line sits below the whole pack — and the destination holds the named
+/// file at the version's bytes and nothing else. A fetch that brought
+/// everything would still restore correctly, so only the count and the tree
+/// together prove the holes were never touched.
+#[test]
+fn a_remote_restore_with_files_fetches_and_writes_only_the_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    tree(dir.path());
+    let server = Server::start(&served_root(dir.path()));
+    let address = remote_of(&server);
+
+    push(dir.path(), "src", &address);
+
+    let destination = tempfile::tempdir().unwrap();
+    let out = destination.path().join("out");
+    let stdout = ok(
+        dir.path(),
+        &[
+            "restore",
+            out.to_str().unwrap(),
+            &serve_target(&address),
+            "--files",
+            "notes.txt",
+        ],
+    );
+
+    let (fetched, length) = fetched(&stdout);
+    assert!(
+        fetched < length,
+        "a selection must cost fewer bytes than the whole pack:\n{stdout}"
+    );
+
+    assert_eq!(
+        fs::read(out.join("notes.txt")).unwrap(),
+        b"the first state\n"
+    );
+    assert!(
+        !out.join("large.bin").exists(),
+        "a file outside the selection must not be written"
+    );
+}
