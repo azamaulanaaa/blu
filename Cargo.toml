@@ -54,6 +54,13 @@ path = "src/main.rs"
 
 [package.metadata.dist]
 dist = true
+# The GitHub Release refers to the app as `blu` (the binary users install),
+# while the package stays `blulib` for crates.io (`blu` is taken there).
+# This only changes release text; archive files stay `blulib-*` because
+# cargo-dist names them after the package. A full `blu-*` rename needs
+# a split `blu` binary package, which would move `src/main.rs` and the
+# binary-dependent tests out of this package.
+display-name = "blu"
 
 [dependencies]
 # The server behind `blu serve`.
