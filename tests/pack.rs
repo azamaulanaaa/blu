@@ -2088,7 +2088,11 @@ fn a_delta_plan_is_what_the_base_does_not_already_place() {
     assert_eq!(delta.chunks()[0].id, c);
 
     // From nothing, everything.
-    assert_eq!(full.since(&target, &Snapshot::new(Timestamp { secs: 1, nanos: 0 })).len(), 3);
+    assert_eq!(
+        full.since(&target, &Snapshot::new(Timestamp { secs: 1, nanos: 0 }))
+            .len(),
+        3
+    );
 }
 
 /// A chunk the base holds in one file is still sent for another.

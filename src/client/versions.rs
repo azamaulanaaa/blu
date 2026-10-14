@@ -132,9 +132,7 @@ fn parse(url: &str, body: &[u8]) -> io::Result<Vec<Version>> {
         // The stamp parses through UTC text. A stamp the server wrote wrongly
         // is drift, and the error names the server it came from.
         let taken_at = entry.text("taken_at").and_then(|text| {
-            Timestamp::parse_utc(text).map_err(|e| {
-                io::Error::new(e.kind(), format!("{url}: {e}"))
-            })
+            Timestamp::parse_utc(text).map_err(|e| io::Error::new(e.kind(), format!("{url}: {e}")))
         })?;
 
         out.push(Version {

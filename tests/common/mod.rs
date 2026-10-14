@@ -255,7 +255,9 @@ pub(crate) async fn run_backup_limited(
         .await
         .unwrap();
     let latest = latest_of(&storage).await;
-    backup(source, Options::default(), storage, latest).await.unwrap()
+    backup(source, Options::default(), storage, latest)
+        .await
+        .unwrap()
 }
 
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
@@ -278,7 +280,9 @@ pub(crate) async fn run_backup_compressed(
         .await
         .unwrap();
     let latest = latest_of(&storage).await;
-    backup(source, Options::default(), storage, latest).await.unwrap()
+    backup(source, Options::default(), storage, latest)
+        .await
+        .unwrap()
 }
 
 /// Restore one specific version of a set.

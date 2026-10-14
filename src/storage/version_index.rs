@@ -32,10 +32,7 @@ use std::{
     path::Path,
 };
 
-use crate::{
-    metadata::Timestamp,
-    storage::BlobId,
-};
+use crate::{metadata::Timestamp, storage::BlobId};
 
 /// Bytes of a version index: three counts, a hash, a stamp, and a checksum.
 const LEN: usize = 4 + 4 + 4 + 32 + 8 + 4 + 8;

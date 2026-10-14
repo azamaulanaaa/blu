@@ -142,11 +142,11 @@ use tokio::{
 };
 use tracing::instrument;
 
+use crate::metadata::Timestamp;
 use crate::storage::{
     BlobId, Codec, Decompressor, MAX_RECORD_HEADER, Plan, PlannedChunk, RecordKind, StorageGet,
     StreamReadSeeker, Zstd,
 };
-use crate::metadata::Timestamp;
 
 /// Largest chunk the chunker can produce, and so the most a pack will decode into
 /// memory in one piece.

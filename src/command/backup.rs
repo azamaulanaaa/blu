@@ -17,8 +17,8 @@ use std::{
 use tracing::instrument;
 use walkdir::WalkDir;
 
-use crate::{command::pipeline, metadata, reader, storage};
 use crate::metadata::Timestamp;
+use crate::{command::pipeline, metadata, reader, storage};
 
 /// Uploads to run at once when the caller has not asked for a specific number.
 /// These uploads are I/O bound, so a little oversubscription keeps them from

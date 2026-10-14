@@ -520,7 +520,10 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
             if index.version == version && self.snapshot(version).ok() == Some(index.snapshot) {
                 return Ok(index.taken_at);
             }
-            tracing::debug!(version, "the index file names another snapshot; reading the blob");
+            tracing::debug!(
+                version,
+                "the index file names another snapshot; reading the blob"
+            );
         }
 
         let id = self.snapshot(version)?;
