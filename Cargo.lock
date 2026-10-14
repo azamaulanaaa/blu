@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "blulib"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "actix-web",
  "awc",
