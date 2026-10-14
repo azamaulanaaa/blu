@@ -2165,6 +2165,61 @@ fn a_delta_from_an_unrelated_base_is_the_whole_version() {
     assert!(!full.since(&target, &unrelated).is_empty());
 }
 
+/// A merge refuses a pack older than the tip.
+///
+/// The pack carries a snapshot stamped before the set's newest version.
+/// Nothing is committed. A dry run refuses the same pack.
+#[tokio::test]
+async fn a_merge_refuses_a_pack_older_than_the_tip() {
+    let built = build(3, 100_000).await;
+    let source = built.dir.path().join("source");
+
+    // A second version moves the tip forward.
+    fs::write(source.join("f0.bin"), common::noisy(110_000)).unwrap();
+    common::run_backup(&source, &built.blob).await;
+
+    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let tip = store.version_time(2).await.unwrap();
+
+    // The first version restamped an hour before the tip.
+    let mut old = snapshot_of(&built.blob).await;
+    old.taken_at = Timestamp {
+        secs: tip.secs - 3_600,
+        nanos: tip.nanos,
+    };
+    let plan = Plan::from_snapshot(&old, |id| store.locate(id)).unwrap();
+    let at = built.dir.path().join("old.pack");
+    Pack::write(&store, &plan, &old, 1, &at).await.unwrap();
+    let pack = Pack::open(&at).unwrap();
+
+    let writing = BlobStore::open_for_writing(
+        &built.blob,
+        lepatch::storage::SegmentLimit::default(),
+        lepatch::storage::Compression::default(),
+    )
+    .await
+    .unwrap();
+
+    let error = lepatch::command::merge(&writing, &pack, lepatch::command::MergeCompression::Keep)
+        .await
+        .expect_err("a pack older than the tip should be refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("refusing to commit"),
+        "the refusal should name the act, got: {error}"
+    );
+    assert_eq!(
+        writing.versions().unwrap().len(),
+        2,
+        "a refused merge must not have published a version"
+    );
+
+    let planned = lepatch::command::merge_plan(&pack, Some(&store))
+        .await
+        .expect_err("a dry run should refuse the same pack");
+    assert_eq!(planned.kind(), std::io::ErrorKind::InvalidData);
+}
+
 /// A delta pack is a pack of fewer chunks, and applies to its holder.
 ///
 /// `--from 7` writes something smaller that a client on version 7 can actually

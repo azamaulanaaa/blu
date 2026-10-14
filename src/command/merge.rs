@@ -210,7 +210,7 @@ use std::io::{self, Cursor};
 use tracing::instrument;
 
 use crate::{
-    metadata::Snapshot,
+    metadata::{Snapshot, Timestamp},
     pack::{Pack, StorageStored},
     progress::{Counter, Phase, Progress},
     storage::{self, BlobId, Codec, Placement, StorageGet, StoragePut},
@@ -396,6 +396,11 @@ pub async fn merge<C: storage::Compressor>(
         Some(base) => Some(establish_base(Some(store), base, pack.path())?),
         None => None,
     };
+
+    // Ordered against the tip before anything is written. A version that
+    // predates the tip never reaches the commit record.
+    let latest = latest_taken_at(store).await?;
+    crate::metadata::refuse_older_taken_at(latest, snapshot.taken_at)?;
 
     // The plan is what makes a merge refuse a pack that is short of a chunk its
     // own snapshot reads.
@@ -613,6 +618,14 @@ pub async fn merge_plan<C: storage::Compressor>(
         None => None,
     };
 
+    // Ordered against the tip like a real merge. A plan that reported a merge
+    // of an older version would tell the user their set is about to grow a
+    // version it must refuse.
+    if let Some(store) = set {
+        let latest = latest_taken_at(store).await?;
+        crate::metadata::refuse_older_taken_at(latest, snapshot.taken_at)?;
+    }
+
     let plan = plan_against(set, pack, &snapshot)?;
 
     let mut merged = MergePlan {
@@ -773,6 +786,23 @@ pub fn version_holding<W: storage::WriteMode, C: storage::Compressor>(
     }
 
     Ok(None)
+}
+
+/// The stamp of a set's newest version, when the set holds one.
+///
+/// Reads the tip through the commit list. An empty set holds nothing.
+///
+/// # Errors
+///
+/// Returns an error when the tip's stamp cannot be read. The stamp lives in
+/// the tip's snapshot blob, or in its index file where one exists.
+async fn latest_taken_at<W: storage::WriteMode, C: storage::Compressor>(
+    store: &storage::BlobStore<W, C>,
+) -> io::Result<Option<Timestamp>> {
+    match store.latest() {
+        None => Ok(None),
+        Some((version, _)) => store.version_time(version).await.map(Some),
+    }
 }
 
 /// Resolve the snapshot against the set and the pack together, as one store.
