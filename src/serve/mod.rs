@@ -76,6 +76,7 @@ use std::path::{Path, PathBuf};
 
 mod error;
 mod handlers;
+mod history;
 mod jobs;
 mod json;
 pub(crate) mod observe;
@@ -186,6 +187,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/sets"),
     ("GET", "/v1/sets/{set}/versions"),
     ("GET", "/v1/sets/{set}/versions/{version}"),
+    ("GET", "/v1/sets/{set}/history"),
     ("POST", "/v1/sets/{set}/packs"),
     ("GET", "/v1/packs/{id}"),
     ("POST", "/v1/packs/{id}/plan"),

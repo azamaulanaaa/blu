@@ -30,8 +30,8 @@ use futures_util::StreamExt as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
 
 use super::{
-    ApiError, ByteRange, JobEvent, JobId, Json, Requested, Sets, Uploads, jobs::State, openapi,
-    pack::Resolved, span, versions,
+    ApiError, ByteRange, JobEvent, JobId, Json, Requested, Sets, Uploads, history, jobs::State,
+    openapi, pack::Resolved, span, versions,
 };
 
 /// The media type of every non-error response that is JSON.
@@ -335,6 +335,7 @@ pub(super) fn app(
         .service(list_sets)
         .service(list_versions)
         .service(show_version)
+        .service(report_history)
         .service(request_pack)
         .service(get_pack)
         .service(plan_pack)
@@ -505,6 +506,66 @@ async fn show_version(sets: web::Data<Sets>, path: web::Path<(String, u32)>) -> 
                 ("content_bytes", Json::int(found.content_bytes)),
                 ("pack", Json::opt(id_for(&requested).map(Json::string))),
             ]))
+        }
+        Err(e) => error(&ApiError::from(e)),
+    }
+}
+
+/// `GET /v1/sets/{set}/history?files=...` — the versions where the named paths changed.
+///
+/// One pass over the snapshots, answered at once: a history reads no chunks
+/// and builds no pack, so this is a `200` and not a job. Only versions where
+/// at least one named path changed appear, oldest first. The numbering is
+/// complete — read off the store's commit records rather than the index files
+/// [`list_versions`] answers from — so a version with no index file still
+/// reports.
+#[actix_web::get("/v1/sets/{set}/history")]
+async fn report_history(
+    sets: web::Data<Sets>,
+    path: web::Path<String>,
+    request: HttpRequest,
+) -> HttpResponse {
+    let name = path.into_inner();
+
+    // The query before the set, as `request_pack` reads its body before its
+    // set: a request this server cannot act on is refused whatever it names.
+    let files = match history::parse_query(request.query_string()) {
+        Ok(files) => files,
+        Err(e) => return error(&e),
+    };
+    if files.is_empty() {
+        return error(&ApiError::bad_request(
+            "a history request names at least one `files` value, e.g. \
+             `/v1/sets/docs/history?files=src/main.rs`. Without one it is a listing: \
+             use `GET /v1/sets/{set}/versions`",
+        ));
+    }
+
+    let store = match sets.reader(&name).await {
+        Ok(store) => store,
+        Err(e) => return error(&ApiError::from(e)),
+    };
+
+    match history::report(&store, &files).await {
+        Ok(events) => {
+            let listed: Vec<Json> = events
+                .into_iter()
+                .map(|found| {
+                    Json::object(vec![
+                        ("version", Json::int(u64::from(found.version))),
+                        (
+                            "snapshot",
+                            Json::string(found.snapshot.to_hex().to_string()),
+                        ),
+                        ("taken_at", Json::string(found.taken_at.to_utc_string())),
+                        ("path", Json::string(found.path)),
+                        ("status", Json::string(found.status)),
+                        ("detail", Json::opt(found.detail.map(Json::string))),
+                    ])
+                })
+                .collect();
+
+            ok(&Json::object(vec![("events", Json::Array(listed))]))
         }
         Err(e) => error(&ApiError::from(e)),
     }

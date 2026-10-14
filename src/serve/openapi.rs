@@ -59,6 +59,8 @@ pub const DOCUMENT: &str = include_str!("../../openapi/blu.json");
 pub const SCHEMAS: &[&str] = &[
     "Accepted",
     "Error",
+    "HistoryEvent",
+    "HistoryList",
     "Job",
     "JobKind",
     "JobList",

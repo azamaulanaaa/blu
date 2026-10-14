@@ -161,6 +161,77 @@
         }
       }
     },
+    "/v1/sets/{set}/history": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Set"
+        },
+        {
+          "name": "files",
+          "in": "query",
+          "required": true,
+          "description": "The paths to report, relative to the backup root (`src/main.rs`). Repeat for more than one. A value holding `*`, `?`, `[`, `\\` or `{` is a glob pattern: `*` spans one path level, `**` spans nested levels, and a backslash names the next byte literally. A value naming a directory matches everything under it. Percent-encode each value as one query value.",
+          "style": "form",
+          "explode": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "sets"
+        ],
+        "operationId": "fileHistory",
+        "summary": "The versions where the named paths changed.",
+        "description": "One pass over the snapshots, answered at once: a history reads no chunks and builds no pack. Only versions where at least one named path changed appear, oldest first. The numbering is complete, read off the store's commit records rather than the index files `listVersions` answers from, so a version with no index file still reports.",
+        "responses": {
+          "200": {
+            "description": "The reported changes, oldest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No `files` value, or one that is empty, absolute, holds `..`, or is not valid percent-encoding.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No set at that name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "A failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sets/{set}/versions/{version}": {
       "parameters": [
         {
@@ -1010,6 +1081,71 @@
           "detail": {
             "type": "string",
             "description": "Why this request failed, in this crate's own words."
+          }
+        }
+      },
+      "HistoryEvent": {
+        "type": "object",
+        "description": "One reported change: what happened to one path at one version.",
+        "required": [
+          "version",
+          "snapshot",
+          "taken_at",
+          "path",
+          "status"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The set's own number for it."
+          },
+          "snapshot": {
+            "type": "string",
+            "description": "Its snapshot's hash, which is what the version is known by. 64 hexadecimal characters.",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "taken_at": {
+            "type": "string",
+            "description": "Time the version ran, in UTC RFC 3339 form with a Z suffix."
+          },
+          "path": {
+            "type": "string",
+            "description": "The path relative to the backup root."
+          },
+          "status": {
+            "type": "string",
+            "description": "What happened here.",
+            "enum": [
+              "created",
+              "modified",
+              "deleted"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "description": "What changed: the bytes, the kind, or the attributes. Null unless the status is `modified`.",
+            "nullable": true,
+            "enum": [
+              "content",
+              "type",
+              "metadata"
+            ]
+          }
+        }
+      },
+      "HistoryList": {
+        "type": "object",
+        "required": [
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "description": "Oldest first. Empty, not absent, when no version changed a named path.",
+            "items": {
+              "$ref": "#/components/schemas/HistoryEvent"
+            }
           }
         }
       },
