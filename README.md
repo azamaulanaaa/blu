@@ -159,7 +159,7 @@ and coincidence.
 One small file per version, saying which segment that version's snapshot is in:
 
 ```text
-games.v0001.idx     version, segment, commit record within it, snapshot hash
+games.v0001.idx     version, segment, commit record within it, snapshot hash, run time
 ```
 
 They exist for one reason: without them, answering "what versions does this set
@@ -230,6 +230,7 @@ special case.
 
 ```text
 magic (4) | format version (4) | version (4) | snapshot hash (32)
+          | UTC seconds (8) | nanos (4)
           | base flag (1) | base hash (32, a delta only)
           | chunk count (varint) | payload bytes (varint)
 ...records, end to end, in plan order: a store record per chunk...
@@ -945,9 +946,10 @@ Stated rather than discovered:
   unreadable rather than misread — but it is not converted, and the old bytes
   stay where they are. The store has had one layout so far: version 1, whose record
   headers had no codec and one length, is refused, and there is nothing in it that
-  would let it be walked anyway. The snapshot encoding is at version 4: every entry
-  carries its mode, its modification time, and the owning user and group. A chunk
-  is a bare hash, named by the hash of its contents. Treat a format change as a
+  would let it be walked anyway. The snapshot encoding is at version 5: every snapshot
+  carries its run time in UTC, and every entry carries its mode, its modification
+  time, and the owning user and group. A chunk is a bare hash, named by the hash
+  of its contents. Treat a format change as a
   reason to re-take your backups. The crate is not published, and the encoding is
   hand-written in `src/metadata/codec.rs` rather than delegated, so there is no
   upstream whose policy can decide whether your backup set can still be read —
@@ -999,8 +1001,8 @@ is a subcommand rather than an example to paste:
 
 ```console
 $ lepatch versions http://127.0.0.1:8480/docs
-1  1976fecc6c84aaa9053093fdd22c4289d45014439b13d3fb84b9248f20863f5e
-2  245b2b54d4d91a0a90a2a95ca9bf2e83ffc3b2cc5bcfa95f8ba7caaf60e51ec0
+1  1976fecc6c84aaa9053093fdd22c4289d45014439b13d3fb84b9248f20863f5e  2026-10-14T09:41:07+00:00
+2  245b2b54d4d91a0a90a2a95ca9bf2e83ffc3b2cc5bcfa95f8ba7caaf60e51ec0  2026-10-14T09:42:31+00:00
 ```
 
 **It prints the same lines a local set prints, and that is the whole feature.**
@@ -1493,8 +1495,8 @@ Re-run it for whatever versions clients are fetching:
 $ lepatch pack set v8.pack --version 8
 ```
 
-A pack in any other format is refused by name — `it is pack format 4, but this build
-reads 6` — rather than read as though the records it does not have were chunk
+A pack in any other format is refused by name — `it is pack format 6, but this build
+reads 7` — rather than read as though the records it does not have were chunk
 content. Every earlier pack format is refused the same way, and the reason is the
 same for all of them: a pack this build cannot parse would otherwise produce byte
 ranges that look entirely plausible and point at the wrong bytes.
