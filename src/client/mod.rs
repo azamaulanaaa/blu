@@ -63,6 +63,7 @@
 //! [`blu merge`]: crate::command::merge
 
 mod error;
+mod history;
 mod jobs;
 mod pull;
 mod uploads;
@@ -297,7 +298,10 @@ pub(crate) fn set_path(name: &str) -> io::Result<String> {
 /// The unreserved set is RFC 3986's, and `.` is in it rather than out of it:
 /// the set names in this crate carry dots (`photos.2024`), and encoding them
 /// would be a set name no request could name back.
-fn encode_component(value: &str) -> String {
+///
+/// History `files` values travel through this too: a path holds slashes and
+/// spaces, and both must survive the query string they ride in.
+pub(crate) fn encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
