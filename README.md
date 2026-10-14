@@ -72,6 +72,17 @@ $ blu versions docs --files src/main.rs README.md
 
 A value with `*`, `?`, `[`, `\` or `{` is a glob pattern: `*` spans one path level, `**` spans nested levels, and a backslash names the next byte literally. Quote patterns so the shell does not expand them. A value naming a directory matches everything under it.
 
+## Restore and apply per file
+
+`restore` and `apply` take the same `--files` to write only the selection. Parent directories are created as scaffolding, and everything else is left alone.
+
+```console
+$ blu restore /tmp/docs-restored docs --files src/main.rs
+$ blu apply game.pack /tmp/docs-restored --files 'src/*.rs'
+```
+
+`restore --clean` is refused with `--files`: a clean restore promises exactly the snapshot. `apply --prune` scopes to the selection, removing only the unrecorded entries the filter keeps. A remote restore fetches only the chunks the selection needs.
+
 ## Remote sets and serve
 
 `file://` works in every build. `sftp://`, `ftp://`, and `s3://` need `--features remote`. `https://` endpoints need `remote-tls`. Remote targets hold no local copy. A `file://` command pulls the set into staging, runs locally, and pushes back its writes. Use `--staging DIR` for the staging copy. Without it, the system cache holds the copy.
