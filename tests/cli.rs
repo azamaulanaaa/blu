@@ -893,14 +893,26 @@ async fn a_chunk_profile_is_the_chunking_and_default_is_the_flagless_run() {
             .to_string()
     };
 
-    let bare = backup_of("bare", None);
-    let default = backup_of("default", Some("default"));
+    let _ = backup_of("bare", None);
+    let _ = backup_of("default", Some("default"));
     let small = backup_of("small", Some("small"));
     let large = backup_of("large", Some("large"));
 
+    // Same tree, same profile, different run times: the snapshots differ by
+    // stamp alone. Compare the recorded tree rather than the hash.
+    let bare_tree = recorded_snapshot(&dir.path().join("bare")).await;
+    let default_tree = recorded_snapshot(&dir.path().join("default")).await;
     assert_eq!(
-        bare, default,
-        "--chunk-profile default should be the same run as no flag at all"
+        bare_tree.files, default_tree.files,
+        "--chunk-profile default should record the same files as no flag at all"
+    );
+    assert_eq!(
+        bare_tree.chunks, default_tree.chunks,
+        "--chunk-profile default should cut the same chunks as no flag at all"
+    );
+    assert_eq!(
+        bare_tree.file_chunks, default_tree.file_chunks,
+        "--chunk-profile default should lay out the same slices as no flag at all"
     );
     assert_ne!(
         small, large,
@@ -929,6 +941,18 @@ async fn chunk_count(base: &Path) -> usize {
         .await
         .unwrap();
     snapshot.chunks.len()
+}
+
+/// The newest version of the set at `base`, decoded.
+///
+/// Two runs stamp different times, so two snapshots of one tree differ.
+/// Comparing the recorded tree rather than the hash says whether the runs
+/// cut the tree the same way.
+async fn recorded_snapshot(base: &Path) -> lepatch::metadata::Snapshot {
+    let store = BlobStore::open_for_reading(base).await.unwrap();
+    load_snapshot(&store, store.latest().unwrap().1)
+        .await
+        .unwrap()
 }
 
 /// A set whose runs were cut at different profiles is still one store.
@@ -1877,23 +1901,13 @@ fn a_delta_packed_with_a_compression_level_applies_and_merges() {
 
     // And into a set that holds the base on its own terms. A merge refuses a delta
     // unless the receiving set holds the version it names. What it matches is the
-    // base *snapshot*. This set is therefore built from the version 1 tree. The
-    // tree is restored rather than saved a second time. The numbering works out on
-    // its own.
-    let base_tree = dir.path().join("v1-tree");
-    ok(
-        dir.path(),
-        &["apply", "v1.pack", &base_tree.to_string_lossy()],
-    );
-
+    // base *snapshot*, stamp included. A re-backup of the version 1 tree stamps a
+    // new time, so its snapshot no longer names the base. This set is therefore
+    // built by merging the version 1 pack. The numbering works out on its own.
     let receiving = dir.path().join("receiving");
     ok(
         dir.path(),
-        &[
-            "backup",
-            &base_tree.to_string_lossy(),
-            &receiving.to_string_lossy(),
-        ],
+        &["merge", "v1.pack", &receiving.to_string_lossy()],
     );
     ok(
         dir.path(),
@@ -2875,8 +2889,10 @@ fn a_dry_backup_of_an_unchanged_set_reports_nothing_to_store_and_grows_nothing()
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(
         ok(dir.path(), &["versions", "snap", "--numbers-only"])
-            .trim()
-            .to_string(),
+            .lines()
+            .next_back()
+            .unwrap_or_default()
+            .trim(),
         "2",
         "the next backup should have committed version 2"
     );
@@ -3587,6 +3603,10 @@ fn merging_the_same_pack_twice_does_nothing_and_names_the_version_holding_it() {
 /// two independently-assigned numbers can support is whether the sender's view of
 /// its own set was stale.
 ///
+/// The packs merge in time order here. A pack older than the tip is refused by
+/// the stamp check instead. So the behind pack comes from another set that ran
+/// later. Its number is behind and its time is not.
+///
 /// What would falsify it, one per assertion. A warning at equal or above. A
 /// sender exactly up to date would learn to ignore the warning, and there would
 /// be nothing left for it to mean. No warning below. The feature would do nothing
@@ -3599,8 +3619,7 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
     let dir = tempfile::tempdir().unwrap();
     let source = merge_tree(dir.path());
 
-    // Three versions at the origin, so there are three recorded numbers to merge.
-    // The order walks the receiving set's tip up past two of them.
+    // Three versions at the origin, so there are three recorded numbers.
     ok(dir.path(), &["backup", source.to_str().unwrap(), "origin"]);
     ok(
         dir.path(),
@@ -3621,9 +3640,23 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
         &["pack", "origin", "three.pack", "--version", "3"],
     );
 
-    // Ahead of the tip (3 against 0) and then on the line (2 against 1): neither
+    // Two more trees, each backed up after the last. Their version 1 packs
+    // carry number 1 with a newer time than anything above.
+    let other = dir.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("solo.bin"), noisy(100_000)).unwrap();
+    ok(dir.path(), &["backup", other.to_str().unwrap(), "otherset"]);
+    ok(dir.path(), &["pack", "otherset", "solo.pack"]);
+
+    let third = dir.path().join("third");
+    fs::create_dir_all(&third).unwrap();
+    fs::write(third.join("third.bin"), noisy(110_000)).unwrap();
+    ok(dir.path(), &["backup", third.to_str().unwrap(), "thirdset"]);
+    ok(dir.path(), &["pack", "thirdset", "third.pack"]);
+
+    // Ahead of the tip (3 against 0) and then on the line (1 against 1): neither
     // is behind, and saying so would be noise.
-    for pack in ["three.pack", "two.pack"] {
+    for pack in ["three.pack", "solo.pack"] {
         let said = ok_logs(dir.path(), &["merge", pack, "behind"]);
         assert!(
             !said.contains("this pack is version"),
@@ -3638,9 +3671,9 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
         "the two unremarkable merges should have published versions"
     );
 
-    // Behind: origin version 1 arriving at a set on version 2. It merges, and
-    // the warning names both numbers and what the merge is about to publish.
-    let said = ok_logs(dir.path(), &["merge", "one.pack", "behind"]);
+    // Behind: another set's version 1 arriving at a set on version 2. It merges,
+    // and the warning names both numbers and what the merge is about to publish.
+    let said = ok_logs(dir.path(), &["merge", "third.pack", "behind"]);
     assert!(
         said.contains("warning")
             && said.contains("this pack is version 1")
@@ -3652,7 +3685,7 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
         "and should say what merging publishes: {said}"
     );
 
-    let report = ok(dir.path(), &["merge", "one.pack", "behind", "--dry-run"]);
+    let report = ok(dir.path(), &["merge", "third.pack", "behind", "--dry-run"]);
     assert!(
         report.contains("already merged"),
         "but a repeat of it is nothing to warn about: {report}"
@@ -3667,15 +3700,12 @@ fn a_pack_from_behind_the_tip_is_warned_about_and_merged() {
         3
     );
     set_contents(dir.path(), "behind", 3);
-    common::assert_same_tree(
-        &merge_tree_at_v1(dir.path()),
-        &dir.path().join("out-behind-3"),
-    );
+    common::assert_same_tree(&third, &dir.path().join("out-behind-3"));
 
     // And a pack exactly on the tip. Equal is not lower. The ordinary case
     // of a sender who is up to date must be silent.
     ok(dir.path(), &["merge", "three.pack", "level"]);
-    let level = ok_logs(dir.path(), &["merge", "one.pack", "level"]);
+    let level = ok_logs(dir.path(), &["merge", "third.pack", "level"]);
     assert!(
         !level.contains("this pack is version"),
         "a pack from the tip's own version is not behind it: {level}"

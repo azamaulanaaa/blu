@@ -521,10 +521,10 @@ async fn a_listing_of_a_set_that_exists_holds_every_version_the_server_names() {
     let mut named = 0;
     for version in versions {
         let snapshot = storage.snapshot(version).unwrap();
-        let line = format!("{version}  {snapshot}\n");
+        let head = format!("{version}  {snapshot}");
 
         assert!(
-            listing.contains(&line),
+            listing.lines().any(|line| line.starts_with(&head)),
             "the local listing should name version {version} and its snapshot:\n{listing}"
         );
         named += 1;
