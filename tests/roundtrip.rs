@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Content round-tripping through backup and restore.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]

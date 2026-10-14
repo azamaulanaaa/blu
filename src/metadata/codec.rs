@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The snapshot wire format. Hand-written rather than delegated. The encoding of
 //! a user's backup set is the one thing that has to keep working. The reasoning
 //! behind that decision is in the README.

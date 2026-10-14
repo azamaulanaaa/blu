@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The IO adapters: bounded reads and writes over an inner stream.
 
 use std::io::{Cursor, SeekFrom};

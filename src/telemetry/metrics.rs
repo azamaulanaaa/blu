@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Metric instruments, and the one rule that names them.
 //!
 //! # Nothing is built until telemetry is on

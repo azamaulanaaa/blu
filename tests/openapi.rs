@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The checked-in `OpenAPI` document, and whether it is still true.
 //!
 //! `openapi/lepatch.json` is the source of truth for this API and it is written

@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! An address of a remote store, without a connection.
 //!
 //! Parsing first, backend later. The `url` crate splits the address into

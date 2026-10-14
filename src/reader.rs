@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Splitting a set of files into content-defined chunks.
 //!
 //! Files are read as if they had been concatenated into one stream, so a chunk

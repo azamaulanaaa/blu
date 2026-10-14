@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Throughput measurement that survives a shared machine.
 //!
 //! `cargo bench` (criterion) is the right tool for the component costs in

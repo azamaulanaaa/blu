@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! An apply: bringing a directory up to the version a pack carries.
 //!
 //! A restore writes every byte a version needs.

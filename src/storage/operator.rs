@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Keyed backends over the network, through `OpenDAL`.
 //!
 //! Gated behind `--features remote`: without it this module does not exist

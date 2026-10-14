@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! A plan resolves a snapshot against a store and yields an ordered chunk list.
 //!
 //! The property that matters is determinism.

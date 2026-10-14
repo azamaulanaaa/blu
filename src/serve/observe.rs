@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Turning the crate's progress lines into a job's counters.
 //!
 //! # Why a `tracing` layer rather than a callback

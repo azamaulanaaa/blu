@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Answering "where is version N's snapshot" without scanning the whole set.
 //!
 //! Every open scans, and the scan is proportional to the number of records in the

@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! A `lepatch serve` running as a real process, for a test to talk to.
 //!
 //! ## Why a subprocess

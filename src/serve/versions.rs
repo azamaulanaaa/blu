@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! What a set holds, as JSON.
 //!
 //! Two things live here because they are the same question at two scopes: *what

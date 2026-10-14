@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! A pack on its way in.
 //!
 //! # Why a pack is uploaded to a resource and not to a set

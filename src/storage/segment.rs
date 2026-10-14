@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! How large a segment gets before a new one is started.
 //!
 //! One value, and it is a write policy rather than part of the format. No record

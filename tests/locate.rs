@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Resolving a version through its index file, and the three ways that can fail.
 //!
 //! [`resolve`] is the fast path, and everything about it is a question of what it

@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! `lepatch versions` of a serve set: the same listing a local set gives, from a
 //! server somewhere else.
 //!

@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! What names a blob, and the short digest that the formats check themselves
 //! with.
 //!

@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Long work, and how a client finds out how it is going.
 //!
 //! A merge of a large pack and a pack of a large version are both measured in

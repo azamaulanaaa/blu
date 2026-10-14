@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The operations a backup tool performs: taking a snapshot, restoring one, and
 //! checking that a stored snapshot is still intact.
 

@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! A pack: one version's chunks, concatenated into a single distributable file.
 //!
 //! A store is a deduplicated pool, and the wrong shape for serving one version: a

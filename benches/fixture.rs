@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The benchmark fixtures' byte generator, shared by both benches.
 //!
 //! Included rather than exported, because a bench target is its own crate.

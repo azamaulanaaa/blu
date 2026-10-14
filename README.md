@@ -177,4 +177,16 @@ $ git config core.hooksPath .githooks
 
 ## License
 
-The project uses GPL-2.0-or-later. See `LICENSE` for the full text.
+Copyright (C) 2025-2026 Aza Maulana.
+
+All source, test, bench, and example files are `GPL-2.0-or-later` — version 2
+of the GNU General Public License, or (at your option) any later version.
+Each `.rs` file carries `SPDX-License-Identifier: GPL-2.0-or-later`; see
+`REUSE.toml` for the machine-readable mapping. `Cargo.toml`, `openapi/lepatch.json`,
+and `deny.toml` declare the same identifier.
+
+`LICENSE` bundles the GPL-2.0 text. No GPL-3.0 text is bundled: later versions
+apply by reference per section 9 of the license.
+
+Exception: `.github/workflows/release.yml` is generated boilerplate from
+`cargo-dist` and stays `MIT OR Apache-2.0` under its own header.

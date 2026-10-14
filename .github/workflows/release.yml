@@ -2,6 +2,8 @@
 #
 # Copyright 2022-2024, axodotdev
 # SPDX-License-Identifier: MIT or Apache-2.0
+# File-level exception: the lepatch project itself is GPL-2.0-or-later
+# (see README.md and REUSE.toml); only this generated workflow file is MIT/Apache.
 #
 # CI that:
 #

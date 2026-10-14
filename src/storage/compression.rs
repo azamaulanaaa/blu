@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! How record payloads are compressed on the way in, and, more often, not.
 //!
 //! The writer receives the policy and the reader never sees it. Every record

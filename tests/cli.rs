@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! End-to-end tests that drive the `lepatch` binary as a subprocess.
 //!
 //! The library integration tests call `backup` and `restore` directly. That left

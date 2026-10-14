@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! `lepatch restore` of a serve set: a tree that went up over a socket comes
 //! back down one, byte for byte.
 //!

@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 // The crate denies `unwrap_used` and `expect_used`, and `allow-expect-in-tests`
 // only covers code inside a `#[test]` function.
 // The helpers below are plain functions that a benchmark calls.

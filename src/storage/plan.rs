@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Turning a snapshot into an ordered list of chunks in a store.
 //!
 //! A [`crate::metadata::Snapshot`] is a location-free recipe. It names the chunks

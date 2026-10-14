@@ -1,3 +1,5 @@
+// Copyright (C) 2025-2026 Aza Maulana
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The on-disk layout of a backup set: path naming, segment numbering, and the
 //! write lock.
 //!
