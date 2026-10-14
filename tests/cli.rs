@@ -873,7 +873,9 @@ async fn a_chunk_profile_is_the_chunking_and_default_is_the_flagless_run() {
     fs::write(source.join("a.bin"), noisy(128 * 1024)).unwrap();
 
     // Back up into a fresh set and report what the run committed. The snapshot's
-    // hash is what says two runs cut the same tree the same way.
+    // hash is what says two runs cut the same tree the same way. The listing
+    // carries the run time too, so the comparison reads the hash field rather
+    // than the whole line.
     let backup_of = |name: &str, profile: Option<&str>| {
         let mut args = vec!["backup", "source", name];
         if let Some(profile) = profile {
@@ -881,7 +883,14 @@ async fn a_chunk_profile_is_the_chunking_and_default_is_the_flagless_run() {
             args.push(profile);
         }
         ok(dir.path(), &args);
-        ok(dir.path(), &["versions", name]).trim().to_string()
+        ok(dir.path(), &["versions", name])
+            .lines()
+            .next()
+            .expect("one version")
+            .split_whitespace()
+            .nth(1)
+            .expect("a hash after the version number")
+            .to_string()
     };
 
     let bare = backup_of("bare", None);
@@ -2425,6 +2434,45 @@ fn both_listing_modes_name_the_same_versions() {
     );
 }
 
+/// Every version line carries the local run time.
+///
+/// Three fields: number, hash, time. The time parses as an instant.
+/// `--numbers-only` carries no time.
+#[test]
+fn versions_lines_carry_local_time() {
+    use lepatch::metadata::Timestamp;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.bin"), noisy(40_000)).unwrap();
+    ok(dir.path(), &["backup", ".", "store"]);
+    ok(dir.path(), &["backup", ".", "store"]);
+
+    let full = ok(dir.path(), &["versions", "store"]);
+    assert_eq!(full.lines().count(), 2, "two versions: {full}");
+
+    for line in full.lines() {
+        let mut fields = line.split_whitespace();
+        fields.next().expect("a version number");
+        fields.next().expect("a snapshot hash");
+        let time = fields.next().expect("a run time");
+        assert!(fields.next().is_none(), "a line holds three fields: {line}");
+
+        let parsed = Timestamp::parse_utc(time).expect("the time should parse");
+        assert!(
+            parsed.secs > 1_600_000_000,
+            "the line should carry a real run time: {line}"
+        );
+    }
+
+    for line in ok(dir.path(), &["versions", "store", "--numbers-only"]).lines() {
+        assert_eq!(
+            line.split_whitespace().count(),
+            1,
+            "numbers-only carries no time: {line}"
+        );
+    }
+}
+
 /// The claim cleans up beside the *resolved* destination, and only there.
 ///
 /// `DestinationLock` resolves "beside the destination" by canonicalising, and its
@@ -2753,13 +2801,16 @@ fn a_dry_backup_of_a_new_location_creates_nothing_and_plans_every_chunk() {
         "a plan should name the snapshot it would commit, got: {report}"
     );
 
-    // And it is true. The real run immediately afterwards commits exactly that
-    // snapshot, which is what makes the hash worth printing at all.
+    // And it is true. The real run immediately afterwards commits version 1,
+    // which is what makes the planned version worth printing at all. The two
+    // snapshots differ: each run stamps its own time.
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(
-        latest_snapshot(dir.path(), "snap"),
-        planned,
-        "the planned snapshot is not the one the next backup committed"
+        ok(dir.path(), &["versions", "snap", "--numbers-only"])
+            .trim()
+            .to_string(),
+        "1",
+        "the real run should have committed version 1"
     );
 
     // Nothing was held before, so every chunk is new. The byte total is the
@@ -2818,14 +2869,16 @@ fn a_dry_backup_of_an_unchanged_set_reports_nothing_to_store_and_grows_nothing()
     );
     assert!(figures[3] > 0, "a tree this size has chunks: {report}");
 
-    // The version it would commit is the next one, and the tree is unchanged, so
-    // the snapshot hash is the one the *first* backup committed. A second version
-    // of the same tree is the same version.
+    // The version it would commit is the next one. Each run stamps its own
+    // time, so the planned hash is not the committed one. The version number
+    // is what the two agree on.
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(
-        latest_snapshot(dir.path(), "snap"),
-        planned_snapshot(&report),
-        "the planned snapshot is not the one the next backup committed"
+        ok(dir.path(), &["versions", "snap", "--numbers-only"])
+            .trim()
+            .to_string(),
+        "2",
+        "the next backup should have committed version 2"
     );
     assert_eq!(
         count_entries(dir.path(), "snap"),

@@ -10,6 +10,7 @@ use lepatch::{
         merge_plan, restore, restore_plan, verify, version_holding,
     },
     layout::IndexSet,
+    metadata::Timestamp,
     pack::Pack,
     reader, storage,
 };
@@ -194,8 +195,9 @@ enum Command {
     /// over-reports.
     ///
     /// **The same listing is printed whether the set is local or remote.**
-    /// The lines are the same lines: `{version}  {snapshot}`, or just
-    /// `{version}` under `--numbers-only`. A script written against a local set
+    /// The lines are the same lines: `{version}  {snapshot}  {taken_at}`, or just
+    /// `{version}` under `--numbers-only`. The time is local time in RFC 3339 form.
+    /// The store keeps UTC. A script written against a local set
     /// works unchanged against a remote one.
     Versions {
         /// The backup set to inspect: a local path (`photos`), a serve set
@@ -1369,7 +1371,8 @@ fn plural_versions(count: usize) -> String {
     }
 }
 
-/// List the versions a backup set holds, oldest first, each with its snapshot hash.
+/// List the versions a backup set holds, oldest first, each with its snapshot hash
+/// and the local time it ran.
 ///
 /// The count is a **lower bound**. A version whose index file was never
 /// written still exists and still restores. So this may report fewer than the set
@@ -1429,8 +1432,11 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
         let Ok(snapshot) = store.snapshot_via_index(version) else {
             continue;
         };
+        let Ok(taken_at) = store.version_time(version).await else {
+            continue;
+        };
 
-        print_version(version, &snapshot, numbers_only)?;
+        print_version(version, &snapshot, taken_at, numbers_only)?;
     }
 
     Ok(())
@@ -1444,15 +1450,19 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
 /// same two-space separator, the same `say!` and so the same broken-pipe
 /// behaviour. A second formatting path would be a difference nothing tests until
 /// a script meets it.
+///
+/// The time is local time. The store keeps UTC. Conversion happens here, at the
+/// point of display, and nowhere else.
 fn print_version(
     version: u32,
     snapshot: &storage::BlobId,
+    taken_at: Timestamp,
     numbers_only: bool,
 ) -> std::io::Result<()> {
     if numbers_only {
         say!("{version}")
     } else {
-        say!("{version}  {snapshot}")
+        say!("{version}  {snapshot}  {}", taken_at.to_local_string())
     }
 }
 
@@ -1467,7 +1477,12 @@ async fn run_versions_remote(set: &str, numbers_only: bool, address: &str) -> st
     let remote = lepatch::client::Remote::new(address)?;
 
     for listed in remote.versions(set).await? {
-        print_version(listed.version, &listed.snapshot, numbers_only)?;
+        print_version(
+            listed.version,
+            &listed.snapshot,
+            listed.taken_at,
+            numbers_only,
+        )?;
     }
 
     Ok(())
