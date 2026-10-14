@@ -20,6 +20,7 @@ use common::noisy;
 use lepatch::{
     command::{PARTIAL_SUFFIX, load_snapshot},
     layout::IndexSet,
+    metadata::Timestamp,
     storage::{BlobId, BlobStore, Codec, VersionIndex},
 };
 
@@ -2405,6 +2406,7 @@ fn both_listing_modes_name_the_same_versions() {
             segment: 0,
             ordinal: 0,
             snapshot: BlobId::from_bytes([7u8; 32]),
+            taken_at: Timestamp { secs: 1, nanos: 0 },
         }
         .to_bytes(),
     )

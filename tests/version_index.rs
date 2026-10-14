@@ -27,6 +27,7 @@ use std::fs;
 
 use lepatch::{
     layout::IndexSet,
+    metadata::Timestamp,
     storage::{
         BlobId, BlobStore, Compression, Read, Resolved, SegmentLimit, VersionIndex, resolve,
     },
@@ -63,6 +64,7 @@ fn a_version_index_round_trips() {
         segment: 12,
         ordinal: 3,
         snapshot: BlobId::from_bytes([9u8; 32]),
+        taken_at: Timestamp { secs: 1, nanos: 0 },
     };
 
     let decoded = VersionIndex::try_from(&original.to_bytes()[..]).unwrap();
@@ -77,6 +79,7 @@ fn a_corrupted_index_does_not_verify() {
         segment: 12,
         ordinal: 3,
         snapshot: BlobId::from_bytes([9u8; 32]),
+        taken_at: Timestamp { secs: 1, nanos: 0 },
     };
 
     for byte in 0..original.to_bytes().len() {
@@ -98,6 +101,7 @@ fn an_index_of_the_wrong_length_is_refused() {
         segment: 0,
         ordinal: 0,
         snapshot: BlobId::from_bytes([9u8; 32]),
+        taken_at: Timestamp { secs: 1, nanos: 0 },
     };
 
     let mut short = original.to_bytes().to_vec();
@@ -119,6 +123,7 @@ fn writing_an_index_leaves_no_temporary() {
         segment: 0,
         ordinal: 0,
         snapshot: BlobId::from_bytes([9u8; 32]),
+        taken_at: Timestamp { secs: 1, nanos: 0 },
     }
     .write_atomic(&path)
     .unwrap();
@@ -240,6 +245,7 @@ async fn an_index_naming_a_version_this_set_does_not_hold_is_refused() {
         segment: 0,
         ordinal: 0,
         snapshot: BlobId::from_bytes([9u8; 32]),
+        taken_at: Timestamp { secs: 1, nanos: 0 },
     }
     .write_atomic(&set.index_path(5))
     .unwrap();
@@ -407,6 +413,7 @@ async fn the_index_files_can_all_be_deleted_and_rebuilt() {
             .await
             .unwrap()
             .write_index_files()
+            .await
             .unwrap();
     assert_eq!(written, 4);
 
@@ -473,6 +480,7 @@ async fn an_index_cannot_invent_a_version() {
             segment: 0,
             ordinal: v - 1,
             snapshot: BlobId::from_bytes([u8::try_from(v).unwrap(); 32]),
+            taken_at: Timestamp { secs: 1, nanos: 0 },
         }
         .write_atomic(&set.index_path(v))
         .unwrap();
@@ -489,6 +497,41 @@ async fn an_index_cannot_invent_a_version() {
             "the store must not report version {v} because a file says so"
         );
     }
+}
+
+/// A published version records its stamp in its index file.
+///
+/// The stamp in the file matches the stamp the store reports.
+/// Deleting the file changes nothing: the blob reports the same stamp.
+#[tokio::test]
+async fn a_published_version_records_its_stamp_in_its_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (blob, store) = set_with_versions(dir.path(), 2).await;
+    let set = IndexSet::new(&blob);
+
+    for v in 1..=2 {
+        let index = version(&blob, v);
+        let timed = store.version_time(v).await.unwrap();
+
+        assert_eq!(
+            index.taken_at, timed,
+            "version {v} should report the stamp its index file records"
+        );
+        assert!(
+            timed.secs > 1_600_000_000,
+            "version {v} should carry a real run time, got {}",
+            timed.to_utc_string()
+        );
+    }
+
+    let before = store.version_time(2).await.unwrap();
+    fs::remove_file(set.index_path(2)).unwrap();
+    let after = store.version_time(2).await.unwrap();
+
+    assert_eq!(
+        before, after,
+        "the blob should report the same stamp the index file did"
+    );
 }
 
 /// An index path that is a directory is no index, and the set still reads.

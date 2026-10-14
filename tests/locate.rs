@@ -29,6 +29,7 @@ use std::fs;
 
 use lepatch::{
     layout::IndexSet,
+    metadata::Timestamp,
     storage::{BlobStore, Resolved, SegmentLimit, VersionIndex, resolve},
 };
 
@@ -194,6 +195,7 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
         segment: last,
         ordinal: 0,
         snapshot: first.snapshot,
+        taken_at: Timestamp { secs: 1, nanos: 0 },
     };
     misfiled.write_atomic(&set.index_path(1)).unwrap();
 

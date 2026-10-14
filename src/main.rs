@@ -1348,7 +1348,7 @@ async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<(
     .await?;
 
     let versions = store.versions()?;
-    let written = store.write_index_files()?;
+    let written = store.write_index_files().await?;
 
     tracing::info!(
         name = %set.base().display(),

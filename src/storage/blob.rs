@@ -84,10 +84,11 @@ use tracing::instrument;
 use super::record::{self, Kind, Placement, STORE_HEADER};
 use crate::{
     layout::IndexSet,
+    metadata::{Snapshot, Timestamp},
     slice::{DecompressReader, SliceAsyncReader},
     storage::{
-        self, BlobId, Codec, Compression, Compressor, Decompressor, SegmentLimit, StreamReadSeeker,
-        VersionIndex, Zstd,
+        self, BlobId, Codec, Compression, Compressor, Decompressor, SegmentLimit, StorageGet,
+        StreamReadSeeker, VersionIndex, Zstd,
     },
 };
 
@@ -504,6 +505,39 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
                 )
             })
     }
+
+    /// The stamp of a version, from its index file or its snapshot blob.
+    ///
+    /// Reads the index file where it names this version. Falls back to
+    /// the snapshot blob where no usable index file exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the set holds no such version. Returns an
+    /// error when the snapshot blob cannot be read or decoded.
+    pub async fn version_time(&self, version: u32) -> io::Result<Timestamp> {
+        if let Some(index) = VersionIndex::read(&self.set.index_path(version)) {
+            if index.version == version && self.snapshot(version).ok() == Some(index.snapshot) {
+                return Ok(index.taken_at);
+            }
+            tracing::debug!(version, "the index file names another snapshot; reading the blob");
+        }
+
+        let id = self.snapshot(version)?;
+        self.snapshot_taken_at(&id).await
+    }
+
+    /// The stamp inside the snapshot blob named by `id`.
+    ///
+    /// Reads the blob whole. A snapshot fits in memory by design.
+    async fn snapshot_taken_at(&self, id: &BlobId) -> io::Result<Timestamp> {
+        let mut reader = self.get(id).await?;
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).await?;
+        Snapshot::try_from(buffer.as_slice())
+            .map(|snapshot| snapshot.taken_at)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
 
 impl<C: Compressor> BlobStore<Write, C> {
@@ -633,19 +667,16 @@ impl<W: WriteMode, C: Compressor> storage::StorageGet for BlobStore<W, C> {
     async fn get(&self, id: &BlobId) -> io::Result<StreamReadSeeker> {
         let placement = self.locate(id)?;
 
-        let segment = self.segments.get(usize::try_from(placement.segment).unwrap_or(usize::MAX))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "this store's index names segment {} for a blob, but it holds {} segment(s)",
-                    placement.segment,
-                    self.segments.len()
-                ),
-            )
-        })?;
+        // The list is fixed at open, but a run that rolled over holds blobs
+        // in segments it opened itself. Those segments are real files with
+        // real names, so the computed path serves where the list ends.
+        let segment = self
+            .segments
+            .get(usize::try_from(placement.segment).unwrap_or(usize::MAX))
+            .cloned()
+            .unwrap_or_else(|| self.segment_path(placement.segment));
 
-        let file = super::at_async(segment, "open", fs::File::open(segment)).await?;
+        let file = super::at_async(&segment, "open", fs::File::open(&segment)).await?;
         let len = file.metadata().await?.len();
 
         // The index is built by a scan and cannot be wrong unless a segment has
@@ -947,21 +978,38 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
         // the run. A version whose index write is lost still exists and still
         // restores. A run that reported failure here would have published a version
         // and told the caller that it had not.
-        if let Err(e) = write_index(
-            &self.set,
-            VersionIndex {
-                version,
-                segment: reservation.segment,
-                ordinal,
-                snapshot: *snapshot,
-            },
-        ) {
-            tracing::debug!(
-                version,
-                error = %e,
-                "published a version but could not write its index file; a scan will \
-                 find it instead"
-            );
+        //
+        // The stamp travels with the index file, so listings read no blob.
+        // The snapshot was just stored, so the read below always hits.
+        // A missed read skips the file rather than failing the run.
+        match self.snapshot_taken_at(snapshot).await {
+            Ok(taken_at) => {
+                if let Err(e) = write_index(
+                    &self.set,
+                    VersionIndex {
+                        version,
+                        segment: reservation.segment,
+                        ordinal,
+                        snapshot: *snapshot,
+                        taken_at,
+                    },
+                ) {
+                    tracing::debug!(
+                        version,
+                        error = %e,
+                        "published a version but could not write its index file; a scan will \
+                         find it instead"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    version,
+                    error = %e,
+                    "published a version but could not read its stamp; a scan will \
+                     find it instead"
+                );
+            }
         }
 
         Ok(version)
@@ -1260,7 +1308,7 @@ impl<C: Compressor> BlobStore<Write, C> {
     ///
     /// Only if the version list cannot be read, which is the store's own in-memory
     /// index and so cannot really fail.
-    pub fn write_index_files(&self) -> io::Result<usize> {
+    pub async fn write_index_files(&self) -> io::Result<usize> {
         let mut written = 0;
 
         for version in self.versions()? {
@@ -1272,6 +1320,10 @@ impl<C: Compressor> BlobStore<Write, C> {
                 continue;
             };
 
+            let Ok(taken_at) = self.snapshot_taken_at(&snapshot).await else {
+                continue;
+            };
+
             if write_index(
                 &self.set,
                 VersionIndex {
@@ -1279,6 +1331,7 @@ impl<C: Compressor> BlobStore<Write, C> {
                     segment,
                     ordinal,
                     snapshot,
+                    taken_at,
                 },
             )
             .is_ok()

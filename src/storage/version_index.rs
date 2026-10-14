@@ -1,11 +1,14 @@
-//! A per-version index file: which segment a version's snapshot is in.
+//! A per-version index file: which segment a version's snapshot is in, and when
+//! the version ran.
 //!
 //! ```text
-//! version (4) | segment (4) | ordinal in segment (4) | snapshot hash (32) | check (8)
+//! version (4) | segment (4) | ordinal in segment (4) | snapshot hash (32) |
+//! UTC seconds (8) | nanos (4) | check (8)
 //! ```
 //!
 //! It answers "where is version 7's snapshot" without a scan of every record
-//! header in the set.
+//! header in the set. It also answers "when did version 7 run" without
+//! reading the snapshot blob.
 //!
 //! ## This is a cache
 //!
@@ -29,10 +32,13 @@ use std::{
     path::Path,
 };
 
-use crate::storage::BlobId;
+use crate::{
+    metadata::Timestamp,
+    storage::BlobId,
+};
 
-/// Bytes of a version index: three counts, a hash, and a checksum.
-const LEN: usize = 4 + 4 + 4 + 32 + 8;
+/// Bytes of a version index: three counts, a hash, a stamp, and a checksum.
+const LEN: usize = 4 + 4 + 4 + 32 + 8 + 4 + 8;
 
 /// Bytes the checksum covers: everything ahead of itself.
 const UNCHECKED: usize = LEN - 8;
@@ -41,7 +47,7 @@ fn check(head: &[u8]) -> [u8; 8] {
     super::hash::truncated_hash(head)
 }
 
-/// Where a version's snapshot is.
+/// Where a version's snapshot is, and when the version ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionIndex {
     /// The version this file describes.
@@ -56,6 +62,11 @@ pub struct VersionIndex {
     pub ordinal: u32,
     /// The snapshot's content hash, and the check on everything above.
     pub snapshot: BlobId,
+    /// Time the version ran, in UTC seconds and nanos.
+    ///
+    /// The store keeps UTC. Display converts to local time.
+    /// The value matches the stamp inside the snapshot blob.
+    pub taken_at: Timestamp,
 }
 
 impl VersionIndex {
@@ -76,11 +87,13 @@ impl VersionIndex {
         out[4..8].copy_from_slice(&self.segment.to_le_bytes());
         out[8..12].copy_from_slice(&self.ordinal.to_le_bytes());
         out[12..44].copy_from_slice(self.snapshot.as_bytes());
+        out[44..52].copy_from_slice(&self.taken_at.secs.to_le_bytes());
+        out[52..56].copy_from_slice(&self.taken_at.nanos.to_le_bytes());
 
         // Computed before the final copy, because the checksum is over everything
         // ahead of itself and the borrow cannot overlap.
         let guard = check(&out[..UNCHECKED]);
-        out[44..].copy_from_slice(&guard);
+        out[56..].copy_from_slice(&guard);
 
         out
     }
@@ -105,12 +118,20 @@ impl VersionIndex {
 
         let mut snapshot = [0u8; 32];
         snapshot.copy_from_slice(&bytes[12..44]);
+        let mut secs = [0u8; 8];
+        secs.copy_from_slice(&bytes[44..52]);
+        let mut nanos = [0u8; 4];
+        nanos.copy_from_slice(&bytes[52..56]);
 
         Ok(Self {
             version: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             segment: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             ordinal: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             snapshot: BlobId::from_bytes(snapshot),
+            taken_at: Timestamp {
+                secs: i64::from_le_bytes(secs),
+                nanos: u32::from_le_bytes(nanos),
+            },
         })
     }
 
@@ -232,8 +253,15 @@ fn temporary_for(path: &Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::VersionIndex;
+    use super::{Timestamp, VersionIndex};
     use crate::storage::BlobId;
+
+    fn stamped() -> Timestamp {
+        Timestamp {
+            secs: 1_700_000_000,
+            nanos: 42,
+        }
+    }
 
     /// Index bytes round-trip without the filesystem.
     ///
@@ -248,6 +276,7 @@ mod tests {
             segment: 2,
             ordinal: 3,
             snapshot: BlobId::from_bytes([5u8; 32]),
+            taken_at: stamped(),
         };
 
         let bytes = index.to_bytes();
@@ -258,5 +287,25 @@ mod tests {
         let mut torn = bytes;
         torn[0] ^= 0xff;
         assert_eq!(VersionIndex::decode(&torn), None);
+    }
+
+    /// The stamp travels with the index and survives the round trip.
+    ///
+    /// A listing reads the stamp off the file rather than the blob.
+    /// A stamp that the round trip drops would list every version wrong.
+    #[test]
+    fn index_records_taken_at() {
+        let index = VersionIndex {
+            version: 1,
+            segment: 0,
+            ordinal: 0,
+            snapshot: BlobId::from_bytes([5u8; 32]),
+            taken_at: stamped(),
+        };
+
+        let decoded = VersionIndex::try_from(&index.to_bytes()[..]).expect("decodes");
+
+        assert_eq!(decoded.taken_at, stamped());
+        assert_eq!(decoded.taken_at.to_utc_string(), stamped().to_utc_string());
     }
 }
