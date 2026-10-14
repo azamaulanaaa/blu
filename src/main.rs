@@ -76,8 +76,11 @@ struct Args {
 #[derive(Debug, Clone, Subcommand)]
 enum Command {
     /// Snapshot a directory into a new version of a backup set.
+    ///
+    /// The run stamps the time. It refuses a stamp older than the newest
+    /// committed version, so a clock behind the tip fails before writing.
     Backup(BackupArgs),
-    /// Apply a pack into a backup set, as a new version of it.
+    /// Merge a pack into a backup set, as a new version of it.
     ///
     /// The receiving half of `pack`, and the one a remote push would use: the set
     /// ends up holding the version the pack carries, and nothing else is consulted
@@ -102,6 +105,12 @@ enum Command {
     /// independently, so the pack's own number says nothing about where it lands.
     /// It lands on the set's next version, which is what `restore` with no
     /// `--version` returns, and that is what the warning says.
+    ///
+    /// The run refuses a pack older than the tip rather than warning about it.
+    /// Each version carries its run time, and a new version never predates the
+    /// latest one. The run therefore refuses such a pack before writing a byte.
+    /// Equal times pass. Two pushes at once race the tip, and the run refuses
+    /// the loser with nothing published.
     Merge {
         /// The pack to merge.
         pack: std::path::PathBuf,
@@ -253,7 +262,7 @@ enum Command {
         bind: Option<String>,
         /// Where uploaded packs are written.
         ///
-        /// A merge reads a pack **twice** — once to check the file table and once
+        /// A merge reads a pack **twice** — once to read the file table and once
         /// per chunk — so an upload has to land on a seekable file rather than be
         /// streamed. Defaults to `.lepatch-serve` under the root, rather than a
         /// system temporary directory: a pack can be larger than one is sized for,
@@ -285,7 +294,7 @@ enum Command {
         /// Say what this restore would write, and write none of it.
         ///
         /// Affects what is written and nothing else: the version is still read out
-        /// of the set and every chunk still checked against the hash it is
+        /// of the set and every chunk still verified against the hash it is
         /// addressed by, so a dry run refuses exactly what a restore refuses and
         /// costs what one costs. Nothing is created and nothing is removed — no
         /// file, no directory, no attribute, no `.partial` beside the destination —
@@ -305,13 +314,13 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         staging: Option<std::path::PathBuf>,
     },
-    /// Check a snapshot's stored chunks against their recorded hashes.
+    /// Verify a snapshot's stored chunks against their recorded hashes.
     Verify {
-        /// The backup set to check: a local path (`photos`) or a keyed store
+        /// The backup set to verify: a local path (`photos`) or a keyed store
         /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). An `http://` target is refused: the
         /// server exposes versions and packs, not chunk verification.
         target: String,
-        /// Version to check, defaulting to the most recent usable one.
+        /// Version to verify, defaulting to the most recent usable one.
         #[arg(long, short)]
         version: Option<u32>,
         /// Directory holding the staging copy for a store target.
@@ -450,7 +459,7 @@ enum Command {
         prune: bool,
         /// Re-read every file, ignoring the record of the last apply.
         ///
-        /// Each apply leaves a note beside the directory saying which files it
+        /// Each apply leaves a record beside the directory saying which files it
         /// wrote and what the filesystem said about them afterwards. The next one
         /// stats those files and skips the ones that have not moved, which is what
         /// makes a repeated apply cost nothing but a stat per file.

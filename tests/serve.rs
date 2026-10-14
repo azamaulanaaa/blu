@@ -2301,10 +2301,7 @@ async fn concurrent_merges_race_the_tip_and_leave_a_consistent_set() {
     // Both at once, without awaiting the first.
     let first = start_merge(&server, "shared", &one_pack, None).await;
     let second = start_merge(&server, "shared", &two_pack, None).await;
-    let (first, second) = tokio::join!(
-        settle_job(&server, &first),
-        settle_job(&server, &second)
-    );
+    let (first, second) = tokio::join!(settle_job(&server, &first), settle_job(&server, &second));
 
     // Each job either committed or lost the race. Any other error is a failure.
     let mut committed = 0;

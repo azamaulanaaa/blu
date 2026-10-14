@@ -3339,7 +3339,7 @@ fn every_writing_subcommand_documents_its_dry_run() {
             "the tree is still walked",
             "not the set's directory",
         ),
-        ("restore", "still checked", "no claim is taken"),
+        ("restore", "still verified", "no claim is taken"),
         ("pack", "still located", "`<OUT>` is neither created"),
         ("apply", "hashed", "no manifest recorded"),
         (
