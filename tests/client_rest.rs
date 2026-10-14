@@ -500,3 +500,88 @@ async fn a_failed_push_leaves_no_upload_on_the_server() {
         held_packs(&root)
     );
 }
+
+/// Pack the tree at `source` into the set at `blob` as its next version.
+///
+/// Opens for writing each call, so two calls publish two versions. Returns
+/// the pack bytes of the version just published.
+async fn pack_version(source: &Path, blob: &Path) -> Vec<u8> {
+    let store = BlobStore::open_for_writing(
+        blob,
+        blulib::storage::SegmentLimit::default(),
+        Compression::default(),
+    )
+    .await
+    .unwrap();
+
+    let latest = match store.latest() {
+        None => None,
+        Some((version, _)) => store.version_time(version).await.ok(),
+    };
+    blulib::command::backup(source, blulib::command::Options::default(), store, latest)
+        .await
+        .unwrap();
+
+    let reader = BlobStore::open_for_reading(blob).await.unwrap();
+    let (version, snapshot_id) = reader.latest().unwrap();
+
+    let mut buffer = Vec::new();
+    reader
+        .get(&snapshot_id)
+        .await
+        .unwrap()
+        .read_to_end(&mut buffer)
+        .await
+        .unwrap();
+    let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
+    let plan = Plan::from_snapshot(&snapshot, |id| Ok(reader.locate(id).unwrap())).unwrap();
+
+    let pack_path = blob.with_extension("pack");
+    Pack::write(&reader, &plan, &snapshot, version, &pack_path)
+        .await
+        .unwrap();
+    fs::read(&pack_path).unwrap()
+}
+
+/// `Remote::history` names the versions where a path changed.
+///
+/// Two pushes move one file through created and modified. The client reports
+/// both versions with those statuses, which is what `blu versions --files`
+/// prints for a serve target.
+#[tokio::test]
+async fn history_names_the_versions_where_a_path_changed() {
+    use blulib::command::{Detail, Status};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+    let blob = dir.path().join("local");
+
+    fs::write(source.join("notes.txt"), b"first\n").unwrap();
+    let first = pack_version(&source, &blob).await;
+    fs::write(source.join("notes.txt"), b"second\n").unwrap();
+    let second = pack_version(&source, &blob).await;
+
+    let server = Server::start(&served_root(dir.path()));
+    let remote = remote_of(&server);
+    for pack in [&first, &second] {
+        let job = remote
+            .merge_pack("docs", pack.clone(), MergeCompression::Keep)
+            .await
+            .unwrap();
+        remote.await_job(&job).await.unwrap();
+    }
+
+    let events = remote.history("docs", &["notes.txt"]).await.unwrap();
+
+    assert_eq!(events.len(), 2, "one creation and one change: {events:?}");
+    assert_eq!(events[0].version, 1);
+    assert_eq!(events[0].status, Status::Created);
+    assert_eq!(events[0].detail, None);
+    assert_eq!(events[1].version, 2);
+    assert_eq!(events[1].status, Status::Modified);
+    assert_eq!(events[1].detail, Some(Detail::Content));
+    for event in &events {
+        assert_eq!(event.path, PathBuf::from("notes.txt"));
+    }
+}

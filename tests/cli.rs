@@ -5112,3 +5112,277 @@ fn store_file_backup_restore_round_trip() {
     let after = common::describe(&dir.join("out"));
     assert_eq!(before, after, "the restored tree differs from the source");
 }
+
+/// `versions --files` names the versions where one file changed.
+///
+/// Three backups move one file through created, modified and deleted. The
+/// report holds those three lines and nothing else.
+#[test]
+fn history_reports_created_modified_deleted_for_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    fs::write(source.join("b.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::write(source.join("a.txt"), b"two\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::remove_file(source.join("a.txt")).unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "a.txt"]),
+        "1  created  a.txt\n2  modified  a.txt\n3  deleted  a.txt\n"
+    );
+}
+
+/// `versions --files` skips versions that leave the file alone.
+///
+/// A second file moves in version two while the watched file rests. The
+/// report names versions one and three only.
+#[test]
+fn history_ignores_versions_without_matching_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::write(source.join("b.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::remove_file(source.join("a.txt")).unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "a.txt"]),
+        "1  created  a.txt\n3  deleted  a.txt\n"
+    );
+}
+
+/// `versions --files` reports a mode-only change as modified.
+///
+/// The bytes stay identical and only the permission bits move. Content
+/// comparison finds no difference, so the attributes decide.
+#[test]
+#[cfg(unix)]
+fn history_reports_metadata_only_change_as_modified() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("run.sh"), b"true\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::set_permissions(source.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "run.sh"]),
+        "1  created  run.sh\n2  modified  run.sh\n"
+    );
+}
+
+/// `versions --files` reports a file turned link as modified.
+///
+/// The path survives with a new kind, so this is neither created nor deleted.
+#[test]
+#[cfg(unix)]
+fn history_reports_type_change_as_modified() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("f"), b"bytes\n").unwrap();
+    fs::write(source.join("target"), b"elsewhere\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::remove_file(source.join("f")).unwrap();
+    std::os::unix::fs::symlink("target", source.join("f")).unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "f"]),
+        "1  created  f\n2  modified  f\n"
+    );
+}
+
+/// `versions --files` with a directory matches everything under it.
+///
+/// The directory itself reports as created beside its first files. A later
+/// version touching one file inside reports that file only.
+#[test]
+fn history_matches_directory_prefix_recursively() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("sub")).unwrap();
+
+    fs::write(source.join("sub").join("d.txt"), b"deep\n").unwrap();
+    fs::write(source.join("top.txt"), b"top\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::write(source.join("sub").join("d.txt"), b"deeper\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "sub"]),
+        "1  created  sub\n1  created  sub/d.txt\n2  modified  sub/d.txt\n"
+    );
+}
+
+/// `versions --files` with a star stays within one path level.
+///
+/// `*.txt` names the top-level files and never the nested ones.
+#[test]
+fn history_expands_star_pattern_within_one_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("sub")).unwrap();
+
+    fs::write(source.join("a.txt"), b"a\n").unwrap();
+    fs::write(source.join("sub").join("b.txt"), b"b\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "*.txt"]),
+        "1  created  a.txt\n"
+    );
+}
+
+/// `versions --files` with a double star spans nested levels.
+///
+/// `**/*.txt` names the nested file the single star cannot reach.
+#[test]
+fn history_expands_double_star_pattern_across_levels() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("sub")).unwrap();
+
+    fs::write(source.join("a.txt"), b"a\n").unwrap();
+    fs::write(source.join("sub").join("b.txt"), b"b\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "**/*.txt"]),
+        "1  created  a.txt\n1  created  sub/b.txt\n"
+    );
+}
+
+/// `versions --files` reads an escaped star as a literal star.
+///
+/// A file named `a*b` is addressable through `a\*b`. Without the escape the
+/// star would pattern-match instead.
+#[test]
+fn history_treats_escaped_star_as_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a*b"), b"star\n").unwrap();
+    fs::write(source.join("ab"), b"plain\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "a\\*b"]),
+        "1  created  a*b\n"
+    );
+}
+
+/// `versions --files` with an unknown path reports nothing.
+///
+/// A path no version holds is an empty report and a success, not a refusal.
+#[test]
+fn history_reports_empty_for_unknown_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"a\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "nope.txt"]),
+        ""
+    );
+}
+
+/// `versions --files --numbers-only` names the touching versions.
+///
+/// The same three-version history reports three numbers and no paths.
+#[test]
+fn history_reports_touching_versions_with_numbers_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    fs::write(source.join("a.txt"), b"two\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    fs::remove_file(source.join("a.txt")).unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    assert_eq!(
+        ok(
+            dir.path(),
+            &["versions", "snap", "--files", "a.txt", "--numbers-only"]
+        ),
+        "1\n2\n3\n"
+    );
+}
+
+/// `versions --files` reads the commit records, not the index files.
+///
+/// With every index file removed the listing is empty, and the history still
+/// reports every change. A version without its index file still counts.
+#[test]
+fn history_finds_versions_without_index_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    fs::write(source.join("a.txt"), b"two\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    for path in index_files(dir.path(), "snap") {
+        fs::remove_file(path).unwrap();
+    }
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--numbers-only"]),
+        "",
+        "with every index file removed there is nothing to list from"
+    );
+
+    assert_eq!(
+        ok(dir.path(), &["versions", "snap", "--files", "a.txt"]),
+        "1  created  a.txt\n2  modified  a.txt\n"
+    );
+}
+
+/// `versions --files` refuses an absolute path.
+///
+/// Absolute paths never reach the disk elsewhere in this tool, and history
+/// values are no exception.
+#[test]
+fn history_refuses_absolute_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"a\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let error = fails(dir.path(), &["versions", "snap", "--files", "/abs.txt"]);
+    assert!(
+        error.contains("is absolute"),
+        "the refusal names the mistake: {error}"
+    );
+}

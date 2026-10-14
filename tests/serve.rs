@@ -37,6 +37,7 @@ use std::{
 };
 
 use blulib::{
+    command::report as report_history,
     metadata::Timestamp,
     pack::Pack,
     storage::{BlobStore, Compression, Plan, StorageGet},
@@ -2706,5 +2707,107 @@ async fn progress_events_carry_the_counters_that_moved() {
             .iter()
             .any(|event| matches!(event, blulib::serve::JobEvent::Progress(_))),
         "a watcher must see the counters too"
+    );
+}
+
+/// The history endpoint answers what a local report does.
+///
+/// One set moves a file through created, modified and deleted. The wire
+/// events carry the same versions, paths and statuses the library reports
+/// over the same set, so a remote report prints what a local one prints.
+#[tokio::test]
+async fn history_endpoint_answers_same_events_as_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    backup(&source, &root.join("docs")).await;
+    fs::write(source.join("a.txt"), b"two\n").unwrap();
+    backup(&source, &root.join("docs")).await;
+    fs::remove_file(source.join("a.txt")).unwrap();
+    backup(&source, &root.join("docs")).await;
+
+    let server = Server::start(&root);
+    let response = Request::new("GET", "/v1/sets/docs/history?files=a.txt")
+        .send(server.address())
+        .await;
+    assert_eq!(response.status, 200, "body: {}", response.text());
+    assert!(
+        response.is_type("application/json"),
+        "a history answer is JSON: {}",
+        response.text()
+    );
+
+    // The library's own report over the same set, for the same path.
+    let store = BlobStore::open_for_reading(root.join("docs"))
+        .await
+        .unwrap();
+    let versions = store.versions().unwrap();
+    let mut named = Vec::new();
+    for version in versions {
+        named.push((version, store.snapshot(version).unwrap()));
+    }
+    let events = report_history(&store, &named, &[PathBuf::from("a.txt")])
+        .await
+        .unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    let wire = parsed["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events in {}", response.text()));
+    assert_eq!(wire.len(), events.len(), "body: {}", response.text());
+    for (got, want) in wire.iter().zip(&events) {
+        assert_eq!(got["version"].as_u64().unwrap(), u64::from(want.version));
+        assert_eq!(got["path"].as_str().unwrap(), want.path.to_str().unwrap());
+        assert_eq!(got["status"].as_str().unwrap(), want.status.word());
+    }
+}
+
+/// The history endpoint refuses a set it does not hold.
+///
+/// A missing set is a 404 carrying the server's own sentence, like every
+/// other endpoint that names a set.
+#[tokio::test]
+async fn history_endpoint_refuses_unknown_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    let server = Server::start(&root);
+    let response = Request::new("GET", "/v1/sets/nope/history?files=a.txt")
+        .send(server.address())
+        .await;
+
+    assert_eq!(response.status, 404, "body: {}", response.text());
+}
+
+/// The history endpoint refuses a request with no files value.
+///
+/// Without a path the request is a listing, and the listing has its own
+/// endpoint. The refusal says so.
+#[tokio::test]
+async fn history_endpoint_refuses_a_request_with_no_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let source = dir.path().join("source");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    backup(&source, &root.join("docs")).await;
+
+    let server = Server::start(&root);
+    let response = Request::new("GET", "/v1/sets/docs/history")
+        .send(server.address())
+        .await;
+
+    assert_eq!(response.status, 400, "body: {}", response.text());
+    assert!(
+        response.text().contains("at least one"),
+        "the refusal names the mistake: {}",
+        response.text()
     );
 }
