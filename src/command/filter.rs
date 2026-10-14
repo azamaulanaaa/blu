@@ -44,8 +44,7 @@ impl Filter {
     /// Reads `--files` values against the directories a snapshot records.
     ///
     /// Takes the directories because a value naming one of them is a prefix,
-    /// and only the snapshot knows which values those are. [`dirs_of`] reads
-    /// them out of one.
+    /// and only the snapshot knows which values those are.
     ///
     /// # Errors
     ///
