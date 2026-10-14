@@ -8,6 +8,7 @@ use std::io;
 use crate::{metadata, storage};
 mod apply;
 mod backup;
+mod history;
 mod manifest;
 mod merge;
 mod pack;
@@ -18,6 +19,7 @@ mod verify;
 
 pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
+pub use history::{Detail, Event, Status, check_query, report};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use merge::{
     Compression as MergeCompression, MergePlan, Merged, Planned, establish_base, merge, merge_plan,
