@@ -2211,6 +2211,11 @@ async fn two_merges_into_one_set_are_serialised() {
     // so two handles onto one set would each believe they owned the next offset.
     // Without the per-set lock the two merges would interleave records into one
     // segment.
+    //
+    // Pushed one after the other, in time order. The two packs ran at different
+    // times, so pushing both at once would race the tip. The concurrent case is
+    // the next test. This one holds the lock and the order fixed, so both
+    // merges commit and the set holds both versions.
     let dir = tempfile::tempdir().unwrap();
 
     // Two packs of two different trees, so neither is a duplicate of the other.
@@ -2235,11 +2240,8 @@ async fn two_merges_into_one_set_are_serialised() {
     fs::create_dir_all(&root).unwrap();
     let server = Server::start(&root);
 
-    // Both at once, without awaiting the first.
-    let a = async { push(&server, "shared", &one_pack).await };
-    let b = async { push(&server, "shared", &two_pack).await };
-    let (first, second) = tokio::join!(a, b);
-    for merged in [&first, &second] {
+    for pack in [&one_pack, &two_pack] {
+        let merged = push(&server, "shared", pack).await;
         assert_eq!(merged["already"], serde_json::json!(false));
     }
 
@@ -2262,6 +2264,116 @@ async fn two_merges_into_one_set_are_serialised() {
         .await
         .unwrap();
     assert_eq!(store.versions().unwrap().len(), 2);
+}
+
+/// Two merges at once race the tip, and the set stays consistent either way.
+///
+/// The two packs ran at different times. Whichever merge commits second commits
+/// against a tip newer than its own stamp when the arrival order inverts the
+/// time order. That merge is refused by the stamp check. The refusal publishes
+/// nothing. The set holds the versions that committed, and every one of them
+/// opens and resolves.
+#[tokio::test]
+async fn concurrent_merges_race_the_tip_and_leave_a_consistent_set() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let first_source = dir.path().join("one");
+    let second_source = dir.path().join("two");
+    fs::create_dir_all(&first_source).unwrap();
+    fs::create_dir_all(&second_source).unwrap();
+    fs::write(first_source.join("a.bin"), common::noisy(30_000)).unwrap();
+    fs::write(second_source.join("b.bin"), common::noisy(35_000)).unwrap();
+
+    let one = dir.path().join("one.store");
+    let two = dir.path().join("two.store");
+    backup(&first_source, &one).await;
+    backup(&second_source, &two).await;
+
+    let one_pack = dir.path().join("one.pack");
+    let two_pack = dir.path().join("two.pack");
+    pack(&one, &one_pack).await;
+    pack(&two, &two_pack).await;
+
+    let root = dir.path().join("served");
+    fs::create_dir_all(&root).unwrap();
+    let server = Server::start(&root);
+
+    // Both at once, without awaiting the first.
+    let first = start_merge(&server, "shared", &one_pack, None).await;
+    let second = start_merge(&server, "shared", &two_pack, None).await;
+    let (first, second) = tokio::join!(
+        settle_job(&server, &first),
+        settle_job(&server, &second)
+    );
+
+    // Each job either committed or lost the race. Any other error is a failure.
+    let mut committed = 0;
+    for (state, text) in [&first, &second] {
+        match state.as_str() {
+            "succeeded" => committed += 1,
+            "failed" => assert!(
+                text.contains("refusing to commit"),
+                "a failed merge should have lost the race, got: {text}"
+            ),
+            other => panic!("a merge ended in an unexpected state: {other}: {text}"),
+        }
+    }
+    assert!(
+        committed >= 1,
+        "at least the newer pack always commits: {first:?} {second:?}"
+    );
+
+    // The set holds what committed, and opens cleanly. Interleaved records
+    // would leave a set that fails to open.
+    let store = BlobStore::open_for_reading(root.join("shared"))
+        .await
+        .unwrap();
+    assert_eq!(store.versions().unwrap().len(), committed);
+
+    let listed = Request::new("GET", "/v1/sets/shared/versions")
+        .send(server.address())
+        .await;
+    assert_eq!(listed.status, 200, "body: {}", listed.text());
+    let body: serde_json::Value = serde_json::from_slice(&listed.body).unwrap();
+    assert_eq!(
+        body["versions"].as_array().map(Vec::len),
+        Some(committed),
+        "the listing should name what committed and nothing else"
+    );
+}
+
+/// Poll a job until it finishes, and report how it ended.
+///
+/// Returns the state with the job's text. A terminal job that failed carries
+/// its error in the text. A succeeded one carries its result there.
+async fn settle_job(server: &Server, job: &str) -> (String, String) {
+    let deadline = std::time::Instant::now() + JOB_BUDGET;
+
+    loop {
+        let response = Request::new("GET", &format!("/v1/jobs/{job}"))
+            .send(server.address())
+            .await;
+
+        assert_eq!(response.status, 200, "body: {}", response.text());
+
+        let state = response
+            .field("state")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .expect("a job document carries a state");
+
+        match state.as_str() {
+            "succeeded" | "failed" | "cancelled" => return (state, response.text()),
+            _ => {}
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job {job} did not finish within {}s",
+            JOB_BUDGET.as_secs()
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]
@@ -2469,9 +2581,14 @@ async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
         None => None,
         Some((version, _)) => storage.version_time(version).await.ok(),
     };
-    lepatch::command::backup(&source, lepatch::command::Options::default(), storage, latest)
-        .await
-        .unwrap();
+    lepatch::command::backup(
+        &source,
+        lepatch::command::Options::default(),
+        storage,
+        latest,
+    )
+    .await
+    .unwrap();
 
     let pack_path = dir.path().join("v2.pack");
     pack(&blob, &pack_path).await;
