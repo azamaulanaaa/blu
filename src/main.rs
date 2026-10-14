@@ -1687,7 +1687,15 @@ async fn run_backup(
     }
 
     let segments = store.segment_count();
-    let committed = backup(source, options, store).await?;
+
+    // The stamp the new version must not predate. Read under the lock with
+    // everything else that inspects the set's commit list.
+    let latest = match store.latest() {
+        None => None,
+        Some((version, _)) => Some(store.version_time(version).await?),
+    };
+
+    let committed = backup(source, options, store, latest).await?;
 
     tracing::info!(
         name = %set.base().display(),

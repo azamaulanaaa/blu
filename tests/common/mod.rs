@@ -219,6 +219,16 @@ pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
     run_backup_with(source, blob, Options::default()).await
 }
 
+/// The stamp of a set's newest version, when the set holds one.
+///
+/// Reads the set through the open handle. A fresh set holds nothing.
+async fn latest_of<C: lepatch::storage::Compressor>(
+    storage: &BlobStore<lepatch::storage::Write, C>,
+) -> Option<lepatch::metadata::Timestamp> {
+    let (version, _) = storage.latest()?;
+    storage.version_time(version).await.ok()
+}
+
 /// Back up `source` with specific options, for tests that need to pin a knob the
 /// defaults would otherwise choose.
 pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
@@ -226,7 +236,8 @@ pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -
         BlobStore::open_for_writing(blob, SegmentLimit::default(), Compression::default())
             .await
             .unwrap();
-    backup(source, opts, storage).await.unwrap()
+    let latest = latest_of(&storage).await;
+    backup(source, opts, storage, latest).await.unwrap()
 }
 
 /// Back up `source` into a store with a given segment limit.
@@ -243,7 +254,8 @@ pub(crate) async fn run_backup_limited(
     let storage = BlobStore::open_for_writing(blob, limit, Compression::default())
         .await
         .unwrap();
-    backup(source, Options::default(), storage).await.unwrap()
+    let latest = latest_of(&storage).await;
+    backup(source, Options::default(), storage, latest).await.unwrap()
 }
 
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
@@ -265,7 +277,8 @@ pub(crate) async fn run_backup_compressed(
     let storage = BlobStore::open_for_writing(blob, SegmentLimit::default(), compression)
         .await
         .unwrap();
-    backup(source, Options::default(), storage).await.unwrap()
+    let latest = latest_of(&storage).await;
+    backup(source, Options::default(), storage, latest).await.unwrap()
 }
 
 /// Restore one specific version of a set.

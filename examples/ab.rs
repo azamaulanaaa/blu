@@ -232,7 +232,7 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
             .expect("store");
     let cpu_before = cpu_seconds();
     let started = Instant::now();
-    backup(src, options, storage).await.expect("backup");
+    backup(src, options, storage, None).await.expect("backup");
     let wall = started.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu_before;
 

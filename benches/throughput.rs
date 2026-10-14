@@ -150,7 +150,7 @@ fn bench_backup(c: &mut Criterion) {
                         };
 
                         let started = Instant::now();
-                        let committed = backup(&src, options, storage).await.expect("backup");
+                        let committed = backup(&src, options, storage, None).await.expect("backup");
                         elapsed += started.elapsed();
 
                         black_box(committed.version);
@@ -177,7 +177,7 @@ fn bench_restore(c: &mut Criterion) {
             BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
                 .await
                 .expect("store");
-        backup(&src, Options::default(), storage)
+        backup(&src, Options::default(), storage, None)
             .await
             .expect("backup")
     });
@@ -229,7 +229,7 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
             BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
                 .await
                 .expect("store");
-        backup(&src, Options::default(), storage)
+        backup(&src, Options::default(), storage, None)
             .await
             .expect("backup")
     });

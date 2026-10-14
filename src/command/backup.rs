@@ -18,6 +18,7 @@ use tracing::instrument;
 use walkdir::WalkDir;
 
 use crate::{command::pipeline, metadata, reader, storage};
+use crate::metadata::Timestamp;
 
 /// Uploads to run at once when the caller has not asked for a specific number.
 /// These uploads are I/O bound, so a little oversubscription keeps them from
@@ -283,11 +284,16 @@ struct Walked {
 /// So does a file that was last seen in any version rather than only the most
 /// recent.
 ///
+/// `latest` is the stamp of the set's newest version, when the set holds one.
+/// The run stamps the new version with the run time. The run refuses a stamp
+/// older than `latest` before writing the snapshot. Equal stamps pass.
+///
 /// # Errors
 ///
 /// Returns an error if `root` is not a directory.
 /// Returns an error if the tree cannot be walked.
 /// Returns an error if a file changes while it is being read.
+/// Returns an error if the new stamp predates `latest`.
 /// Returns an error if the store rejects a write, or if the run cannot be
 /// committed.
 /// A run that returns an error has written no commit record, so the store is
@@ -300,8 +306,9 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     root: P,
     options: Options,
     storage: S,
+    latest: Option<Timestamp>,
 ) -> io::Result<Committed> {
-    Ok(run(root, options, storage).await?.1)
+    Ok(run(root, options, storage, latest).await?.1)
 }
 
 /// Work out what a backup of `root` would write, and write none of it.
@@ -327,6 +334,9 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 /// A plan can therefore run against a set another backup is holding the lock on.
 /// The cost is possibly planning against a set that moves under it.
 ///
+/// The run stamps the planned version with the run time, like a real run.
+/// The run refuses a stamp older than the newest committed one, like a real run.
+///
 /// # Errors
 ///
 /// As [`backup`]: a tree that cannot be walked or read, or a file that changes
@@ -337,13 +347,21 @@ pub async fn backup_plan<P: AsRef<Path> + Debug>(
     options: Options,
     store: Option<storage::BlobStore<storage::Read>>,
 ) -> io::Result<BackupPlan> {
+    let latest = match store.as_ref() {
+        None => None,
+        Some(held) => match held.latest() {
+            None => None,
+            Some((version, _)) => Some(held.version_time(version).await?),
+        },
+    };
+
     let asked = Arc::new(Mutex::new(Vec::new()));
     let planned = Planned {
         store,
         asked: Arc::clone(&asked),
     };
 
-    let (entries, committed) = run(root, options, planned).await?;
+    let (entries, committed) = run(root, options, planned, latest).await?;
 
     // The snapshot is offered to the store like any other blob and is not a chunk
     // of anything.
@@ -388,6 +406,7 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     root: P,
     options: Options,
     storage: S,
+    latest: Option<Timestamp>,
 ) -> io::Result<(Entries, Committed)> {
     let Options {
         exclude,
@@ -432,6 +451,14 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     // A file that changed size in between would silently shift every subsequent
     // chunk into the wrong file.
     snapshot.verify_file_lengths("changed while it was being backed up")?;
+
+    // Stamped at commit time rather than walk time. The walk only records the
+    // tree. The stamp says when the version ran.
+    snapshot.taken_at = Timestamp::now();
+
+    // Refused before a byte of snapshot is stored. A version that predates the
+    // latest one never reaches the commit record.
+    metadata::refuse_older_taken_at(latest, snapshot.taken_at)?;
 
     // Only fails where a path in the snapshot cannot be represented on this
     // platform, which on unix cannot happen.

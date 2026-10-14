@@ -1365,7 +1365,7 @@ let store = BlobStore::open_for_writing(
     SegmentLimit::default(),
     Compression::default(),
 ).await?;
-let first = backup("~/Documents", Options::default(), store).await?;
+let first = backup("~/Documents", Options::default(), store, None).await?;
 
 // Later backups need nothing passed to deduplicate: the store holds every
 // version it has ever been given, so a chunk it already has is not written
@@ -1375,7 +1375,7 @@ let store = BlobStore::open_for_writing(
     SegmentLimit::default(),
     Compression::default(),
 ).await?;
-backup("~/Documents", Options::default(), store).await?;
+backup("~/Documents", Options::default(), store, None).await?;
 
 // A read-only store takes no segment limit, because a read never rolls over.
 let store = BlobStore::open_for_reading("docs").await?;

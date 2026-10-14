@@ -92,7 +92,7 @@ async fn a_backup_root_that_is_a_file_is_refused() {
         .await
         .unwrap();
 
-    let error = backup(&file, Options::default(), store)
+    let error = backup(&file, Options::default(), store, None)
         .await
         .expect_err("a file is not a tree, and backing one up records an empty path");
     let message = error.to_string();
@@ -128,7 +128,7 @@ async fn a_backup_root_that_is_a_symlink_to_a_directory_is_followed() {
     let store = BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
         .await
         .unwrap();
-    let committed = backup(&link, Options::default(), store)
+    let committed = backup(&link, Options::default(), store, None)
         .await
         .expect("a symlink to a directory names a directory");
 

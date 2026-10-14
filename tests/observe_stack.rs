@@ -384,7 +384,7 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
                     .await
                     .expect("a fresh set opens for writing");
 
-            let committed = lepatch::command::backup(&source, Options::default(), storage)
+            let committed = lepatch::command::backup(&source, Options::default(), storage, None)
                 .await
                 .expect("the backup should commit");
 

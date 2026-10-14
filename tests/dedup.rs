@@ -15,8 +15,9 @@ mod common;
 use std::fs;
 
 use lepatch::{
-    command::Options,
-    storage::{BlobId, BlobStore, StorageGet},
+    command::{Options, backup},
+    metadata::Timestamp,
+    storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet},
 };
 
 /// Read a snapshot back out of a store.
@@ -66,7 +67,7 @@ async fn repeated_content_within_one_run_is_stored_once() {
     );
 }
 
-/// Re-backing up an unchanged tree stores nothing.
+/// Re-backing up an unchanged tree stores no chunk data.
 ///
 /// This is the property the redesign is for.
 /// The old design deduplicated a run only against a snapshot the caller named.
@@ -94,24 +95,34 @@ async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
         first.version, second.version,
         "each run should publish its own version"
     );
-    assert_eq!(
-        first.snapshot, second.snapshot,
-        "an unchanged tree describes the same snapshot, so it should be the same bytes"
-    );
-
-    // The second run writes a commit record and nothing else.
-    // The snapshot blob is already there, and no chunk data is new.
-    let growth = after_second - after_first;
-    assert!(
-        growth < 1024,
-        "re-backing up an unchanged tree grew the store by {growth} bytes, \
-         which suggests chunk data was stored again"
-    );
 
     let first_snapshot = snapshot(&blob, &first.snapshot).await;
     let second_snapshot = snapshot(&blob, &second.snapshot).await;
+
+    // Each run stamps its own time, so the two snapshot blobs differ.
+    // The tree did not move, so everything but the stamp matches.
+    assert_ne!(
+        first.snapshot, second.snapshot,
+        "two runs stamp different times, so the bytes differ"
+    );
+    assert!(
+        second_snapshot.taken_at >= first_snapshot.taken_at,
+        "the second run must not predate the first"
+    );
+    assert_eq!(first_snapshot.files, second_snapshot.files);
+    assert_eq!(first_snapshot.dirs, second_snapshot.dirs);
     assert_eq!(first_snapshot.chunks, second_snapshot.chunks);
     assert_eq!(first_snapshot.file_chunks, second_snapshot.file_chunks);
+    assert_eq!(first_snapshot.links, second_snapshot.links);
+
+    // The second run writes a snapshot blob and a commit record, and nothing
+    // else. No chunk data is new.
+    let growth = after_second - after_first;
+    assert!(
+        growth < 2048,
+        "re-backing up an unchanged tree grew the store by {growth} bytes, \
+         which suggests chunk data was stored again"
+    );
 }
 
 /// Content last seen in an *earlier* version is still recognised.
@@ -398,4 +409,71 @@ async fn no_two_stored_chunks_share_content() {
             );
         }
     }
+}
+
+/// A version older than the latest one is refused before it commits.
+///
+/// The run stamps the new version with the run time. A latest stamp from
+/// the future therefore always predates it. Nothing is committed.
+#[tokio::test]
+async fn a_version_older_than_the_latest_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("a.bin"), b"first").unwrap();
+
+    let blob = dir.path().join("store");
+    common::run_backup(&source, &blob).await;
+
+    let storage =
+        BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
+            .await
+            .unwrap();
+    let future = Timestamp {
+        secs: 9_999_999_999,
+        nanos: 0,
+    };
+    let error = backup(&source, Options::default(), storage, Some(future))
+        .await
+        .expect_err("an older version should be refused");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("refusing to commit"),
+        "the refusal should name the act, got: {error}"
+    );
+
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    assert_eq!(
+        store.versions().unwrap().len(),
+        1,
+        "a refused run must not have published a version"
+    );
+}
+
+/// A version stamped at the latest time commits.
+///
+/// Equal stamps pass, so two runs in quick succession both land.
+/// The stamp of the second run is never older than the first.
+#[tokio::test]
+async fn a_version_stamped_at_the_latest_time_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("a.bin"), b"first").unwrap();
+
+    let blob = dir.path().join("store");
+    let first = common::run_backup(&source, &blob).await;
+
+    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let latest = store.version_time(1).await.unwrap();
+
+    fs::write(source.join("b.bin"), b"second").unwrap();
+    let storage =
+        BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
+            .await
+            .unwrap();
+    let second = backup(&source, Options::default(), storage, Some(latest))
+        .await
+        .expect("an equal stamp should commit");
+
+    assert_eq!(second.version, first.version + 1);
 }

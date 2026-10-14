@@ -99,7 +99,7 @@ async fn a_path_this_platform_cannot_represent_is_refused() {
         .await
         .unwrap();
 
-    let error = backup(&source, Options::default(), store)
+    let error = backup(&source, Options::default(), store, None)
         .await
         .expect_err("a name this platform cannot write should be refused, not mangled");
 

@@ -36,6 +36,7 @@ use std::{
 
 use common::{http::Request, server::Server};
 use lepatch::{
+    metadata::Timestamp,
     pack::Pack,
     storage::{BlobStore, Compression, Plan, StorageGet},
 };
@@ -158,10 +159,20 @@ async fn backup(source: &Path, blob: &Path) -> lepatch::storage::BlobId {
     .await
     .unwrap();
 
-    lepatch::command::backup(source, lepatch::command::Options::default(), storage)
-        .await
-        .unwrap()
-        .snapshot
+    let latest: Option<Timestamp> = match storage.latest() {
+        None => None,
+        Some((version, _)) => storage.version_time(version).await.ok(),
+    };
+
+    lepatch::command::backup(
+        source,
+        lepatch::command::Options::default(),
+        storage,
+        latest,
+    )
+    .await
+    .unwrap()
+    .snapshot
 }
 
 /// Pack a set's latest version, into `at`, recorded as the pack's own version.
@@ -2454,7 +2465,11 @@ async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
     )
     .await
     .unwrap();
-    lepatch::command::backup(&source, lepatch::command::Options::default(), storage)
+    let latest: Option<Timestamp> = match storage.latest() {
+        None => None,
+        Some((version, _)) => storage.version_time(version).await.ok(),
+    };
+    lepatch::command::backup(&source, lepatch::command::Options::default(), storage, latest)
         .await
         .unwrap();
 

@@ -216,7 +216,11 @@ async fn a_delta_virtual_pack_is_the_written_delta() {
         BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
             .await
             .unwrap();
-    lepatch::command::backup(&source, Options::default(), storage)
+    let latest = match storage.latest() {
+        None => None,
+        Some((version, _)) => storage.version_time(version).await.ok(),
+    };
+    lepatch::command::backup(&source, Options::default(), storage, latest)
         .await
         .unwrap();
 
@@ -314,7 +318,7 @@ async fn a_set_that_rolled_over_a_segment_produces_the_same_bytes() {
         BlobStore::open_for_writing(&blob, SegmentLimit::new(50_000), Compression::default())
             .await
             .unwrap();
-    lepatch::command::backup(&source, Options::default(), storage)
+    lepatch::command::backup(&source, Options::default(), storage, None)
         .await
         .unwrap();
 

@@ -123,7 +123,7 @@ async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
     )
     .await
     .unwrap();
-    lepatch::command::backup(&source, lepatch::command::Options::default(), store)
+    lepatch::command::backup(&source, lepatch::command::Options::default(), store, None)
         .await
         .unwrap();
 
