@@ -86,7 +86,7 @@ fn apply_concurrency() -> usize {
 }
 
 /// Knobs for a single [`apply`] run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     /// Remove entries the version does not record.
     ///
@@ -96,6 +96,10 @@ pub struct Options {
     /// Nothing in the version can tell those apart.
     /// A tool that deleted the first to satisfy the second would destroy data on
     /// a guess.
+    ///
+    /// With [`Options::files`] set, only the entries the filter keeps are
+    /// eligible: pruning a selection removes what the selection does not
+    /// record under it, and leaves everything else alone.
     pub prune: bool,
 
     /// Re-read every file, ignoring any manifest beside the destination.
@@ -122,6 +126,17 @@ pub struct Options {
     /// An apply prints its figure after it has rewritten the tree.
     /// A dry run reports that figure before.
     pub dry_run: bool,
+
+    /// Only bring these paths up to the version.
+    ///
+    /// Empty means the whole version. Otherwise the run works from the view the
+    /// filter selects: the matched entries, the ancestors they need above them,
+    /// and the recorded files a kept hard link shares with. The same dialect
+    /// `blu versions --files` reads. Pruning scopes to the selection, and the
+    /// manifest records the selection merged with any earlier one for the same
+    /// version, so repeated selections stay fast without ever trusting a file
+    /// this run did not write.
+    pub files: Vec<PathBuf>,
 }
 
 /// What an [`apply`] run changed.
@@ -216,7 +231,7 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
 
     // The file table out of the pack, checked against the hash the header names
     // before it is parsed. See `Pack::snapshot`.
-    let snapshot = pack.snapshot()?;
+    let full = pack.snapshot()?;
 
     // Both before anything is written, and for the reasons a restore checks.
     // A path that escapes the root cannot be laid down at all.
@@ -224,8 +239,14 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     // all.
     // Finding out afterwards leaves a directory that is neither the old one nor
     // the new one.
-    super::restore::check_paths(&snapshot)?;
-    snapshot.verify_file_lengths("does not match its own chunks")?;
+    super::restore::check_paths(&full)?;
+    full.verify_file_lengths("does not match its own chunks")?;
+
+    // The selection, or the whole version where no `--files` was given. The
+    // probe, the writes, the prune and the figures below all run against this
+    // view, so a selection touches nothing outside it.
+    let filter = super::filter::Filter::new(&options.files, &super::filter::dirs_of(&full))?;
+    let snapshot = filter.select(&full);
 
     // What is already accounted for, and so need not be read.
     // Two sources, and they are independent.
@@ -258,20 +279,34 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     // A probe against a damaged pack finds everything absent.
     verify_delta(&probed, pack).await?;
 
+    // The extras this run answers for, scoped to the selection as the prune
+    // below is. With `--files`, the version files outside the selection are
+    // extras of the view, and neither the figures nor the prune may touch them.
+    let extra: Vec<PathBuf> = probed
+        .extra
+        .iter()
+        .filter(|path| filter.matches(path))
+        .cloned()
+        .collect();
+
     // And everything after here is a write, or a consequence of one.
     // The counts the run would have reported are already in hand.
     // The probe found every slice that is not right.
     // `verify_delta` has read the bytes behind them.
     // The counts are derived below rather than by doing the work.
     if options.dry_run {
-        let wanted = DryRun { fetched, ranges };
+        let planned = Planned {
+            extra: &extra,
+            fetched,
+            ranges,
+        };
         return Ok(would_write(
             root,
             &snapshot,
             &probed,
             &established,
-            options,
-            &wanted,
+            options.prune,
+            &planned,
         ));
     }
 
@@ -305,7 +340,7 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
     .map_err(|e| io::Error::other(format!("a link task failed: {e}")))??;
 
     let removed = if options.prune {
-        prune(root, &probed.extra)?
+        prune(root, &extra)?
     } else {
         0
     };
@@ -341,15 +376,22 @@ pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io
         written: written.chunks.len().try_into().unwrap_or(0),
         bytes: written.bytes,
         removed,
-        extra: probed.extra.len().try_into().unwrap_or(0),
+        extra: u64::try_from(extra.len()).unwrap_or(0),
         unowned,
     })
 }
 
-/// The two figures a pack would be fetched with, carried into the plan so it can
-/// report them without asking the pack again.
-struct DryRun {
+/// The figures a dry run reports without asking the pack again, and what it
+/// scopes them to.
+///
+/// Carried into the plan so it can report the fetch figures and the scoped
+/// extras from the same values the write stage takes them from.
+struct Planned<'a> {
+    /// The extras this run answers for, scoped to the selection.
+    extra: &'a [PathBuf],
+    /// Bytes of the pack a fetch would have needed to reach this version.
     fetched: u64,
+    /// How many range requests the fetch would have been.
     ranges: usize,
 }
 
@@ -375,8 +417,8 @@ fn would_write(
     snapshot: &metadata::Snapshot,
     probed: &Probed,
     established: &super::probe::Established<'_>,
-    options: Options,
-    transfer: &DryRun,
+    prune: bool,
+    planned: &Planned<'_>,
 ) -> Applied {
     let mut chunks: HashSet<BlobId> = HashSet::new();
     let mut bytes = 0u64;
@@ -402,19 +444,19 @@ fn would_write(
     // This is the one figure an apply reports about entries it does *not* touch.
     // There are none of those here.
     // It is the length of what a `--prune` would remove, which is what the same
-    // run would report.
-    let extra = u64::try_from(probed.extra.len()).unwrap_or(0);
+    // run would report. Scoped to the selection, as the prune is.
+    let extra = u64::try_from(planned.extra.len()).unwrap_or(0);
 
     Applied {
         held: u64::try_from(probed.held.len()).unwrap_or(0),
         chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
-        fetched: transfer.fetched,
-        ranges: transfer.ranges,
+        fetched: planned.fetched,
+        ranges: planned.ranges,
         files,
         trusted: u64::try_from(established.files.len()).unwrap_or(0),
         written: u64::try_from(chunks.len()).unwrap_or(0),
         bytes,
-        removed: if options.prune { extra } else { 0 },
+        removed: if prune { extra } else { 0 },
         extra,
         unowned: owners(snapshot),
     }
@@ -454,12 +496,22 @@ pub(super) fn owners(snapshot: &metadata::Snapshot) -> u64 {
 /// `file.len` and `file.attrs.mtime` are what the attribute stage has just
 /// imposed, so they are the tree's state by the time this runs.
 ///
+/// A selection records only what it wrote. Any earlier records for the same
+/// version are merged back in, so repeated selections stay fast: a path this
+/// run did not write keeps its earlier record, and the stat check still guards
+/// every one of them.
+///
 /// # Errors
 ///
 /// Returns an error if the manifest's path cannot be formed or written.
 /// Callers are expected to log and carry on. See the call site.
 fn write_manifest(root: &Path, pack: &Pack, snapshot: &metadata::Snapshot) -> io::Result<PathBuf> {
-    let manifest = super::manifest::Manifest::record(root, pack.snapshot_id(), snapshot)?;
+    let mut manifest = super::manifest::Manifest::record(root, pack.snapshot_id(), snapshot)?;
+    if let Some(previous) = super::manifest::Manifest::load(root)?
+        && previous.version == pack.snapshot_id()
+    {
+        manifest.merge(previous);
+    }
     manifest.save(root)
 }
 

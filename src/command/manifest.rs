@@ -231,6 +231,20 @@ impl Manifest {
         self.untrusted(root, snapshot).is_empty()
     }
 
+    /// Union another manifest's records into this one.
+    ///
+    /// Keeps this manifest's own records where both name a path, and takes the
+    /// other's where this one has none. Both manifests name one version, so the
+    /// states they impose agree wherever they overlap. A partial apply records
+    /// only what it wrote; merging the earlier records for the same version
+    /// keeps the next apply from re-reading files that are already right, and
+    /// the stat check still guards every record either side wrote.
+    pub fn merge(&mut self, other: Self) {
+        for (path, recorded) in other.recorded {
+            self.recorded.entry(path).or_insert(recorded);
+        }
+    }
+
     /// Write this manifest beside its destination.
     ///
     /// Through a temporary and a rename, so a crash mid-write leaves either the

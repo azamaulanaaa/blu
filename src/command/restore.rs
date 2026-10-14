@@ -17,6 +17,8 @@ use crate::{
     storage::{self, StreamReadSeeker},
 };
 
+use super::filter::{Filter, dirs_of};
+
 /// Files to write at once. A restore spends most of its time waiting, so several
 /// files in flight keep the store and the disk busy. The cap stops a tree of a
 /// million small files from opening a million of them.
@@ -104,9 +106,41 @@ pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     snapshot_id: storage::BlobId,
     storage: S,
 ) -> io::Result<Restored> {
+    restore_filtered(root, snapshot_id, storage, &[]).await
+}
+
+/// Reassemble only the `--files` selection of the snapshot under `root`.
+///
+/// The same four phases [`restore`] runs, over the view [`Filter::select`]
+/// returns: the matched entries, the ancestors they need above them, and the
+/// recorded files a kept hard link shares with. Parent directories are created
+/// and attributed as scaffolding. Everything else in the destination is left
+/// alone. The figures report the selection.
+///
+/// Chunk verification covers the selection too: every byte written is checked,
+/// and chunks nothing selected needs are not read.
+///
+/// # Errors
+///
+/// As [`restore`], and if a `--files` value is empty, absolute, or holds `..`.
+#[instrument(level = "info", skip(storage, root, files), err)]
+pub async fn restore_filtered<P: AsRef<Path>, S: storage::StorageGet + 'static>(
+    root: P,
+    snapshot_id: storage::BlobId,
+    storage: S,
+    files: &[std::path::PathBuf],
+) -> io::Result<Restored> {
     // Shared, not copied: the write tasks need owned data, and a clone of the
     // chunk table would be one allocation per chunk in the store.
-    let snapshot = Arc::new(super::load_snapshot(&storage, snapshot_id).await?);
+    // A full run skips the view: selecting with no query would clone the whole
+    // table to return it unchanged.
+    let full = super::load_snapshot(&storage, snapshot_id).await?;
+    let snapshot = if files.is_empty() {
+        Arc::new(full)
+    } else {
+        let filter = Filter::new(files, &dirs_of(&full))?;
+        Arc::new(filter.select(&full))
+    };
 
     let root = root.as_ref();
     let storage = Arc::new(storage);
@@ -230,7 +264,30 @@ pub async fn restore_plan<S: storage::StorageGet + 'static>(
     snapshot_id: storage::BlobId,
     storage: S,
 ) -> io::Result<RestorePlan> {
-    let snapshot = super::load_snapshot(&storage, snapshot_id).await?;
+    restore_plan_filtered(snapshot_id, storage, &[]).await
+}
+
+/// Work out what restoring a `--files` selection would write, and write none of it.
+///
+/// The same checks [`restore_plan`] runs, over the same view
+/// [`restore_filtered`] restores. The figures describe the selection.
+///
+/// # Errors
+///
+/// As [`restore_plan`], and if a `--files` value is empty, absolute, or holds
+/// `..`.
+pub async fn restore_plan_filtered<S: storage::StorageGet + 'static>(
+    snapshot_id: storage::BlobId,
+    storage: S,
+    files: &[std::path::PathBuf],
+) -> io::Result<RestorePlan> {
+    let full = super::load_snapshot(&storage, snapshot_id).await?;
+    let snapshot = if files.is_empty() {
+        full
+    } else {
+        let filter = Filter::new(files, &dirs_of(&full))?;
+        filter.select(&full)
+    };
 
     super::verify::check(&snapshot, Arc::new(storage))
         .await

@@ -7,17 +7,16 @@
 //! path absent now and present before was deleted here. A path present in both
 //! with a different fingerprint was modified here.
 //!
-//! [`Query`] decides whether a snapshot path answers a `--files` value. An
-//! exact value names one path. A value naming a directory names everything
-//! under it. A value holding a metacharacter is a glob pattern. A backslash
-//! names the next byte literally.
+//! Which paths count as requested is [`Filter`](super::filter::Filter)'s
+//! answer, shared with the restores and applies that take the same flag.
 
 use std::{
     collections::{HashMap, HashSet},
     io,
-    path::{Component, Path, PathBuf},
+    path::PathBuf,
 };
 
+use super::filter::{Filter, dirs_of};
 use crate::{metadata, storage};
 
 /// What happened to one path at one version.
@@ -163,10 +162,6 @@ pub async fn report<S: storage::StorageGet>(
     versions: &[(u32, storage::BlobId)],
     raw: &[PathBuf],
 ) -> io::Result<Vec<Event>> {
-    for path in raw {
-        check_query(path)?;
-    }
-
     let loaded = load_snapshots(store, versions).await?;
     let maps: Vec<HashMap<PathBuf, Entry>> = loaded
         .iter()
@@ -174,15 +169,10 @@ pub async fn report<S: storage::StorageGet>(
         .collect::<io::Result<_>>()?;
 
     let mut dirs: HashSet<PathBuf> = HashSet::new();
-    for map in &maps {
-        for (path, entry) in map {
-            if matches!(entry, Entry::Dir { .. }) {
-                dirs.insert(path.clone());
-            }
-        }
+    for item in &loaded {
+        dirs.extend(dirs_of(&item.snapshot_body));
     }
-
-    let queries: Vec<Query> = raw.iter().map(|path| parse_query(path, &dirs)).collect();
+    let filter = Filter::new(raw, &dirs)?;
 
     let mut out = Vec::new();
     let mut before: HashMap<PathBuf, Entry> = HashMap::new();
@@ -190,7 +180,7 @@ pub async fn report<S: storage::StorageGet>(
         let mut paths: Vec<PathBuf> = before
             .keys()
             .chain(current.keys())
-            .filter(|path| queries.iter().any(|query| match_one(path, query)))
+            .filter(|path| filter.matches(path))
             .cloned()
             .collect::<HashSet<PathBuf>>()
             .into_iter()
@@ -234,54 +224,6 @@ pub async fn report<S: storage::StorageGet>(
     }
 
     Ok(out)
-}
-
-/// Refuses a `--files` value no backup could have recorded.
-///
-/// Empty, absolute, and `..` values never match a snapshot path. Refusing them
-/// here keeps a typo from reading as a path no version holds.
-///
-/// # Errors
-///
-/// Returns [`io::ErrorKind::InvalidInput`] naming the value.
-pub fn check_query(path: &Path) -> io::Result<()> {
-    if path.as_os_str().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a `--files` value may not be empty. Pass a path relative to the backup root",
-        ));
-    }
-    if path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} is absolute. Pass a path relative to the backup root",
-                path.display()
-            ),
-        ));
-    }
-    if path.components().any(|part| part == Component::ParentDir) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} holds `..`. No backup records a path with `..`",
-                path.display()
-            ),
-        ));
-    }
-    if path
-        .components()
-        .any(|part| matches!(part, Component::Prefix(_)))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} is not relative to the backup root. Pass a relative path",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Everything one comparison needs to know about one path.
@@ -363,45 +305,37 @@ fn entries_of(snapshot: &metadata::Snapshot) -> io::Result<HashMap<PathBuf, Entr
         let mut slices = ordered.remove(&index).unwrap_or_default();
         slices.sort_by_key(|(offset, _)| *offset);
         let slices: Vec<Slice> = slices.into_iter().map(|(_, slice)| slice).collect();
-        if let Some(path) = normalize(&file.path) {
-            out.insert(
-                path,
-                Entry::File {
-                    len: file.len,
-                    slices,
-                    attrs: file.attrs,
-                },
-            );
-        }
+        out.insert(
+            file.path.clone(),
+            Entry::File {
+                len: file.len,
+                slices,
+                attrs: file.attrs,
+            },
+        );
     }
     for dir in &snapshot.dirs {
-        if let Some(path) = normalize(&dir.path) {
-            out.insert(path, Entry::Dir { attrs: dir.attrs });
-        }
+        out.insert(dir.path.clone(), Entry::Dir { attrs: dir.attrs });
     }
     for link in &snapshot.links {
         match link {
             metadata::Link::Symbolic { path, target } => {
-                if let Some(key) = normalize(path) {
-                    out.insert(
-                        key,
-                        Entry::Symbolic {
-                            target: target.clone(),
-                            attrs: metadata::Attributes::default(),
-                        },
-                    );
-                }
+                out.insert(
+                    path.clone(),
+                    Entry::Symbolic {
+                        target: target.clone(),
+                        attrs: metadata::Attributes::default(),
+                    },
+                );
             }
             metadata::Link::Hard { path, shares } => {
-                if let Some(key) = normalize(path) {
-                    out.insert(
-                        key,
-                        Entry::Hard {
-                            shares: shares.clone(),
-                            attrs: metadata::Attributes::default(),
-                        },
-                    );
-                }
+                out.insert(
+                    path.clone(),
+                    Entry::Hard {
+                        shares: shares.clone(),
+                        attrs: metadata::Attributes::default(),
+                    },
+                );
             }
         }
     }
@@ -558,180 +492,9 @@ async fn content_hash<S: storage::StorageGet>(
     Ok(hash.finalize())
 }
 
-/// A `--files` value, read for what it asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Query {
-    /// A glob pattern over the path bytes.
-    Glob(Vec<u8>),
-    /// A directory and everything under it.
-    Prefix(PathBuf),
-    /// One exact path.
-    Exact(PathBuf),
-}
-
-/// Reads one `--files` value against the directories any version holds.
-///
-/// A value holding a metacharacter is a glob pattern. A value naming a
-/// directory, or ending in a separator, is a prefix. Anything else is exact.
-fn parse_query(raw: &Path, dirs: &HashSet<PathBuf>) -> Query {
-    let bytes = raw.as_os_str().as_encoded_bytes();
-    if bytes
-        .iter()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'\\' | b'{'))
-    {
-        return Query::Glob(bytes.to_vec());
-    }
-    let Some(normal) = normalize(raw) else {
-        return Query::Exact(raw.to_path_buf());
-    };
-    if raw.as_os_str().as_encoded_bytes().ends_with(b"/") || dirs.contains(&normal) {
-        return Query::Prefix(normal);
-    }
-    Query::Exact(normal)
-}
-
-/// Whether a snapshot path answers a query.
-fn match_one(path: &Path, query: &Query) -> bool {
-    match query {
-        Query::Exact(wanted) => path == wanted,
-        Query::Prefix(dir) => path == dir || path.starts_with(dir),
-        Query::Glob(pattern) => glob_match(pattern, path.as_os_str().as_encoded_bytes()),
-    }
-}
-
-/// Whether path bytes match glob pattern bytes.
-///
-/// `*` spans any bytes within one component. `**` as a whole component spans
-/// nested components. `?` spans one byte. `[...]` spans one listed byte. A
-/// backslash names the next byte literally.
-fn glob_match(pattern: &[u8], path: &[u8]) -> bool {
-    match_parts(&split_parts(pattern), &split_parts(path))
-}
-
-/// One path split at each separator.
-fn split_parts(bytes: &[u8]) -> Vec<&[u8]> {
-    bytes.split(|byte| *byte == b'/').collect()
-}
-
-/// Whether split pattern parts match split path parts.
-fn match_parts(pattern: &[&[u8]], path: &[&[u8]]) -> bool {
-    if pattern.is_empty() {
-        return path.is_empty();
-    }
-    if pattern[0] == b"**" {
-        for at in 0..=path.len() {
-            if match_parts(&pattern[1..], &path[at..]) {
-                return true;
-            }
-        }
-        return false;
-    }
-    if path.is_empty() {
-        return false;
-    }
-    component_match(pattern[0], path[0]) && match_parts(&pattern[1..], &path[1..])
-}
-
-/// Whether one pattern component matches one path component.
-fn component_match(pattern: &[u8], text: &[u8]) -> bool {
-    if pattern.is_empty() {
-        return text.is_empty();
-    }
-    match pattern[0] {
-        b'\\' => {
-            if pattern.len() == 1 {
-                return text == b"\\";
-            }
-            !text.is_empty() && text[0] == pattern[1] && component_match(&pattern[2..], &text[1..])
-        }
-        b'*' => {
-            let mut rest = 1;
-            while rest < pattern.len() && pattern[rest] == b'*' {
-                rest += 1;
-            }
-            (0..=text.len()).any(|at| component_match(&pattern[rest..], &text[at..]))
-        }
-        b'?' => !text.is_empty() && component_match(&pattern[1..], &text[1..]),
-        b'[' => match class_match(&pattern[1..], text.first().copied()) {
-            Some((hit, rest)) => hit && component_match(rest, &text[1..]),
-            None => {
-                !text.is_empty() && text[0] == b'[' && component_match(&pattern[1..], &text[1..])
-            }
-        },
-        byte => !text.is_empty() && text[0] == byte && component_match(&pattern[1..], &text[1..]),
-    }
-}
-
-/// Whether the byte after `[` lists `byte`, and the pattern past `]`.
-///
-/// Reads an optional `!` or `^` negation, ranges, and backslash escapes. A `]`
-/// in first position is a literal member. Returns nothing for an unclosed
-/// class, which the caller reads as a literal `[`.
-fn class_match(pattern: &[u8], byte: Option<u8>) -> Option<(bool, &[u8])> {
-    let mut at = 0;
-    let mut negated = false;
-    if at < pattern.len() && (pattern[at] == b'!' || pattern[at] == b'^') {
-        negated = true;
-        at += 1;
-    }
-    let mut hit = false;
-    let mut first = true;
-    loop {
-        if at >= pattern.len() {
-            return None;
-        }
-        if pattern[at] == b']' && !first {
-            return Some((negated != hit, &pattern[at + 1..]));
-        }
-        let (low, next) = class_byte(pattern, at)?;
-        at = next;
-        let mut high = low;
-        if at + 1 < pattern.len() && pattern[at] == b'-' && pattern[at + 1] != b']' {
-            let (end, next) = class_byte(pattern, at + 1)?;
-            high = end;
-            at = next;
-        }
-        if byte.is_some_and(|value| (low..=high).contains(&value)) {
-            hit = true;
-        }
-        first = false;
-    }
-}
-
-/// One class member byte and the offset past it.
-fn class_byte(pattern: &[u8], at: usize) -> Option<(u8, usize)> {
-    if at >= pattern.len() {
-        return None;
-    }
-    if pattern[at] == b'\\' {
-        if at + 1 >= pattern.len() {
-            return None;
-        }
-        return Some((pattern[at + 1], at + 2));
-    }
-    Some((pattern[at], at + 1))
-}
-
-/// A path cleaned of `.` without changing what it names.
-///
-/// Returns nothing for an absolute path or one holding `..` or a prefix. The
-/// caller refuses those before matching, so nothing here is one.
-fn normalize(path: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            Component::Normal(piece) => out.push(piece),
-            Component::CurDir => {}
-            Component::RootDir | Component::ParentDir | Component::Prefix(_) => return None,
-        }
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Slice};
-    use super::{Verdict, class_match, component_match, glob_match, verdict_of};
+    use super::{Entry, Slice, Verdict, verdict_of};
     use crate::{metadata::Attributes, storage::BlobId};
 
     /// One chunk slice covering whole test content.
@@ -795,61 +558,5 @@ mod tests {
         };
 
         assert_eq!(verdict_of(&file(A), &dir), Verdict::Type);
-    }
-
-    #[test]
-    fn a_star_spans_bytes_within_one_component() {
-        assert!(component_match(b"*.rs", b"main.rs"));
-        assert!(!component_match(b"*.rs", b"main.txt"));
-        assert!(component_match(b"*", b"anything"));
-        assert!(!component_match(b"a*c", b"abbd"));
-    }
-
-    #[test]
-    fn a_question_mark_spans_exactly_one_byte() {
-        assert!(component_match(b"f?le", b"file"));
-        assert!(!component_match(b"f?le", b"fle"));
-        assert!(!component_match(b"f?le", b"fiile"));
-    }
-
-    #[test]
-    fn a_class_lists_its_members_and_ranges() {
-        assert!(component_match(b"f[ai]le", b"file"));
-        assert!(!component_match(b"f[ai]le", b"fole"));
-        assert!(component_match(b"f[a-z]le", b"fole"));
-        assert!(component_match(b"f[!ai]le", b"fole"));
-        assert!(!component_match(b"f[!ai]le", b"file"));
-    }
-
-    #[test]
-    fn an_unclosed_class_is_a_literal_bracket() {
-        assert!(component_match(b"f[le", b"f[le"));
-        assert!(!component_match(b"f[le", b"file"));
-    }
-
-    #[test]
-    fn a_backslash_names_the_next_byte_literally() {
-        assert!(component_match(b"a\\*b", b"a*b"));
-        assert!(!component_match(b"a\\*b", b"aab"));
-    }
-
-    #[test]
-    fn a_star_does_not_span_a_separator() {
-        assert!(!glob_match(b"*.rs", b"src/main.rs"));
-        assert!(glob_match(b"*/*.rs", b"src/main.rs"));
-    }
-
-    #[test]
-    fn a_double_star_spans_nested_components() {
-        assert!(glob_match(b"src/**", b"src/a/b/c.rs"));
-        assert!(glob_match(b"src/**", b"src"));
-        assert!(glob_match(b"**/*.rs", b"a/b/main.rs"));
-        assert!(!glob_match(b"src/**", b"other/main.rs"));
-    }
-
-    #[test]
-    fn a_brace_is_a_literal_byte() {
-        assert!(component_match(b"a{b", b"a{b"));
-        assert!(class_match(b"a]", Some(b'a')).is_some());
     }
 }

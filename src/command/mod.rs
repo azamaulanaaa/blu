@@ -8,6 +8,7 @@ use std::io;
 use crate::{metadata, storage};
 mod apply;
 mod backup;
+mod filter;
 mod history;
 mod manifest;
 mod merge;
@@ -19,7 +20,8 @@ mod verify;
 
 pub use apply::{Applied, Options as ApplyOptions, apply};
 pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
-pub use history::{Detail, Event, Status, check_query, report};
+pub use filter::Filter;
+pub use history::{Detail, Event, Status, report};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use merge::{
     Compression as MergeCompression, MergePlan, Merged, Planned, establish_base, merge, merge_plan,
@@ -29,7 +31,7 @@ pub use pack::{Base, Options as PackOptions, Packed, Version, pack};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan, Restored, lock_destination,
-    restore, restore_plan,
+    restore, restore_filtered, restore_plan, restore_plan_filtered,
 };
 pub use verify::{Failure, Reason, Report, verify};
 
