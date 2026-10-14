@@ -5386,3 +5386,249 @@ fn history_refuses_absolute_path() {
         "the refusal names the mistake: {error}"
     );
 }
+
+/// `restore --files` writes only the named files.
+///
+/// Version two changes one file and adds another. A fresh destination restored
+/// with the new file's name holds that file at version two and nothing else.
+#[test]
+fn restore_reports_only_the_named_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    fs::write(source.join("a.txt"), b"two\n").unwrap();
+    fs::write(source.join("b.txt"), b"new\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    ok(dir.path(), &["restore", "out", "snap", "--files", "b.txt"]);
+
+    assert_eq!(fs::read(dir.path().join("out/b.txt")).unwrap(), b"new\n");
+    assert!(
+        !dir.path().join("out/a.txt").exists(),
+        "a file outside the selection must not be written"
+    );
+}
+
+/// `restore --files` with a nested path creates its parents.
+///
+/// The parents are scaffolding: they exist so the file has somewhere to go,
+// and the run attributes them as it would in a full restore.
+#[test]
+fn restore_with_files_creates_parent_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("sub")).unwrap();
+
+    fs::write(source.join("top.txt"), b"top\n").unwrap();
+    fs::write(source.join("sub").join("d.txt"), b"deep\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    ok(
+        dir.path(),
+        &["restore", "out", "snap", "--files", "sub/d.txt"],
+    );
+
+    assert_eq!(
+        fs::read(dir.path().join("out/sub/d.txt")).unwrap(),
+        b"deep\n"
+    );
+    assert!(
+        !dir.path().join("out/top.txt").exists(),
+        "a file outside the selection must not be written"
+    );
+}
+
+/// `restore --clean --files` is refused.
+///
+/// A clean restore promises exactly the snapshot, and a selection promises
+/// only part of it. The two cannot both hold, so the run fails before it
+/// touches the destination.
+#[test]
+fn restore_refuses_clean_with_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"a\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let error = fails(
+        dir.path(),
+        &["restore", "out", "snap", "--clean", "--files", "a.txt"],
+    );
+    assert!(
+        error.contains("--clean") && error.contains("--files"),
+        "the refusal names both flags: {error}"
+    );
+    assert!(
+        !dir.path().join("out").exists(),
+        "a refused restore creates nothing"
+    );
+}
+
+/// `restore --files --dry-run` counts only the selection.
+///
+/// The plan figures describe what the run would write: one file, no
+/// directories, and no other entries.
+#[test]
+fn restore_dry_run_counts_only_the_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    fs::write(source.join("b.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    let plan = ok(
+        dir.path(),
+        &["restore", "out", "snap", "--files", "a.txt", "--dry-run"],
+    );
+    assert!(
+        plan.contains("1 files, 0 dirs, 0 links"),
+        "the plan counts the selection and nothing else: {plan}"
+    );
+    assert!(!dir.path().join("out").exists(), "a dry run writes nothing");
+}
+
+/// `apply --files` writes only the named files, and a later full apply finishes.
+///
+/// The first run brings one file up to the version. The second run trusts the
+/// manifest for that file and writes the rest, leaving the first file's inode
+/// alone.
+#[test]
+fn apply_writes_only_the_named_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    fs::write(source.join("b.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    fs::write(source.join("a.txt"), b"two\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["pack", "snap", "v2.pack", "--version", "2"]);
+
+    ok(
+        dir.path(),
+        &["apply", "v2.pack", "dest", "--files", "a.txt"],
+    );
+    assert_eq!(fs::read(dir.path().join("dest/a.txt")).unwrap(), b"two\n");
+    assert!(
+        !dir.path().join("dest/b.txt").exists(),
+        "a file outside the selection must not be written"
+    );
+
+    ok(dir.path(), &["apply", "v2.pack", "dest"]);
+    assert_eq!(fs::read(dir.path().join("dest/a.txt")).unwrap(), b"two\n");
+    assert_eq!(fs::read(dir.path().join("dest/b.txt")).unwrap(), b"one\n");
+}
+
+/// `apply` rewrites a file changed after a partial apply.
+///
+/// The partial run records the file. The user moves it afterwards, and the
+/// stat check catches the move: the full run reads the file properly and puts
+/// the version back.
+#[test]
+fn apply_rewrites_a_file_changed_after_a_partial_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["pack", "snap", "v1.pack", "--version", "1"]);
+
+    ok(
+        dir.path(),
+        &["apply", "v1.pack", "dest", "--files", "a.txt"],
+    );
+    fs::write(dir.path().join("dest/a.txt"), b"edited\n").unwrap();
+
+    ok(dir.path(), &["apply", "v1.pack", "dest"]);
+    assert_eq!(
+        fs::read(dir.path().join("dest/a.txt")).unwrap(),
+        b"one\n",
+        "the full apply puts the version back over the edit"
+    );
+}
+
+/// `apply --files --prune` removes only the matching extras.
+///
+/// An unrecorded file under the selection goes, and one outside it stays.
+#[test]
+fn apply_prune_with_files_removes_only_matching_extras() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("sub")).unwrap();
+
+    fs::write(source.join("a.txt"), b"a\n").unwrap();
+    fs::write(source.join("sub").join("d.txt"), b"d\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["pack", "snap", "v1.pack", "--version", "1"]);
+
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(dest.join("sub")).unwrap();
+    fs::write(dest.join("junk.txt"), b"mine\n").unwrap();
+    fs::write(dest.join("sub").join("stale.txt"), b"stale\n").unwrap();
+
+    ok(
+        dir.path(),
+        &["apply", "v1.pack", "dest", "--files", "sub", "--prune"],
+    );
+
+    assert!(
+        !dest.join("sub/stale.txt").exists(),
+        "an unrecorded file under the selection is pruned"
+    );
+    assert!(
+        dest.join("junk.txt").is_file(),
+        "an unrecorded file outside the selection is left alone"
+    );
+    assert_eq!(fs::read(dest.join("sub/d.txt")).unwrap(), b"d\n");
+    assert!(
+        !dest.join("a.txt").exists(),
+        "a file outside the selection must not be written"
+    );
+}
+
+/// `restore --files` from a `file://` target restores through staging.
+///
+/// The staged run reports with the same code a local run uses, so the subset
+/// is the same subset.
+#[test]
+fn restore_with_files_from_a_store_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+
+    fs::write(source.join("a.txt"), b"one\n").unwrap();
+    fs::write(source.join("b.txt"), b"one\n").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+
+    fs::create_dir_all(dir.path().join("remote")).unwrap();
+    let target = format!("file://{}/snap", dir.path().join("remote").display());
+    ok(dir.path(), &["backup", "src", &target]);
+
+    ok(
+        dir.path(),
+        &[
+            "restore",
+            "out",
+            &target,
+            "--staging",
+            "staging",
+            "--files",
+            "a.txt",
+        ],
+    );
+
+    assert_eq!(fs::read(dir.path().join("out/a.txt")).unwrap(), b"one\n");
+    assert!(
+        !dir.path().join("out/b.txt").exists(),
+        "a file outside the selection must not be written"
+    );
+}

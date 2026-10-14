@@ -853,3 +853,92 @@ async fn the_record_is_beside_the_destination_and_not_inside_it() {
         "and never appear inside the tree"
     );
 }
+
+/// An apply with `--files` writes only the selection.
+///
+/// One file comes up to the version and the rest stay missing. A later full
+/// apply of the same pack trusts the manifest for the file the selection
+/// wrote and finishes the tree.
+#[tokio::test]
+async fn apply_with_files_writes_only_the_selection() {
+    let versions = Versions::new(3, 1_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+
+    let applied = apply(
+        &target,
+        &pack,
+        ApplyOptions {
+            files: vec![std::path::PathBuf::from("f0.bin")],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(applied.files, 1);
+    assert!(target.join("f0.bin").is_file());
+    assert!(
+        !target.join("f1.bin").exists(),
+        "a file outside the selection must not be written"
+    );
+
+    let finished = apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        finished.files, 2,
+        "the full apply writes the two missing files"
+    );
+    assert_eq!(
+        finished.trusted, 1,
+        "the file the selection wrote is taken on the manifest's word"
+    );
+    for i in 0..3 {
+        assert_eq!(
+            fs::read(target.join(format!("f{i}.bin"))).unwrap(),
+            fs::read(versions.source.join(format!("f{i}.bin"))).unwrap(),
+            "f{i}.bin differs from the version"
+        );
+    }
+}
+
+/// An apply with `--files --prune` removes only the matching extras.
+///
+/// An unrecorded file under the selection goes, and one outside it stays.
+#[tokio::test]
+async fn apply_with_files_and_prune_scopes_removal() {
+    let versions = Versions::new(2, 1_000).await;
+    let pack = versions.pack().await;
+    let target = versions.dir.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+
+    apply(&target, &pack, ApplyOptions::default())
+        .await
+        .unwrap();
+    fs::write(target.join("fx.bin"), b"stale\n").unwrap();
+    fs::write(target.join("notes.txt"), b"mine\n").unwrap();
+
+    let pruned = apply(
+        &target,
+        &pack,
+        ApplyOptions {
+            files: vec![std::path::PathBuf::from("f*.bin")],
+            prune: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(pruned.removed, 1);
+    assert!(
+        !target.join("fx.bin").exists(),
+        "an unrecorded file under the selection is pruned"
+    );
+    assert!(
+        target.join("notes.txt").is_file(),
+        "an unrecorded file outside the selection is left alone"
+    );
+}
