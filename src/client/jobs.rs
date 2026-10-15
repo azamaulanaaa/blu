@@ -456,8 +456,7 @@ impl Remote {
     /// job built from this would be eight fields of nothing.
     async fn start(&self, url: &str, body: &serde_json::Value) -> io::Result<String> {
         let mut response = self
-            .client
-            .post(url)
+            .authorize(self.client.post(url))
             .send_json(body)
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
@@ -591,8 +590,7 @@ impl Remote {
         let url = self.url(&format!("/v1/jobs/{}", segment(id)))?;
 
         let mut response = self
-            .client
-            .get(&url)
+            .authorize(self.client.get(&url))
             .send()
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;

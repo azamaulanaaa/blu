@@ -72,8 +72,7 @@ impl Remote {
         }
 
         let mut response = self
-            .client
-            .get(&url)
+            .authorize(self.client.get(&url))
             .send()
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;

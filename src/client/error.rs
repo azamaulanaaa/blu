@@ -26,6 +26,7 @@
 //! | Status | Kind here | What it means |
 //! |---|---|---|
 //! | `400` | `InvalidInput` | a request this server refuses, such as a compression value that is neither `keep` nor a level |
+//! | `401` | `PermissionDenied` | a request without the bearer token a proxy guards with, or with a wrong one |
 //! | `403` | `PermissionDenied` | |
 //! | `404` | `NotFound` | no set, version, upload or job at that name |
 //! | `409` | `AlreadyExists` | another run holds the claim, or the job has already finished |
@@ -64,13 +65,13 @@ use crate::storage::BlobId;
 
 /// The most this client will read for one response body.
 ///
-/// A pack is not one of these bodies — a pack is bytes this client sends — but a
-/// job's `result` and a version's snapshot hash are, and both are small. This is
-/// a ceiling rather than whatever arrives, because this client talks to a server
-/// with no authentication and an unbounded body is a decision nobody took.
-/// `awc` caps at 2 MiB by default; this is higher, and is still a ceiling: a body
-/// past it is an error naming the limit, never a value truncated at whatever
-/// happened to arrive first.
+/// A pack is not one of these bodies. A pack is bytes this client sends.
+/// A job `result` and a version snapshot hash are small bodies.
+/// This ceiling caps what arrives.
+/// `awc` caps at 2 MiB by default.
+/// This ceiling is higher and still a ceiling.
+/// A body past it fails and names the limit.
+/// The client never truncates at whatever arrived first.
 pub(crate) const PAYLOAD_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Read a response body whole, refusing one larger than [`PAYLOAD_LIMIT`].
@@ -125,7 +126,7 @@ pub(crate) fn kind_for(status: u16) -> io::ErrorKind {
         // file cannot answer, and no endpoint this client calls asks for a range,
         // so both are "a request this client made that the server refused".
         400 | 416 => io::ErrorKind::InvalidInput,
-        403 => io::ErrorKind::PermissionDenied,
+        401 | 403 => io::ErrorKind::PermissionDenied,
         404 => io::ErrorKind::NotFound,
         409 => io::ErrorKind::AlreadyExists,
         422 => io::ErrorKind::InvalidData,
@@ -526,10 +527,12 @@ mod tests {
     }
 
     #[test]
-    fn every_mapped_status_keeps_its_meaning_in_both_directions() {
-        // The inverse of the server's `status_for`. Each row here is a status
-        // that table produces from a kind, so a change to either side shows up.
+    fn check_status_mapping_in_both_directions() {
+        // The inverse of the server `status_for` table.
+        // Each row maps a status the server sends from a kind.
+        // A change on either side shows up here.
         assert_eq!(kind_for(400), std::io::ErrorKind::InvalidInput);
+        assert_eq!(kind_for(401), std::io::ErrorKind::PermissionDenied);
         assert_eq!(kind_for(403), std::io::ErrorKind::PermissionDenied);
         assert_eq!(kind_for(404), std::io::ErrorKind::NotFound);
         assert_eq!(kind_for(409), std::io::ErrorKind::AlreadyExists);

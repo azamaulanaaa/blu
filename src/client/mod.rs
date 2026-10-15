@@ -62,6 +62,15 @@
 //! The client never downgrades HTTPS before plain HTTP.
 //! The client never upgrades HTTP before HTTPS.
 //!
+//! ## Auth
+//!
+//! The client forwards a bearer token when the caller holds one.
+//! It sends `Authorization: Bearer <token>` on every request.
+//! It never checks the token.
+//! A proxy before the server checks it.
+//! `blu serve` itself checks nothing.
+//! Put the server behind a proxy when it needs auth.
+//!
 //! [`blu merge`]: crate::command::merge
 
 mod error;
@@ -91,10 +100,15 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A `blu serve` this client can ask.
 ///
-/// Built from the address the server printed on its first line of stdout — the
-/// one reason that line goes to stdout rather than stderr — and held for as many
-/// requests as the caller wants.
+/// Built from the address the server printed on its first line of stdout.
+/// That line goes to stdout rather than stderr for this reason.
+/// One client serves as many requests as the caller wants.
 ///
+/// Use [`Remote::with_token`] when a proxy guards the server.
+/// The client forwards the token as a Bearer header.
+/// The client never checks the token.
+/// The proxy checks it.
+//
 /// # Example
 ///
 /// ```no_run
@@ -114,13 +128,15 @@ pub struct Remote {
     base: String,
     /// The underlying actix client.
     client: awc::Client,
+    /// The bearer token the proxy checks, if any.
+    token: Option<String>,
 }
 
 impl std::fmt::Debug for Remote {
-    /// The address and nothing else.
+    /// Show the address and hide the token.
     ///
     /// Hand-written because `awc::Client` is not the thing a reader of a
-    /// `Debug` wants, and this type is put in error messages.
+    /// `Debug` wants, and the token must never reach logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Remote")
             .field("base", &self.base)
@@ -133,6 +149,8 @@ impl Remote {
     ///
     /// The client accepts `http://` and `https://`.
     /// It verifies HTTPS against the system roots.
+    /// The client sends no auth header.
+    /// Use [`Remote::with_token`] when a proxy guards the server.
     ///
     /// # Errors
     ///
@@ -145,14 +163,38 @@ impl Remote {
     /// The address the server prints works.
     /// The address a user types works.
     pub fn new(address: &str) -> io::Result<Self> {
-        Ok(Self {
-            base: base_of(address)?,
+        Ok(Self::build(base_of(address)?, None))
+    }
+
+    /// Build a client that forwards a bearer token.
+    ///
+    /// The client sends `Authorization: Bearer <token>` on every request.
+    /// The client never checks the token.
+    /// A proxy before the server checks it.
+    /// Use a JWT or another bearer token the proxy accepts.
+    ///
+    /// # Errors
+    ///
+    /// The call fails when `address` is not a server address.
+    /// The call fails when `token` is empty.
+    /// The call fails when `token` holds whitespace or control bytes.
+    /// A token with a newline could split the header.
+    pub fn with_token(address: &str, token: &str) -> io::Result<Self> {
+        Ok(Self::build(
+            base_of(address)?,
+            Some(check_token(token)?.to_string()),
+        ))
+    }
+
+    /// Build a client from a checked address and an optional token.
+    fn build(base: String, token: Option<String>) -> Self {
+        Self {
+            base,
             client: awc::Client::builder()
                 // A version listing is JSON and small, and a client that read an
-                // unbounded body off a server with no authentication would be a
-                // decision rather than a default. `awc` has no builder for the
-                // ceiling, so `versions` enforces its own; this is where the
-                // number lives.
+                // unbounded body off a server would accept a decision nobody took.
+                // `awc` has no builder for the ceiling, so `versions` enforces
+                // its own. This is where the number lives.
                 // A listing is one request and one response, and `awc`'s own
                 // default of five seconds is short enough that a server busy
                 // merging a pack would fail a `versions` that was about to
@@ -160,7 +202,18 @@ impl Remote {
                 // that a wedged server is an error rather than a hang.
                 .timeout(TIMEOUT)
                 .finish(),
-        })
+            token,
+        }
+    }
+
+    /// Attach the bearer header to one request.
+    ///
+    /// The call adds nothing when the client holds no token.
+    pub(crate) fn authorize(&self, req: awc::ClientRequest) -> awc::ClientRequest {
+        match &self.token {
+            Some(token) => req.insert_header(("authorization", format!("Bearer {token}"))),
+            None => req,
+        }
     }
 
     /// The address this client was built with, as normalised.
@@ -246,6 +299,38 @@ fn base_of(address: &str) -> io::Result<String> {
     }
 
     Ok(address.trim_end_matches('/').to_string())
+}
+
+/// Check a bearer token.
+///
+/// The token travels in one header value.
+/// Whitespace would split the header.
+/// Control bytes would split the header.
+/// An empty token names nothing.
+///
+/// # Errors
+///
+/// The call fails when `token` is empty.
+/// The call fails when `token` holds whitespace or control bytes.
+fn check_token(token: &str) -> io::Result<&str> {
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no token: pass --token or set BLU_TOKEN",
+        ));
+    }
+
+    if token
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bad token: a bearer token holds no whitespace",
+        ));
+    }
+
+    Ok(token)
 }
 
 /// Encode a set name for a URL path.
@@ -663,5 +748,43 @@ mod tests {
                 "{target:?} must fail"
             );
         }
+    }
+
+    #[test]
+    fn accept_token_with_bearer_shape() {
+        // A JWT holds dots and base64url bytes.
+        // It holds no whitespace.
+        let remote = Remote::with_token(
+            "http://127.0.0.1:8480",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJibHUifQ.c2ln",
+        )
+        .unwrap();
+
+        assert_eq!(remote.address(), "http://127.0.0.1:8480");
+    }
+
+    #[test]
+    fn refuse_bad_token_before_transfer() {
+        // An empty token names nothing.
+        // Whitespace would split the header.
+        // Control bytes would split the header.
+        for token in ["", "bad token", "bad\ntoken", "bad\rtoken", "bad\ttoken"] {
+            let error = Remote::with_token("http://127.0.0.1:8480", token).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{token:?} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn hide_token_in_debug_text() {
+        // Logs must never carry the bearer token.
+        let remote = Remote::with_token("http://127.0.0.1:8480", "secret-jwt-value").unwrap();
+        let text = format!("{remote:?}");
+
+        assert!(text.contains("http://127.0.0.1:8480"));
+        assert!(!text.contains("secret-jwt-value"));
     }
 }

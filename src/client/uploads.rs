@@ -141,9 +141,12 @@ impl Upload {
 
         let mut response = self
             .remote
-            .client
-            .put(&url)
-            .insert_header(("content-type", PACK_MEDIA_TYPE))
+            .authorize(
+                self.remote
+                    .client
+                    .put(&url)
+                    .insert_header(("content-type", PACK_MEDIA_TYPE)),
+            )
             .send_body(pack)
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
@@ -189,8 +192,7 @@ impl Upload {
 
         let mut response = self
             .remote
-            .client
-            .post(&url)
+            .authorize(self.remote.client.post(&url))
             .send()
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
@@ -243,8 +245,7 @@ impl Upload {
 
         let mut response = self
             .remote
-            .client
-            .delete(&url)
+            .authorize(self.remote.client.delete(&url))
             .send()
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
@@ -314,8 +315,7 @@ impl Remote {
         let url = self.url("/v1/uploads")?;
 
         let mut response = self
-            .client
-            .post(&url)
+            .authorize(self.client.post(&url))
             .send()
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;

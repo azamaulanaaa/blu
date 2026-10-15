@@ -157,8 +157,7 @@ impl Remote {
         let body = serde_json::json!({ "have": held });
 
         let mut response = self
-            .client
-            .post(&url)
+            .authorize(self.client.post(&url))
             .send_json(&body)
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
@@ -224,9 +223,11 @@ impl Remote {
         let header = header_for(range)?;
 
         let mut response = self
-            .client
-            .get(&url)
-            .insert_header(("range", header.clone()))
+            .authorize(
+                self.client
+                    .get(&url)
+                    .insert_header(("range", header.clone())),
+            )
             .send()
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
