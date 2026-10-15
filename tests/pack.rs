@@ -3645,3 +3645,57 @@ async fn pack_builder_writes_delta_against_named_base() {
         "the first merge publishes version 1, got: {merged:?}"
     );
 }
+
+/// A pack with the same tree as the tip merges nothing.
+///
+/// The stamp differs, so the hash never matches.
+/// The tree decides.
+/// The run reports the tip and writes nothing.
+#[tokio::test]
+async fn a_pack_with_the_same_tree_as_the_tip_merges_nothing() {
+    use blulib::command::{MergeBuilder, Merged};
+
+    let built = build(4, 100_000).await;
+    let source = built.dir.path().join("source");
+
+    let received = built.dir.path().join("received");
+    let writing = BlobStore::builder(&received).open_writer().await.unwrap();
+    let first_at = built.dir.path().join("first.pack");
+    let first_pack = built.pack(&first_at).await;
+    let merged = MergeBuilder::new(&writing, &first_pack)
+        .run()
+        .await
+        .unwrap();
+    assert!(
+        matches!(merged, Merged::Committed { version: 1, .. }),
+        "the first merge publishes version 1, got: {merged:?}"
+    );
+    drop(writing);
+
+    // The same tree, backed up elsewhere. The stamp moves on.
+    // The tree does not.
+    let staging = built.dir.path().join("staging");
+    common::run_backup(&source, &staging).await;
+    let second_at = built.dir.path().join("second.pack");
+    pack(&staging, &second_at).await;
+    let second_pack = Pack::open(&second_at).unwrap();
+
+    let before = common::set_size(&received);
+    let writing = BlobStore::builder(&received).open_writer().await.unwrap();
+    let repeated = MergeBuilder::new(&writing, &second_pack)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated,
+        Merged::Already { version: 1 },
+        "a pack with the tip tree merges nothing"
+    );
+    drop(writing);
+
+    assert_eq!(
+        common::set_size(&received),
+        before,
+        "a same-tree merge wrote to the set"
+    );
+}

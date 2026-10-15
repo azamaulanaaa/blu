@@ -108,6 +108,7 @@
 //!
 //! **A no-op, reported and successful.**
 //! A pack whose snapshot the set already holds changes nothing.
+//! A pack whose tree matches the tip changes nothing either.
 //! No version is published and no chunk is stored.
 //! The run says which version the set is already holding it as.
 //!
@@ -478,6 +479,13 @@ async fn merge<C: storage::Compressor>(
         return Ok(Merged::Already { version });
     }
 
+    // A pack rebuilt from an unchanged tree carries a new stamp.
+    // Its hash never matches, but its tree does.
+    // That merge writes nothing and reports the tip.
+    if let Some(version) = tip_with_same_tree(store, &snapshot).await {
+        return Ok(Merged::Already { version });
+    }
+
     let base = match pack.base() {
         Some(base) => Some(establish_base(Some(store), base, pack.path())?),
         None => None,
@@ -670,6 +678,15 @@ async fn merge_plan<C: storage::Compressor>(
         return Ok(Planned::Already { version });
     }
 
+    // A pack rebuilt from an unchanged tree carries a new stamp.
+    // Its hash never matches, but its tree does.
+    // That plan reports nothing to do.
+    if let Some(store) = set
+        && let Some(version) = tip_with_same_tree(store, &snapshot).await
+    {
+        return Ok(Planned::Already { version });
+    }
+
     let base = match pack.base() {
         Some(base) => Some(establish_base(set, base, pack.path())?),
         None => None,
@@ -843,6 +860,27 @@ pub fn version_holding<W: storage::WriteMode, C: storage::Compressor>(
     }
 
     Ok(None)
+}
+
+/// The tip version whose tree matches `snapshot`, if the tip matches.
+///
+/// Compare trees without stamps.
+/// A rebuilt pack carries a new stamp.
+/// Its hash never matches, but its tree can.
+/// Only the tip counts here.
+/// An older match means the tip moved on, so the merge still commits.
+async fn tip_with_same_tree<W: storage::WriteMode, C: storage::Compressor>(
+    store: &storage::BlobStore<W, C>,
+    snapshot: &Snapshot,
+) -> Option<u32> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (tip, tip_id) = store.latest()?;
+    let mut reader = store.get(&tip_id).await.ok()?;
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).await.ok()?;
+    let tip_tree = Snapshot::try_from(buffer.as_slice()).ok()?;
+    snapshot.matches_tree(&tip_tree).then_some(tip)
 }
 
 /// The stamp of a set's newest version, when the set holds one.

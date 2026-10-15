@@ -45,13 +45,13 @@
 //! let store = BlobStore::builder("photos").open_writer().await?;
 //! let first = BackupBuilder::new("~/Pictures", store).latest(None).run().await?;
 //!
-//! // Later backup. Nothing new to store means nothing is written.
+//! // Later backup. An unchanged tree commits no new version.
 //! let store = BlobStore::builder("photos").open_writer().await?;
 //! BackupBuilder::new("~/Pictures", store).latest(None).run().await?;
 //!
 //! // A read-only open takes no policies. A read never rolls over.
 //! let store = BlobStore::builder("photos").open_reader().await?;
-//! RestoreBuilder::new("~/Pictures-restored", first.snapshot, store)
+//! RestoreBuilder::new("~/Pictures-restored", first.snapshot(), store)
 //!     .run()
 //!     .await?;
 //! # Ok(())

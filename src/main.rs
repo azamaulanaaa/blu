@@ -2022,14 +2022,14 @@ async fn run_backup(
 
     tracing::info!(
         name = %set.base().display(),
-        version = committed.version,
-        snapshot = %&committed.snapshot,
+        version = committed.version(),
+        snapshot = %&committed.snapshot(),
         store = %set.base().display(),
         segments,
         "backup complete"
     );
 
-    Ok(Some(committed.version))
+    Ok(Some(committed.version()))
 }
 
 /// Say what a backup would have stored, on stdout, and that it stored nothing.

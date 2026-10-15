@@ -23,7 +23,7 @@ async fn an_intact_snapshot_verifies_clean() {
     let committed = common::run_backup(&source, &blob).await;
 
     let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let report = VerifyBuilder::new(committed.snapshot, storage)
+    let report = VerifyBuilder::new(committed.snapshot(), storage)
         .run()
         .await
         .unwrap();
@@ -50,7 +50,7 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     fs::write(&segment, &bytes).unwrap();
 
     let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let report = VerifyBuilder::new(committed.snapshot, storage)
+    let report = VerifyBuilder::new(committed.snapshot(), storage)
         .run()
         .await
         .unwrap();
@@ -134,7 +134,7 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
 
     let destination = dir.path().join("restored");
     let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let error = blulib::command::RestoreBuilder::new(&destination, committed.snapshot, storage)
+    let error = blulib::command::RestoreBuilder::new(&destination, committed.snapshot(), storage)
         .run()
         .await
         .unwrap_err();

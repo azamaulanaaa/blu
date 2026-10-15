@@ -49,7 +49,7 @@ async fn repeated_content_within_one_run_is_stored_once() {
 
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
-    let snapshot = snapshot(&blob, &committed.snapshot).await;
+    let snapshot = snapshot(&blob, &committed.snapshot()).await;
 
     assert_eq!(
         snapshot.chunks.len(),
@@ -69,18 +69,15 @@ async fn repeated_content_within_one_run_is_stored_once() {
     );
 }
 
-/// Re-backing up an unchanged tree stores no chunk data.
+/// Re-backing up an unchanged tree writes nothing.
 ///
-/// This is the property the redesign is for.
-/// The old design deduplicated a run only against a snapshot the caller named.
-/// A run had to know which version came before it.
-/// That version had to still be intact.
-/// The store holds every version it has ever been given.
-/// A run hands over every chunk it read, and the store recognises the content
-/// however far back it was last seen.
-/// That includes content from a version that is not the latest.
+/// The run reports the tip as already held.
+/// No snapshot is stored and no version is published.
+/// The store does not grow at all.
 #[tokio::test]
 async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
+    use blulib::command::BackedUp;
+
     let dir = tempfile::tempdir().unwrap();
     let source = common::source(dir.path());
     fs::write(source.join("stable.bin"), vec![0x11u8; 100_000]).unwrap();
@@ -93,37 +90,90 @@ async fn a_second_run_of_an_unchanged_tree_stores_nothing_new() {
     let second = common::run_backup(&source, &blob).await;
     let after_second = common::set_size(&blob);
 
-    assert_ne!(
-        first.version, second.version,
-        "each run should publish its own version"
+    assert_eq!(
+        second,
+        BackedUp::Already {
+            version: first.version(),
+            snapshot: first.snapshot(),
+        },
+        "an unchanged tree commits no new version"
     );
 
-    let first_snapshot = snapshot(&blob, &first.snapshot).await;
-    let second_snapshot = snapshot(&blob, &second.snapshot).await;
-
-    // Each run stamps its own time, so the two snapshot blobs differ.
-    // The tree did not move, so everything but the stamp matches.
-    assert_ne!(
-        first.snapshot, second.snapshot,
-        "two runs stamp different times, so the bytes differ"
+    assert_eq!(
+        after_second,
+        after_first,
+        "re-backing up an unchanged tree grew the store by {} bytes",
+        after_second.saturating_sub(after_first),
     );
-    assert!(
-        second_snapshot.taken_at >= first_snapshot.taken_at,
-        "the second run must not predate the first"
-    );
-    assert_eq!(first_snapshot.files, second_snapshot.files);
-    assert_eq!(first_snapshot.dirs, second_snapshot.dirs);
-    assert_eq!(first_snapshot.chunks, second_snapshot.chunks);
-    assert_eq!(first_snapshot.file_chunks, second_snapshot.file_chunks);
-    assert_eq!(first_snapshot.links, second_snapshot.links);
+}
 
-    // The second run writes a snapshot blob and a commit record, and nothing
-    // else. No chunk data is new.
-    let growth = after_second - after_first;
-    assert!(
-        growth < 2048,
-        "re-backing up an unchanged tree grew the store by {growth} bytes, \
-         which suggests chunk data was stored again"
+/// An unchanged tree keeps its version number.
+///
+/// A cron job reads the version to decide what happened.
+/// A new number every run would read as new work.
+/// The same number reads as nothing to do.
+#[tokio::test]
+async fn an_unchanged_tree_keeps_its_version() {
+    use blulib::command::BackedUp;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("stable.bin"), vec![0x11u8; 100_000]).unwrap();
+
+    let blob = dir.path().join("store");
+    let first = common::run_backup(&source, &blob).await;
+    let second = common::run_backup(&source, &blob).await;
+
+    assert_eq!(first.version(), 1);
+    assert_eq!(
+        second,
+        BackedUp::Already {
+            version: 1,
+            snapshot: first.snapshot(),
+        },
+    );
+
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    assert_eq!(
+        store.versions().unwrap().len(),
+        1,
+        "an unchanged run publishes no version"
+    );
+}
+
+/// A changed tree still commits after an unchanged run.
+///
+/// The skip must not stick.
+/// The next real change publishes the next version.
+#[tokio::test]
+async fn a_changed_tree_commits_after_an_unchanged_run() {
+    use blulib::command::BackedUp;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("stable.bin"), vec![0x11u8; 100_000]).unwrap();
+
+    let blob = dir.path().join("store");
+    let first = common::run_backup(&source, &blob).await;
+    let skipped = common::run_backup(&source, &blob).await;
+    assert_eq!(skipped.version(), 1);
+
+    fs::write(source.join("stable.bin"), vec![0x22u8; 100_000]).unwrap();
+    let third = common::run_backup(&source, &blob).await;
+
+    match third {
+        BackedUp::Committed(committed) => {
+            assert_eq!(committed.version(), 2);
+            assert_ne!(committed.snapshot(), first.snapshot());
+        }
+        BackedUp::Already { .. } => panic!("a changed tree must commit"),
+    }
+
+    let destination = dir.path().join("restored");
+    common::run_restore(&blob, third.snapshot(), &destination).await;
+    assert_eq!(
+        fs::read(destination.join("stable.bin")).unwrap(),
+        vec![0x22u8; 100_000]
     );
 }
 
@@ -198,7 +248,7 @@ async fn content_last_seen_an_earlier_version_is_still_deduplicated() {
     // And the version is genuinely restorable, which is the part that matters.
     // Skipping the write is only correct if the bytes were already there.
     let destination = dir.path().join("restored");
-    common::run_restore(&blob, third.snapshot, &destination).await;
+    common::run_restore(&blob, third.snapshot(), &destination).await;
     assert_eq!(fs::read(destination.join("stable.bin")).unwrap(), stable);
     assert_eq!(
         fs::read(destination.join("changing.bin")).unwrap(),
@@ -219,7 +269,7 @@ async fn deduplication_does_not_change_the_restored_tree() {
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
     let destination = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
 
     assert_eq!(common::describe(&source), common::describe(&destination));
 }
@@ -256,7 +306,7 @@ async fn chunks_are_deduplicated_however_many_are_in_flight() {
         },
     )
     .await;
-    let snap = snapshot(&serial_blob, &committed.snapshot).await;
+    let snap = snapshot(&serial_blob, &committed.snapshot()).await;
     let serial = snap.chunks.len();
 
     // The eight identical files share one stored chunk.
@@ -291,7 +341,7 @@ async fn count_at(blob: &std::path::Path, source: &std::path::Path, concurrency:
     )
     .await;
 
-    snapshot(blob, &committed.snapshot).await.chunks.len()
+    snapshot(blob, &committed.snapshot()).await.chunks.len()
 }
 
 #[tokio::test]
@@ -325,7 +375,7 @@ async fn concurrency_does_not_change_the_snapshot() {
             },
         )
         .await;
-        snapshot(&blob, &committed.snapshot).await
+        snapshot(&blob, &committed.snapshot()).await
     };
 
     for concurrency in [2, 8, 32] {
@@ -345,7 +395,7 @@ async fn concurrency_does_not_change_the_snapshot() {
                 },
             )
             .await;
-            let parallel = snapshot(&blob, &committed.snapshot).await;
+            let parallel = snapshot(&blob, &committed.snapshot()).await;
 
             // Compared on what the design actually promises.
             //
@@ -405,7 +455,7 @@ async fn no_two_stored_chunks_share_content() {
             },
         )
         .await;
-        let snapshot = snapshot(&blob, &committed.snapshot).await;
+        let snapshot = snapshot(&blob, &committed.snapshot()).await;
 
         let mut seen = std::collections::HashSet::new();
         for chunk in &snapshot.chunks {
@@ -491,5 +541,5 @@ async fn a_version_stamped_at_the_latest_time_commits() {
         .await
         .expect("an equal stamp should commit");
 
-    assert_eq!(second.version, first.version + 1);
+    assert_eq!(second.version(), first.version() + 1);
 }

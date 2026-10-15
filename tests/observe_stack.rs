@@ -391,7 +391,7 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
                 .await
                 .expect("the backup should commit");
 
-            let _ = done.send(committed.version);
+            let _ = done.send(committed.version());
             Ok(Json::Null)
         });
 

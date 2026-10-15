@@ -157,7 +157,7 @@ fn bench_backup(c: &mut Criterion) {
                             .expect("backup");
                         elapsed += started.elapsed();
 
-                        black_box(committed.version);
+                        black_box(committed.version());
                     }
 
                     elapsed
@@ -206,7 +206,7 @@ fn bench_restore(c: &mut Criterion) {
                         .expect("store");
 
                     let started = Instant::now();
-                    RestoreBuilder::new(&destination, committed.snapshot, storage)
+                    RestoreBuilder::new(&destination, committed.snapshot(), storage)
                         .run()
                         .await
                         .expect("restore");
@@ -251,7 +251,7 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
             .open_reader()
             .await
             .expect("store");
-        RestoreBuilder::new(&out, committed.snapshot, storage)
+        RestoreBuilder::new(&out, committed.snapshot(), storage)
             .run()
             .await
             .expect("restore");

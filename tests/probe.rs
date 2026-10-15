@@ -56,7 +56,7 @@ async fn built(dir: tempfile::TempDir, source: std::path::PathBuf) -> Built {
     let committed = common::run_backup(&source, &blob).await;
 
     let store = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let mut reader = store.get(&committed.snapshot).await.unwrap();
+    let mut reader = store.get(&committed.snapshot()).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
     let snapshot = Snapshot::try_from(buffer.as_slice()).unwrap();
@@ -66,7 +66,7 @@ async fn built(dir: tempfile::TempDir, source: std::path::PathBuf) -> Built {
         dir,
         source,
         blob,
-        id: committed.snapshot,
+        id: committed.snapshot(),
         snapshot,
         plan,
     }

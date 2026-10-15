@@ -217,7 +217,7 @@ async fn a_set_built_across_several_segments_restores() {
     );
 
     let destination = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
 
     assert_eq!(
         common::describe(&source),
@@ -251,10 +251,10 @@ async fn a_version_committed_in_a_later_segment_is_reachable() {
 
     // Every version, each in whichever segment holds its commit record.
     for expected in versions {
-        let snapshot = store.snapshot(expected.version).unwrap();
-        assert_eq!(snapshot, expected.snapshot);
+        let snapshot = store.snapshot(expected.version()).unwrap();
+        assert_eq!(snapshot, expected.snapshot());
 
-        let destination = dir.path().join(format!("out{}", expected.version));
+        let destination = dir.path().join(format!("out{}", expected.version()));
         common::run_restore(&blob, snapshot, &destination).await;
     }
 }
@@ -346,7 +346,8 @@ async fn the_last_segments_torn_tail_is_reclaimed_by_a_run() {
     let committed = common::run_backup_limited(&source, &blob, small()).await;
 
     assert_eq!(
-        committed.version, 2,
+        committed.version(),
+        2,
         "the first version should still be there"
     );
 

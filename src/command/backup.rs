@@ -83,6 +83,72 @@ pub struct Committed {
     pub snapshot: storage::BlobId,
 }
 
+impl Committed {
+    /// Version this run committed.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Snapshot this run committed.
+    #[must_use]
+    pub fn snapshot(&self) -> storage::BlobId {
+        self.snapshot
+    }
+}
+
+/// What a [`BackupBuilder`] run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackedUp {
+    /// The run published a new version.
+    Committed(Committed),
+    /// The tree matches the previous version.
+    ///
+    /// The run wrote nothing.
+    /// It reports the version that already holds the tree.
+    Already {
+        /// Version that already holds this tree.
+        version: u32,
+        /// Snapshot that version names.
+        snapshot: storage::BlobId,
+    },
+}
+
+impl BackedUp {
+    /// Version this run committed or already held.
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        match *self {
+            Self::Committed(committed) => committed.version,
+            Self::Already { version, .. } => version,
+        }
+    }
+
+    /// Snapshot this run committed or already held.
+    #[must_use]
+    pub fn snapshot(&self) -> storage::BlobId {
+        match *self {
+            Self::Committed(committed) => committed.snapshot,
+            Self::Already { snapshot, .. } => snapshot,
+        }
+    }
+}
+
+/// The version an unchanged run compares against.
+///
+/// Hold the set tip before the run.
+/// The run compares its tree against `tree`.
+/// A match skips the commit and reports `version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Previous {
+    /// Version that holds `tree`.
+    pub version: u32,
+    /// Snapshot that version names.
+    pub snapshot: storage::BlobId,
+    /// Decoded tree of `snapshot`.
+    pub tree: metadata::Snapshot,
+}
+
 /// What a backup of a tree would do, worked out by reading the tree and by asking
 /// the set what it already holds.
 /// A plan writes nothing.
@@ -98,19 +164,26 @@ pub struct Committed {
 ///
 /// The plan is a separate builder rather than a flag on [`BackupBuilder`], and
 /// the reason is the return type.
-/// [`BackupBuilder`] answers with a [`Committed`], whose version number is chosen by the
+/// [`BackupBuilder`] answers with a [`BackedUp`], whose version number is chosen by the
 /// store at the moment it commits.
-/// A run that writes nothing never reaches a commit, so there is no version for
-/// it to report.
+/// A run that writes nothing never reaches a commit, so there is no new version
+/// for it to report.
 /// Asking one builder for either answer means either making that field a lie or
 /// inventing a report type a caller has to unwrap.
 /// The plan is worth having in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackupPlan {
     /// The version this run would commit, given the set as it stands.
+    ///
+    /// The tip version when the tree is unchanged.
+    /// No commit follows then.
     pub version: u32,
     /// Hash of the snapshot blob it would commit.
+    ///
+    /// The tip snapshot when the tree is unchanged.
     pub snapshot: storage::BlobId,
+    /// Whether the tree matches the tip, so a real run would write nothing.
+    pub unchanged: bool,
     /// Regular files the walk found.
     pub files: u64,
     /// Directories the walk found.
@@ -286,6 +359,9 @@ struct Walked {
 /// A chunk the store already holds is not written again.
 /// An unchanged file costs nothing after the first run.
 /// A file seen in any earlier version costs nothing either.
+///
+/// An unchanged tree commits no new version.
+/// The run reports the tip as `Already`.
 #[derive(Debug)]
 pub struct BackupBuilder<S> {
     root: PathBuf,
@@ -294,6 +370,7 @@ pub struct BackupBuilder<S> {
     chunker: reader::ChunkerConfig,
     concurrency: usize,
     latest: Option<Timestamp>,
+    previous: Option<Previous>,
 }
 
 impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
@@ -308,6 +385,7 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
             chunker: reader::ChunkerConfig::default(),
             concurrency: default_concurrency(),
             latest: None,
+            previous: None,
         }
     }
 
@@ -362,6 +440,16 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
         self
     }
 
+    /// Compare the run against `previous`.
+    ///
+    /// Pass the set tip. Pass `None` for the first backup.
+    /// An unchanged tree commits no new version.
+    #[must_use]
+    pub fn previous(mut self, previous: Option<Previous>) -> Self {
+        self.previous = previous;
+        self
+    }
+
     /// Replace every option with `options`.
     ///
     /// Later calls override single fields. Use a preset bundle and adjust it.
@@ -375,6 +463,8 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
 
     /// Snapshot the tree and commit it as a new version.
     ///
+    /// Report `Already` when the tree matches `previous`.
+    /// That run writes nothing.
     /// A run that returns an error commits nothing. The store stays as it was.
     ///
     /// # Errors
@@ -385,13 +475,17 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
     /// Returns an error when the new stamp predates `latest`.
     /// Returns an error when the store rejects a write or a commit.
     #[instrument(level = "info", skip(self), err)]
-    pub async fn run(self) -> io::Result<Committed> {
+    pub async fn run(self) -> io::Result<BackedUp> {
         let options = Options {
             exclude: self.exclude,
             chunker: self.chunker,
             concurrency: self.concurrency,
         };
-        Ok(run(self.root, options, self.store, self.latest).await?.1)
+        Ok(
+            run(self.root, options, self.store, self.latest, self.previous)
+                .await?
+                .1,
+        )
     }
 }
 
@@ -495,6 +589,9 @@ impl BackupPlanBuilder {
 
     /// Work out the figures and write nothing.
     ///
+    /// Report `unchanged` when the tree matches the tip.
+    /// That run would write nothing.
+    ///
     /// # Errors
     ///
     /// Returns an error when the tree cannot be walked or read.
@@ -502,11 +599,22 @@ impl BackupPlanBuilder {
     /// Returns an error when the set cannot answer what it holds.
     #[instrument(level = "info", skip(self), err)]
     pub async fn run(self) -> io::Result<BackupPlan> {
-        let latest = match self.store.as_ref() {
-            None => None,
+        let (latest, previous) = match self.store.as_ref() {
+            None => (None, None),
             Some(held) => match held.latest() {
-                None => None,
-                Some((version, _)) => Some(held.version_time(version).await?),
+                None => (None, None),
+                Some((version, snapshot)) => {
+                    let taken_at = held.version_time(version).await?;
+                    let tree = super::load_snapshot(held, snapshot).await?;
+                    (
+                        Some(taken_at),
+                        Some(Previous {
+                            version,
+                            snapshot,
+                            tree,
+                        }),
+                    )
+                }
             },
         };
 
@@ -522,18 +630,19 @@ impl BackupPlanBuilder {
             asked: Arc::clone(&asked),
         };
 
-        let (entries, committed) = run(self.root, options, planned, latest).await?;
+        let (entries, outcome) = run(self.root, options, planned, latest, previous).await?;
 
         // The snapshot is offered to the store like any other blob and is not a chunk
         // of anything.
         // It is dropped here rather than counted.
         // It is identified by the hash the run committed it under.
         // That hash is the one thing that run knows it is not.
+        // An unchanged run offers no snapshot, so the filter matches nothing.
         let asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
         let mut chunks = 0u64;
         let mut held = 0u64;
         let mut bytes = 0u64;
-        for ask in asked.iter().filter(|ask| ask.id != committed.snapshot) {
+        for ask in asked.iter().filter(|ask| ask.id != outcome.snapshot()) {
             chunks = chunks.saturating_add(1);
             if ask.held {
                 held = held.saturating_add(1);
@@ -542,9 +651,15 @@ impl BackupPlanBuilder {
             }
         }
 
+        let (version, snapshot, unchanged) = match outcome {
+            BackedUp::Committed(committed) => (committed.version, committed.snapshot, false),
+            BackedUp::Already { version, snapshot } => (version, snapshot, true),
+        };
+
         Ok(BackupPlan {
-            version: committed.version,
-            snapshot: committed.snapshot,
+            version,
+            snapshot,
+            unchanged,
             files: entries.files,
             dirs: entries.dirs,
             links: entries.links,
@@ -563,13 +678,14 @@ impl BackupPlanBuilder {
 /// A dry run that walked the tree by any other route could report a snapshot no
 /// backup would ever commit.
 /// That would be worse than no report.
-#[instrument(level = "info", skip(storage, options), err)]
+#[instrument(level = "info", skip(storage, options, previous), err)]
 async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     root: P,
     options: Options,
     storage: S,
     latest: Option<Timestamp>,
-) -> io::Result<(Entries, Committed)> {
+    previous: Option<Previous>,
+) -> io::Result<(Entries, BackedUp)> {
     let Options {
         exclude,
         chunker: config,
@@ -614,6 +730,20 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     // chunk into the wrong file.
     snapshot.verify_file_lengths("changed while it was being backed up")?;
 
+    // Compare before stamping. The stamp always differs.
+    // A stamped snapshot never matches anything.
+    if let Some(prev) = previous.as_ref()
+        && snapshot.matches_tree(&prev.tree)
+    {
+        return Ok((
+            entries,
+            BackedUp::Already {
+                version: prev.version,
+                snapshot: prev.snapshot,
+            },
+        ));
+    }
+
     // Stamped at commit time rather than walk time. The walk only records the
     // tree. The stamp says when the version ran.
     snapshot.taken_at = Timestamp::now();
@@ -653,10 +783,10 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 
     Ok((
         entries,
-        Committed {
+        BackedUp::Committed(Committed {
             version,
             snapshot: id,
-        },
+        }),
     ))
 }
 

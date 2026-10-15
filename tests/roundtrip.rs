@@ -78,7 +78,7 @@ async fn restore_builder_writes_the_selected_paths_only() {
     let committed = common::run_backup(&source, &blob).await;
 
     let store = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let plan = RestorePlanBuilder::new(committed.snapshot, store)
+    let plan = RestorePlanBuilder::new(committed.snapshot(), store)
         .files(["keep.bin"])
         .run()
         .await
@@ -87,7 +87,7 @@ async fn restore_builder_writes_the_selected_paths_only() {
 
     let destination = dir.path().join("restored");
     let store = BlobStore::builder(&blob).open_reader().await.unwrap();
-    RestoreBuilder::new(&destination, committed.snapshot, store)
+    RestoreBuilder::new(&destination, committed.snapshot(), store)
         .files(["keep.bin"])
         .run()
         .await

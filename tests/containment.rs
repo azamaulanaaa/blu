@@ -257,7 +257,7 @@ async fn an_ordinary_symbolic_link_out_of_the_tree_is_restored() {
     let blob = dir.path().join("store.bin");
     let committed = common::run_backup(&src, &blob).await;
     let dest = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &dest).await;
+    common::run_restore(&blob, committed.snapshot(), &dest).await;
 
     assert_eq!(
         fs::read_link(dest.join("to-etc")).unwrap(),
@@ -291,7 +291,7 @@ async fn a_file_is_not_written_through_a_symlink_left_by_an_earlier_restore() {
     fs::write(&victim, b"do not touch").unwrap();
     std::os::unix::fs::symlink(&victim, dest.join("thing")).unwrap();
 
-    common::run_restore(&blob, committed.snapshot, &dest).await;
+    common::run_restore(&blob, committed.snapshot(), &dest).await;
 
     assert_eq!(
         fs::read(&victim).unwrap(),
@@ -315,7 +315,7 @@ async fn an_ordinary_tree_still_restores() {
     let blob = dir.path().join("store.bin");
     let committed = common::run_backup(&src, &blob).await;
     let dest = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &dest).await;
+    common::run_restore(&blob, committed.snapshot(), &dest).await;
 
     assert_eq!(common::describe(&src), common::describe(&dest));
 }

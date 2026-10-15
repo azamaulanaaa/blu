@@ -28,7 +28,7 @@ pub(crate) mod http;
 pub(crate) mod server;
 
 use blulib::{
-    command::{BackupBuilder, Committed, Options, RestoreBuilder},
+    command::{BackedUp, BackupBuilder, Options, Previous, RestoreBuilder, load_snapshot},
     layout::IndexSet,
     storage::{BlobId, BlobStore, SegmentLimit, StreamReadSeeker},
 };
@@ -217,28 +217,37 @@ pub(crate) fn set_size(base: &Path) -> u64 {
 /// Deduplication is the store's own business.
 /// A run hands the store every chunk it read.
 /// The store decides what is new.
-pub(crate) async fn run_backup(source: &Path, blob: &Path) -> Committed {
+pub(crate) async fn run_backup(source: &Path, blob: &Path) -> BackedUp {
     run_backup_with(source, blob, Options::default()).await
 }
 
-/// The stamp of a set's newest version, when the set holds one.
+/// The tip version of a set, with its decoded tree.
 ///
 /// Reads the set through the open handle. A fresh set holds nothing.
-async fn latest_of<C: blulib::storage::Compressor>(
+/// A run passes this back as `previous`.
+/// An unchanged tree then commits no new version.
+async fn previous_of<C: blulib::storage::Compressor>(
     storage: &BlobStore<blulib::storage::Write, C>,
-) -> Option<blulib::metadata::Timestamp> {
-    let (version, _) = storage.latest()?;
-    storage.version_time(version).await.ok()
+) -> Option<Previous> {
+    let (version, snapshot) = storage.latest()?;
+    let tree = load_snapshot(storage, snapshot).await.ok()?;
+    Some(Previous {
+        version,
+        snapshot,
+        tree,
+    })
 }
 
 /// Back up `source` with specific options, for tests that need to pin a knob the
 /// defaults would otherwise choose.
-pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
+pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> BackedUp {
     let storage = BlobStore::builder(blob).open_writer().await.unwrap();
-    let latest = latest_of(&storage).await;
+    let previous = previous_of(&storage).await;
+    let latest = previous.as_ref().map(|held| held.tree.taken_at);
     BackupBuilder::new(source, storage)
         .options(opts)
         .latest(latest)
+        .previous(previous)
         .run()
         .await
         .unwrap()
@@ -254,15 +263,17 @@ pub(crate) async fn run_backup_limited(
     source: &Path,
     blob: &Path,
     limit: SegmentLimit,
-) -> Committed {
+) -> BackedUp {
     let storage = BlobStore::builder(blob)
         .segment_limit(limit)
         .open_writer()
         .await
         .unwrap();
-    let latest = latest_of(&storage).await;
+    let previous = previous_of(&storage).await;
+    let latest = previous.as_ref().map(|held| held.tree.taken_at);
     BackupBuilder::new(source, storage)
         .latest(latest)
+        .previous(previous)
         .run()
         .await
         .unwrap()
@@ -286,15 +297,17 @@ pub(crate) async fn run_backup_compressed(
     source: &Path,
     blob: &Path,
     compression: blulib::storage::Compression,
-) -> Committed {
+) -> BackedUp {
     let storage = BlobStore::builder(blob)
         .compression(compression)
         .open_writer()
         .await
         .unwrap();
-    let latest = latest_of(&storage).await;
+    let previous = previous_of(&storage).await;
+    let latest = previous.as_ref().map(|held| held.tree.taken_at);
     BackupBuilder::new(source, storage)
         .latest(latest)
+        .previous(previous)
         .run()
         .await
         .unwrap()
@@ -363,7 +376,7 @@ pub(crate) async fn assert_round_trip(source: &Path) {
     let committed = run_backup(source, &blob).await;
     let destination = dir.path().join("restored");
 
-    run_restore(&blob, committed.snapshot, &destination).await;
+    run_restore(&blob, committed.snapshot(), &destination).await;
 
     assert_same_tree(source, &destination);
 }

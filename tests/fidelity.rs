@@ -130,7 +130,7 @@ async fn a_backup_root_that_is_a_symlink_to_a_directory_is_followed() {
 
     // And the version it produced is one a restore can actually use.
     let destination = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
     assert_eq!(fs::read(destination.join("f.txt")).unwrap(), b"payload");
 }
 
@@ -167,7 +167,7 @@ async fn restore_does_not_leave_trailing_bytes_from_a_previous_larger_file() {
     fs::create_dir_all(&destination).unwrap();
     fs::write(destination.join("shrunk"), vec![0xffu8; 10_000]).unwrap();
 
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
 
     assert_eq!(fs::read(destination.join("shrunk")).unwrap(), b"short");
 }
@@ -192,7 +192,7 @@ async fn a_restore_without_clean_leaves_a_stale_entry_in_place() {
     fs::create_dir_all(&destination).unwrap();
     fs::write(destination.join("stale"), b"left over").unwrap();
 
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
 
     // The version's own entry is written.
     assert_eq!(fs::read(destination.join("sub/file")).unwrap(), b"fresh");
@@ -273,7 +273,7 @@ async fn a_directory_holding_a_link_keeps_its_recorded_time() {
     let committed = common::run_backup(&source, &blob).await;
 
     let destination = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
 
     let restored = destination.join("holding");
     assert_eq!(
@@ -361,7 +361,7 @@ async fn the_setuid_bit_survives_a_restore_that_changes_the_owner() {
 
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
-    common::run_restore(&blob, committed.snapshot, &dir.path().join("restored")).await;
+    common::run_restore(&blob, committed.snapshot(), &dir.path().join("restored")).await;
 
     let restored = dir.path().join("restored/su");
     assert_eq!(
@@ -404,7 +404,7 @@ async fn an_owner_survives_a_restore() {
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
     let restored = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &restored).await;
+    common::run_restore(&blob, committed.snapshot(), &restored).await;
 
     assert_eq!(
         fs::metadata(restored.join("owned")).unwrap().uid(),
@@ -582,7 +582,7 @@ async fn a_file_keeps_its_user_xattrs() {
     let blob = dir.path().join("store.bin");
     let committed = common::run_backup(&source, &blob).await;
     let destination = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
 
     let restored = destination.join("noted");
     assert_eq!(
@@ -617,7 +617,7 @@ async fn a_dir_keeps_its_user_xattr() {
     let blob = dir.path().join("store.bin");
     let committed = common::run_backup(&source, &blob).await;
     let destination = dir.path().join("restored");
-    common::run_restore(&blob, committed.snapshot, &destination).await;
+    common::run_restore(&blob, committed.snapshot(), &destination).await;
 
     assert_eq!(
         xattr::get(destination.join("sub"), "user.blu-test").unwrap(),
@@ -649,7 +649,7 @@ async fn a_restore_of_recorded_xattrs_reports_no_misses() {
 
     let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let destination = dir.path().join("restored");
-    let restored = RestoreBuilder::new(&destination, committed.snapshot, store)
+    let restored = RestoreBuilder::new(&destination, committed.snapshot(), store)
         .run()
         .await
         .unwrap();

@@ -154,19 +154,32 @@ fn compressible_tree(dir: &Path, files: usize, size: usize) -> PathBuf {
 
 /// Back a tree up into a set at `blob`, and return the set.
 async fn backup(source: &Path, blob: &Path) -> blulib::storage::BlobId {
+    use blulib::command::{Previous, load_snapshot};
+
     let storage = BlobStore::builder(blob).open_writer().await.unwrap();
 
-    let latest: Option<Timestamp> = match storage.latest() {
+    let previous: Option<Previous> = match storage.latest() {
         None => None,
-        Some((version, _)) => storage.version_time(version).await.ok(),
+        Some((version, snapshot)) => {
+            load_snapshot(&storage, snapshot)
+                .await
+                .ok()
+                .map(|tree| Previous {
+                    version,
+                    snapshot,
+                    tree,
+                })
+        }
     };
+    let latest: Option<Timestamp> = previous.as_ref().map(|held| held.tree.taken_at);
 
     blulib::command::BackupBuilder::new(source, storage)
         .latest(latest)
+        .previous(previous)
         .run()
         .await
         .unwrap()
-        .snapshot
+        .snapshot()
 }
 
 /// Pack a set's latest version, into `at`, recorded as the pack's own version.
@@ -2557,12 +2570,21 @@ async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
     // Version 2: change one file, back up again, and push it too.
     fs::write(source.join("f0.bin"), common::noisy(60_000)).unwrap();
     let storage = BlobStore::builder(&blob).open_writer().await.unwrap();
-    let latest: Option<Timestamp> = match storage.latest() {
+    let previous: Option<blulib::command::Previous> = match storage.latest() {
         None => None,
-        Some((version, _)) => storage.version_time(version).await.ok(),
+        Some((version, snapshot)) => blulib::command::load_snapshot(&storage, snapshot)
+            .await
+            .ok()
+            .map(|tree| blulib::command::Previous {
+                version,
+                snapshot,
+                tree,
+            }),
     };
+    let latest: Option<Timestamp> = previous.as_ref().map(|held| held.tree.taken_at);
     blulib::command::BackupBuilder::new(&source, storage)
         .latest(latest)
+        .previous(previous)
         .run()
         .await
         .unwrap();
