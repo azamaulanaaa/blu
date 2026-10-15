@@ -153,7 +153,7 @@ use crate::storage::{
 /// Largest chunk the chunker can produce, and so the most a pack will decode into
 /// memory in one piece.
 ///
-/// `ronomon::MAXIMUM_MAX`, the ceiling `ChunkerConfig::validate` enforces on
+/// `simd_cdc::MAXIMUM_MAX`, the ceiling `ChunkerConfig::validate` enforces on
 /// `max_size`, which makes it the largest content any chunk in a set this crate
 /// wrote can have. The bound is on the *record's claim* rather than on anything
 /// measured. A pack is a file that was downloaded, so a frame that declares a
@@ -162,7 +162,7 @@ use crate::storage::{
 /// The largest chunk any named profile cuts is 256 KiB. That figure is tighter and
 /// more usual. It is not the one used here, because a caller may configure a
 /// chunker with a larger `max_size`. A pack of such a set has to remain readable.
-pub(crate) const MAX_CHUNK: u64 = fastcdc::ronomon::MAXIMUM_MAX as u64;
+pub(crate) const MAX_CHUNK: u64 = crate::simd_cdc::MAXIMUM_MAX as u64;
 
 /// Most chunks a pack's order can name, which is `u32::MAX`.
 ///

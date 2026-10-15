@@ -69,6 +69,7 @@ pub mod pack;
 pub mod progress;
 pub mod reader;
 pub mod serve;
+pub mod simd_cdc;
 pub mod slice;
 pub mod storage;
 pub mod telemetry;

@@ -246,13 +246,26 @@ async fn chunks_are_deduplicated_however_many_are_in_flight() {
     fs::write(source.join("one.bin"), common::noisy(70 * 1024)).unwrap();
     fs::write(source.join("two.bin"), common::noisy(70 * 1024)).unwrap();
 
-    let serial = count_at(&dir.path().join("serial.bin"), &source, 1).await;
+    let serial_blob = dir.path().join("serial.bin");
+    let committed = common::run_backup_with(
+        &source,
+        &serial_blob,
+        Options {
+            concurrency: 1,
+            ..Options::default()
+        },
+    )
+    .await;
+    let snap = snapshot(&serial_blob, &committed.snapshot).await;
+    let serial = snap.chunks.len();
 
-    // The eight identical files must have become one chunk, not eight.
-    assert!(
-        serial < 8,
-        "eight identical files produced {serial} stored chunks, so they were not \
-         deduplicated at all"
+    // The eight identical files share one stored chunk.
+    // The count below covers the noisy files too, and cut positions move it.
+    let constant = blake3::hash(&shared);
+    assert_eq!(
+        snap.chunks.iter().filter(|hash| *hash == &constant).count(),
+        1,
+        "eight identical files did not collapse to one stored chunk"
     );
 
     for concurrency in [2, 4, 8, 16, 32] {

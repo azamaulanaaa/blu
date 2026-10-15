@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 
-use fastcdc::{ronomon, v2020::StreamCDC};
+use crate::simd_cdc::{self, SimdStream};
 use tracing::instrument;
 
 /// The part of one file that a chunk covers.
@@ -234,17 +234,17 @@ impl Default for ChunkerConfig {
 }
 
 impl ChunkerConfig {
-    /// Check these parameters are ones fastcdc will actually chunk with.
+    /// Check these parameters are ones the chunker will actually chunk with.
     ///
-    /// fastcdc asserts its own bounds with `debug_assert!`, so they are **gone
-    /// from a release build**. A value it would refuse then reaches the chunker.
+    /// `SimdStream` trusts its sizes, so they are **unchecked past this
+    /// point**. A value it cannot cut with then reaches the chunker.
     /// It produces chunks of a nonsense shape rather than an error. Validating here
     /// is what makes a bad configuration a message instead of a corrupt backup.
     ///
     /// # Errors
     ///
     /// Returns an error naming the bound that was not met. It names a bound of
-    /// fastcdc's own limits, or the ordering the three sizes must satisfy.
+    /// the chunker's own limits, or the ordering the three sizes must satisfy.
     pub fn validate(&self) -> io::Result<()> {
         let (min, avg, max) = (
             usize::try_from(self.min_size).unwrap_or(usize::MAX),
@@ -253,9 +253,24 @@ impl ChunkerConfig {
         );
 
         let bounds = [
-            ("min_size", min, ronomon::MINIMUM_MIN, ronomon::MINIMUM_MAX),
-            ("avg_size", avg, ronomon::AVERAGE_MIN, ronomon::AVERAGE_MAX),
-            ("max_size", max, ronomon::MAXIMUM_MIN, ronomon::MAXIMUM_MAX),
+            (
+                "min_size",
+                min,
+                simd_cdc::MINIMUM_MIN,
+                simd_cdc::MINIMUM_MAX,
+            ),
+            (
+                "avg_size",
+                avg,
+                simd_cdc::AVERAGE_MIN,
+                simd_cdc::AVERAGE_MAX,
+            ),
+            (
+                "max_size",
+                max,
+                simd_cdc::MAXIMUM_MIN,
+                simd_cdc::MAXIMUM_MAX,
+            ),
         ];
 
         for (name, value, lowest, highest) in bounds {
@@ -270,17 +285,18 @@ impl ChunkerConfig {
             }
         }
 
-        // The ordering is not fastcdc's assertion but its algorithm's. A boundary
-        // is only looked for above `min`, and `avg` sets the masks the gear
-        // table is indexed with. So `avg <= min` chunks at `min` every time, and
-        // `max < avg` can never reach the forced boundary. Both are silent, so
-        // both are refused.
+        // The ordering is not the stream's assertion but its algorithm's. The
+        // strict mask runs below `avg` and the skip region runs below `min`.
+        // An `avg` at or below `min` inverts the two: the strict region ends
+        // before skipping does. Cuts stop meaning what the sizes say, and
+        // `max` at or below `avg` never reaches the forced boundary. Both are
+        // silent, so both are refused.
         if self.avg_size <= self.min_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "avg_size ({}) must be greater than min_size ({}), or every chunk comes out \
-                     the same length",
+                    "avg_size ({}) must be greater than min_size ({}), or the masks cannot pull \
+                     cuts toward the average",
                     self.avg_size, self.min_size
                 ),
             ));
@@ -360,8 +376,8 @@ impl ChunkerProfile {
     /// The chunker parameters this profile stands for.
     ///
     /// Each one validates. A profile that did not would be a bad backup rather
-    /// than an error, because `fastcdc` asserts its bounds with `debug_assert!`. A
-    /// release build does not contain them.
+    /// than an error, because the stream trusts its sizes. Nothing past
+    /// `validate` checks them.
     #[must_use]
     pub fn config(self) -> ChunkerConfig {
         match self {
@@ -431,12 +447,12 @@ impl std::str::FromStr for ChunkerProfile {
 /// the file slices it covers.
 pub struct Chunker {
     registry: Arc<FileRegistry>,
-    cdc_iter: StreamCDC<GlobalStream>,
+    cdc_iter: SimdStream<GlobalStream>,
 }
 
 impl Debug for Chunker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `StreamCDC` is not `Debug`.
+        // `SimdStream` omits user bytes from `Debug`.
         f.debug_struct("Chunker")
             .field("files", &self.registry.entries.len())
             .finish_non_exhaustive()
@@ -446,13 +462,16 @@ impl Debug for Chunker {
 impl Chunker {
     /// Chunk `paths` according to `config`.
     ///
+    /// The scan runs SIMD Gear hashing. Cuts differ from the `fastcdc` cuts
+    /// of older releases. Old chunks still restore. New backups share less
+    /// data with old ones.
+    ///
     /// # Errors
     ///
     /// Returns an error if any file cannot be stat'ed while being registered, or
     /// if `config` is not one the chunker can chunk with. The second check is
     /// here rather than at the call site because it is the last point before the
-    /// parameters stop being checked at all. `fastcdc` asserts its bounds with
-    /// `debug_assert!`, which a release build does not contain.
+    /// parameters stop being checked at all. The stream trusts its sizes.
     #[instrument(level = "trace", skip(paths, config), err)]
     pub fn new(paths: Vec<PathBuf>, config: ChunkerConfig) -> io::Result<Self> {
         config.validate()?;
@@ -465,7 +484,7 @@ impl Chunker {
         let widen = |value: u32| usize::try_from(value).unwrap_or(usize::MAX);
 
         let stream = GlobalStream::new(paths.iter());
-        let cdc = StreamCDC::new(
+        let cdc = SimdStream::new(
             stream,
             widen(config.min_size),
             widen(config.avg_size),
@@ -532,7 +551,7 @@ mod tests {
         assert!(good().validate().is_ok());
     }
 
-    /// Sizes below fastcdc's own floor are refused.
+    /// Sizes below the chunker floor are refused.
     #[test]
     fn a_min_size_below_the_floor_is_refused() {
         let config = ChunkerConfig {
@@ -561,9 +580,8 @@ mod tests {
         );
     }
 
-    /// `avg <= min` is silent in fastcdc, because every chunk comes out at `min`.
-    /// It is therefore refused rather than left to produce a uniform-chunked
-    /// backup.
+    /// `avg <= min` inverts the masks.
+    /// The stream stays silent, so validation refuses it.
     #[test]
     fn an_avg_at_or_below_min_is_refused() {
         let config = ChunkerConfig {
@@ -597,9 +615,8 @@ mod tests {
     /// Every profile the command line offers is one the chunker can chunk with.
     ///
     /// Checked here rather than trusted, because a profile is a set of numbers
-    /// typed into a match arm. Fastcdc's bounds are `debug_assert!`s, and a
-    /// release build does not contain them. One out of range would be a bad
-    /// backup rather than a message. [`ChunkerProfile::ALL`] is what `--help` and
+    /// typed into a match arm. The stream trusts its sizes, so one out of
+    /// range would be a bad backup rather than a message. [`ChunkerProfile::ALL`] is what `--help` and
     /// the parse error list, so anything not in it cannot be named at all.
     #[test]
     fn every_profile_is_a_configuration_the_chunker_accepts() {
