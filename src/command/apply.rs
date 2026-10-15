@@ -470,7 +470,7 @@ fn would_write(
 /// Whether an owner can be set is only knowable by setting it.
 /// Every entry that would be tried is named here before any of them is.
 ///
-/// Shared with [`super::restore::restore_plan`], which reports the same bound for
+/// Shared with [`RestorePlanBuilder`](super::restore::RestorePlanBuilder), which reports the same bound for
 /// the same reason.
 /// A restore that did not set the owner is not a failure.
 /// A plan that could not report it would leave the figure out of the one run that

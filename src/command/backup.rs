@@ -89,20 +89,20 @@ pub struct Committed {
 ///
 /// **Every figure here comes from the run a real backup would have made.**
 /// It is not a second walk and an estimate beside it.
-/// [`backup_plan`] drives the same walk, the same chunker and the same
-/// deduplication map as [`backup`].
+/// [`BackupPlanBuilder`] drives the same walk, the same chunker and the same
+/// deduplication map as [`BackupBuilder`].
 /// It uses a store that answers what it is asked and keeps none of it.
 /// A plan that says two chunks are new describes a set that will grow by exactly
 /// those two chunks.
 /// A plan that says none are new describes a set that will not grow at all.
 ///
-/// The dry run is a separate entry point rather than a field on [`Options`], and
+/// The plan is a separate builder rather than a flag on [`BackupBuilder`], and
 /// the reason is the return type.
-/// `backup` answers with a [`Committed`], whose version number is chosen by the
+/// [`BackupBuilder`] answers with a [`Committed`], whose version number is chosen by the
 /// store at the moment it commits.
 /// A run that writes nothing never reaches a commit, so there is no version for
 /// it to report.
-/// Asking one function for either answer means either making that field a lie or
+/// Asking one builder for either answer means either making that field a lie or
 /// inventing a report type a caller has to unwrap.
 /// The plan is worth having in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -57,3 +57,47 @@ async fn round_trip_reproduces_a_file_larger_than_the_chunk_maximum() {
 
     assert_round_trip(&source).await;
 }
+
+/// The restore builder writes a path selection and skips the rest.
+///
+/// The plan names the selected file only. The run writes that file.
+/// The unselected file stays absent from the destination.
+#[tokio::test]
+async fn restore_builder_writes_the_selected_paths_only() {
+    use blulib::{
+        command::{RestoreBuilder, RestorePlanBuilder},
+        storage::BlobStore,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("keep.bin"), noisy(50_000)).unwrap();
+    fs::write(source.join("skip.bin"), noisy(50_000)).unwrap();
+
+    let blob = dir.path().join("store.bin");
+    let committed = common::run_backup(&source, &blob).await;
+
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    let plan = RestorePlanBuilder::new(committed.snapshot, store)
+        .files(["keep.bin"])
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(plan.files, 1, "the plan covers the selection only");
+
+    let destination = dir.path().join("restored");
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    RestoreBuilder::new(&destination, committed.snapshot, store)
+        .files(["keep.bin"])
+        .run()
+        .await
+        .unwrap();
+    assert!(
+        destination.join("keep.bin").exists(),
+        "the selected file lands"
+    );
+    assert!(
+        !destination.join("skip.bin").exists(),
+        "the unselected file stays absent"
+    );
+}

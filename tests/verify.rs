@@ -7,7 +7,7 @@ mod common;
 use std::fs;
 
 use blulib::{
-    command::{Reason, Report, restore, verify},
+    command::{Reason, Report, verify},
     layout::IndexSet,
     storage::{BlobId, BlobStore},
 };
@@ -128,7 +128,8 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
 
     let destination = dir.path().join("restored");
     let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let error = restore(&destination, committed.snapshot, storage)
+    let error = blulib::command::RestoreBuilder::new(&destination, committed.snapshot, storage)
+        .run()
         .await
         .unwrap_err();
 

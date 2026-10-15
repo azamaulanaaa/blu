@@ -30,8 +30,8 @@ pub use merge::{
 pub use pack::{Base, Options as PackOptions, Packed, Version, pack};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{
-    DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestorePlan, Restored, lock_destination,
-    restore, restore_filtered, restore_plan, restore_plan_filtered,
+    DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestoreBuilder, RestorePlan,
+    RestorePlanBuilder, Restored, lock_destination,
 };
 pub use verify::{Failure, Reason, Report, verify};
 

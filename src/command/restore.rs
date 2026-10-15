@@ -84,51 +84,135 @@ pub struct RestorePlan {
     pub unowned: u64,
 }
 
-/// Reassemble the snapshot identified by `key` under `root`.
+/// Reassemble a snapshot under a destination.
 ///
-/// Restoration runs in four phases so that ordering constraints hold:
+/// Start with [`RestoreBuilder::new`]. Select paths with `files`.
+/// Call `run` to write. Call `plan` through the plan builder to preview.
 ///
-/// 1. directories, so that every parent exists.
-/// 2. regular files, created at their final length before any content is written.
-///    This makes empty files and hard link targets exist.
-/// 3. links, which may only be created once their targets do.
-/// 4. attributes, last, because writing into a directory updates its
-///    modification time.
+/// A restore merges by default. It writes snapshot files and leaves the rest.
+/// The destination may hold more than the snapshot records when the run ends.
 ///
-/// # Errors
-///
-/// Returns an error if the snapshot cannot be read or decoded. It returns an
-/// error if the snapshot refers to a file or chunk it does not contain. It
-/// returns an error if the tree cannot be written.
-#[instrument(level = "info", skip(storage, root), err)]
-pub async fn restore<P: AsRef<Path>, S: storage::StorageGet + 'static>(
-    root: P,
+/// The run checks every chunk before writing one byte.
+/// A damaged chunk refuses the whole run. Nothing is half written.
+#[derive(Debug)]
+pub struct RestoreBuilder<S> {
+    root: PathBuf,
     snapshot_id: storage::BlobId,
-    storage: S,
-) -> io::Result<Restored> {
-    restore_filtered(root, snapshot_id, storage, &[]).await
+    store: S,
+    files: Vec<PathBuf>,
 }
 
-/// Reassemble only the `--files` selection of the snapshot under `root`.
+impl<S: storage::StorageGet + 'static> RestoreBuilder<S> {
+    /// Start a restore of `snapshot_id` under `root` from `store`.
+    ///
+    /// The builder restores the whole snapshot. Select less with `files`.
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>, snapshot_id: storage::BlobId, store: S) -> Self {
+        Self {
+            root: root.into(),
+            snapshot_id,
+            store,
+            files: Vec::new(),
+        }
+    }
+
+    /// Restore only these paths.
+    ///
+    /// Empty means the whole snapshot. Parents are built as scaffolding.
+    /// Everything else stays alone.
+    #[must_use]
+    pub fn files<I, P>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.files.extend(files.into_iter().map(Into::into));
+        self
+    }
+
+    /// Reassemble the snapshot under the destination.
+    ///
+    /// Restoration runs in four phases. Directories land first so parents exist.
+    /// Files land next at their final length. Links land after their targets.
+    /// Attributes land last so link creation cannot move directory times.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot cannot be read or decoded.
+    /// Returns an error when the snapshot names a missing file or chunk.
+    /// Returns an error when the tree cannot be written.
+    /// Returns an error when a `--files` value is empty, absolute, or holds `..`.
+    #[instrument(level = "info", skip(self), err)]
+    pub async fn run(self) -> io::Result<Restored> {
+        run_restore(self.root, self.snapshot_id, self.store, &self.files).await
+    }
+}
+
+/// Work out what a restore would write, and write nothing.
 ///
-/// The same four phases [`restore`] runs, over the view [`Filter::select`]
-/// returns: the matched entries, the ancestors they need above them, and the
-/// recorded files a kept hard link shares with. Parent directories are created
-/// and attributed as scaffolding. Everything else in the destination is left
-/// alone. The figures report the selection.
+/// Start with [`RestorePlanBuilder::new`]. Select paths with `files`.
+/// Call `run` to work out the figures.
 ///
-/// Chunk verification covers the selection too: every byte written is checked,
-/// and chunks nothing selected needs are not read.
-///
-/// # Errors
-///
-/// As [`restore`], and if a `--files` value is empty, absolute, or holds `..`.
-#[instrument(level = "info", skip(storage, root, files), err)]
-pub async fn restore_filtered<P: AsRef<Path>, S: storage::StorageGet + 'static>(
-    root: P,
+/// The plan reads the whole version and hashes it. That is most of a restore.
+/// A dry run saves the writes, not the reading.
+/// A plan that succeeds describes a restore that would succeed.
+#[derive(Debug)]
+pub struct RestorePlanBuilder<S> {
+    snapshot_id: storage::BlobId,
+    store: S,
+    files: Vec<PathBuf>,
+}
+
+impl<S: storage::StorageGet + 'static> RestorePlanBuilder<S> {
+    /// Start a plan for `snapshot_id` from `store`.
+    ///
+    /// The builder plans the whole snapshot. Select less with `files`.
+    #[must_use]
+    pub fn new(snapshot_id: storage::BlobId, store: S) -> Self {
+        Self {
+            snapshot_id,
+            store,
+            files: Vec::new(),
+        }
+    }
+
+    /// Plan only these paths.
+    ///
+    /// Empty means the whole snapshot. The figures describe the selection.
+    #[must_use]
+    pub fn files<I, P>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.files.extend(files.into_iter().map(Into::into));
+        self
+    }
+
+    /// Work out the figures and write nothing.
+    ///
+    /// A plan refuses what a restore refuses. A chunk that does not verify
+    /// refuses the plan. A path that escapes the destination refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot cannot be read or decoded.
+    /// Returns an error when a chunk does not verify.
+    /// Returns an error when a path would land outside the destination.
+    /// Returns an error when a recorded length mismatches its own slices.
+    /// Returns an error when a `--files` value is empty, absolute, or holds `..`.
+    #[instrument(level = "info", skip(self), err)]
+    pub async fn run(self) -> io::Result<RestorePlan> {
+        run_restore_plan(self.snapshot_id, self.store, &self.files).await
+    }
+}
+
+/// Reassemble the snapshot under `root`, limited to `files`.
+async fn run_restore<S: storage::StorageGet + 'static>(
+    root: PathBuf,
     snapshot_id: storage::BlobId,
     storage: S,
-    files: &[std::path::PathBuf],
+    files: &[PathBuf],
 ) -> io::Result<Restored> {
     // Shared, not copied: the write tasks need owned data, and a clone of the
     // chunk table would be one allocation per chunk in the store.
@@ -142,7 +226,7 @@ pub async fn restore_filtered<P: AsRef<Path>, S: storage::StorageGet + 'static>(
         Arc::new(filter.select(&full))
     };
 
-    let root = root.as_ref();
+    let root = root.as_path();
     let storage = Arc::new(storage);
 
     // Nothing below can detect damaged chunk data on its own. A short read would
@@ -231,55 +315,11 @@ pub async fn restore_filtered<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     })
 }
 
-/// Work out what restoring `snapshot_id` would write, and write none of it.
-///
-/// Everything a real restore does before its first byte, and nothing after:
-///
-/// 1. the version is read out of the store and decoded.
-/// 2. Its chunks are read back and checked against the hashes that address them.
-/// 3. Its recorded paths are resolved.
-///
-/// A plan refuses exactly what a restore refuses. It refuses a version whose
-/// chunks do not verify. It refuses one that records a path escaping the
-/// destination. A plan that succeeds is a restore that would have.
-///
-/// It costs what it costs: the whole version is read and hashed, which is most of
-/// a restore's work. A dry run saves the writes, not the reading.
-///
-/// A separate entry point rather than a field on the options a restore takes.
-/// [`super::backup_plan`] gives the reason. `restore` answers with a [`Restored`],
-/// and every figure in that describes work that happened. No code can return that
-/// from a run that wrote nothing without the field being a lie. A plan worth
-/// having is worth having in full.
-///
-/// # Errors
-///
-/// As [`restore`], and for the same reasons:
-///
-/// * the snapshot cannot be read or decoded.
-/// * a chunk does not verify.
-/// * a path would land outside the destination.
-/// * a recorded length does not match its own slices.
-pub async fn restore_plan<S: storage::StorageGet + 'static>(
+/// Work out the figures a restore would report, and write nothing.
+async fn run_restore_plan<S: storage::StorageGet + 'static>(
     snapshot_id: storage::BlobId,
     storage: S,
-) -> io::Result<RestorePlan> {
-    restore_plan_filtered(snapshot_id, storage, &[]).await
-}
-
-/// Work out what restoring a `--files` selection would write, and write none of it.
-///
-/// The same checks [`restore_plan`] runs, over the same view
-/// [`restore_filtered`] restores. The figures describe the selection.
-///
-/// # Errors
-///
-/// As [`restore_plan`], and if a `--files` value is empty, absolute, or holds
-/// `..`.
-pub async fn restore_plan_filtered<S: storage::StorageGet + 'static>(
-    snapshot_id: storage::BlobId,
-    storage: S,
-    files: &[std::path::PathBuf],
+    files: &[PathBuf],
 ) -> io::Result<RestorePlan> {
     let full = super::load_snapshot(&storage, snapshot_id).await?;
     let snapshot = if files.is_empty() {

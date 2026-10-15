@@ -2036,7 +2036,8 @@ async fn a_push_then_a_pull_round_trips_into_a_second_set() {
     let restored = dir.path().join("restored");
     let store = BlobStore::builder(&mirror).open_reader().await.unwrap();
     let snapshot = store.snapshot_via_index(1).unwrap();
-    blulib::command::restore(&restored, snapshot, store)
+    blulib::command::RestoreBuilder::new(&restored, snapshot, store)
+        .run()
         .await
         .unwrap();
 

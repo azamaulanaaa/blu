@@ -23,7 +23,7 @@ use std::{
 };
 
 use blulib::{
-    command::restore,
+    command::RestoreBuilder,
     metadata::{Attributes, Dir, File, FileChunk, Link, Snapshot, Timestamp},
     storage::{BlobId, BlobStore, StoragePut},
 };
@@ -86,7 +86,10 @@ impl Forged {
     /// Restore into `dest`, and report the error if it refused.
     async fn restore_into(&self, dest: &Path) -> Result<(), String> {
         let storage = BlobStore::builder(&self.blob).open_reader().await.unwrap();
-        match restore(dest, self.snapshot, storage).await {
+        match RestoreBuilder::new(dest, self.snapshot, storage)
+            .run()
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => Err(e.to_string()),
         }

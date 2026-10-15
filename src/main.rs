@@ -7,9 +7,8 @@ use std::process::ExitCode;
 use blulib::{
     command::{
         ApplyOptions, BackupBuilder, BackupPlan, BackupPlanBuilder, MergePlan, Merged,
-        PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Planned, RestorePlan, apply, load_snapshot,
-        lock_destination, merge, merge_plan, restore, restore_filtered, restore_plan_filtered,
-        verify, version_holding,
+        PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Planned, RestoreBuilder, RestorePlan, RestorePlanBuilder,
+        apply, load_snapshot, lock_destination, merge, merge_plan, verify, version_holding,
     },
     layout::IndexSet,
     metadata::Timestamp,
@@ -2554,7 +2553,10 @@ async fn run_restore(
             version,
             destination,
             clean,
-            restore_plan_filtered(snapshot, store, files).await?,
+            RestorePlanBuilder::new(snapshot, store)
+                .files(files)
+                .run()
+                .await?,
         );
     }
 
@@ -2565,7 +2567,10 @@ async fn run_restore(
     if clean {
         restore_atomically(&claim, snapshot, store).await?;
     } else {
-        let restored = restore_filtered(destination, snapshot, store, files).await?;
+        let restored = RestoreBuilder::new(destination, snapshot, store)
+            .files(files)
+            .run()
+            .await?;
         report_restored(&restored);
 
         // A merging restore cannot say which extra files are there. The snapshot
@@ -2616,7 +2621,7 @@ async fn restore_atomically<S: storage::StorageGet + 'static>(
         }
     }
 
-    let restored = match restore(&partial, snapshot, store).await {
+    let restored = match RestoreBuilder::new(&partial, snapshot, store).run().await {
         Ok(restored) => restored,
         Err(e) => {
             // The destination was never touched, so there is nothing to put back.

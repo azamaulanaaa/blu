@@ -28,7 +28,7 @@ pub(crate) mod http;
 pub(crate) mod server;
 
 use blulib::{
-    command::{BackupBuilder, Committed, Options, restore},
+    command::{BackupBuilder, Committed, Options, RestoreBuilder},
     layout::IndexSet,
     storage::{BlobId, BlobStore, SegmentLimit, StreamReadSeeker},
 };
@@ -271,7 +271,10 @@ pub(crate) async fn run_backup_limited(
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
 pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Path) {
     let storage = BlobStore::builder(blob).open_reader().await.unwrap();
-    restore(destination, snapshot, storage).await.unwrap();
+    RestoreBuilder::new(destination, snapshot, storage)
+        .run()
+        .await
+        .unwrap();
 }
 
 /// Back up `source` into a store with a given compression policy.
@@ -301,7 +304,10 @@ pub(crate) async fn run_backup_compressed(
 pub(crate) async fn run_restore_version(blob: &Path, destination: &Path, version: u32) {
     let storage = BlobStore::builder(blob).open_reader().await.unwrap();
     let snapshot = storage.snapshot(version).unwrap();
-    restore(destination, snapshot, storage).await.unwrap();
+    RestoreBuilder::new(destination, snapshot, storage)
+        .run()
+        .await
+        .unwrap();
 }
 
 /// Assert that two trees are identical, naming every difference.

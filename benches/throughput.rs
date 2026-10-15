@@ -66,7 +66,7 @@ use std::{
 };
 
 use blulib::{
-    command::{BackupBuilder, Options, restore},
+    command::{BackupBuilder, Options, RestoreBuilder},
     layout::IndexSet,
     storage::BlobStore,
 };
@@ -206,7 +206,8 @@ fn bench_restore(c: &mut Criterion) {
                         .expect("store");
 
                     let started = Instant::now();
-                    restore(&destination, committed.snapshot, storage)
+                    RestoreBuilder::new(&destination, committed.snapshot, storage)
+                        .run()
                         .await
                         .expect("restore");
                     elapsed += started.elapsed();
@@ -250,7 +251,8 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
             .open_reader()
             .await
             .expect("store");
-        restore(&out, committed.snapshot, storage)
+        RestoreBuilder::new(&out, committed.snapshot, storage)
+            .run()
             .await
             .expect("restore");
     });

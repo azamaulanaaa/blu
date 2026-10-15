@@ -33,7 +33,7 @@
 //! ```no_run
 //! # async fn example() -> std::io::Result<()> {
 //! use blulib::{
-//!     command::{BackupBuilder, lock_destination, restore},
+//!     command::{BackupBuilder, RestoreBuilder, lock_destination},
 //!     storage::BlobStore,
 //! };
 //!
@@ -51,7 +51,9 @@
 //!
 //! // A read-only open takes no policies. A read never rolls over.
 //! let store = BlobStore::builder("photos").open_reader().await?;
-//! restore("~/Pictures-restored", first.snapshot, store).await?;
+//! RestoreBuilder::new("~/Pictures-restored", first.snapshot, store)
+//!     .run()
+//!     .await?;
 //! # Ok(())
 //! # }
 //! ```
