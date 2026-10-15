@@ -59,18 +59,15 @@ struct Args {
     /// Where it goes is the exporter's standard resolution:
     /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` first, then
     /// `OTEL_EXPORTER_OTLP_ENDPOINT` with `/v1/traces` (or `/v1/metrics`)
-    /// appended, then `http://localhost:4318`. **Only the base
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` switches telemetry on**; the per-signal
-    /// variables point an exporter somewhere and are read by nothing until
-    /// something has already turned it on.
+    /// appended, then `http://localhost:4318`. Only the base
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` switches telemetry on.
+    /// The per-signal variables point an exporter somewhere.
+    /// Nothing reads them until something has turned telemetry on.
     ///
-    /// **This build has no TLS backend unless it was compiled with
-    /// `--features telemetry-tls`.** Without it, an `https://` endpoint fails to
-    /// connect rather than being downgraded — the same refusal
-    /// `versions` of an `https://` serve target makes. That matches `blu serve`, which offers no
-    /// TLS either: a telemetry backend is expected to sit on the same trust
-    /// boundary as the thing it is describing. A build that does speak `https`
-    /// reads the operating system's trust store, not one compiled in.
+    /// The exporter speaks plain HTTP and verified HTTPS.
+    /// It verifies HTTPS against the system roots.
+    /// It never downgrades HTTPS before plain HTTP.
+    /// `blu serve` offers plain HTTP only.
     #[arg(long)]
     telemetry: bool,
 }
@@ -118,7 +115,7 @@ enum Command {
         pack: std::path::PathBuf,
         /// The backup set to merge into: a local path (`photos`), a serve
         /// set (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy.
+        /// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). Remote targets hold no local copy.
         target: String,
         /// How each chunk the pack carries is stored. `keep` (the default) writes the stored
         /// form the pack already has. `0` writes the content as it is. 1 to 9 decode and store
@@ -178,8 +175,8 @@ enum Command {
     /// They are a cache: nothing is lost if they are missing or wrong.
     Reindex {
         /// The backup set to rebuild: a local path (`photos`) or a keyed
-        /// store (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`), pulled into staging first and
-        /// pushed back afterwards. An `http://` target is refused: the index
+        /// store (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots), pulled into staging first and
+        /// pushed back afterwards. An `http://` or `https://` target fails: the index
         /// lives on the server, where no endpoint rebuilds it.
         target: String,
         /// Say how many index files would be written, and write none of them.
@@ -218,7 +215,7 @@ enum Command {
     Versions {
         /// The backup set to inspect: a local path (`photos`), a serve set
         /// (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy.
+        /// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). Remote targets hold no local copy.
         target: String,
         /// Print just the version numbers, one per line, and nothing else.
         ///
@@ -295,7 +292,7 @@ enum Command {
         destination: std::path::PathBuf,
         /// The backup set to restore from: a local path (`photos`), a serve
         /// set (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy:
+        /// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). Remote targets hold no local copy:
         /// an `http://` restore fetches a pack over the socket and applies
         /// it, and a `file://` restore pulls into staging first. Reads never
         /// push back.
@@ -345,7 +342,7 @@ enum Command {
     /// Verify a snapshot's stored chunks against their recorded hashes.
     Verify {
         /// The backup set to verify: a local path (`photos`) or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). An `http://` target is refused: the
+        /// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). An `http://` or `https://` target fails: the
         /// server exposes versions and packs, not chunk verification.
         target: String,
         /// Version to verify, defaulting to the most recent usable one.
@@ -388,7 +385,7 @@ enum Command {
     Pack {
         /// The backup set to pack from: a local path (`photos`), a serve set
         /// (`http://127.0.0.1:8480/docs`), or a keyed store
-        /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy:
+        /// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). Remote targets hold no local copy:
         /// a `file://` set is pulled into staging first, and an `http://`
         /// set is packed on the server and fetched.
         target: String,
@@ -933,7 +930,7 @@ struct BackupArgs {
     /// The backup set to write: a local path (`photos`, creating
     /// `photos.0000.bin` and `photos.lock`), a serve set
     /// (`http://127.0.0.1:8480/docs`), or a keyed store
-    /// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Remote targets hold no local copy: a
+    /// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). Remote targets hold no local copy: a
     /// `file://` set is pulled into staging, backed up there, and pushed
     /// back, and an `http://` set is backed up into temporary staging,
     /// packed, and merged on the server.
@@ -1158,7 +1155,7 @@ async fn dispatch_restore(
 
 /// Run `verify` against a local path or a keyed store.
 ///
-/// An `http://` target is refused: the server exposes versions and packs,
+/// An `http://` or `https://` target fails: the server exposes versions and packs,
 /// not chunk verification, so there is nothing here to check one against.
 async fn dispatch_verify(target: Target, version: Option<u32>) -> std::io::Result<()> {
     match target {
@@ -1230,7 +1227,7 @@ async fn dispatch_merge_command(
 
 /// Run `reindex` against a local path or a keyed store.
 ///
-/// An `http://` target is refused: the index lives on the server, where no
+/// An `http://` or `https://` target fails: the index lives on the server, where no
 /// endpoint rebuilds it.
 async fn dispatch_reindex(target: Target, dry_run: bool) -> std::io::Result<()> {
     match target {
@@ -2898,12 +2895,13 @@ fn report_pack(
 
 /// The set a command works on, and where it lives.
 ///
-/// One `TARGET`: a local path (`photos`), a serve set
-/// (`http://127.0.0.1:8480/docs`), or a keyed store
-/// (`file:///mnt/drive/docs`; `file://` in every build, other schemes need `--features remote`, `https://` needs `remote-tls`). Anything holding `://` is a remote address
-/// and anything else is a path on this machine. Remote targets hold no local
-/// copy: a store target works in staging and an `http://` target works on
-/// the server.
+/// One `TARGET` names a local path (`photos`), a serve set
+/// (`http://127.0.0.1:8480/docs` or `https://example.test/docs`), or a keyed store
+/// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). Anything holding `://` is a remote address.
+/// Anything else is a path on this machine.
+/// Remote targets hold no local copy.
+/// A store target works in staging.
+/// An `http://` or `https://` target works on the server.
 #[derive(Debug)]
 enum Target {
     /// A path on this machine.
@@ -2919,13 +2917,15 @@ enum Target {
     Store(StoreTarget),
 }
 
-/// Resolve one `TARGET` into where the set lives, or say why not.
+/// Resolve one `TARGET` into where the set lives.
 ///
-/// `http://` targets split into server and set; every other `://` target
-/// splits into store and set. `--staging` selects the staging directory for
-/// a store target and is refused otherwise: without a store there is no copy
-/// to stage, and an `http://` backup stages in a temporary directory that is
-/// removed afterwards.
+/// `http://` and `https://` targets split into server and set.
+/// Every other `://` target splits into store and set.
+/// `--staging` selects the staging directory for a store target.
+/// It fails otherwise.
+/// Without a store there is no copy to stage.
+/// An `http://` or `https://` backup stages in a temp directory.
+/// The runner removes the temp directory afterwards.
 fn resolve_target(
     command: &str,
     raw: &str,
@@ -2937,8 +2937,7 @@ fn resolve_target(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "`blu {command} --staging` needs a store target: an `http://` \
-                         target works on the server and stages nothing here"
+                        "`blu {command} --staging` needs a store target. An `http://` or `https://` target works on the server and stages nothing here"
                     ),
                 ));
             }
@@ -2961,20 +2960,19 @@ fn resolve_target(
     if staging.is_some() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "`blu {command} --staging` needs a store target: a local path stages \
-                 nothing, so there is no copy to select a directory for"
-            ),
+            format!("`blu {command} --staging` needs a store target. A local path stages nothing"),
         ));
     }
     Ok(Target::Local(std::path::PathBuf::from(raw)))
 }
 
-/// A set held by a keyed store, and the staging copy this machine works on.
+/// A set held by a keyed store, and the staging copy.
 ///
-/// Resolution only. The staged runners pull into staging, run the local
-/// command there, and push back after a write. Nothing else reads these
-/// fields.
+/// Resolution only.
+/// Staged runners pull into staging.
+/// They run the local command there.
+/// They push back after a write.
+/// Nothing else reads these fields.
 #[derive(Debug)]
 struct StoreTarget {
     /// The store holding the set, without the set.
@@ -2985,16 +2983,15 @@ struct StoreTarget {
     staging: std::path::PathBuf,
 }
 
-/// A connected keyed store: local or through the operator.
+/// A connected keyed store.
 ///
-/// One type because the staged runners are generic over one backend. The
-/// local arm works in every build. The operator arm exists behind
-/// `--features remote` only.
+/// One type holds both backends because staged runners are generic.
+/// The local arm holds a directory.
+/// The remote arm holds a network operator.
 enum StoreBackend {
-    /// A local directory, through `file://`.
+    /// A local directory through `file://`.
     Local(storage::LocalDirStore),
     /// An operator over the network.
-    #[cfg(feature = "remote")]
     Remote(opendal::Operator),
 }
 
@@ -3002,7 +2999,6 @@ impl storage::AsyncObjectStore for StoreBackend {
     async fn keys(&self) -> std::io::Result<Vec<String>> {
         match self {
             Self::Local(backend) => backend.keys().await,
-            #[cfg(feature = "remote")]
             Self::Remote(operator) => operator.keys().await,
         }
     }
@@ -3010,9 +3006,8 @@ impl storage::AsyncObjectStore for StoreBackend {
     async fn stat(&self, key: &str) -> std::io::Result<Option<u64>> {
         match self {
             Self::Local(backend) => backend.stat(key).await,
-            // Fully qualified: `Operator` already has an inherent `stat`
-            // returning metadata, and method resolution prefers it.
-            #[cfg(feature = "remote")]
+            // Fully qualified because `Operator` holds an inherent `stat`.
+            // Method resolution prefers the inherent one.
             Self::Remote(operator) => storage::AsyncObjectStore::stat(operator, key).await,
         }
     }
@@ -3020,7 +3015,6 @@ impl storage::AsyncObjectStore for StoreBackend {
     async fn read_range(&self, key: &str, offset: u64, len: u64) -> std::io::Result<Vec<u8>> {
         match self {
             Self::Local(backend) => backend.read_range(key, offset, len).await,
-            #[cfg(feature = "remote")]
             Self::Remote(operator) => operator.read_range(key, offset, len).await,
         }
     }
@@ -3028,7 +3022,6 @@ impl storage::AsyncObjectStore for StoreBackend {
     async fn write_bytes(&self, key: &str, data: &[u8]) -> std::io::Result<()> {
         match self {
             Self::Local(backend) => backend.write_bytes(key, data).await,
-            #[cfg(feature = "remote")]
             Self::Remote(operator) => operator.write_bytes(key, data).await,
         }
     }
@@ -3036,7 +3029,6 @@ impl storage::AsyncObjectStore for StoreBackend {
     async fn import_file(&self, key: &str, path: &std::path::Path) -> std::io::Result<u64> {
         match self {
             Self::Local(backend) => backend.import_file(key, path).await,
-            #[cfg(feature = "remote")]
             Self::Remote(operator) => operator.import_file(key, path).await,
         }
     }
@@ -3044,7 +3036,6 @@ impl storage::AsyncObjectStore for StoreBackend {
     async fn export_file(&self, key: &str, path: &std::path::Path) -> std::io::Result<u64> {
         match self {
             Self::Local(backend) => backend.export_file(key, path).await,
-            #[cfg(feature = "remote")]
             Self::Remote(operator) => operator.export_file(key, path).await,
         }
     }
@@ -3052,9 +3043,10 @@ impl storage::AsyncObjectStore for StoreBackend {
 
 /// Open the backend behind `url`.
 ///
-/// `file://` opens a local directory in every build. Other schemes need a
-/// `--features remote` build, and fail closed without one. `https://`
-/// endpoints need `remote-tls` on top.
+/// `file://` opens a local directory.
+/// Other schemes open a network operator.
+/// `s3` accepts `http://` and `https://`.
+/// HTTPS verifies against the system roots.
 fn connect_store(url: &storage::RemoteUrl) -> std::io::Result<StoreBackend> {
     if url.scheme() == storage::RemoteScheme::File {
         return Ok(StoreBackend::Local(storage::LocalDirStore::new(
@@ -3064,29 +3056,17 @@ fn connect_store(url: &storage::RemoteUrl) -> std::io::Result<StoreBackend> {
     connect_remote(url)
 }
 
-/// Open a network backend behind `url`, in a `--features remote` build.
-#[cfg(feature = "remote")]
+/// Open a network backend behind `url`.
 fn connect_remote(url: &storage::RemoteUrl) -> std::io::Result<StoreBackend> {
     storage::connect(url).map(StoreBackend::Remote)
 }
 
-/// Refuse a network backend in a build without one.
-#[cfg(not(feature = "remote"))]
-fn connect_remote(url: &storage::RemoteUrl) -> std::io::Result<StoreBackend> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!(
-            "{}:// stores need --features remote: this build speaks file:// only",
-            url.scheme().name()
-        ),
-    ))
-}
-
-/// Refuse an empty staging copy with the store address, not the cache path.
+/// Refuse an empty staging copy with the store address.
 ///
-/// A fresh pull from an empty remote leaves staging with no segments. The
-/// local commands would then report the cache directory. The user pointed at
-/// a URL and a set, so the error names those.
+/// A fresh pull from an empty remote leaves staging with no segments.
+/// Local commands would then report the cache directory.
+/// The user pointed at a URL and a set.
+/// The error names those.
 fn require_staged_set(staging: &IndexSet, target: &StoreTarget) -> std::io::Result<()> {
     if staging.segments()?.is_empty() {
         return Err(std::io::Error::new(
@@ -4389,11 +4369,13 @@ mod tests {
         assert_eq!(bad_url.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    /// `file://` connects in every build. Other schemes need `--features
-    /// remote`: without it they fail closed, with it they read configuration.
-    /// No network either way.
+    /// Check local and network backends.
+    ///
+    /// `file://` connects.
+    /// Other schemes read configuration.
+    /// No network runs here.
     #[test]
-    fn remote_schemes_connect_only_behind_the_feature() {
+    fn check_local_and_network_backends() {
         let file = blulib::storage::RemoteUrl::parse("file:///remote").unwrap();
         assert!(super::connect_store(&file).is_ok());
 
@@ -4401,10 +4383,7 @@ mod tests {
         match super::connect_store(&s3) {
             Ok(_) => panic!("an s3 store must not connect in this test: no network"),
             Err(refused) => {
-                #[cfg(feature = "remote")]
                 assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
-                #[cfg(not(feature = "remote"))]
-                assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
             }
         }
     }
