@@ -22,7 +22,7 @@ $ blu merge game.pack other
 $ blu serve ./backups
 ```
 
-Every command takes one `TARGET`. A local path names a local set. An address with `://` names a serve set or a keyed store. Remote targets hold no local copy.
+Every command that works on a backup set takes one `TARGET`. A local path names a local set. An address with `://` names a serve set or a keyed store. Remote targets hold no local copy.
 
 ```console
 $ blu backup ~/Documents docs
@@ -30,11 +30,11 @@ $ blu backup ~/Documents file:///mnt/drive/docs
 $ blu backup ~/Documents http://127.0.0.1:8480/docs
 ```
 
-Without `--version`, restore, verify, and pack use the most recent usable version. `stdout` is data. `stderr` is diagnostics. Every command is pipeable without `--quiet`. Use `--numbers-only` to print just the version numbers, one per line.
+Without `--version`, restore, verify, and pack use the most recent version. `stdout` is data. `stderr` is diagnostics. Every command is pipeable without `--quiet`. Use `--numbers-only` to print just the version numbers, one per line.
 
 ## Restore
 
-Restore merges by default. It writes files from the snapshot and leaves other files alone. It reports extra files when it finishes.
+Restore merges by default. It writes files from the snapshot and leaves other files alone. It reports what it wrote when it finishes, and points at `--clean` for an exact copy.
 
 Use `--clean` to hold exactly the snapshot and nothing else.
 
