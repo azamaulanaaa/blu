@@ -65,61 +65,52 @@ display-name = "blu"
 [dependencies]
 # The server behind `blu serve`.
 #
-# `default-features = false` is deliberate and each omission has a reason.
+# `default-features = false` drops compression and cookies.
+# Compression is dropped because this crate already links `zstd 0.13`.
+# Cookies are dropped because the API sets none.
 #
-# `compress-brotli`, `compress-gzip` and `compress-zstd` are dropped. This crate
-# already depends on `zstd 0.13`, so leaving actix's on would put a *second*
-# zstd in the graph and let two copies answer "what is the compression
-# algorithm". Dropping all three also drops `brotli` and `flate2`, which nothing
-# here uses. `cookies` is dropped because the API sets none.
+# What actix adds to our own tokio requirement is `net`.
+# The features unify, so there is no second runtime.
 #
-# What actix adds to our own tokio requirement is `net`, and to the graph
-# `actix-rt`'s `parking_lot` and `time`. The features unify, so there is no
-# second runtime.
-#
-# **On serde, read the `serde_json` entry below before drawing a conclusion.**
-# This crate has a no-serde rule for its ON-DISK format. That rule is intact and
-# `bincode` is still gone because of it. It does not reach the API boundary, and
-# `serde_json` below is now a direct dependency — for parsing request bodies, not
-# for writing this crate's types.
-#
-# `macros` is the only feature kept: the handlers are `#[get]` and `#[post]`.
+# `macros` is the only feature kept.
+# The handlers are `#[get]` and `#[post]`.
 actix-web = { version = "4.15", default-features = false, features = ["macros"] }
-# The client half, for `blu versions --remote`.
+# The client half, for serve targets over `http://` and `https://`.
 #
 # `awc` is actix's own client, so it sits on the `actix-http` this crate already
-# links and adds no second runtime and no second event loop. The alternative,
-# `reqwest`, would bring `hyper` and a TLS stack to answer one GET against a
-# server that ships neither.
+# links and adds no second runtime and no second event loop.
 #
-# `default-features = false` for the same reason and in the same direction as
-# above. Dropped: `compress-brotli`, `compress-gzip` and `compress-zstd` (the
-# responses asked for are JSON, and this crate already carries `zstd 0.13`);
-# `cookies`, which nothing sets; and every `tls-*` feature, so **there is no TLS
-# backend in the graph at all**. `blu serve` does not offer TLS and says so,
-# so a client that cannot speak it cannot silently pretend to: `--remote` refuses
-# an `https://` address rather than connecting in the clear to something that
-# believes it is secure.
+# `default-features = false` drops compression and cookies.
+# Compression is dropped because responses are JSON.
+# Cookies are dropped because nothing sets them.
 #
-# What `awc` does pull unconditionally is `actix-tls` and `h2`. `actix-tls` is
-# here with no TLS feature enabled, so it is the shim and not a stack.
+# `rustls-0_23-native-roots` is kept.
+# The client speaks plain HTTP and verified HTTPS.
+# It verifies against the operating system roots.
+# It uses rustls with ring.
+# It pulls no openssl and no cmake.
+# It pulls no compiled-in Mozilla bundle.
 #
-# **`h2` is a consequence that is not free, and it is this crate's fault to say
-# so here.** `awc` declares `actix-http` with `http2` turned on and offers no
-# feature to turn it off, and `actix-http`'s `http2` feature *is* `dep:h2`. So
-# `h2` arrives with `awc` — an earlier draft of this comment claimed it was
-# already in the graph through `actix-web`, which was false: with the features
-# above, the baseline graph has no `h2` in it at all.
+# `blu serve` offers plain HTTP only.
+# A client behind TLS still reaches it through plain HTTP.
+# A client before a terminator reaches the terminator through HTTPS.
+#
+# What `awc` pulls unconditionally is `actix-tls` and `h2`.
+# `actix-tls` carries the TLS connector here, not a shim.
+#
+# `h2` arrives with `awc`.
+# `awc` declares `actix-http` with `http2` turned on and offers no
+# feature to turn it off, and `actix-http`'s `http2` feature is `dep:h2`.
 #
 # It also arrives with RUSTSEC-2026-0258, which `cargo deny check advisories`
-# denies and **cannot be resolved**: `h2 0.3.27` is the last release of the
-# unmaintained 0.3 line, `actix-http 3.18` pins `h2 = "0.3.27"`, and the fix is
-# in `0.4.16`. So this is a gate that is red until either `actix-http` moves to
-# `h2 0.4` or this dependency goes. `blu serve` speaks HTTP/1.1 and neither
-# end of the transfer uses it, so the vulnerable code is never reached; that is
-# an argument, not a mitigation, and the advisory stays denied rather than
-# ignored.
-awc = { version = "3.8.2", default-features = false }
+# denies and cannot be resolved.
+# `h2 0.3.27` is the last release of the unmaintained 0.3 line.
+# `actix-http 3.18` pins `h2 = "0.3.27"`, and the fix is in `0.4.16`.
+# `blu serve` speaks HTTP/1.1 and neither end of the transfer uses `h2`,
+# so the vulnerable code is never reached.
+# That is an argument, not a mitigation.
+# The advisory stays denied rather than ignored.
+awc = { version = "3.8.2", default-features = false, features = ["rustls-0_23-native-roots"] }
 blake3 = { version = "1.8.2", features = ["traits-preview"] }
 clap = { version = "4.5.53", features = ["derive"] }
 # **This one is a parser, and it is here because the alternative was worse.**
@@ -244,111 +235,84 @@ opentelemetry-semantic-conventions = { version = "0.31", default-features = fals
 # directly and has no `log` records to forward) and `metrics` (the layer's
 # metrics bridge, which would duplicate the instruments rather than feed them).
 tracing-opentelemetry = { version = "0.32", default-features = false }
-# **The exporter, and the whole of the feature argument.**
+# **The exporter, and the whole of the TLS argument.**
 #
-# * `http-proto` — OTLP over HTTP with protobuf bodies. The other HTTP encoding
-#   is `http-json`, which would put `serde` and `serde_json` on the wire for no
-#   benefit, and the third option is `grpc-tonic`, which is a whole gRPC stack.
+# * `http-proto` sends OTLP over HTTP with protobuf bodies.
+#   The JSON encoding would put `serde` on the wire for no benefit.
+#   The gRPC encoding would pull a whole gRPC stack.
 #   Protobuf over HTTP is what a collector accepts by default.
-# * `reqwest-client` — the **asynchronous** HTTP client. An earlier version of
-#   this line named `reqwest-blocking-client`, which was wrong twice: it brings
-#   `reqwest` in with a TLS backend, and a *blocking* client has no business
-#   being the transport of an exporter inside an actix process.
-# * **No TLS feature, so no TLS backend is in the graph.** `reqwest` is declared
-#   `default-features = false` upstream and nothing here turns a TLS feature on,
-#   so the shipped binary carries no rustls, no aws-lc-rs and no openssl — the
-#   same position `awc` takes for `blu versions --remote` (see the comment
-#   above it), and for the same reason: `blu serve` offers no TLS, so a
-#   telemetry endpoint is expected to be on the same trust boundary as the
-#   server it is describing.
+# * `reqwest-client` selects the asynchronous HTTP client.
+#   A blocking client has no place inside an actix process.
+# * `reqwest-rustls` enables TLS for the exporter.
+#   The client speaks plain HTTP and verified HTTPS.
+#   It verifies against the operating system roots.
+#   It uses rustls with ring, not `aws-lc-rs`, which needs `cmake`.
+#   It pulls no openssl and no compiled-in Mozilla bundle.
 #
-# **To send to an `https://` collector**, build with `--features telemetry-tls`,
-# which turns on `opentelemetry-otlp`'s `reqwest-rustls`. That is opt-in on
-# purpose: it puts `rustls`, `ring` and `rustls-native-certs` in the graph — a
-# licence and build-toolchain decision, and not one a default `cargo build`
-# should make for the person who installs the binary. It is the **native-roots**
-# variant: the feature resolves to `reqwest`'s `rustls-tls-native-roots`, so a
-# collector is verified against the operating system's certificate store. An
-# earlier version of this comment named `reqwest-rustls-webpki-roots` and claimed
-# `rustls-webpki`; the feature line below says `reqwest-rustls` and that is what
-# `blu --help` promises a build that can speak `https://`. An `https://`
-# endpoint in the default build fails to connect rather than falling back to
-# plaintext, which is the same refusal `blu versions --remote` makes for an
-# `https://` server.
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client"] }
+# The feature resolves to `reqwest`'s `rustls-tls-native-roots`.
+# A collector is verified against the operating system store.
+# An `https://` endpoint connects.
+# An `http://` endpoint still connects.
+# Nothing downgrades and nothing upgrades.
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls"] }
 # Keyed stores beyond `file://` (`src/storage/operator.rs`).
 #
-# Optional, so the default build holds no operator, no new transports, and no
-# TLS backend at all — the same position `telemetry-tls` takes above, one
-# stricter: without `--features remote`, `sftp://`, `ftp://`, and
-# `s3://` fail closed with `Unsupported` rather than connecting.
+# Always built, so every build speaks `file://`, `sftp://`, `ftp://`,
+# and `s3://`.
+# Configuration still arrives through the environment.
+# A missing endpoint or identity still fails before the first byte moves.
 #
-# Even the `remote` build carries no TLS, and that is a licence decision
-# rather than a taste one. Every reqwest TLS backend verifies through
-# `rustls-platform-verifier`, which pulls `webpki-root-certs` under
-# `CDLA-Permissive-2.0` — the licence `deny.toml` deliberately refuses to take
-# a compatibility position on — and the native-TLS one links system OpenSSL,
-# a build toolchain this crate does not require. So the transport below is
-# plain HTTP: `http://` endpoints connect, and `https://` ones are refused by
-# name at connect time rather than downgraded. `ftp://` and `sftp://` never
-# touch HTTP either way.
+# The S3 transport speaks plain HTTP and verified HTTPS.
+# It verifies against the operating system roots.
+# It uses rustls with ring and no compiled-in Mozilla bundle.
+# It pulls no system OpenSSL and no cmake.
+# `ftp://` and `sftp://` never touch HTTP either way.
 #
-# `default-features = false` keeps the layers this crate does not use out;
-# retry and timeout stay because a network fails mid-run, and the tokio
-# executor stays because the mirror awaits the operator on it.
-opendal = { version = "0.59", default-features = false, features = ["services-memory", "services-s3", "services-ftp", "services-sftp", "executors-tokio", "layers-retry", "layers-timeout"], optional = true }
-# Plain-HTTP transport for the operator above, installed process-wide on
-# connect. A direct dependency rather than a facade feature, because every
-# facade transport bundles a TLS backend this build refuses to link.
-opendal-http-transport-reqwest = { version = "0.59", default-features = false, optional = true }
-# TLS transport for the operator (`src/storage/tls.rs`), behind `remote-tls`.
+# `default-features = false` keeps unused layers out.
+# Retry and timeout stay because a network fails mid-run.
+# The tokio executor stays because the mirror awaits the operator on it.
+opendal = { version = "0.59", default-features = false, features = ["services-memory", "services-s3", "services-ftp", "services-sftp", "executors-tokio", "layers-retry", "layers-timeout"] }
+# HTTP transport for the operator above.
+# The TLS transport in `src/storage/tls.rs` wraps it for HTTPS.
+# Plain HTTP passes through.
+# Verified HTTPS connects.
+opendal-http-transport-reqwest = { version = "0.59", default-features = false }
+# TLS transport for the operator (`src/storage/tls.rs`).
 #
-# rustls with ring and the operating system's roots: no compiled-in Mozilla
-# bundle (CDLA, refused), no system OpenSSL (absent toolchain), no cmake
-# (aws-lc). Each crate below is already in the graph through reqwest or the
-# telemetry stack, so naming them adds no new crates — only the features this
-# use needs. `hyper-util` drives the connections, `hyper-rustls` wraps them in
-# TLS, `rustls-native-certs` loads the system roots, and `http`, `http-body`
-# and `bytes` move the bytes.
-bytes = { version = "1", optional = true }
-http = { version = "1", optional = true }
-http-body-util = { version = "0.1", optional = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio"], optional = true }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
+# rustls with ring and the operating system roots.
+# No compiled-in Mozilla bundle.
+# No system OpenSSL.
+# No cmake from aws-lc.
+# `hyper-util` drives the connections.
+# `hyper-rustls` wraps them in TLS.
+# `rustls-native-certs` loads the system roots.
+# `http`, `http-body` and `bytes` move the bytes.
+bytes = { version = "1" }
+http = { version = "1" }
+http-body-util = { version = "0.1" }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-native-certs = { version = "0.8" }
 
 [features]
 # Windows file identity, needed to detect hard links there.
 experimental = []
-# Keyed stores over the network: `sftp://`, `ftp://`, and `s3://`
-# through `--store`. Off by default, so the shipped binary speaks `file://`
-# only. Turning it on pulls the operator, its service backends, and a plain
-# HTTP transport — weight a default `cargo build` should not carry, and still
-# no TLS anywhere, so `https://` endpoints stay refused by name. Changes
-# nothing else: the same flags resolve the same way, and the mirror refuses
-# the same divergences.
-remote = ["dep:opendal", "dep:opendal-http-transport-reqwest"]
-# TLS for keyed stores: `https://` S3 endpoints through
-# `--store`. Implies `remote`. Off by default, so even a `remote` build fails
-# `https://` closed by name. Turning it on verifies with rustls/ring against
-# the operating system's roots — no Mozilla bundle, no OpenSSL, no cmake —
-# and changes nothing else: `file://`, `ftp://`, `sftp://`, and plain-HTTP
-# endpoints resolve and behave exactly as without it.
-remote-tls = ["remote", "dep:bytes", "dep:http", "dep:http-body-util", "dep:hyper-rustls", "dep:hyper-util", "dep:rustls", "dep:rustls-native-certs"]
-# **Telemetry over `https://`, and nothing else.**
-#
-# Off by default, so the shipped binary has no TLS backend at all — see the
-# `opentelemetry-otlp` entry above for the whole argument, and `deny.toml` for
-# the licences the default graph is held to. This turns on `rustls` with `ring`
-# (not `aws-lc-rs`, which needs `cmake`) and `rustls-native-certs` for the
-# exporter's HTTP client, and it changes nothing else: no endpoint, no span and
-# no flag behaves differently, and the same env vars resolve the same way.
-#
-# Without it an `https://` endpoint is refused by the connect rather than
-# downgraded, which is the same refusal `blu versions --remote` makes for
-# an `https://` server this tool cannot speak TLS to.
-telemetry-tls = ["opentelemetry-otlp/reqwest-rustls"]
+# DEPRECATED: network stores are always built now.
+# This feature remains so old `--features remote` commands still resolve.
+# It selects nothing.
+# Use no feature flag for `sftp://`, `ftp://`, and `s3://`.
+remote = []
+# DEPRECATED: TLS for keyed stores is always built now.
+# This feature remains so old `--features remote-tls` commands still resolve.
+# It selects nothing.
+# Every build speaks `http://` and verified `https://`.
+remote-tls = []
+# DEPRECATED: TLS for telemetry is always built now.
+# This feature remains so old `--features telemetry-tls` commands still resolve.
+# It selects nothing.
+# Every build speaks `http://` and verified `https://`.
+telemetry-tls = []
 
 [dev-dependencies]
 # `default-features = false` drops criterion's `plotters`, `rayon` and
@@ -417,17 +381,16 @@ expect_used = "deny"
 # One lint is relaxed, deliberately and narrowly.
 #
 # `awc` pulls a second `rand`, and `actix-tls` wants `http 1.x` where this crate
-# is on `http 0.2` through actix-web. Neither is avoidable by a feature choice,
-# and neither adds a TLS backend: `awc` alone grows the graph by 23 crates, with
-# no rustls and no openssl.
+# is on `http 0.2` through actix-web.
+# Neither is avoidable by a feature choice.
 #
 # **The OpenTelemetry dependency adds six more duplicate pairs, and it does bring
-# `hyper` into the graph**, which the sentence above used to be able to claim it
-# did not. `http-proto` reuses tonic's generated message types, so `tonic`
-# arrives with its `tower` and `hyper` whether or not any gRPC is spoken; the
-# async OTLP client is `reqwest`, which is a `hyper` client underneath. It
-# still adds **no TLS backend** — see its entry above — and `h2` is still the
-# only unmaintained crate the advisory check has to ignore.
+# `hyper` into the graph.**
+# `http-proto` reuses tonic's generated message types, so `tonic`
+# arrives with its `tower` and `hyper` whether or not any gRPC is spoken.
+# The async OTLP client is `reqwest`, which is a `hyper` client underneath.
+# TLS comes from rustls with ring and system roots.
+# `h2` is still the only unmaintained crate the advisory check has to ignore.
 #
 # `allow`, and the reporting moves to `deny.toml`, which is where it already was.
 #
