@@ -108,6 +108,8 @@ Three tuned profiles cut trees into chunks.
 
 Use `default` for most trees. Use `small` for many small files. Use `large` for video and archives of compressed files. A profile affects later writes only. Old chunks stay readable, but later runs deduplicate less well across profiles.
 
+The scan uses SIMD Gear hashing where the CPU supports it. Cuts stay the same on every CPU. Cuts differ from releases before SIMD. Old chunks still restore.
+
 ```console
 $ blu backup ~/Documents docs
 $ blu backup ~/src docs --chunk-profile small
