@@ -58,6 +58,8 @@ fn snapshot(files: &[(&str, u64)]) -> Snapshot {
                     secs: IMPOSED,
                     nanos: 0,
                 }),
+                xattrs: Vec::new(),
+                windows_acl: None,
             },
         });
     }

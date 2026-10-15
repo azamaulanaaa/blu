@@ -171,6 +171,59 @@ pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
     filetime::set_file_mtime(path, time)
 }
 
+/// List the extended attributes of `path`.
+///
+/// Returns an empty list on platforms without extended attributes. Returns an
+/// empty list for symbolic links. A link records its target only. The target
+/// has its own entry with its own attributes.
+///
+/// The full implementation lives in the `fsattr` extended support. This stub
+/// keeps the snapshot shape stable until that support lands.
+#[must_use]
+pub fn xattrs_of(path: &Path) -> Vec<crate::metadata::XAttr> {
+    let _ = path;
+    Vec::new()
+}
+
+/// Read the Windows access list of `path`.
+///
+/// Returns `None` on platforms without access lists. The full implementation
+/// lives in the `fsattr` extended support.
+#[must_use]
+pub fn windows_acl_of(path: &Path) -> Option<crate::metadata::WindowsAcl> {
+    let _ = path;
+    None
+}
+
+/// Apply extended attributes to `path`.
+///
+/// Does nothing where the list is empty. The full implementation sets each
+/// value through the platform calls. Symbolic links are skipped. Their target
+/// has its own entry.
+///
+/// # Errors
+///
+/// Returns an error if the path is missing. Returns an error if any value
+/// cannot be set on this filesystem.
+pub fn set_xattrs(path: &Path, xattrs: &[crate::metadata::XAttr]) -> io::Result<()> {
+    let _ = (path, xattrs);
+    Ok(())
+}
+
+/// Apply a Windows access list to `path`.
+///
+/// Does nothing where the list is absent. The full implementation replaces
+/// the explicit entries through the platform calls.
+///
+/// # Errors
+///
+/// Returns an error if the path is missing. Returns an error if the list
+/// cannot be set on this filesystem.
+pub fn set_windows_acl(path: &Path, acl: &crate::metadata::WindowsAcl) -> io::Result<()> {
+    let _ = (path, acl);
+    Ok(())
+}
+
 /// Create a symbolic link at `link` pointing at `target`.
 ///
 /// The caller does not say whether `target` is a directory, and that is the

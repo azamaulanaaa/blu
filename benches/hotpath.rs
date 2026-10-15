@@ -99,6 +99,8 @@ fn sample_snapshot(chunks: usize) -> Snapshot {
             owner: None,
             mode: Some(0o644),
             mtime: None,
+            xattrs: Vec::new(),
+            windows_acl: None,
         },
     });
 

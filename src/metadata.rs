@@ -30,10 +30,11 @@ pub const MAGIC: &[u8; 8] = b"BLU\x00\x00\x00\x00\x00";
 /// Snapshot layout version written by this build.
 ///
 /// Bump this when the shape of [`Snapshot`] changes.
-/// This build writes 5 and reads 5 only.
+/// This build writes 6 and reads 6 only.
+/// Version 6 records extended attributes and Windows access entries per file.
 /// Version 5 records one UTC stamp per snapshot.
 /// Older layouts carry no snapshot stamp.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Reasons a snapshot blob could not be decoded. No encode variant, because
 /// encoding cannot fail: every field is a number, a byte string or a byte array.
@@ -527,21 +528,104 @@ pub enum Link {
         shares: PathBuf,
     },
 }
+/// One extended attribute of a file or a directory.
+///
+/// The name uses raw bytes. Linux accepts any byte string without a zero byte.
+/// The value holds raw bytes. It can be empty. The pair records what the
+/// filesystem reported at backup time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XAttr {
+    /// Attribute name as raw bytes.
+    pub name: Vec<u8>,
+    /// Attribute value as raw bytes.
+    pub value: Vec<u8>,
+}
+
+impl XAttr {
+    /// Whether this attribute holds a POSIX access list.
+    ///
+    /// The backup stores access lists as attributes. The restore sets them
+    /// after other attributes. The name decides the order.
+    #[must_use]
+    pub fn is_acl(&self) -> bool {
+        self.name == b"system.posix_acl_access" || self.name == b"system.posix_acl_default"
+    }
+}
+
+/// One Windows access entry of a file or a directory.
+///
+/// The entry names a trustee by SID string. The type selects allow or deny.
+/// The flags select inheritance. The mask selects the granted rights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsAce {
+    /// Trustee SID in string form, such as `S-1-5-32-544`.
+    pub sid: String,
+    /// Entry type. `0` allows access. `1` denies access.
+    pub ace_type: u8,
+    /// Inheritance flags from the access entry header.
+    pub flags: u8,
+    /// Granted rights as an access mask.
+    pub mask: u32,
+}
+
+/// The Windows access list of a file or a directory.
+///
+/// The list holds explicit entries only. Inherited entries come from the
+/// parent at restore time. The flag records whether inheritance stays blocked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowsAcl {
+    /// Explicit access entries in stored order.
+    pub aces: Vec<WindowsAce>,
+    /// Whether the entry blocks inheritance from its parent.
+    pub protected: bool,
+}
+
+/// The result of reapplying extended attributes to one path.
+///
+/// The restore counts entries, not values. One entry with three attributes
+/// counts once when any of them fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttrOutcome {
+    /// Whether the owner change took effect.
+    pub owner_applied: bool,
+    /// Whether all extended attributes took effect.
+    pub xattrs_applied: bool,
+    /// Whether the Windows access list took effect.
+    pub acl_applied: bool,
+}
+
+impl AttrOutcome {
+    /// A result where every recorded attribute took effect.
+    #[must_use]
+    pub fn applied() -> Self {
+        Self {
+            owner_applied: true,
+            xattrs_applied: true,
+            acl_applied: true,
+        }
+    }
+}
+
 /// Everything this platform records about one entry, and a restore reapplies.
 ///
 /// All of it is the same kind of thing. It is something the platform may or may
 /// not have. The code records it if the platform has it. The code reapplies it
-/// if it is there. Each field is an `Option`. "This platform has no permission
+/// if it is there. Each scalar field is an `Option`. "This platform has no permission
 /// bits" and "the permissions are the empty set" are different facts. A sentinel
 /// like `0` could not tell them apart. A restore acts on them differently. One
 /// is a no-op and the other is a set of permissions nobody has.
 ///
 /// `owner` is the user and group as one value. They are one identity, and they
-/// come out of one `stat`. The field is absent on a platform with no users. The
-/// field is also absent in every snapshot taken before this field existed. That
-/// absence is a fact, not a guess. A snapshot that recorded nothing about
-/// ownership had none to record.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// come out of one `stat`. The field is absent on a platform with no users.
+///
+/// `xattrs` holds Linux extended attributes. It holds `user` attributes and
+/// POSIX access lists. It stays empty on a platform without them. It stays
+/// empty where the filesystem reports none.
+///
+/// `windows_acl` holds the Windows access list. It stays absent on a platform
+/// without access lists. It stays absent where the file carries the inherited
+/// list only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Attributes {
     /// User and group that own the entry, or `None` where the platform has neither.
     pub owner: Option<Owner>,
@@ -549,6 +633,10 @@ pub struct Attributes {
     pub mode: Option<u32>,
     /// Last modification time, or `None` where the platform reports none.
     pub mtime: Option<Timestamp>,
+    /// Extended attributes to restore.
+    pub xattrs: Vec<XAttr>,
+    /// Windows access list to restore.
+    pub windows_acl: Option<WindowsAcl>,
 }
 
 /// A user and a group, which are one identity rather than two numbers.
@@ -573,18 +661,19 @@ impl Owner {
 }
 
 impl Attributes {
-    /// Capture whatever this platform records about `meta`.
+    /// Capture the stat attributes of `meta`.
     ///
-    /// One call rather than three. The interesting case is a missing one. A backup
-    /// that captured the mode and the time but forgot the owner would produce
-    /// snapshots that look complete. Such snapshots restore a tree that nobody
-    /// can read.
+    /// The call records owner and mode and time. It records no extended
+    /// attributes. The caller adds those from the path. The stat call cannot
+    /// list them.
     #[must_use]
     pub fn of(meta: &std::fs::Metadata) -> Self {
         Self {
             owner: Owner::of(meta),
             mode: crate::fsattr::mode_of(meta),
             mtime: crate::fsattr::mtime_of(meta),
+            xattrs: Vec::new(),
+            windows_acl: None,
         }
     }
 
@@ -594,58 +683,65 @@ impl Attributes {
         self.owner.is_some()
     }
 
-    /// Reapply all of them to `path`, in the order that survives.
+    /// Whether this entry records extended attributes.
+    #[must_use]
+    pub fn has_xattrs(&self) -> bool {
+        !self.xattrs.is_empty()
+    }
+
+    /// Whether this entry records a Windows access list.
+    #[must_use]
+    pub fn has_windows_acl(&self) -> bool {
+        self.windows_acl.is_some()
+    }
+
+    /// Reapply every attribute to `path`. Use the order that survives.
     ///
-    /// **Owner first, and that is not a style preference.** Linux clears a file's
-    /// set-user-ID and set-group-ID bits when its owner changes. So setting the
-    /// mode first and the owner second silently strips setuid from everything
-    /// restored. The failure is silent in the worst way. The file is written and
-    /// its bytes match. The only difference is a bit nobody was looking for.
-    ///
-    /// Modification time is last for a different reason. Creating a link inside a
-    /// directory updates that directory's time. So a time set before the links
-    /// would be overwritten by them.
+    /// Owner comes first. Linux clears set-user-ID and set-group-ID bits when
+    /// the owner changes. Mode comes next. Extended attributes come after mode.
+    /// Access lists come last among permissions. Time comes last of all.
+    /// Link creation moves directory times. A time set earlier would not survive.
     ///
     /// An owner that cannot be set is an error here. [`Self::apply_restoring`] is
-    /// the other policy, for a caller that would rather report it than stop.
+    /// the other policy. It reports an owner failure instead of stopping.
     ///
     /// # Errors
     ///
-    /// Returns an error if the path cannot be found, or if any attribute cannot
-    /// be applied. One cause is that the caller does not own the file. Another
-    /// cause is that the caller cannot change the owner.
+    /// Returns an error if the path is missing. Returns an error if any
+    /// attribute cannot be applied. One cause is a missing privilege.
     pub fn apply(&self, path: &std::path::Path) -> std::io::Result<()> {
         self.apply_inner(path, true).map(|_| ())
     }
 
-    /// Reapply all of them, treating an owner that cannot be set as a fact to report
-    /// rather than a failure.
+    /// Reapply every attribute. Report an owner failure instead of stopping.
     ///
-    /// Returns whether the owner took, or `true` where there was none to set.
+    /// Returns the outcome for this path. The caller counts failures across
+    /// entries. A `true` owner flag means the owner took effect or was absent.
     ///
-    /// Changing an owner takes privilege. For an unprivileged caller, that is the
-    /// ordinary case rather than an exceptional one. Restoring a tree that
-    /// contains a file you do not own is a normal thing to want. Stopping there
-    /// would be the wrong answer twice over. The tree is left half-written. The
-    /// file that failed already exists with the wrong owner. So there is nothing
-    /// to retry and no record that the owner is wrong.
+    /// A missing privilege is the ordinary case. An unprivileged restore of a
+    /// system tree meets it on every owned file. Stopping there would leave a
+    /// half written tree. The file already exists with the wrong owner. Nothing
+    /// remains to retry. A nearly right tree beats an aborted run.
     ///
-    /// Everything else is still applied. A file with the right contents and mode
-    /// but the wrong owner is a tree that is nearly right. A nearly right tree
-    /// is a much better thing to hand back than an aborted run and a partial
-    /// directory.
+    /// Extended attribute failures are also reported, not fatal. A filesystem
+    /// without attribute support meets them on every entry. Stopping there
+    /// would refuse restores to such filesystems entirely.
     ///
     /// # Errors
     ///
-    /// Returns an error if the path cannot be found, or if the mode or modification
-    /// time cannot be applied. Only the owner is allowed to fail quietly.
-    pub fn apply_restoring(&self, path: &std::path::Path) -> std::io::Result<bool> {
+    /// Returns an error if the path is missing. Returns an error if the mode
+    /// or the time cannot be applied. Owner and extended failures stay quiet.
+    pub fn apply_restoring(&self, path: &std::path::Path) -> std::io::Result<AttrOutcome> {
         self.apply_inner(path, false)
     }
 
-    /// The one place the order is decided, whichever policy is in force.
-    fn apply_inner(&self, path: &std::path::Path, owner_is_fatal: bool) -> std::io::Result<bool> {
-        let mut owner_applied = true;
+    /// The one place the order lives. Both policies share it.
+    fn apply_inner(
+        &self,
+        path: &std::path::Path,
+        owner_is_fatal: bool,
+    ) -> std::io::Result<AttrOutcome> {
+        let mut outcome = AttrOutcome::applied();
 
         if let Some(owner) = self.owner {
             match crate::fsattr::set_owner(path, Some((owner.uid, owner.gid))) {
@@ -654,20 +750,46 @@ impl Attributes {
                     tracing::debug!(
                         path = %path.display(),
                         error = %e,
-                        "could not set an owner; leaving the one this process has"
+                        "could not set an owner. keep the one this process has"
                     );
-                    owner_applied = false;
+                    outcome.owner_applied = false;
                 }
                 Err(e) => return Err(e),
             }
         }
 
         crate::fsattr::set_mode(path, self.mode)?;
+        match crate::fsattr::set_xattrs(path, &self.xattrs) {
+            Ok(()) => {}
+            Err(e) if !owner_is_fatal => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not set extended attributes. keep the ones the filesystem has"
+                );
+                outcome.xattrs_applied = false;
+            }
+            Err(e) => return Err(e),
+        }
+        if let Some(acl) = &self.windows_acl {
+            match crate::fsattr::set_windows_acl(path, acl) {
+                Ok(()) => {}
+                Err(e) if !owner_is_fatal => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not set the access list. keep the one the filesystem has"
+                    );
+                    outcome.acl_applied = false;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         if let Some(mtime) = self.mtime {
             crate::fsattr::set_mtime(path, mtime)?;
         }
 
-        Ok(owner_applied)
+        Ok(outcome)
     }
 }
 

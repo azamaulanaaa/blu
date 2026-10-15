@@ -364,12 +364,17 @@ fn entries_of(snapshot: &metadata::Snapshot) -> io::Result<HashMap<PathBuf, Entr
             Entry::File {
                 len: file.len,
                 slices,
-                attrs: file.attrs,
+                attrs: file.attrs.clone(),
             },
         );
     }
     for dir in &snapshot.dirs {
-        out.insert(dir.path.clone(), Entry::Dir { attrs: dir.attrs });
+        out.insert(
+            dir.path.clone(),
+            Entry::Dir {
+                attrs: dir.attrs.clone(),
+            },
+        );
     }
     for link in &snapshot.links {
         match link {

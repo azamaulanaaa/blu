@@ -107,6 +107,8 @@ fn snapshot_with_file(path: &str) -> impl FnOnce(&mut Snapshot) {
                 owner: None,
                 mode: Some(0o644),
                 mtime: None,
+                xattrs: Vec::new(),
+                windows_acl: None,
             },
         });
         snapshot.file_chunks.push(FileChunk {
@@ -182,6 +184,8 @@ async fn an_escaping_directory_path_is_refused() {
                 owner: None,
                 mode: Some(0o755),
                 mtime: None,
+                xattrs: Vec::new(),
+                windows_acl: None,
             },
         });
     })
@@ -214,6 +218,8 @@ async fn an_escaping_hard_link_target_is_refused() {
                 owner: None,
                 mode: Some(0o644),
                 mtime: None,
+                xattrs: Vec::new(),
+                windows_acl: None,
             },
         });
         snapshot.links.push(Link::Hard {
@@ -348,6 +354,8 @@ async fn a_file_longer_than_its_chunks_is_refused() {
                 owner: None,
                 mode: Some(0o644),
                 mtime: None,
+                xattrs: Vec::new(),
+                windows_acl: None,
             },
         });
         snapshot.file_chunks.push(FileChunk {

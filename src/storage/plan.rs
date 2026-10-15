@@ -332,6 +332,8 @@ mod tests {
                 owner: None,
                 mode: Some(0o644),
                 mtime: None,
+                xattrs: Vec::new(),
+                windows_acl: None,
             },
         });
         s.chunks.push(chunk());
@@ -391,6 +393,8 @@ mod tests {
                 owner: None,
                 mode: Some(0o644),
                 mtime: None,
+                xattrs: Vec::new(),
+                windows_acl: None,
             },
         });
         s.chunks.push(chunk());

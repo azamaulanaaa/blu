@@ -16,6 +16,8 @@ fn sample() -> Snapshot {
             owner: None,
             mode: Some(0o644),
             mtime: None,
+            xattrs: Vec::new(),
+            windows_acl: None,
         },
     });
     // A chunk is the BLAKE3 of its contents, and that is also how the store

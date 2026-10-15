@@ -943,14 +943,14 @@ pub(crate) fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result
 
     for file in &snapshot.files {
         let path = resolve(root, &file.path, "a file")?;
-        if !file.attrs.apply_restoring(&path)? {
+        if !file.attrs.apply_restoring(&path)?.owner_applied {
             unowned = unowned.saturating_add(1);
         }
     }
 
     for dir in &snapshot.dirs {
         let path = resolve(root, &dir.path, "a directory")?;
-        if !dir.attrs.apply_restoring(&path)? {
+        if !dir.attrs.apply_restoring(&path)?.owner_applied {
             unowned = unowned.saturating_add(1);
         }
     }
