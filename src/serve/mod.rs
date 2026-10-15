@@ -41,14 +41,21 @@
 //!
 //! ## Auth
 //!
-//! There is none. **Anyone who can reach the port can read every set this
-//! server keeps and can append versions to them.** That is a decision, not an
-//! oversight. The binding defaults to `127.0.0.1` so the common case is a
-//! service on the same machine, and `--bind` says otherwise out loud, but the
-//! server does not check and does not warn.
+//! The server checks nothing.
+//! Anyone who reaches the port reads every set it keeps.
+//! Anyone who reaches the port appends versions to them.
+//! That is a decision, not an oversight.
+//! The binding defaults to `127.0.0.1`.
+//! The common case is a service on the same machine.
+//! `--bind` says otherwise out loud.
+//! The server does not check and does not warn.
 //!
-//! Put it behind something that does, if it needs it. There is no token flag,
-//! no TLS, and no middleware to configure.
+//! Put the server behind a proxy when it needs auth.
+//! The proxy checks the bearer token.
+//! The client forwards it as `Authorization: Bearer <token>`.
+//! Pass `--token` or set `BLU_TOKEN` on the client.
+//! There is no token flag on `serve` itself.
+//! There is no TLS and no middleware to configure here.
 //!
 //! ## Where the state lives
 //!

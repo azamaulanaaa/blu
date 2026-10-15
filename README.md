@@ -87,7 +87,7 @@ $ blu apply game.pack /tmp/docs-restored --files 'src/*.rs'
 
 Every build speaks `file://`, `sftp://`, `ftp://` and `s3://`. `s3` speaks plain HTTP and verified HTTPS. HTTPS verifies against the system roots. Remote targets hold no local copy. A `file://` command pulls the set into staging, runs locally, and pushes back its writes. Use `--staging DIR` for the staging copy. Without it, the system cache holds the copy.
 
-`blu serve` serves the sets under a directory over HTTP. It binds `--bind`, `127.0.0.1:8480` by default. There is no authentication and no TLS. Put it behind a terminator that adds TLS and authentication, if it needs them. The server moves packs and nothing else. Clients speak plain HTTP and verified HTTPS.
+`blu serve` serves the sets under a directory over HTTP. It binds `--bind`, `127.0.0.1:8480` by default. The server checks no auth. Put it behind a proxy (nginx, Caddy) when it needs auth. The proxy checks the bearer token. The client forwards it: pass `--token` or set `BLU_TOKEN`. The token travels as `Authorization: Bearer`. The server moves packs and nothing else. Clients speak plain HTTP and verified HTTPS.
 
 Run backup and pack locally. Upload the pack. Merge it on the server. Or fetch a pack from the server. Merge it locally. `versions` of an `http://` or `https://` set prints the same lines as a local set.
 
