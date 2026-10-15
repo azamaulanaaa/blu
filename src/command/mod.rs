@@ -27,7 +27,7 @@ pub use history::{Detail, Event, HistoryBuilder, Status};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use merge::{
     Compression as MergeCompression, MergeBuilder, MergePlan, MergePlanBuilder, Merged, Planned,
-    establish_base, version_holding,
+    establish_base, tip_with_same_tree, version_holding,
 };
 pub use pack::{Base, PackBuilder, Packed, Version};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};

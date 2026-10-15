@@ -2170,10 +2170,12 @@ fn a_delta_from_an_unrelated_base_is_the_whole_version() {
 
 /// A merge refuses a pack older than the tip.
 ///
-/// The pack carries a snapshot stamped before the set's newest version.
+/// The pack carries an older tree stamped before the set's newest version.
 /// Nothing is committed. A dry run refuses the same pack.
 #[tokio::test]
 async fn a_merge_refuses_a_pack_older_than_the_tip() {
+    use tokio::io::AsyncReadExt as _;
+
     let built = build(3, 100_000).await;
     let source = built.dir.path().join("source");
 
@@ -2184,8 +2186,14 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
     let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let tip = store.version_time(2).await.unwrap();
 
-    // The first version restamped an hour before the tip.
-    let mut old = snapshot_of(&built.blob).await;
+    // The first version's tree, restamped an hour before the tip.
+    // The tree differs from the tip, so this is an older version.
+    // A pack of the tip tree would merge as already held instead.
+    let first_id = store.snapshot(1).unwrap();
+    let mut reader = store.get(&first_id).await.unwrap();
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).await.unwrap();
+    let mut old = Snapshot::try_from(buffer.as_slice()).unwrap();
     old.taken_at = Timestamp {
         secs: tip.secs - 3_600,
         nanos: tip.nanos,

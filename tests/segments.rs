@@ -343,6 +343,10 @@ async fn the_last_segments_torn_tail_is_reclaimed_by_a_run() {
     assert!(BlobStore::builder(&blob).open_reader().await.is_err());
 
     // A run truncates and carries on, publishing a second version over the first.
+    // The tree changed below, so the run has a version to publish.
+    // An unchanged tree would report the tip and publish nothing.
+    let first_tree = common::describe(&source);
+    fs::write(source.join("b.bin"), common::noisy(1_000)).unwrap();
     let committed = common::run_backup_limited(&source, &blob, small()).await;
 
     assert_eq!(
@@ -364,12 +368,13 @@ async fn the_last_segments_torn_tail_is_reclaimed_by_a_run() {
     // And both versions still restore, which is the part that matters.
     // A repair that cost a version would not be a repair.
     let store = BlobStore::builder(&blob).open_reader().await.unwrap();
-    for version in 1..=2 {
+    let second_tree = common::describe(&source);
+    for (version, tree) in [1, 2].into_iter().zip([&first_tree, &second_tree]) {
         let destination = dir.path().join(format!("out{version}"));
         common::run_restore(&blob, store.snapshot(version).unwrap(), &destination).await;
         assert_eq!(
-            common::describe(&source),
-            common::describe(&destination),
+            tree,
+            &common::describe(&destination),
             "version {version} should still restore after the repair"
         );
     }

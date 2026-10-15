@@ -869,7 +869,11 @@ pub fn version_holding<W: storage::WriteMode, C: storage::Compressor>(
 /// Its hash never matches, but its tree can.
 /// Only the tip counts here.
 /// An older match means the tip moved on, so the merge still commits.
-async fn tip_with_same_tree<W: storage::WriteMode, C: storage::Compressor>(
+///
+/// Public so the CLI reports a same-tree pack as already merged before it
+/// warns about the pack version.
+/// The run under the lock asks again, and that answer counts.
+pub async fn tip_with_same_tree<W: storage::WriteMode, C: storage::Compressor>(
     store: &storage::BlobStore<W, C>,
     snapshot: &Snapshot,
 ) -> Option<u32> {
