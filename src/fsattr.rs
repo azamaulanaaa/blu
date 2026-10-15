@@ -186,7 +186,7 @@ fn keep_xattr(name: &[u8]) -> bool {
 
 /// List the extended attributes of `path`.
 ///
-/// Returns what the filesystem reports under the allowlist in [`keep_xattr`].
+/// Returns what the filesystem reports under the internal allowlist.
 /// Returns an empty list on filesystems without attribute support. Returns an
 /// empty list for symbolic links. A link records its target only. The target
 /// carries its own entry with its own attributes.
