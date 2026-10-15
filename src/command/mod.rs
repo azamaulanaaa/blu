@@ -18,10 +18,10 @@ mod probe;
 mod restore;
 mod verify;
 
-pub use apply::{Applied, Options as ApplyOptions, apply};
+pub use apply::{Applied, ApplyBuilder, Options as ApplyOptions};
 pub use backup::{BackupBuilder, BackupPlan, BackupPlanBuilder, Committed, Options};
 pub use filter::Filter;
-pub use history::{Detail, Event, Status, report};
+pub use history::{Detail, Event, HistoryBuilder, Status};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use merge::{
     Compression as MergeCompression, MergeBuilder, MergePlan, MergePlanBuilder, Merged, Planned,
@@ -33,7 +33,7 @@ pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestoreBuilder, RestorePlan,
     RestorePlanBuilder, Restored, lock_destination,
 };
-pub use verify::{Failure, Reason, Report, verify};
+pub use verify::{Failure, Reason, Report, VerifyBuilder};
 
 /// How many things to work on at once: the machine's parallelism.
 /// The value is clamped into `1..=ceiling`, so a platform reporting none

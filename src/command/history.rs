@@ -18,6 +18,7 @@ use std::{
 
 use super::filter::{Filter, dirs_of};
 use crate::{metadata, storage};
+use tracing::instrument;
 
 /// What happened to one path at one version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,24 +141,77 @@ async fn load_snapshots<S: storage::StorageGet>(
     Ok(out)
 }
 
-/// Reports the events for `raw` across the named versions, oldest first.
+/// Report where named paths changed across versions.
 ///
-/// Loads each snapshot whole and compares each one with the one before it.
-/// Only versions where at least one requested path changed appear. Within a
-/// version the paths are sorted, so two runs report the same lines.
+/// Start with [`HistoryBuilder::new`]. Name versions with `versions`.
+/// Name paths with `files`. Call `run`.
 ///
-/// A file counts as changed when its bytes differ, not when its chunks do:
-/// small files share chunks with their neighbours, so a neighbour's edit
-/// re-hashes the chunk without touching the file. The report compares bytes
-/// where the chunk layout leaves doubt, and reads only the files it reports
-/// on.
+/// The report loads each named snapshot whole and compares neighbours.
+/// Only versions where a requested path changed appear, oldest first.
+/// Within a version paths sort, so two runs report the same lines.
 ///
-/// # Errors
-///
-/// Returns an error if a `--files` value is empty, absolute, or holds `..`.
-/// Returns an error if a named snapshot cannot be read, decoded, or
-/// fingerprinted. Returns an error if a compared chunk cannot be read.
-pub async fn report<S: storage::StorageGet>(
+/// A file counts as changed when its bytes differ, not its chunks.
+/// Small files share chunks with neighbours. The report compares bytes
+/// where layout leaves doubt, and reads only reported files.
+#[derive(Debug)]
+pub struct HistoryBuilder<'a, S> {
+    store: &'a S,
+    versions: Vec<(u32, storage::BlobId)>,
+    files: Vec<PathBuf>,
+}
+
+impl<'a, S: storage::StorageGet> HistoryBuilder<'a, S> {
+    /// Start a history report from `store`.
+    ///
+    /// The builder names no versions and no paths. Add both below.
+    #[must_use]
+    pub fn new(store: &'a S) -> Self {
+        Self {
+            store,
+            versions: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    /// Compare these versions, oldest first.
+    ///
+    /// Each pair holds the set's own number with the snapshot it names.
+    /// Read the numbering off the store that owns it.
+    #[must_use]
+    pub fn versions(mut self, versions: &[(u32, storage::BlobId)]) -> Self {
+        self.versions = versions.to_vec();
+        self
+    }
+
+    /// Report changes under these paths.
+    ///
+    /// Values use the `versions --files` dialect. Exact paths, directory
+    /// prefixes, and glob patterns all match.
+    #[must_use]
+    pub fn files<I, P>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.files.extend(files.into_iter().map(Into::into));
+        self
+    }
+
+    /// Load the snapshots and compare them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a `--files` value is empty, absolute, or holds `..`.
+    /// Returns an error when a snapshot cannot be read, decoded, or fingerprinted.
+    /// Returns an error when a compared chunk cannot be read.
+    #[instrument(level = "info", skip(self), err)]
+    pub async fn run(self) -> io::Result<Vec<Event>> {
+        report(self.store, &self.versions, &self.files).await
+    }
+}
+
+/// Report the events for `raw` across the named versions, oldest first.
+async fn report<S: storage::StorageGet>(
     store: &S,
     versions: &[(u32, storage::BlobId)],
     raw: &[PathBuf],

@@ -32,7 +32,7 @@ mod common;
 use std::{collections::HashSet, fs, path::Path};
 
 use blulib::{
-    command::{ApplyOptions, Manifest, apply},
+    command::{ApplyBuilder, ApplyOptions, Manifest},
     metadata::Snapshot,
     pack::Pack,
     storage::{BlobId, BlobStore, Plan, StorageGet},
@@ -127,9 +127,7 @@ async fn an_empty_directory_becomes_the_version() {
     let target = versions.dir.path().join("target");
     fs::create_dir_all(&target).unwrap();
 
-    let applied = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let applied = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     common::assert_same_tree(&versions.source, &target);
     assert_eq!(applied.held, 0, "an empty directory holds nothing");
@@ -161,9 +159,7 @@ async fn a_directory_already_holding_the_version_is_not_touched() {
         .map(|name| (name, inode(&target.join(name)).unwrap()))
         .collect();
 
-    let applied = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let applied = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     assert_eq!(applied.files, 0, "no file should have been written");
     assert_eq!(applied.bytes, 0);
@@ -200,9 +196,7 @@ async fn one_edited_file_is_repaired_and_the_rest_are_left_alone() {
     bytes[at..at + 96].copy_from_slice(&common::untagged_stream(77, 96));
     fs::write(&path, &bytes).unwrap();
 
-    let applied = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let applied = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     common::assert_same_tree(&versions.source, &target);
     assert_eq!(applied.files, 1, "only the edited file should be written");
@@ -280,9 +274,7 @@ async fn a_missing_file_is_created_even_where_its_chunks_are_held_elsewhere() {
     // Now delete one of them. Every chunk it needs is still held — in the other.
     fs::remove_file(target.join("twin.bin")).unwrap();
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     common::assert_same_tree(&versions.source, &target);
     assert_eq!(
@@ -312,9 +304,7 @@ async fn a_file_longer_than_the_version_is_truncated() {
     )
     .unwrap();
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     common::assert_same_tree(&versions.source, &target);
     assert_eq!(fs::metadata(&path).unwrap().len(), original);
@@ -349,9 +339,7 @@ async fn a_corrupt_pack_is_refused_and_nothing_is_written() {
     let before = common::describe(&target);
     let broken = Pack::open(&at).unwrap();
 
-    let error = apply(&target, &broken, ApplyOptions::default())
-        .await
-        .unwrap_err();
+    let error = ApplyBuilder::new(&target, &broken).run().await.unwrap_err();
 
     assert!(
         error.to_string().contains("do not hash to it"),
@@ -381,14 +369,10 @@ async fn running_an_apply_twice_converges() {
 
     // A first run that is interrupted partway: emulate it by applying to a
     // destination holding *part* of the change, then the whole of it.
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
     common::assert_same_tree(&versions.source, &target);
 
-    let again = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let again = ApplyBuilder::new(&target, &pack).run().await.unwrap();
     assert_eq!(again.files, 0, "a second run should find nothing to do");
     assert_eq!(again.written, 0);
     assert_eq!(again.bytes, 0);
@@ -411,9 +395,7 @@ async fn unrecorded_entries_survive_unless_pruning_was_asked_for() {
     fs::create_dir_all(&stray).unwrap();
     fs::write(stray.join("notes.txt"), b"mine").unwrap();
 
-    let applied = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let applied = ApplyBuilder::new(&target, &pack).run().await.unwrap();
     assert_eq!(applied.extra, 2, "the file and the directory holding it");
     assert_eq!(applied.removed, 0);
     assert!(
@@ -421,16 +403,14 @@ async fn unrecorded_entries_survive_unless_pruning_was_asked_for() {
         "an unrecorded entry must not be deleted on a guess"
     );
 
-    let pruned = apply(
-        &target,
-        &pack,
-        ApplyOptions {
+    let pruned = ApplyBuilder::new(&target, &pack)
+        .options(ApplyOptions {
             prune: true,
             ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .run()
+        .await
+        .unwrap();
 
     assert_eq!(pruned.removed, 2);
     assert!(
@@ -460,9 +440,7 @@ async fn directories_and_links_come_out_the_same_as_a_restores() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     common::assert_same_tree(&versions.source, &target);
 }
@@ -503,16 +481,14 @@ async fn updating_a_version_costs_a_delta_and_not_a_tree() {
     );
 
     // Apply it.
-    let applied = apply(
-        &client,
-        &pack7,
-        ApplyOptions {
+    let applied = ApplyBuilder::new(&client, &pack7)
+        .options(ApplyOptions {
             prune: true,
             ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .run()
+        .await
+        .unwrap();
 
     common::assert_same_tree(&versions.source, &client);
     assert!(
@@ -537,9 +513,7 @@ async fn a_file_the_version_dropped_stays_without_pruning() {
     versions.commit().await;
     let pack = versions.pack().await;
 
-    apply(&client, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&client, &pack).run().await.unwrap();
 
     assert!(
         client.join("f2.bin").exists(),
@@ -560,9 +534,7 @@ async fn a_second_apply_trusts_the_first_and_reads_nothing() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    let first = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let first = ApplyBuilder::new(&target, &pack).run().await.unwrap();
     assert!(
         first.written > 0,
         "an empty directory has to be given everything"
@@ -572,9 +544,7 @@ async fn a_second_apply_trusts_the_first_and_reads_nothing() {
         "an apply should leave a record of what it did"
     );
 
-    let second = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let second = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     assert_eq!(
         second.written, 0,
@@ -603,9 +573,7 @@ async fn an_edited_file_is_read_while_its_neighbours_are_trusted() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     // One file rewritten, in place, same length.
     let edited = target.join("f2.bin");
@@ -614,9 +582,7 @@ async fn an_edited_file_is_read_while_its_neighbours_are_trusted() {
     bytes[at..at + 32].copy_from_slice(&common::untagged_stream(200, 32));
     fs::write(&edited, &bytes).unwrap();
 
-    let second = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let second = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     assert!(
         second.written > 0,
@@ -640,9 +606,7 @@ async fn a_recheck_trusts_nothing_and_agrees() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     // One byte changed, and the modification time put back to what the record
     // holds.
@@ -662,24 +626,20 @@ async fn a_recheck_trusts_nothing_and_agrees() {
     )
     .unwrap();
 
-    let fast = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let fast = ApplyBuilder::new(&target, &pack).run().await.unwrap();
     assert_eq!(
         fast.written, 0,
         "nothing the record holds distinguishes this from the right bytes"
     );
 
-    let checked = apply(
-        &target,
-        &pack,
-        ApplyOptions {
+    let checked = ApplyBuilder::new(&target, &pack)
+        .options(ApplyOptions {
             recheck: true,
             ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .run()
+        .await
+        .unwrap();
 
     assert_eq!(
         checked.trusted, 0,
@@ -702,9 +662,7 @@ async fn a_file_that_has_grown_is_truncated_with_a_record_present() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     let grown = target.join("f0.bin");
     let original = fs::metadata(&grown).unwrap().len();
@@ -712,9 +670,7 @@ async fn a_file_that_has_grown_is_truncated_with_a_record_present() {
     bytes.extend_from_slice(b"somebody appended this");
     fs::write(&grown, &bytes).unwrap();
 
-    let second = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let second = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     assert_eq!(
         fs::metadata(&grown).unwrap().len(),
@@ -740,9 +696,7 @@ async fn a_record_naming_another_version_is_not_believed() {
     let pack7 = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack7, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack7).run().await.unwrap();
 
     // Change the tree and take another version.
     fs::write(
@@ -753,9 +707,7 @@ async fn a_record_naming_another_version_is_not_believed() {
     versions.commit().await;
     let pack8 = versions.pack().await;
 
-    let second = apply(&target, &pack8, ApplyOptions::default())
-        .await
-        .unwrap();
+    let second = ApplyBuilder::new(&target, &pack8).run().await.unwrap();
 
     assert_eq!(
         second.trusted, 0,
@@ -778,14 +730,10 @@ async fn a_destination_with_no_record_is_read_in_full() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
     Manifest::remove(&target).unwrap();
 
-    let second = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let second = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     assert_eq!(second.trusted, 0, "nothing to trust");
     assert_eq!(second.written, 0, "but nothing wrong either");
@@ -803,9 +751,7 @@ async fn a_corrupt_record_is_a_cache_miss() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     // Bytes that name chunks belonging to some other version, in a format of their
     // own. Nothing here should be believed and nothing should fail.
@@ -815,9 +761,7 @@ async fn a_corrupt_record_is_a_cache_miss() {
     )
     .unwrap();
 
-    let second = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let second = ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     assert_eq!(
         second.trusted, 0,
@@ -838,9 +782,7 @@ async fn the_record_is_beside_the_destination_and_not_inside_it() {
     let pack = versions.pack().await;
     let target = versions.dir.path().join("target");
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
 
     let record = Manifest::path_for(&target).unwrap();
     assert!(record.exists(), "it should have been written");
@@ -869,16 +811,14 @@ async fn apply_with_files_writes_only_the_selection() {
     let target = versions.dir.path().join("target");
     fs::create_dir_all(&target).unwrap();
 
-    let applied = apply(
-        &target,
-        &pack,
-        ApplyOptions {
+    let applied = ApplyBuilder::new(&target, &pack)
+        .options(ApplyOptions {
             files: vec![std::path::PathBuf::from("f0.bin")],
             ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .run()
+        .await
+        .unwrap();
 
     assert_eq!(applied.files, 1);
     assert!(target.join("f0.bin").is_file());
@@ -887,9 +827,7 @@ async fn apply_with_files_writes_only_the_selection() {
         "a file outside the selection must not be written"
     );
 
-    let finished = apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    let finished = ApplyBuilder::new(&target, &pack).run().await.unwrap();
     assert_eq!(
         finished.files, 2,
         "the full apply writes the two missing files"
@@ -917,23 +855,19 @@ async fn apply_with_files_and_prune_scopes_removal() {
     let target = versions.dir.path().join("target");
     fs::create_dir_all(&target).unwrap();
 
-    apply(&target, &pack, ApplyOptions::default())
-        .await
-        .unwrap();
+    ApplyBuilder::new(&target, &pack).run().await.unwrap();
     fs::write(target.join("fx.bin"), b"stale\n").unwrap();
     fs::write(target.join("notes.txt"), b"mine\n").unwrap();
 
-    let pruned = apply(
-        &target,
-        &pack,
-        ApplyOptions {
+    let pruned = ApplyBuilder::new(&target, &pack)
+        .options(ApplyOptions {
             files: vec![std::path::PathBuf::from("f*.bin")],
             prune: true,
             ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .run()
+        .await
+        .unwrap();
 
     assert_eq!(pruned.removed, 1);
     assert!(
@@ -944,4 +878,38 @@ async fn apply_with_files_and_prune_scopes_removal() {
         target.join("notes.txt").is_file(),
         "an unrecorded file outside the selection is left alone"
     );
+}
+
+/// The apply builder previews with dry_run and prunes extras on request.
+///
+/// A dry run changes nothing and still names the extra file. A prune run
+/// removes it. Both runs report the same file count for the version.
+#[tokio::test]
+async fn apply_builder_previews_then_prunes_extras() {
+    let versions = Versions::new(2, 120_000).await;
+    let pack = versions.pack().await;
+    let target = versions.client().await;
+    fs::write(target.join("extra.bin"), b"mine\n").unwrap();
+
+    let preview = ApplyBuilder::new(&target, &pack)
+        .dry_run()
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(preview.extra, 1, "the dry run names the extra file");
+    assert_eq!(preview.removed, 0, "a dry run removes nothing");
+    assert!(
+        target.join("extra.bin").is_file(),
+        "a dry run leaves the tree alone"
+    );
+
+    let pruned = ApplyBuilder::new(&target, &pack)
+        .prune()
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(pruned.extra, 1);
+    assert_eq!(pruned.removed, 1, "the prune run removes the extra file");
+    assert!(!target.join("extra.bin").exists(), "the extra file is gone");
+    assert_eq!(pruned.files, preview.files);
 }

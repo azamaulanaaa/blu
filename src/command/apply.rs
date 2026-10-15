@@ -201,33 +201,126 @@ pub struct Applied {
     pub unowned: u64,
 }
 
-/// Make `root` match the version `pack` carries, writing only what is missing.
+/// Bring a directory up to the version a pack carries.
 ///
-/// The pack is read for its file table as well as its payload, so nothing else is
-/// needed. No set is needed. No snapshot is fetched separately. There is no second
-/// file to keep in step with the first.
+/// Start with [`ApplyBuilder::new`]. Prune with `prune`. Recheck with
+/// `recheck`. Preview with `dry_run`. Select paths with `files`. Call `run`.
 ///
-/// # Errors
+/// The run writes only the bytes the destination lacks. A file with nothing
+/// to write stays unopened. It keeps its inode and its timestamps.
+/// The pack carries its own file table. No set is needed.
 ///
-/// Returns an error if the pack's file table cannot be read or decoded.
-/// Returns an error if the file table records a path that would land outside
-/// `root`.
-/// Returns an error if the recorded slice lengths do not account for each file's
-/// length.
-/// Returns an error if a chunk about to be written does not hash to the hash it is
-/// addressed by.
-/// Returns an error if the tree cannot be written.
-/// Returns an error if the tree already at `root` cannot be read.
-/// Every one of those is checked before the first byte is written.
-/// It also returns an error if a link task or an attribute task stopped before
-/// it finished.
-/// A run that fails during verification leaves the destination exactly as it
-/// found it.
-/// A run that fails later may have written some of the delta.
-/// Running the same run again finishes it.
-#[instrument(level = "info", skip_all, err)]
-pub async fn apply<P: AsRef<Path>>(root: P, pack: &Pack, options: Options) -> io::Result<Applied> {
-    let root = root.as_ref();
+/// Pruning is opt-in and removes entries the version does not record.
+/// A dry run probes the destination and checks every chunk. It writes nothing.
+/// Rerunning a failed apply finishes the job. A probe is idempotent.
+#[derive(Debug)]
+pub struct ApplyBuilder<'a> {
+    root: PathBuf,
+    pack: &'a Pack,
+    prune: bool,
+    recheck: bool,
+    dry_run: bool,
+    files: Vec<PathBuf>,
+}
+
+impl<'a> ApplyBuilder<'a> {
+    /// Start an apply of `pack` into `root`.
+    ///
+    /// The builder writes the whole version. Narrow it with `files`.
+    /// Nothing is pruned unless `prune` is set.
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>, pack: &'a Pack) -> Self {
+        Self {
+            root: root.into(),
+            pack,
+            prune: false,
+            recheck: false,
+            dry_run: false,
+            files: Vec::new(),
+        }
+    }
+
+    /// Remove entries the version does not record.
+    ///
+    /// Off means extra entries are reported and left alone. On removes them.
+    /// With `files` set, only entries under the selection are eligible.
+    #[must_use]
+    pub fn prune(mut self) -> Self {
+        self.prune = true;
+        self
+    }
+
+    /// Re-read every file, ignoring the last apply record.
+    ///
+    /// Off trusts the manifest beside the destination and stats each file.
+    /// On costs a full read of the tree. Use it when timestamps may lie.
+    #[must_use]
+    pub fn recheck(mut self) -> Self {
+        self.recheck = true;
+        self
+    }
+
+    /// Work out what the apply would change, and change none of it.
+    ///
+    /// The run probes the destination and checks every chunk hash. It opens
+    /// no file, prunes no entry, and records no manifest.
+    #[must_use]
+    pub fn dry_run(mut self) -> Self {
+        self.dry_run = true;
+        self
+    }
+
+    /// Bring only these paths up to the version.
+    ///
+    /// Empty means the whole version. Parents land as scaffolding.
+    /// Pruning scopes to the selection.
+    #[must_use]
+    pub fn files<I, P>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.files.extend(files.into_iter().map(Into::into));
+        self
+    }
+
+    /// Replace every option with `options`.
+    ///
+    /// Later calls override single fields. Use a preset bundle and adjust it.
+    #[must_use]
+    pub fn options(mut self, options: Options) -> Self {
+        self.prune = options.prune;
+        self.recheck = options.recheck;
+        self.dry_run = options.dry_run;
+        self.files = options.files;
+        self
+    }
+
+    /// Apply the pack to the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pack's file table cannot be read or decoded.
+    /// Returns an error when the file table records a path outside `root`.
+    /// Returns an error when recorded slice lengths mismatch file lengths.
+    /// Returns an error when a chunk does not hash to the hash it names.
+    /// Returns an error when the tree cannot be written or read.
+    /// A run that fails during verification leaves the destination as found.
+    #[instrument(level = "info", skip_all, err)]
+    pub async fn run(self) -> io::Result<Applied> {
+        let options = Options {
+            prune: self.prune,
+            recheck: self.recheck,
+            dry_run: self.dry_run,
+            files: self.files,
+        };
+        apply(self.root, self.pack, options).await
+    }
+}
+
+/// Bring `root` up to the version `pack` carries, writing only what is missing.
+async fn apply(root: PathBuf, pack: &Pack, options: Options) -> io::Result<Applied> {
+    let root = root.as_path();
 
     // The file table out of the pack, checked against the hash the header names
     // before it is parsed. See `Pack::snapshot`.

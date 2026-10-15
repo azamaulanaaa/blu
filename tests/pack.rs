@@ -2243,7 +2243,8 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
 
     // The client takes version 1, which is what leaves the record the delta will
     // be checked against.
-    blulib::command::apply(&client, &v1_pack, blulib::command::ApplyOptions::default())
+    blulib::command::ApplyBuilder::new(&client, &v1_pack)
+        .run()
         .await
         .unwrap();
 
@@ -2293,10 +2294,10 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
         "the file table must be the whole version, not just the delta"
     );
 
-    let applied =
-        blulib::command::apply(&client, &packed, blulib::command::ApplyOptions::default())
-            .await
-            .unwrap();
+    let applied = blulib::command::ApplyBuilder::new(&client, &packed)
+        .run()
+        .await
+        .unwrap();
 
     assert!(
         applied.written > 0,
@@ -2344,7 +2345,8 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     )
     .await
     .unwrap();
-    blulib::command::apply(&client, &v2_pack, blulib::command::ApplyOptions::default())
+    blulib::command::ApplyBuilder::new(&client, &v2_pack)
+        .run()
         .await
         .unwrap();
 
@@ -2372,8 +2374,9 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     .await
     .unwrap();
 
-    let result =
-        blulib::command::apply(&client, &packed, blulib::command::ApplyOptions::default()).await;
+    let result = blulib::command::ApplyBuilder::new(&client, &packed)
+        .run()
+        .await;
 
     let error = match result {
         Err(e) => e,
@@ -3234,9 +3237,11 @@ async fn every_pack_form_restores_through_every_merge_form() {
             // statement that what it holds is what it says it holds. That is the
             // property the verbatim paths keep while skipping the encode.
             let reopened = BlobStore::builder(&name).open_reader().await.unwrap();
-            let report = blulib::command::verify(reopened.snapshot(1).unwrap(), reopened)
-                .await
-                .unwrap_or_else(|e| panic!("{pack_form} into {merge_form} should verify: {e}"));
+            let report =
+                blulib::command::VerifyBuilder::new(reopened.snapshot(1).unwrap(), reopened)
+                    .run()
+                    .await
+                    .unwrap_or_else(|e| panic!("{pack_form} into {merge_form} should verify: {e}"));
             assert!(
                 report.chunks > 0,
                 "{pack_form} into {merge_form} verified nothing, so it checked nothing: \

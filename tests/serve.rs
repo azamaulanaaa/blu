@@ -37,7 +37,7 @@ use std::{
 };
 
 use blulib::{
-    command::report as report_history,
+    command::HistoryBuilder,
     metadata::Timestamp,
     pack::Pack,
     storage::{BlobStore, Plan, StorageGet},
@@ -2734,7 +2734,10 @@ async fn history_endpoint_answers_same_events_as_local() {
     for version in versions {
         named.push((version, store.snapshot(version).unwrap()));
     }
-    let events = report_history(&store, &named, &[PathBuf::from("a.txt")])
+    let events = HistoryBuilder::new(&store)
+        .versions(&named)
+        .files([PathBuf::from("a.txt")])
+        .run()
         .await
         .unwrap();
 

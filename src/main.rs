@@ -6,9 +6,9 @@ use std::process::ExitCode;
 
 use blulib::{
     command::{
-        ApplyOptions, BackupBuilder, BackupPlan, BackupPlanBuilder, MergeBuilder, MergePlan,
-        MergePlanBuilder, Merged, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, PackBuilder, Planned,
-        RestoreBuilder, RestorePlan, RestorePlanBuilder, apply, lock_destination, verify,
+        ApplyBuilder, ApplyOptions, BackupBuilder, BackupPlan, BackupPlanBuilder, MergeBuilder,
+        MergePlan, MergePlanBuilder, Merged, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, PackBuilder, Planned,
+        RestoreBuilder, RestorePlan, RestorePlanBuilder, VerifyBuilder, lock_destination,
         version_holding,
     },
     layout::IndexSet,
@@ -1691,7 +1691,11 @@ async fn run_history(
         named.push((version, store.snapshot(version)?));
     }
 
-    let events = blulib::command::report(&store, &named, files).await?;
+    let events = blulib::command::HistoryBuilder::new(&store)
+        .versions(&named)
+        .files(files)
+        .run()
+        .await?;
 
     print_history(&events, numbers_only)
 }
@@ -2367,17 +2371,15 @@ async fn apply_pulled(
         Some(lock_destination(destination)?)
     };
 
-    let applied = apply(
-        destination,
-        pack,
-        ApplyOptions {
+    let applied = ApplyBuilder::new(destination, pack)
+        .options(ApplyOptions {
             prune: clean,
             recheck: false,
             dry_run,
             files: files.to_vec(),
-        },
-    )
-    .await?;
+        })
+        .run()
+        .await?;
 
     tracing::info!(
         held = applied.held,
@@ -2874,7 +2876,7 @@ async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Re
 
     tracing::info!(name = %set.base().display(), version, "verifying");
 
-    let report = verify(snapshot, store).await?;
+    let report = VerifyBuilder::new(snapshot, store).run().await?;
 
     for failure in &report.failures {
         eprintln!("error: {failure}");
@@ -4185,17 +4187,15 @@ async fn run_apply(
         "applying pack"
     );
 
-    let applied = apply(
-        destination,
-        &pack,
-        ApplyOptions {
+    let applied = ApplyBuilder::new(destination, &pack)
+        .options(ApplyOptions {
             prune,
             recheck,
             dry_run,
             files,
-        },
-    )
-    .await?;
+        })
+        .run()
+        .await?;
 
     tracing::info!(
         held = applied.held,

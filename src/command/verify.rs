@@ -197,26 +197,39 @@ impl Report {
     }
 }
 
-/// Read back every distinct chunk in `snapshot` and check it against the hash it
-/// is addressed by.
+/// Check every chunk a snapshot names against its recorded hash.
 ///
-/// Every failure is collected rather than stopping at the first, so a damaged
-/// store can be assessed in one pass. An unreadable store is reported as failures
-/// of the chunks it holds rather than aborting the run.
+/// Start with [`VerifyBuilder::new`]. Call `run`.
 ///
-/// # Errors
-///
-/// Returns an error only if the snapshot itself cannot be read or decoded.
-/// Damaged chunk data is reported through [`Report::failures`] rather than as an
-/// error, so a single call assesses the whole store.
-#[instrument(level = "info", skip(storage), err)]
-pub async fn verify<S: storage::StorageGet + 'static>(
+/// Every failure is collected rather than stopping at the first.
+/// A damaged store is assessed in one pass. An unreadable store reports
+/// failures for the chunks it holds rather than aborting the run.
+#[derive(Debug)]
+pub struct VerifyBuilder<S> {
     snapshot_id: storage::BlobId,
-    storage: S,
-) -> io::Result<Report> {
-    let snapshot = super::load_snapshot(&storage, snapshot_id).await?;
+    store: S,
+}
 
-    Ok(check(&snapshot, Arc::new(storage)).await)
+impl<S: storage::StorageGet + 'static> VerifyBuilder<S> {
+    /// Start a verify of `snapshot_id` from `store`.
+    #[must_use]
+    pub fn new(snapshot_id: storage::BlobId, store: S) -> Self {
+        Self { snapshot_id, store }
+    }
+
+    /// Read back every distinct chunk and check its hash.
+    ///
+    /// Damaged chunk data lands in [`Report::failures`], not in the error.
+    /// One call assesses the whole store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the snapshot itself cannot be read or decoded.
+    #[instrument(level = "info", skip(self), err)]
+    pub async fn run(self) -> io::Result<Report> {
+        let snapshot = super::load_snapshot(&self.store, self.snapshot_id).await?;
+        Ok(check(&snapshot, Arc::new(self.store)).await)
+    }
 }
 
 /// What checking one chunk found.

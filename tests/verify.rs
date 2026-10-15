@@ -7,7 +7,7 @@ mod common;
 use std::fs;
 
 use blulib::{
-    command::{Reason, Report, verify},
+    command::{Reason, Report, VerifyBuilder},
     layout::IndexSet,
     storage::{BlobId, BlobStore},
 };
@@ -23,7 +23,10 @@ async fn an_intact_snapshot_verifies_clean() {
     let committed = common::run_backup(&source, &blob).await;
 
     let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let report = verify(committed.snapshot, storage).await.unwrap();
+    let report = VerifyBuilder::new(committed.snapshot, storage)
+        .run()
+        .await
+        .unwrap();
 
     assert!(report.is_ok(), "unexpected failures: {:?}", report.failures);
     assert!(report.chunks > 1, "expected several distinct chunks");
@@ -47,7 +50,10 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     fs::write(&segment, &bytes).unwrap();
 
     let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
-    let report = verify(committed.snapshot, storage).await.unwrap();
+    let report = VerifyBuilder::new(committed.snapshot, storage)
+        .run()
+        .await
+        .unwrap();
 
     assert!(!report.is_ok(), "corruption went undetected");
 

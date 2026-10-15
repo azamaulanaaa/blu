@@ -58,7 +58,11 @@ pub(super) async fn report(
         named.push((version, store.snapshot(version)?));
     }
 
-    let events = command::report(store, &named, &raw).await?;
+    let events = command::HistoryBuilder::new(store)
+        .versions(&named)
+        .files(raw)
+        .run()
+        .await?;
 
     Ok(events
         .into_iter()
