@@ -732,9 +732,12 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
 
             // Recorded so empty ones and their permissions survive a restore.
             if meta.is_dir() {
+                let mut attrs = metadata::Attributes::of(&meta);
+                attrs.xattrs = crate::fsattr::xattrs_of(&path);
+                attrs.windows_acl = crate::fsattr::windows_acl_of(&path);
                 snapshot.dirs.push(metadata::Dir {
                     path: relative_path,
-                    attrs: metadata::Attributes::of(&meta),
+                    attrs,
                 });
                 return Ok(None);
             }
@@ -771,7 +774,12 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
             snapshot.files.push(metadata::File {
                 path: relative_path,
                 len: meta.len(),
-                attrs: metadata::Attributes::of(&meta),
+                attrs: {
+                    let mut attrs = metadata::Attributes::of(&meta);
+                    attrs.xattrs = crate::fsattr::xattrs_of(&path);
+                    attrs.windows_acl = crate::fsattr::windows_acl_of(&path);
+                    attrs
+                },
             });
 
             Ok(Some(path))
