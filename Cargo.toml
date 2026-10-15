@@ -309,6 +309,25 @@ rustls-native-certs = { version = "0.8" }
 # (blocked upstream: apache/opendal#2963) with a cross-platform backend
 # such as russh + russh-sftp implementing AsyncObjectStore.
 opendal = { version = "0.59", default-features = false, features = ["services-sftp"] }
+# Extended attributes for capture and restore (`src/fsattr.rs`).
+#
+# MIT OR Apache-2.0, both allowed by `deny.toml`.
+# Unix-only and fails Windows builds, so this stays out of `[dependencies]`
+# above like `services-sftp` does. Thin wrapper over `getxattr` and
+# `setxattr` with no other runtime cost. Calls that target a symlink act on
+# the link itself. The `_deref` variants follow it. This crate uses the plain
+# calls. A link records its target elsewhere. Its own attributes stay out of
+# the snapshot.
+xattr = "1.6.1"
+
+[target.'cfg(windows)'.dependencies]
+# Windows access lists for capture and restore (`src/fsattr.rs`).
+#
+# MIT, allowed by `deny.toml`. Windows-only, so the unix graph is unchanged.
+# `winapi` provides the `INHERITED_ACE` flag and the `PSID` type. The
+# `windows-acl` calls need both. The two resolve to one `winapi` version.
+windows-acl = "0.3.0"
+winapi = "0.3"
 
 [features]
 # Windows file identity, needed to detect hard links there.

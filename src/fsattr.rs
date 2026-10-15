@@ -171,57 +171,234 @@ pub fn set_mtime(path: &Path, mtime: Timestamp) -> io::Result<()> {
     filetime::set_file_mtime(path, time)
 }
 
+/// Whether an xattr name belongs in a snapshot.
+///
+/// The backup keeps `user` attributes and POSIX access lists. It skips
+/// `security` and `trusted` and other `system` names. Those need privilege to
+/// read and to write. A hostile snapshot carrying `security.capability` would
+/// hand capabilities to restored files. The allowlist keeps that out.
+#[cfg(unix)]
+fn keep_xattr(name: &[u8]) -> bool {
+    name.starts_with(b"user.")
+        || name == b"system.posix_acl_access"
+        || name == b"system.posix_acl_default"
+}
+
 /// List the extended attributes of `path`.
 ///
-/// Returns an empty list on platforms without extended attributes. Returns an
+/// Returns what the filesystem reports under the allowlist in [`keep_xattr`].
+/// Returns an empty list on filesystems without attribute support. Returns an
 /// empty list for symbolic links. A link records its target only. The target
-/// has its own entry with its own attributes.
+/// carries its own entry with its own attributes.
 ///
-/// The full implementation lives in the `fsattr` extended support. This stub
-/// keeps the snapshot shape stable until that support lands.
+/// The list is sorted by name. The same tree always encodes to the same bytes.
+/// Unreadable entries are skipped. A file that loses one attribute between
+/// listing and reading keeps the rest.
 #[must_use]
 pub fn xattrs_of(path: &Path) -> Vec<crate::metadata::XAttr> {
-    let _ = path;
-    Vec::new()
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        if fs::symlink_metadata(path).map_or(true, |meta| meta.file_type().is_symlink()) {
+            return Vec::new();
+        }
+        let Ok(names) = xattr::list(path) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for name in names {
+            let raw = name.into_vec();
+            if !keep_xattr(&raw) {
+                continue;
+            }
+            if let Ok(Some(value)) = xattr::get(path, std::ffi::OsStr::from_bytes(&raw)) {
+                out.push(crate::metadata::XAttr { name: raw, value });
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Vec::new()
+    }
 }
 
 /// Read the Windows access list of `path`.
 ///
-/// Returns `None` on platforms without access lists. The full implementation
-/// lives in the `fsattr` extended support.
+/// Returns the explicit allow and deny entries. Returns `None` where the file
+/// carries inherited entries only. Returns `None` on platforms without access
+/// lists. Other entry kinds are skipped. The restore only writes allow and
+/// deny entries.
 #[must_use]
 pub fn windows_acl_of(path: &Path) -> Option<crate::metadata::WindowsAcl> {
-    let _ = path;
-    None
+    #[cfg(windows)]
+    {
+        let text = path.to_str()?;
+        let list = windows_acl::acl::ACL::from_file_path(text, false).ok()?;
+        let entries = list.all().ok()?;
+        let mut aces = Vec::new();
+        for entry in entries {
+            if entry.flags & winapi::um::winnt::INHERITED_ACE != 0 {
+                continue;
+            }
+            let ace_type = match entry.entry_type {
+                windows_acl::acl::AceType::AccessAllow => 0,
+                windows_acl::acl::AceType::AccessDeny => 1,
+                _ => continue,
+            };
+            aces.push(crate::metadata::WindowsAce {
+                sid: entry.string_sid,
+                ace_type,
+                flags: entry.flags,
+                mask: entry.mask,
+            });
+        }
+        if aces.is_empty() {
+            return None;
+        }
+        aces.sort_by(|a, b| (&a.sid, a.ace_type).cmp(&(&b.sid, b.ace_type)));
+        Some(crate::metadata::WindowsAcl { aces })
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Apply extended attributes to `path`.
 ///
-/// Does nothing where the list is empty. The full implementation sets each
-/// value through the platform calls. Symbolic links are skipped. Their target
-/// has its own entry.
+/// Writes plain attributes before access lists. Linux rewrites the access
+/// mask when the mode changes. An access list written before the mode would
+/// not survive it. The mode is already set by the caller. The list goes last.
+///
+/// Does nothing where the list is empty. Symbolic links are skipped. Their
+/// target carries its own entry.
 ///
 /// # Errors
 ///
 /// Returns an error if the path is missing. Returns an error if any value
 /// cannot be set on this filesystem.
 pub fn set_xattrs(path: &Path, xattrs: &[crate::metadata::XAttr]) -> io::Result<()> {
-    let _ = (path, xattrs);
-    Ok(())
+    if xattrs.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mut ordered: Vec<&crate::metadata::XAttr> = xattrs.iter().collect();
+        ordered.sort_by_key(|attr| attr.is_acl());
+        for attr in ordered {
+            xattr::set(path, std::ffi::OsStr::from_bytes(&attr.name), &attr.value)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, xattrs);
+        Ok(())
+    }
 }
 
 /// Apply a Windows access list to `path`.
 ///
-/// Does nothing where the list is absent. The full implementation replaces
-/// the explicit entries through the platform calls.
+/// Replaces the explicit entries with the recorded ones. Inherited entries
+/// stay as the parent provides them. The write marks the list protected, as
+/// the underlying call always does. Restored files block inheritance.
 ///
 /// # Errors
 ///
-/// Returns an error if the path is missing. Returns an error if the list
+/// Returns an error if the path is missing. Returns an error if any entry
 /// cannot be set on this filesystem.
 pub fn set_windows_acl(path: &Path, acl: &crate::metadata::WindowsAcl) -> io::Result<()> {
-    let _ = (path, acl);
-    Ok(())
+    #[cfg(windows)]
+    {
+        use windows_acl::acl::AceType;
+        let text = path.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a Windows path that is not valid text cannot carry an access list",
+            )
+        })?;
+        let mut list = windows_acl::acl::ACL::from_file_path(text, false).map_err(|code| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "could not read the access list of {}: {code}",
+                    path.display()
+                ),
+            )
+        })?;
+        let current = list.all().map_err(|code| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "could not list the access list of {}: {code}",
+                    path.display()
+                ),
+            )
+        })?;
+        for entry in &current {
+            if entry.flags & winapi::um::winnt::INHERITED_ACE != 0 {
+                continue;
+            }
+            let kind = match entry.entry_type {
+                AceType::AccessAllow | AceType::AccessDeny => Some(entry.entry_type),
+                _ => None,
+            };
+            let Some(kind) = kind else { continue };
+            let raw = windows_acl::helper::string_to_sid(&entry.string_sid).map_err(|code| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("could not parse a SID on {}: {code}", path.display()),
+                )
+            })?;
+            let _ = list.remove_entry(raw.as_ptr() as winapi::um::winnt::PSID, Some(kind), None);
+        }
+        for ace in &acl.aces {
+            let kind = match ace.ace_type {
+                0 => AceType::AccessAllow,
+                _ => AceType::AccessDeny,
+            };
+            let raw = windows_acl::helper::string_to_sid(&ace.sid).map_err(|code| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("could not parse a SID on {}: {code}", path.display()),
+                )
+            })?;
+            list.add_entry(
+                raw.as_ptr() as winapi::um::winnt::PSID,
+                kind,
+                ace.flags,
+                ace.mask,
+            )
+            .map_err(|code| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "could not set the access list of {}: {code}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (path, acl);
+        Ok(())
+    }
 }
 
 /// Create a symbolic link at `link` pointing at `target`.

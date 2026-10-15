@@ -31,9 +31,9 @@
 //! A link's `u8` kind is `0` hard or `1` symbolic. Any other value is refused.
 //! An xattr entry is a varint name length plus name bytes plus a varint value
 //! length plus value bytes. A Windows access list is a `u8` tag (`0` absent,
-//! `1` present) plus a `u8` protected flag plus a varint entry count plus one
-//! record per entry. Each entry holds a varint SID length plus SID bytes plus
-//! a `u8` type plus a `u8` flags plus a `u32` mask.
+//! `1` present) plus a varint entry count plus one record per entry. Each
+//! entry holds a varint SID length plus SID bytes plus a `u8` type plus a `u8`
+//! flags plus a `u32` mask.
 //!
 //! # Decoding is the security-relevant half
 //!
@@ -283,11 +283,6 @@ impl<'a> Reader<'a> {
         match self.u8()? {
             0 => Ok(None),
             1 => {
-                let protected = match self.u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(Malformed("an access list has a bad flag")),
-                };
                 let count = self.count()?;
                 let mut aces = Vec::with_capacity(count.min(64));
                 for _ in 0..count {
@@ -312,7 +307,7 @@ impl<'a> Reader<'a> {
                         mask,
                     });
                 }
-                Ok(Some(WindowsAcl { aces, protected }))
+                Ok(Some(WindowsAcl { aces }))
             }
             _ => Err(Malformed("an access list has an invalid tag")),
         }
@@ -478,14 +473,13 @@ impl Writer {
 
     /// Write a Windows access list with a presence tag.
     ///
-    /// Absent lists cost one zero byte. Present lists carry a protected flag
-    /// plus one record per entry. The decoder checks every length before use.
+    /// Absent lists cost one zero byte. Present lists carry one record per
+    /// entry. The decoder checks every length before use.
     fn windows_acl(&mut self, acl: Option<&super::WindowsAcl>) {
         match acl {
             None => self.u8(0),
             Some(list) => {
                 self.u8(1);
-                self.u8(u8::from(list.protected));
                 self.count(list.aces.len());
                 for ace in &list.aces {
                     self.varint(ace.sid.len() as u64);
@@ -1051,8 +1045,8 @@ mod tests {
 
     /// A Windows access list survives the round trip.
     ///
-    /// The test records two entries and the protected flag. All three must
-    /// decode to the same values.
+    /// The test records two entries. Both must decode to the same values.
+    /// Order is significant. The encoder keeps capture order.
     #[test]
     fn a_windows_access_list_survives_a_round_trip() {
         let mut snapshot = Snapshot::new(stamped());
@@ -1078,7 +1072,6 @@ mod tests {
                             mask: 0x0010_0000,
                         },
                     ],
-                    protected: true,
                 }),
             },
         });
@@ -1135,7 +1128,6 @@ mod tests {
                         flags: 0,
                         mask: 0,
                     }],
-                    protected: false,
                 }),
             },
         });

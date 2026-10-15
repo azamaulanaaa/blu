@@ -571,13 +571,13 @@ pub struct WindowsAce {
 /// The Windows access list of a file or a directory.
 ///
 /// The list holds explicit entries only. Inherited entries come from the
-/// parent at restore time. The flag records whether inheritance stays blocked.
+/// parent at restore time. The restore writes the recorded entries as
+/// explicit entries. It marks the list protected. Restored files block
+/// inheritance from their parent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WindowsAcl {
     /// Explicit access entries in stored order.
     pub aces: Vec<WindowsAce>,
-    /// Whether the entry blocks inheritance from its parent.
-    pub protected: bool,
 }
 
 /// The result of reapplying extended attributes to one path.
