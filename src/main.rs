@@ -70,6 +70,17 @@ struct Args {
     /// `blu serve` offers plain HTTP only.
     #[arg(long)]
     telemetry: bool,
+
+    /// Bearer token a proxy guards serve targets with.
+    ///
+    /// The client forwards it as `Authorization: Bearer <token>`.
+    /// The client never checks it.
+    /// A proxy before the server checks it.
+    /// `BLU_TOKEN` in the environment selects the same token.
+    /// The flag wins when both name one.
+    /// Leave both unset for a server with no proxy.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -534,6 +545,15 @@ async fn main() -> ExitCode {
     // rather than the environment. See `blulib::telemetry`.
     let telemetry = blulib::telemetry::Config::from_environment(args.telemetry);
 
+    // The bearer token is read once, here, for the same reason.
+    // The flag wins when both name one.
+    // An empty environment value counts as unset.
+    let token = args.token.or_else(|| {
+        std::env::var("BLU_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty())
+    });
+
     init_tracing(
         args.verbose,
         args.quiet,
@@ -555,7 +575,7 @@ async fn main() -> ExitCode {
     // has already finished are still sitting in a queue on a thread the process
     // is about to stop using. That is a silent loss: no error, no warning, and
     // a run that looks exactly like a successful one.
-    let code = match run(args.command, jobs).await {
+    let code = match run(args.command, jobs, token).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             // The message, not the `Debug` form.
@@ -796,9 +816,13 @@ macro_rules! say {
 ///
 /// The claims a run holds are released by `Drop`, so stopping is a matter of
 /// letting the work future drop rather than resuming it.
-async fn run(command: Command, jobs: blulib::serve::Jobs) -> std::io::Result<()> {
+async fn run(
+    command: Command,
+    jobs: blulib::serve::Jobs,
+    token: Option<String>,
+) -> std::io::Result<()> {
     tokio::select! {
-        result = dispatch(command, jobs) => result,
+        result = dispatch(command, jobs, token) => result,
         signal = stop_signal() => Err(signal),
     }
 }
@@ -908,10 +932,14 @@ fn command_name(command: &Command) -> &'static str {
 /// `serve` is timed too: a server that runs for a day and is then told to stop
 /// has a duration, and a histogram of one very large sample is a true answer
 /// rather than a wrong one.
-async fn dispatch(command: Command, jobs: blulib::serve::Jobs) -> std::io::Result<()> {
+async fn dispatch(
+    command: Command,
+    jobs: blulib::serve::Jobs,
+    token: Option<String>,
+) -> std::io::Result<()> {
     let name = command_name(&command);
     let started = std::time::Instant::now();
-    let outcome = dispatch_inner(command, jobs).await;
+    let outcome = dispatch_inner(command, jobs, token).await;
     blulib::telemetry::metrics::record_command_duration(name, started.elapsed());
     outcome
 }
@@ -988,11 +1016,16 @@ struct BackupArgs {
 
 impl BackupArgs {
     /// Run the backup into a local path, a keyed store, or a server.
-    async fn run(self) -> std::io::Result<()> {
+    async fn run(self, token: Option<String>) -> std::io::Result<()> {
         let compression = compression_policy(self.compression_level);
         let profile = self.chunk_profile.unwrap_or_default();
 
-        match resolve_target("backup", &self.target, self.staging.as_deref())? {
+        match resolve_target(
+            "backup",
+            &self.target,
+            self.staging.as_deref(),
+            token.as_deref(),
+        )? {
             Target::Local(path) => run_backup(
                 &self.source,
                 &path,
@@ -1014,7 +1047,11 @@ impl BackupArgs {
                 )
                 .await
             }
-            Target::Serve { address, set } => {
+            Target::Serve {
+                address,
+                set,
+                token,
+            } => {
                 if self.dry_run {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
@@ -1030,6 +1067,7 @@ impl BackupArgs {
                     self.segment_size,
                     compression,
                     profile,
+                    token.as_deref(),
                 )
                 .await
             }
@@ -1038,9 +1076,13 @@ impl BackupArgs {
 }
 
 /// The commands themselves.
-async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io::Result<()> {
+async fn dispatch_inner(
+    command: Command,
+    jobs: blulib::serve::Jobs,
+    token: Option<String>,
+) -> std::io::Result<()> {
     match command {
-        Command::Backup(args) => args.run().await,
+        Command::Backup(args) => args.run(token).await,
         Command::Restore {
             destination,
             target,
@@ -1050,7 +1092,7 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             files,
             staging,
         } => {
-            let target = resolve_target("restore", &target, staging.as_deref())?;
+            let target = resolve_target("restore", &target, staging.as_deref(), token.as_deref())?;
             dispatch_restore(&destination, target, version, clean, dry_run, files).await
         }
         Command::Verify {
@@ -1058,7 +1100,7 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             version,
             staging,
         } => {
-            let target = resolve_target("verify", &target, staging.as_deref())?;
+            let target = resolve_target("verify", &target, staging.as_deref(), token.as_deref())?;
             dispatch_verify(target, version).await
         }
         Command::Pack {
@@ -1072,7 +1114,7 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             staging,
         } => {
             let from = effective_from(from, full);
-            let target = resolve_target("pack", &target, staging.as_deref())?;
+            let target = resolve_target("pack", &target, staging.as_deref(), token.as_deref())?;
             dispatch_pack(target, &out, version, from, compression, dry_run).await
         }
         Command::Apply {
@@ -1090,7 +1132,7 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             dry_run,
             staging,
         } => {
-            let target = resolve_target("merge", &target, staging.as_deref())?;
+            let target = resolve_target("merge", &target, staging.as_deref(), token.as_deref())?;
             dispatch_merge_command(pack, target, compression, dry_run).await
         }
         Command::Reindex {
@@ -1098,7 +1140,7 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             dry_run,
             staging,
         } => {
-            let target = resolve_target("reindex", &target, staging.as_deref())?;
+            let target = resolve_target("reindex", &target, staging.as_deref(), token.as_deref())?;
             dispatch_reindex(target, dry_run).await
         }
         Command::Versions {
@@ -1107,7 +1149,7 @@ async fn dispatch_inner(command: Command, jobs: blulib::serve::Jobs) -> std::io:
             files,
             staging,
         } => {
-            let target = resolve_target("versions", &target, staging.as_deref())?;
+            let target = resolve_target("versions", &target, staging.as_deref(), token.as_deref())?;
             dispatch_versions(target, numbers_only, files).await
         }
         Command::Serve {
@@ -1144,8 +1186,22 @@ async fn dispatch_restore(
         Target::Local(name) => {
             run_restore(destination, &name, version, clean, dry_run, &files).await
         }
-        Target::Serve { address, set } => {
-            run_restore_remote(destination, &set, version, clean, dry_run, &files, &address).await
+        Target::Serve {
+            address,
+            set,
+            token,
+        } => {
+            run_restore_remote(
+                destination,
+                &set,
+                version,
+                clean,
+                dry_run,
+                &files,
+                &address,
+                token.as_deref(),
+            )
+            .await
         }
         Target::Store(target) => {
             run_restore_stored(destination, &target, version, clean, dry_run, &files).await
@@ -1183,7 +1239,11 @@ async fn dispatch_pack(
         Target::Store(target) => {
             run_pack_stored(&target, out, version, from, compression, dry_run).await
         }
-        Target::Serve { address, set } => {
+        Target::Serve {
+            address,
+            set,
+            token,
+        } => {
             if compression != KeepOrLevel::Keep {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1191,7 +1251,16 @@ async fn dispatch_pack(
                      holds and re-encodes nothing",
                 ));
             }
-            run_pack_serve(&address, &set, out, version, from, dry_run).await
+            run_pack_serve(
+                &address,
+                &set,
+                out,
+                version,
+                from,
+                dry_run,
+                token.as_deref(),
+            )
+            .await
         }
     }
 }
@@ -1211,7 +1280,11 @@ async fn dispatch_merge_command(
     match target {
         Target::Local(name) => run_merge(&pack, &name, compression, dry_run).await,
         Target::Store(target) => run_merge_stored(&pack, &target, compression, dry_run).await,
-        Target::Serve { address, set } => {
+        Target::Serve {
+            address,
+            set,
+            token,
+        } => {
             if dry_run {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1220,7 +1293,9 @@ async fn dispatch_merge_command(
                      local path or a `file://` store instead",
                 ));
             }
-            Push::open(&address, &set)?.pack(&pack, compression).await
+            Push::open(&address, &set, token.as_deref())?
+                .pack(&pack, compression)
+                .await
         }
     }
 }
@@ -1259,11 +1334,15 @@ async fn dispatch_versions(
                 run_history(&name, &files, numbers_only).await
             }
         }
-        Target::Serve { address, set } => {
+        Target::Serve {
+            address,
+            set,
+            token,
+        } => {
             if files.is_empty() {
-                run_versions_remote(&set, numbers_only, &address).await
+                run_versions_remote(&set, numbers_only, &address, token.as_deref()).await
             } else {
-                run_history_remote(&set, &files, numbers_only, &address).await
+                run_history_remote(&set, &files, numbers_only, &address, token.as_deref()).await
             }
         }
         Target::Store(target) => {
@@ -1548,15 +1627,21 @@ fn print_version(
     }
 }
 
-/// List a set held by a `blu serve`, printing exactly what a local listing
-/// of the same set would.
+/// List a set held by a `blu serve`, printing what a local listing prints.
 ///
-/// The fetch is [`blulib::client::Remote`]'s. Everything here is printing what
-/// came back; [`resolve_target`] decided what text is a set name — the last
-/// segment of the `http://` target — and neither it nor anything else here is
-/// a path on this machine.
-async fn run_versions_remote(set: &str, numbers_only: bool, address: &str) -> std::io::Result<()> {
-    let remote = blulib::client::Remote::new(address)?;
+/// The fetch is [`blulib::client::Remote`]'s.
+/// Everything here prints what came back.
+/// [`resolve_target`] decided what text is a set name.
+/// The last segment of the serve target names the set.
+/// Nothing here is a path on this machine.
+/// The client forwards `token` when one is set.
+async fn run_versions_remote(
+    set: &str,
+    numbers_only: bool,
+    address: &str,
+    token: Option<&str>,
+) -> std::io::Result<()> {
+    let remote = remote_for(address, token)?;
 
     for listed in remote.versions(set).await? {
         print_version(
@@ -1635,8 +1720,9 @@ async fn run_history_remote(
     files: &[std::path::PathBuf],
     numbers_only: bool,
     address: &str,
+    token: Option<&str>,
 ) -> std::io::Result<()> {
-    let remote = blulib::client::Remote::new(address)?;
+    let remote = remote_for(address, token)?;
     blulib::client::check_set(set)?;
 
     let mut named = Vec::with_capacity(files.len());
@@ -2016,10 +2102,11 @@ async fn run_restore_remote(
     dry_run: bool,
     files: &[std::path::PathBuf],
     address: &str,
+    token: Option<&str>,
 ) -> std::io::Result<()> {
     use blulib::client::Outcome;
 
-    let remote = blulib::client::Remote::new(address)?;
+    let remote = remote_for(address, token)?;
     blulib::client::check_set(set)?;
 
     // The manifest, once. It is what `have` is built from, and reading it twice
@@ -2912,6 +2999,8 @@ enum Target {
         address: String,
         /// The set's name there.
         set: String,
+        /// The bearer token a proxy guards with, if any.
+        token: Option<String>,
     },
     /// A set in a keyed store, with its staging copy.
     Store(StoreTarget),
@@ -2926,10 +3015,12 @@ enum Target {
 /// Without a store there is no copy to stage.
 /// An `http://` or `https://` backup stages in a temp directory.
 /// The runner removes the temp directory afterwards.
+/// The token travels beside the address, never inside it.
 fn resolve_target(
     command: &str,
     raw: &str,
     staging: Option<&std::path::Path>,
+    token: Option<&str>,
 ) -> std::io::Result<Target> {
     if raw.contains("://") {
         if raw.trim().to_ascii_lowercase().starts_with("http") {
@@ -2942,7 +3033,11 @@ fn resolve_target(
                 ));
             }
             let (address, set) = blulib::client::split_serve_target(raw)?;
-            return Ok(Target::Serve { address, set });
+            return Ok(Target::Serve {
+                address,
+                set,
+                token: token.map(str::to_string),
+            });
         }
         let (url, set) = storage::RemoteUrl::split_set(raw)?;
         let root = match staging {
@@ -2964,6 +3059,23 @@ fn resolve_target(
         ));
     }
     Ok(Target::Local(std::path::PathBuf::from(raw)))
+}
+
+/// Build a serve client for `address`, with a bearer token when one is set.
+///
+/// The token travels as `Authorization: Bearer <token>`.
+/// The client never checks it.
+/// A proxy before the server checks it.
+///
+/// # Errors
+///
+/// The call fails when `address` is not a server address.
+/// The call fails when the token is empty or holds whitespace.
+fn remote_for(address: &str, token: Option<&str>) -> std::io::Result<blulib::client::Remote> {
+    match token {
+        Some(value) => blulib::client::Remote::with_token(address, value),
+        None => blulib::client::Remote::new(address),
+    }
 }
 
 /// A set held by a keyed store, and the staging copy.
@@ -3143,6 +3255,10 @@ fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
 /// run uses, packs the committed version, and has the server merge it. The
 /// staging directory is removed however the run ends: a remote backup leaves
 /// nothing behind here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a backup's own arguments, plus the address"
+)]
 async fn run_backup_serve(
     source: &std::path::Path,
     address: &str,
@@ -3150,8 +3266,9 @@ async fn run_backup_serve(
     segment_size: Option<u64>,
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
+    token: Option<&str>,
 ) -> std::io::Result<()> {
-    let push = Push::open(address, set)?;
+    let push = Push::open(address, set, token)?;
     let work = temp_work_dir("backup");
     std::fs::create_dir_all(&work)?;
     let staging = work.join(set);
@@ -3250,6 +3367,10 @@ async fn run_pack_stored(
 /// A dry run reports the server's summary and fetches nothing: the counts
 /// are the pack's own, and the size on disk and the content hash are left
 /// out as properties of a file this run does not write.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a pack's own arguments, plus the address"
+)]
 async fn run_pack_serve(
     address: &str,
     set: &str,
@@ -3257,8 +3378,9 @@ async fn run_pack_serve(
     version: Option<u32>,
     from: Option<u32>,
     dry_run: bool,
+    token: Option<&str>,
 ) -> std::io::Result<()> {
-    let remote = blulib::client::Remote::new(address)?;
+    let remote = remote_for(address, token)?;
     blulib::client::check_set(set)?;
 
     let started = remote.start_pack(set, version, from).await?;
@@ -3471,16 +3593,21 @@ struct Push {
 }
 
 impl Push {
-    /// A push to `address`, into `set`.
+    /// Open a push to `address`, into `set`.
+    ///
+    /// The client forwards `token` as a Bearer header when one is set.
+    /// The client never checks the token.
+    /// A proxy before the server checks it.
     ///
     /// # Errors
     ///
-    /// Returns an error if `address` is not an `http://` address this client can
-    /// use, or if `set` is not a single path component. Both are checked here,
-    /// before the caller does any work — a mistyped address or set name should
-    /// not be discovered after a transfer.
-    fn open(address: &str, set: &str) -> std::io::Result<Self> {
-        let remote = blulib::client::Remote::new(address)?;
+    /// The call fails when `address` is not a server address.
+    /// The call fails when `set` is not one path component.
+    /// The call fails when `token` is empty or holds whitespace.
+    /// Both address and set are checked here, before any work.
+    /// A mistyped value fails before a transfer.
+    fn open(address: &str, set: &str, token: Option<&str>) -> std::io::Result<Self> {
+        let remote = remote_for(address, token)?;
 
         blulib::client::check_set(set)?;
 
@@ -4286,15 +4413,18 @@ mod tests {
         );
     }
 
-    /// One `TARGET` resolves to a store, a set name, and a staging path.
-    /// Explicit staging keeps the test off the environment: no cache
-    /// directory is read. Small strings only, no filesystem.
+    /// Check one store target.
+    ///
+    /// Explicit staging keeps the test off the environment.
+    /// No cache directory is read.
+    /// Small strings only, no filesystem.
     #[test]
-    fn target_resolution_names_store_set_and_staging() {
+    fn check_store_target_with_set_and_staging() {
         let target = super::resolve_target(
             "backup",
             "file:///remote/docs",
             Some(std::path::Path::new("/stage")),
+            None,
         )
         .unwrap();
 
@@ -4307,46 +4437,88 @@ mod tests {
         assert!(target.staging.ends_with("docs"));
     }
 
-    /// A `TARGET` with no `://` is a local path, and an `http://` target
-    /// splits into server and set. `--staging` with either is refused.
+    /// Check local and serve targets.
+    ///
+    /// A `TARGET` with no `://` is a local path.
+    /// An `http://` target splits into server and set.
+    /// `--staging` with either fails.
     /// Small strings only.
     #[test]
-    fn target_resolution_splits_local_and_serve() {
-        let local = super::resolve_target("restore", "photos", None).unwrap();
+    fn check_local_and_serve_targets() {
+        let local = super::resolve_target("restore", "photos", None, None).unwrap();
         assert!(
             matches!(local, super::Target::Local(path) if path.as_os_str() == "photos"),
             "a bare name must resolve to a local path"
         );
 
-        let serve = super::resolve_target("versions", "http://127.0.0.1:8480/docs", None).unwrap();
-        assert!(
-            matches!(serve, super::Target::Serve { address, set }
-                if address == "http://127.0.0.1:8480" && set == "docs"),
-            "an http:// target must resolve to a server and a set"
-        );
+        let super::Target::Serve {
+            address,
+            set,
+            token,
+        } = super::resolve_target("versions", "http://127.0.0.1:8480/docs", None, None).unwrap()
+        else {
+            panic!("an http:// target must resolve to a server and a set");
+        };
+        assert_eq!(address, "http://127.0.0.1:8480");
+        assert_eq!(set, "docs");
+        assert_eq!(token, None);
 
-        let staged =
-            super::resolve_target("restore", "photos", Some(std::path::Path::new("/stage")))
-                .unwrap_err();
+        let staged = super::resolve_target(
+            "restore",
+            "photos",
+            Some(std::path::Path::new("/stage")),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(staged.kind(), std::io::ErrorKind::InvalidInput);
 
         let staged = super::resolve_target(
             "versions",
             "http://127.0.0.1:8480/docs",
             Some(std::path::Path::new("/stage")),
+            None,
         )
         .unwrap_err();
         assert_eq!(staged.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    /// A store `TARGET` without a set is refused, and a bad URL fails in
-    /// parsing. Small strings only.
+    /// Check token threading through targets.
+    ///
+    /// The token travels beside the address, never inside it.
+    /// Small strings only.
     #[test]
-    fn target_resolution_refuses_what_it_cannot_name() {
+    fn check_token_travels_beside_address() {
+        let super::Target::Serve { token, .. } = super::resolve_target(
+            "versions",
+            "https://example.test/docs",
+            None,
+            Some("jwt-value"),
+        )
+        .unwrap() else {
+            panic!("an https:// target must resolve to a server and a set");
+        };
+        assert_eq!(token.as_deref(), Some("jwt-value"));
+
+        let super::Target::Serve { token, .. } =
+            super::resolve_target("versions", "https://example.test/docs", None, None).unwrap()
+        else {
+            panic!("an https:// target must resolve to a server and a set");
+        };
+        assert_eq!(token, None);
+    }
+
+    /// Refuse targets without a set name.
+    ///
+    /// A store `TARGET` without a set fails.
+    /// A bad URL fails in parsing.
+    /// Small strings only.
+    #[test]
+    fn refuse_target_without_set_name() {
         let missing = super::resolve_target(
             "backup",
             "s3://bucket/backups",
             Some(std::path::Path::new("/stage")),
+            None,
         );
         // `s3://bucket/backups` names the store `s3://bucket` holding the set
         // `backups`: a set address always carries its set.
@@ -4356,6 +4528,7 @@ mod tests {
             "backup",
             "s3://bucket",
             Some(std::path::Path::new("/stage")),
+            None,
         )
         .unwrap_err();
         assert_eq!(bare.kind(), std::io::ErrorKind::InvalidInput);
@@ -4364,6 +4537,7 @@ mod tests {
             "versions",
             "gopher://host/backups",
             Some(std::path::Path::new("/stage")),
+            None,
         )
         .unwrap_err();
         assert_eq!(bad_url.kind(), std::io::ErrorKind::InvalidInput);
