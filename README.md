@@ -85,11 +85,11 @@ $ blu apply game.pack /tmp/docs-restored --files 'src/*.rs'
 
 ## Remote sets and serve
 
-`file://` works in every build. `sftp://`, `ftp://`, and `s3://` need `--features remote`. `https://` endpoints need `remote-tls`. Remote targets hold no local copy. A `file://` command pulls the set into staging, runs locally, and pushes back its writes. Use `--staging DIR` for the staging copy. Without it, the system cache holds the copy.
+Every build speaks `file://`, `sftp://`, `ftp://` and `s3://`. `s3` speaks plain HTTP and verified HTTPS. HTTPS verifies against the system roots. Remote targets hold no local copy. A `file://` command pulls the set into staging, runs locally, and pushes back its writes. Use `--staging DIR` for the staging copy. Without it, the system cache holds the copy.
 
-`blu serve` serves the sets under a directory over HTTP. It binds `--bind`, `127.0.0.1:8480` by default. There is no authentication and no TLS. Put it behind something that does the authentication, if it needs it. The server moves packs and nothing else.
+`blu serve` serves the sets under a directory over HTTP. It binds `--bind`, `127.0.0.1:8480` by default. There is no authentication and no TLS. Put it behind a terminator that adds TLS and authentication, if it needs them. The server moves packs and nothing else. Clients speak plain HTTP and verified HTTPS.
 
-Run backup and pack locally. Upload the pack. Merge it on the server. Or fetch a pack from the server. Merge it locally. `versions` of an `http://` set prints the same lines as a local set.
+Run backup and pack locally. Upload the pack. Merge it on the server. Or fetch a pack from the server. Merge it locally. `versions` of an `http://` or `https://` set prints the same lines as a local set.
 
 ```console
 $ blu serve ./backups
