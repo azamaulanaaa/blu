@@ -345,46 +345,45 @@ fn closed_port() -> std::net::SocketAddr {
 }
 
 #[tokio::test]
-async fn an_address_that_is_not_http_is_refused_before_anything_is_sent() {
+async fn refuse_bad_address_before_transfer() {
     let dir = tempfile::tempdir().unwrap();
 
-    // `https://` first, and it is the case with a reason worth reading: there
-    // is no TLS backend in the graph, so an `https://` target is a refusal
-    // rather than a connection attempt in the clear to something that believes
-    // it is secure.
+    // HTTPS dials now.
+    // A bad host fails as a connection failure.
+    // It no longer fails as a refusal.
     let tls = fails(dir.path(), &["versions", "https://example.test/docs"]);
     assert!(
-        tls.contains("needs TLS"),
-        "an https target should say why it is refused: {tls}"
+        tls.contains("could not reach"),
+        "an https target dials before it fails: {tls}"
+    );
+    assert!(
+        !tls.contains("needs TLS"),
+        "an https target no longer names a missing backend: {tls}"
     );
 
-    // An unknown store scheme names the schemes it could have been.
+    // An unknown store scheme names the schemes it could use.
     let scheme = fails(dir.path(), &["versions", "gopher://host/docs"]);
     assert!(
         scheme.contains("not a store scheme"),
-        "an unknown scheme should be told what the schemes are: {scheme}"
+        "an unknown scheme names the valid schemes: {scheme}"
     );
 
-    // A known network scheme without a network backend fails closed rather
-    // than connecting. With `--features remote` it would dial, so this half
-    // only runs in a build that holds no backend at all.
-    #[cfg(not(feature = "remote"))]
-    {
-        let closed = fails(dir.path(), &["versions", "ftp://host/docs"]);
-        assert!(
-            closed.contains("--features remote"),
-            "a network scheme in a local-only build should name the feature: {closed}"
-        );
-    }
+    // A known network scheme dials now.
+    // It fails in the backend, not at the feature gate.
+    let network = fails(dir.path(), &["versions", "ftp://host/docs"]);
+    assert!(
+        !network.contains("--features remote"),
+        "a network scheme no longer names a feature: {network}"
+    );
 
-    // Anything else without `://` is a local path, and a local path that is
-    // not a set is the local miss rather than a usage error.
+    // Anything else without `://` is a local path.
+    // A local path that is not a set gives the local miss.
     for target in ["127.0.0.1:8480", "//127.0.0.1:8480", ""] {
         let stderr = fails(dir.path(), &["versions", target]);
 
         assert!(
             stderr.contains("no backup set"),
-            "{target:?} is a local path, so it should get the local miss: {stderr}"
+            "{target:?} is a local path and gets the local miss: {stderr}"
         );
     }
 }
