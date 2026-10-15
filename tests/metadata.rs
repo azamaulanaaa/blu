@@ -211,6 +211,76 @@ fn a_bincode_encoded_blob_is_reported_as_an_unsupported_version() {
     }
 }
 
+/// Snapshots with different stamps still match when trees match.
+///
+/// The stamp records run time.
+/// It never describes tree content.
+/// Two runs of one tree must compare equal here.
+#[test]
+fn snapshots_with_different_stamps_still_match() {
+    let mut first = sample();
+    let mut second = sample();
+    first.taken_at = Timestamp { secs: 1, nanos: 0 };
+    second.taken_at = Timestamp {
+        secs: 2,
+        nanos: 500,
+    };
+
+    assert!(first.matches_tree(&second));
+    assert!(second.matches_tree(&first));
+}
+
+/// Snapshots with different files never match.
+///
+/// One changed byte changes the tree.
+/// The stamp cannot hide that.
+/// Each field below gets its own case.
+#[test]
+fn snapshots_with_different_trees_never_match() {
+    let base = sample();
+
+    let mut moved_stamp = sample();
+    moved_stamp.taken_at = Timestamp {
+        secs: 9_999,
+        nanos: 0,
+    };
+    assert!(
+        base.matches_tree(&moved_stamp),
+        "a stamp change alone must not break the match"
+    );
+
+    let mut changed_file = sample();
+    changed_file.files[0].len = 11;
+    assert!(!base.matches_tree(&changed_file));
+
+    let mut changed_dir = sample();
+    changed_dir.dirs.push(blulib::metadata::Dir {
+        path: "new".into(),
+        attrs: Attributes {
+            owner: None,
+            mode: None,
+            mtime: None,
+            xattrs: Vec::new(),
+            windows_acl: None,
+        },
+    });
+    assert!(!base.matches_tree(&changed_dir));
+
+    let mut changed_chunk = sample();
+    changed_chunk.chunks.push(BlobId::from_bytes([9u8; 32]));
+    assert!(!base.matches_tree(&changed_chunk));
+
+    let mut changed_slice = sample();
+    changed_slice.file_chunks[0].length = 9;
+    assert!(!base.matches_tree(&changed_slice));
+
+    let mut changed_link = sample();
+    changed_link.links.push(blulib::metadata::Link::Symbolic {
+        path: "link".into(),
+        target: "target".into(),
+    });
+    assert!(!base.matches_tree(&changed_link));
+}
 /// The encoded form should not have the same size as the old one by accident.
 ///
 /// Not a strong property on its own.

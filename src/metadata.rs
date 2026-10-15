@@ -385,6 +385,20 @@ impl Snapshot {
         Ok(())
     }
 
+    /// Check whether two snapshots describe the same tree.
+    ///
+    /// Ignore `taken_at`.
+    /// Compare files, dirs, chunks, slices, and links.
+    /// A stamp change alone never counts as a tree change.
+    #[must_use]
+    pub fn matches_tree(&self, other: &Self) -> bool {
+        self.files == other.files
+            && self.dirs == other.dirs
+            && self.chunks == other.chunks
+            && self.file_chunks == other.file_chunks
+            && self.links == other.links
+    }
+
     /// An empty snapshot stamped with `taken_at`.
     ///
     /// Takes the stamp the backup ran at.
