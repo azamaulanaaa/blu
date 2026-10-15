@@ -199,6 +199,14 @@ pub struct Applied {
     /// Reporting zero would claim a tree could be fully owned on the strength of a
     /// run that touched nothing.
     pub unowned: u64,
+
+    /// Entries whose extended attributes this process could not set.
+    ///
+    /// Extended attributes are xattrs on Linux and access lists on Windows.
+    /// A filesystem without support for them fails every entry that records
+    /// any. On a dry run this is a bound rather than a count, for the same
+    /// reason as `unowned`.
+    pub unattributed: u64,
 }
 
 /// Bring a directory up to the version a pack carries.
@@ -440,7 +448,7 @@ async fn apply(root: PathBuf, pack: &Pack, options: Options) -> io::Result<Appli
 
     let for_attrs = root.to_path_buf();
     let for_attrs_snapshot = snapshot.clone();
-    let unowned = tokio::task::spawn_blocking(move || {
+    let attrs = tokio::task::spawn_blocking(move || {
         super::restore::restore_attributes(&for_attrs, &for_attrs_snapshot)
     })
     .await
@@ -470,7 +478,8 @@ async fn apply(root: PathBuf, pack: &Pack, options: Options) -> io::Result<Appli
         bytes: written.bytes,
         removed,
         extra: u64::try_from(extra.len()).unwrap_or(0),
-        unowned,
+        unowned: attrs.unowned,
+        unattributed: attrs.unattributed,
     })
 }
 
@@ -552,6 +561,7 @@ fn would_write(
         removed: if prune { extra } else { 0 },
         extra,
         unowned: owners(snapshot),
+        unattributed: extended(snapshot),
     }
 }
 
@@ -578,6 +588,30 @@ pub(super) fn owners(snapshot: &metadata::Snapshot) -> u64 {
         .dirs
         .iter()
         .filter(|dir| dir.attrs.owner.is_some())
+        .count();
+
+    u64::try_from(files.saturating_add(dirs)).unwrap_or(0)
+}
+
+/// How many entries a version records extended attributes for.
+///
+/// The most that could fail to have them set. Extended attributes are xattrs
+/// on Linux and access lists on Windows. This is the reason
+/// [`Applied::unattributed`] carries a bound rather than a count on a dry
+/// run. Whether attributes take effect is only knowable by setting them.
+///
+/// Shared with [`RestorePlanBuilder`](super::restore::RestorePlanBuilder),
+/// which reports the same bound for the same reason.
+pub(super) fn extended(snapshot: &metadata::Snapshot) -> u64 {
+    let files = snapshot
+        .files
+        .iter()
+        .filter(|file| file.attrs.has_xattrs() || file.attrs.has_windows_acl())
+        .count();
+    let dirs = snapshot
+        .dirs
+        .iter()
+        .filter(|dir| dir.attrs.has_xattrs() || dir.attrs.has_windows_acl())
         .count();
 
     u64::try_from(files.saturating_add(dirs)).unwrap_or(0)

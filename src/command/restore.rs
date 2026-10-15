@@ -51,6 +51,12 @@ pub struct Restored {
     /// files it does not own. Reported rather than refused because the alternative is
     /// a half-written tree with the wrong owner already on disk.
     pub unowned: u64,
+    /// Entries whose extended attributes this process could not set.
+    ///
+    /// Extended attributes are xattrs on Linux and access lists on Windows.
+    /// A filesystem without support for them fails every entry that records
+    /// any. Reported rather than refused for the same reason as `unowned`.
+    pub unattributed: u64,
 }
 
 /// What a restore of a version would put into a destination, worked out by reading
@@ -82,6 +88,11 @@ pub struct RestorePlan {
     /// cannot know how many of these it would have failed on. Every entry that
     /// records an owner is named, which is the most that could fail.
     pub unowned: u64,
+    /// Entries that record extended attributes, which this process may fail to set.
+    ///
+    /// A bound rather than a count for the same reason as `unowned`. Extended
+    /// attributes are xattrs on Linux and access lists on Windows.
+    pub unattributed: u64,
 }
 
 /// Reassemble a snapshot under a destination.
@@ -297,7 +308,7 @@ async fn run_restore<S: storage::StorageGet + 'static>(
     .map_err(|e| join_panic(&e))??;
 
     let for_attributes = root.to_path_buf();
-    let unowned = tokio::task::spawn_blocking({
+    let attrs = tokio::task::spawn_blocking({
         let root = for_attributes;
         let snapshot = Arc::clone(&snapshot);
         move || restore_attributes(&root, &snapshot)
@@ -311,7 +322,8 @@ async fn run_restore<S: storage::StorageGet + 'static>(
         links: u64::try_from(snapshot.links.len()).unwrap_or(0),
         chunks: u64::try_from(snapshot.chunks.len()).unwrap_or(0),
         bytes: written,
-        unowned,
+        unowned: attrs.unowned,
+        unattributed: attrs.unattributed,
     })
 }
 
@@ -365,6 +377,7 @@ async fn run_restore_plan<S: storage::StorageGet + 'static>(
             .iter()
             .fold(0u64, |total, file| total.saturating_add(file.len)),
         unowned: super::apply::owners(&snapshot),
+        unattributed: super::apply::extended(&snapshot),
     })
 }
 
@@ -920,42 +933,61 @@ pub(crate) fn restore_links(root: &Path, snapshot: &Snapshot) -> io::Result<()> 
     Ok(())
 }
 
-/// Apply owners, permission bits and modification times, files before directories.
+/// What one attribute stage recorded about failures.
 ///
-/// Shared with [`super::apply`] for the same reason [`restore_links`] is. This is
-/// also why an apply prunes *before* calling this. Removing an entry updates the
-/// modification time of the directory that held it. A directory's time can only
-/// be set once nothing else is going to change it.
+/// Both counts cover files and directories. The stage reports them together
+/// because it walks both in one pass. Callers split them into their reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AttrCounts {
+    /// Entries whose owner could not be set.
+    pub unowned: u64,
+    /// Entries whose extended attributes could not be set.
+    pub unattributed: u64,
+}
+
+/// Apply owners and permission bits and times and extended attributes.
 ///
-/// Returns how many entries recorded an owner that this process could not set.
-/// For an unprivileged caller, that is every entry, because the caller does not
-/// own every file in the tree. It is a count rather than an error. Stopping at
-/// the first failure is worse than a wrong number in a report. Stopping there
-/// leaves a tree half written, with that file already on disk under the wrong
-/// owner and nothing to retry.
+/// Files come before directories. Shared with [`super::apply`] for the same
+/// reason [`restore_links`] is. An apply prunes before calling this. Removing
+/// an entry moves the time of the directory that held it. A directory time is
+/// set only once nothing else moves it.
+///
+/// Returns how many entries missed an owner or extended attributes. An
+/// unprivileged caller misses every owned entry. A filesystem without
+/// attribute support misses every entry that records any. Both are counts
+/// rather than errors. Stopping at the first miss leaves a half written tree
+/// with nothing to retry.
 ///
 /// # Errors
 ///
-/// Returns an error if a path escapes the root, or if a mode or modification time
-/// cannot be applied. Only the owner is permitted to fail without stopping the run.
-pub(crate) fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<u64> {
-    let mut unowned = 0u64;
+/// Returns an error if a path escapes the root. Returns an error if a mode or
+/// a time cannot be applied. Owner and extended misses stay quiet.
+pub(crate) fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result<AttrCounts> {
+    let mut counts = AttrCounts::default();
 
     for file in &snapshot.files {
         let path = resolve(root, &file.path, "a file")?;
-        if !file.attrs.apply_restoring(&path)?.owner_applied {
-            unowned = unowned.saturating_add(1);
+        let outcome = file.attrs.apply_restoring(&path)?;
+        if !outcome.owner_applied {
+            counts.unowned = counts.unowned.saturating_add(1);
+        }
+        if !outcome.xattrs_applied || !outcome.acl_applied {
+            counts.unattributed = counts.unattributed.saturating_add(1);
         }
     }
 
     for dir in &snapshot.dirs {
         let path = resolve(root, &dir.path, "a directory")?;
-        if !dir.attrs.apply_restoring(&path)?.owner_applied {
-            unowned = unowned.saturating_add(1);
+        let outcome = dir.attrs.apply_restoring(&path)?;
+        if !outcome.owner_applied {
+            counts.unowned = counts.unowned.saturating_add(1);
+        }
+        if !outcome.xattrs_applied || !outcome.acl_applied {
+            counts.unattributed = counts.unattributed.saturating_add(1);
         }
     }
 
-    Ok(unowned)
+    Ok(counts)
 }
 
 /// Remove whatever currently occupies `path`, if anything.
