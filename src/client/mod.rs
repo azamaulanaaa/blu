@@ -54,11 +54,13 @@
 //!
 //! ## TLS
 //!
-//! **There is none, and this client refuses to pretend otherwise.** `awc` is
-//! built here with no TLS backend, `blu serve` offers no TLS either, and an
-//! `https://` address is [`io::ErrorKind::InvalidInput`] rather than a
-//! connection that fails somewhere confusing. A server reachable over TLS wants
-//! a terminator in front of it, and that terminator speaks `http://` to this.
+//! The client speaks plain HTTP and verified HTTPS.
+//! It verifies HTTPS against the system roots.
+//! `blu serve` offers plain HTTP only.
+//! A server behind a terminator uses HTTPS before the terminator.
+//! The terminator uses HTTP before the server.
+//! The client never downgrades HTTPS before plain HTTP.
+//! The client never upgrades HTTP before HTTPS.
 //!
 //! [`blu merge`]: crate::command::merge
 
@@ -127,14 +129,21 @@ impl std::fmt::Debug for Remote {
 }
 
 impl Remote {
-    /// A client for the server at `address`.
+    /// Build a client for the server at `address`.
+    ///
+    /// The client accepts `http://` and `https://`.
+    /// It verifies HTTPS against the system roots.
     ///
     /// # Errors
     ///
-    /// Returns an error if `address` is not an `http://` address this client can
-    /// use: empty, not HTTP, an `https://` address this client cannot speak, a
-    /// query or a fragment, whitespace, or no host. A trailing `/` is dropped,
-    /// so the address the server prints and the address a user types both work.
+    /// The call fails when `address` is empty.
+    /// The call fails when `address` starts with another scheme.
+    /// The call fails when `address` carries a query or a fragment.
+    /// The call fails when `address` holds whitespace.
+    /// The call fails when `address` names no host.
+    /// A trailing `/` is dropped.
+    /// The address the server prints works.
+    /// The address a user types works.
     pub fn new(address: &str) -> io::Result<Self> {
         Ok(Self {
             base: base_of(address)?,
@@ -160,17 +169,17 @@ impl Remote {
         &self.base
     }
 
-    /// The absolute URL of `path` on this server.
+    /// Build the absolute URL of `path` on this server.
     ///
     /// # Errors
     ///
-    /// Returns an error if `path` does not begin with a `/`, which is the only
-    /// thing that would let it escape the server's own URL space.
+    /// The call fails when `path` does not start with `/`.
+    /// A path without `/` could escape the server URL space.
     pub(crate) fn url(&self, path: &str) -> io::Result<String> {
         if !path.starts_with('/') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{path:?} is not a path on this server: it has to begin with a `/`"),
+                format!("{path:?} is not a path on this server. Start the path with `/`"),
             ));
         }
 
@@ -178,38 +187,33 @@ impl Remote {
     }
 }
 
-/// Normalise and check an address, without the trailing `/`.
+/// Check an address and drop the trailing `/`.
+///
+/// The address uses `http://` or `https://`.
+/// The check is case-insensitive for the scheme.
+/// The client verifies HTTPS against the system roots.
 fn base_of(address: &str) -> io::Result<String> {
     let address = address.trim();
 
     if address.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "no server address: a serve target wants the address `blu serve` printed, \
-             which looks like http://127.0.0.1:8480",
+            "no server address: use the address `blu serve` printed, such as http://127.0.0.1:8480",
         ));
     }
 
-    // Case-insensitive, because a scheme is, and a user who types HTTPS in
-    // capitals has still typed HTTPS.
+    // The scheme is case-insensitive.
+    // A user who types HTTPS still types HTTPS.
     let lowered = address.to_ascii_lowercase();
-
-    if lowered.starts_with("https://") {
+    let rest = if lowered.starts_with("https://") {
+        address.get("https://".len()..).unwrap_or_default()
+    } else if lowered.starts_with("http://") {
+        address.get("http://".len()..).unwrap_or_default()
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{address} needs TLS, and this client has none: `blu serve` offers no TLS \
-                 either, so use the http:// address it printed, or put a terminator in front of it"
-            ),
-        ));
-    }
-
-    let Some(rest) = address.strip_prefix("http://") else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{address:?} is not a server address: it has to begin with http://, and \
-                 blu serve does not speak anything else"
+                "{address:?} is not a server address. Start the address with http:// or https://"
             ),
         ));
     };
@@ -225,14 +229,13 @@ fn base_of(address: &str) -> io::Result<String> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{address:?} carries a query or a fragment; a server address is a scheme, a host \
-                 and a port"
+                "{address:?} carries a query or a fragment. A server address holds a scheme, a host and a port"
             ),
         ));
     }
 
-    // Up to the first `/` is the authority. What is left may be a path, and
-    // dropping the trailing slash makes `url` an append rather than a join.
+    // Up to the first `/` is the authority.
+    // Dropping the trailing slash turns `url` into an append.
     let host = rest.split('/').next().unwrap_or("");
 
     if host.is_empty() {
@@ -245,21 +248,21 @@ fn base_of(address: &str) -> io::Result<String> {
     Ok(address.trim_end_matches('/').to_string())
 }
 
-/// A set name as it goes into a URL path.
+/// Encode a set name for a URL path.
 ///
 /// # Errors
 ///
-/// Returns an error if `name` is empty or is not a single normal path
-/// component.
+/// The call fails when `name` is empty.
+/// The call fails when `name` is not one normal path component.
 ///
-/// **The same rule the server applies to the name it receives**, taken from
-/// [`crate::serve`]'s own check, so a name accepted here is a name the server
-/// will not refuse as a path. The two sides of a name have to agree on what a
-/// name is, and the server's rule is the one that was written down first.
+/// The rule matches the server rule.
+/// A name accepted here is a name the server accepts.
+/// The server rule was written first.
 ///
-/// Percent-encoding is applied rather than assumed away: a set may be named
-/// `photos 2024`, and a space sent raw would truncate the path into something
-/// the server reads as a different set.
+/// The encoder percent-encodes the name.
+/// A set may use `photos 2024`.
+/// A raw space would truncate the path.
+/// The server would then read another set.
 pub(crate) fn set_path(name: &str) -> io::Result<String> {
     use std::path::{Component, Path};
 
@@ -279,8 +282,7 @@ pub(crate) fn set_path(name: &str) -> io::Result<String> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidFilename,
             format!(
-                "{name:?} is a path, and a set on a server is named by one path component: pass \
-                 the set's name (`docs`), not where it lives (`backups/docs`)"
+                "{name:?} is a path. A set on a server uses one path component. Use the set name (`docs`)"
             ),
         ));
     }
@@ -288,19 +290,20 @@ pub(crate) fn set_path(name: &str) -> io::Result<String> {
     Ok(encode_component(name))
 }
 
-/// One path component, percent-encoded.
+/// Percent-encode one path component.
 ///
-/// **One function for both callers, because the encoder is not the part that
-/// differs.** A set name and a server-issued id differ in whether they are
-/// validated or only made safe, and the bytes that come out are the same either
-/// way — so the loop that produces them is written once, here.
+/// One function encodes for both callers.
+/// A set name and a server id differ in checks.
+/// The output bytes stay the same.
 ///
-/// The unreserved set is RFC 3986's, and `.` is in it rather than out of it:
-/// the set names in this crate carry dots (`photos.2024`), and encoding them
-/// would be a set name no request could name back.
+/// The unreserved set follows RFC 3986.
+/// It keeps `.` unencoded.
+/// Set names carry dots, such as `photos.2024`.
+/// Encoding dots would hide the name from requests.
 ///
-/// History `files` values travel through this too: a path holds slashes and
-/// spaces, and both must survive the query string they ride in.
+/// History `files` values also use this encoder.
+/// A path holds slashes and spaces.
+/// Both survive the query string.
 pub(crate) fn encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -319,70 +322,65 @@ pub(crate) fn encode_component(value: &str) -> String {
     encoded
 }
 
-/// One server-issued id as it goes into a URL path.
+/// Encode a server id for a URL path.
 ///
-/// **Encoded rather than validated, because this id is not the caller's choice.**
-/// A set name is something a user types and is told about when it is wrong, so
-/// [`set_path`] checks it and explains itself. An upload or a job id is something
-/// the server chose and this client read back out of a document, so the only
-/// thing worth doing with it is making sure it cannot climb out of its own path
-/// segment — which a server answering `{"job":"../../v1/version"}` could
-/// otherwise talk this client into requesting.
-///
-/// An id is never empty in practice, and one that is is refused by the request
-/// that names it rather than here.
+/// The encoder makes the id safe.
+/// It does not check the id.
+/// The caller types a set name.
+/// The server selects an upload id or a job id.
+/// The encoder stops the id from leaving its path segment.
+/// A server that answers `{"job":"../../v1/version"}` cannot redirect this client.
+/// An empty id is refused by the request that names it.
 pub(crate) fn segment(id: &str) -> String {
     encode_component(id)
 }
 
-/// Refuse a name a server will not accept as a set's, without sending anything.
+/// Check a set name before any transfer.
 ///
-/// **The same rule `set_path` applies, and for the same reason: before the
-/// bytes.** A command that is about to upload a pack — and, for a backup to a
-/// serve target, about to stage a whole backup first — can ask this whether the
-/// name it was given is a name, and be told the server's own complaint, rather
-/// than finding out after the transfer that the path was never going to be one.
+/// The check uses the same rule as `set_path`.
+/// A command checks the name before it stages a backup.
+/// The caller learns the server complaint before the transfer.
+/// The caller avoids a failure after the transfer.
 ///
-/// Returns the same [`io::Error`] `set_path` would, so the sentence a user
-/// reads is the one every other set name in this crate produces.
+/// The call returns the same error as `set_path`.
 ///
 /// # Errors
 ///
-/// Returns an error if `name` is empty or is not a single normal path
-/// component — a set on a server is named by one name, not by a path.
+/// The call fails when `name` is empty.
+/// The call fails when `name` is not one path component.
 pub fn check_set(name: &str) -> io::Result<()> {
     set_path(name).map(|_| ())
 }
 
-/// Split a full serve address into its server and its set name.
+/// Split a serve target into server address and set name.
 ///
-/// A `TARGET` names both halves at once: `http://127.0.0.1:8480/docs` is the
-/// server `http://127.0.0.1:8480` holding the set `docs`. The set is the
-/// single path segment after the authority, percent-decoded, and follows the
-/// one-component rule. An `https://` address is refused for the same reason
-/// [`Remote::new`] refuses one: neither end speaks TLS.
+/// A target names both halves at once.
+/// `http://127.0.0.1:8480/docs` names server `http://127.0.0.1:8480`.
+/// It names set `docs`.
+/// `https://example.test/docs` names server `https://example.test`.
+/// It names set `docs`.
+/// The set is one path segment after the authority.
+/// The splitter percent-decodes the segment.
+/// The set follows the one-component rule.
 ///
 /// # Errors
 ///
-/// Returns an error when the address is not `http://`, when it names no host,
-/// when it names no set, or when it names more than one path segment.
+/// The call fails when the target uses another scheme.
+/// The call fails when the target names no host.
+/// The call fails when the target names no set.
+/// The call fails when the target names more than one segment.
 pub fn split_serve_target(target: &str) -> io::Result<(String, String)> {
     let trimmed = target.trim();
-    if trimmed.to_ascii_lowercase().starts_with("https://") {
+    let lowered = trimmed.to_ascii_lowercase();
+    let (scheme, rest) = if lowered.starts_with("https://") {
+        ("https", trimmed.get("https://".len()..).unwrap_or_default())
+    } else if lowered.starts_with("http://") {
+        ("http", trimmed.get("http://".len()..).unwrap_or_default())
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{target} needs TLS, and this client has none: `blu serve` offers no TLS \
-                 either, so use the http:// address it printed, or put a terminator in front of it"
-            ),
-        ));
-    }
-    let Some(rest) = trimmed.strip_prefix("http://") else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{target:?} is not a serve address: a remote set looks like \
-                 http://127.0.0.1:8480/docs"
+                "{target:?} is not a serve address. Start the address with http:// or https://"
             ),
         ));
     };
@@ -396,8 +394,7 @@ pub fn split_serve_target(target: &str) -> io::Result<(String, String)> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{target:?} carries a query or a fragment; a serve address is a scheme, a host, \
-                 a port, and one set name"
+                "{target:?} carries a query or a fragment. A serve address holds a scheme, a host, a port and one set name"
             ),
         ));
     }
@@ -411,22 +408,21 @@ pub fn split_serve_target(target: &str) -> io::Result<(String, String)> {
             format!("{target:?} names no host"),
         ));
     }
-    // The address half, validated the same way `Remote::new` validates one.
-    let address = format!("http://{host}");
+    // Check the address half the same way `Remote::new` checks one.
+    let address = format!("{scheme}://{host}");
     Remote::new(&address)?;
     let path = path.trim_matches('/');
     if path.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{target:?} names no set: append the set name (`{target}/docs`)"),
+            format!("{target:?} names no set. Append the set name (`{target}/docs`)"),
         ));
     }
     if path.contains('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidFilename,
             format!(
-                "{path:?} is a path, and a set on a server is named by one path component: \
-                 pass the set's name (`docs`), not where it lives (`backups/docs`)"
+                "{path:?} is a path. A set on a server uses one path component. Use the set name (`docs`)"
             ),
         ));
     }
@@ -436,6 +432,12 @@ pub fn split_serve_target(target: &str) -> io::Result<(String, String)> {
 }
 
 /// Decode one percent-encoded path segment.
+///
+/// # Errors
+///
+/// The call fails when the segment ends with incomplete encoding.
+/// The call fails when the segment holds bad hex.
+/// The call fails when the decoded bytes are not UTF-8.
 fn percent_decode(segment: &str) -> io::Result<String> {
     let mut out = Vec::with_capacity(segment.len());
     let bytes = segment.as_bytes();
@@ -475,7 +477,7 @@ mod tests {
     use super::{Remote, base_of, set_path};
 
     #[test]
-    fn the_address_the_server_prints_is_accepted() {
+    fn accept_address_from_server() {
         assert_eq!(
             base_of("http://127.0.0.1:8480").unwrap(),
             "http://127.0.0.1:8480"
@@ -483,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trailing_slash_is_the_same_address() {
+    fn accept_address_with_trailing_slash() {
         assert_eq!(
             base_of("http://127.0.0.1:8480/").unwrap(),
             "http://127.0.0.1:8480"
@@ -491,9 +493,9 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_around_the_address_is_trimmed() {
-        // Typed, pasted, or copied out of a terminal line that had a prompt on
-        // it. All the same mistake.
+    fn trim_space_around_address() {
+        // Users paste an address from terminal output.
+        // The pasted text holds spaces or a newline.
         assert_eq!(
             base_of("  http://127.0.0.1:8480\n").unwrap(),
             "http://127.0.0.1:8480"
@@ -501,62 +503,68 @@ mod tests {
     }
 
     #[test]
-    fn https_is_refused_with_the_reason() {
-        // The error has to name what is wrong, not just that something is.
-        let error = base_of("https://example.test").unwrap_err();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("needs TLS"));
+    fn accept_https_address() {
+        // The client verifies HTTPS against the system roots.
+        assert_eq!(
+            base_of("https://example.test").unwrap(),
+            "https://example.test"
+        );
     }
 
     #[test]
-    fn https_is_refused_whatever_the_case() {
-        assert!(base_of("HTTPS://example.test").is_err());
+    fn accept_https_address_in_any_case() {
+        // The scheme check ignores case.
+        assert_eq!(
+            base_of("HTTPS://example.test").unwrap(),
+            "HTTPS://example.test"
+        );
     }
 
     #[test]
-    fn an_address_that_is_not_http_is_refused() {
+    fn refuse_address_without_http_scheme() {
         for address in ["ftp://host", "127.0.0.1:8480", "//127.0.0.1:8480"] {
             let error = base_of(address).unwrap_err();
             assert_eq!(
                 error.kind(),
                 std::io::ErrorKind::InvalidInput,
-                "{address} should be refused"
+                "{address} must fail"
             );
         }
     }
 
     #[test]
-    fn an_empty_address_is_refused_with_an_example() {
-        // The message carries the shape of a good one, because a user who typed
-        // nothing is asking what this option wants.
+    fn refuse_empty_address_with_example() {
+        // The message shows a good address.
+        // A user who types nothing asks what the option wants.
         let error = base_of("   ").unwrap_err();
 
         assert!(error.to_string().contains("http://127.0.0.1:8480"));
     }
 
     #[test]
-    fn an_address_with_no_host_is_refused() {
+    fn refuse_address_without_host() {
         assert!(base_of("http://").is_err());
+        assert!(base_of("https://").is_err());
     }
 
     #[test]
-    fn an_address_carrying_a_query_is_refused() {
+    fn refuse_address_with_query() {
         assert!(base_of("http://host:8480/?a=b").is_err());
         assert!(base_of("http://host:8480/#frag").is_err());
+        assert!(base_of("https://host:8480/?a=b").is_err());
     }
 
     #[test]
-    fn a_set_name_is_one_path_component() {
+    fn accept_set_name_with_one_component() {
         assert_eq!(set_path("docs").unwrap(), "docs");
         assert_eq!(set_path("photos.2024").unwrap(), "photos.2024");
         assert_eq!(set_path("a-b_c~d").unwrap(), "a-b_c~d");
     }
 
     #[test]
-    fn a_set_name_is_percent_encoded_rather_than_assumed_safe() {
-        // A space sent raw would end the path, and the server would read what
-        // came before it as the set's name.
+    fn encode_set_name_with_percent_encoding() {
+        // A raw space would end the path.
+        // The server would then read another set name.
         assert_eq!(set_path("photos 2024").unwrap(), "photos%202024");
         assert!(set_path("a/b").is_err(), "a path is not a name");
         assert!(set_path("../etc").is_err());
@@ -564,9 +572,9 @@ mod tests {
     }
 
     #[test]
-    fn a_set_the_server_would_refuse_is_refused_before_anything_is_sent() {
-        // The point of the public half: `check_set` and `set_path` are one rule,
-        // so this asserting against `set_path` is what stops them being two.
+    fn refuse_bad_set_name_before_transfer() {
+        // `check_set` and `set_path` enforce one rule.
+        // This test locks the two together.
         assert!(super::check_set("docs").is_ok());
         assert!(super::check_set("photos 2024").is_ok());
 
@@ -584,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_is_refused_with_a_message_that_says_which_half_is_wrong() {
+    fn refuse_path_with_clear_half_message() {
         let error = set_path("backups/docs").unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidFilename);
@@ -592,37 +600,43 @@ mod tests {
     }
 
     #[test]
-    fn a_path_is_built_by_appending_and_never_by_joining() {
+    fn build_path_by_append() {
         let remote = Remote::new("http://127.0.0.1:8480/").unwrap();
 
         assert_eq!(
             remote.url("/v1/sets/docs/versions").unwrap(),
             "http://127.0.0.1:8480/v1/sets/docs/versions"
         );
+
+        let secure = Remote::new("https://example.test/").unwrap();
+
+        assert_eq!(
+            secure.url("/v1/sets/docs/versions").unwrap(),
+            "https://example.test/v1/sets/docs/versions"
+        );
     }
 
     #[test]
-    fn a_relative_path_is_refused_rather_than_appended() {
+    fn refuse_relative_path() {
         let remote = Remote::new("http://127.0.0.1:8480").unwrap();
 
-        // Without this, a path that did not start at the root would be appended
-        // to whatever the address already carried.
+        // A path without root must fail.
+        // Appending it would mix it with the address.
         assert!(remote.url("v1/sets").is_err());
     }
 
     #[test]
-    fn a_server_issued_id_cannot_climb_out_of_its_own_path_segment() {
-        // An id is not typed by a user, so it is encoded rather than validated,
-        // and the encoding is the whole of the guarantee. A server answering
-        // `{"job":"../../v1/version"}` must not be able to talk this client into
-        // requesting something other than a job.
+    fn encode_server_id_for_path_segment() {
+        // The encoder makes a server id safe.
+        // It does not check the id.
+        // A hostile server id stays inside its segment.
         assert_eq!(super::segment("abc123"), "abc123");
         assert_eq!(super::segment("../../v1/version"), "..%2F..%2Fv1%2Fversion");
         assert_eq!(super::segment("a b"), "a%20b");
     }
 
     #[test]
-    fn a_serve_target_splits_into_address_and_set() {
+    fn split_serve_target_into_address_and_set() {
         let (address, set) = super::split_serve_target("http://127.0.0.1:8480/docs").unwrap();
         assert_eq!(address, "http://127.0.0.1:8480");
         assert_eq!(set, "docs");
@@ -632,17 +646,21 @@ mod tests {
         assert_eq!(address, "http://127.0.0.1:8480");
         assert_eq!(set, "photos 2024");
 
+        let (address, set) = super::split_serve_target("https://example.test/docs").unwrap();
+        assert_eq!(address, "https://example.test");
+        assert_eq!(set, "docs");
+
         for target in [
             "http://127.0.0.1:8480",
             "http://127.0.0.1:8480/",
             "http://127.0.0.1:8480/a/b",
-            "https://example.test/docs",
             "photos",
             "http://",
+            "https://",
         ] {
             assert!(
                 super::split_serve_target(target).is_err(),
-                "{target:?} must be refused"
+                "{target:?} must fail"
             );
         }
     }
