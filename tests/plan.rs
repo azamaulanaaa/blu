@@ -256,3 +256,34 @@ async fn a_plans_payloads_concatenate_into_the_files_it_describes() {
 
     assert_eq!(rebuilt, body, "the file did not come back out of the plan");
 }
+
+/// The plan builder marks a new tree as fresh and a stored tree as held.
+///
+/// Without a store every chunk reads as new. After a backup the same tree
+/// reads as held. The chunk count stays the same in both runs.
+#[tokio::test]
+async fn plan_builder_separates_fresh_chunks_from_held_chunks() {
+    use blulib::command::BackupPlanBuilder;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("a.bin"), common::noisy(100_000)).unwrap();
+
+    let fresh = BackupPlanBuilder::new(&source).run().await.unwrap();
+    assert!(fresh.chunks > 0, "the tree should cut into chunks");
+    assert_eq!(fresh.held, 0, "nothing is held without a store");
+    assert_eq!(fresh.fresh, fresh.chunks);
+
+    let blob = dir.path().join("store.bin");
+    common::run_backup(&source, &blob).await;
+
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    let held = BackupPlanBuilder::new(&source)
+        .store(Some(store))
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(held.chunks, fresh.chunks);
+    assert_eq!(held.held, held.chunks, "the set holds every chunk");
+    assert_eq!(held.fresh, 0);
+}

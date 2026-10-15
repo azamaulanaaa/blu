@@ -17,7 +17,7 @@ mod common;
 use std::fs;
 
 use blulib::{
-    command::{Options, backup},
+    command::{BackupBuilder, Options},
     metadata::Timestamp,
     storage::{BlobId, BlobStore, StorageGet},
 };
@@ -442,14 +442,14 @@ async fn a_version_older_than_the_latest_one_is_refused() {
     let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;
 
-    let storage =
-        BlobStore::builder(&blob).open_writer().await
-            .unwrap();
+    let storage = BlobStore::builder(&blob).open_writer().await.unwrap();
     let future = Timestamp {
         secs: 9_999_999_999,
         nanos: 0,
     };
-    let error = backup(&source, Options::default(), storage, Some(future))
+    let error = BackupBuilder::new(&source, storage)
+        .latest(Some(future))
+        .run()
         .await
         .expect_err("an older version should be refused");
 
@@ -484,10 +484,10 @@ async fn a_version_stamped_at_the_latest_time_commits() {
     let latest = store.version_time(1).await.unwrap();
 
     fs::write(source.join("b.bin"), b"second").unwrap();
-    let storage =
-        BlobStore::builder(&blob).open_writer().await
-            .unwrap();
-    let second = backup(&source, Options::default(), storage, Some(latest))
+    let storage = BlobStore::builder(&blob).open_writer().await.unwrap();
+    let second = BackupBuilder::new(&source, storage)
+        .latest(Some(latest))
+        .run()
         .await
         .expect("an equal stamp should commit");
 

@@ -646,7 +646,9 @@ mod tests {
     async fn call_a_real_instrumented_function() {
         // Fails, because the path is not a store. The span is made either way,
         // which is the whole point: this is about the callsite, not the result.
-        let _ = crate::storage::BlobStore::builder("no/such/set/anywhere").open_reader().await;
+        let _ = crate::storage::BlobStore::builder("no/such/set/anywhere")
+            .open_reader()
+            .await;
     }
 
     /// Whether the progress filter would let this callsite through.

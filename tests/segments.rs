@@ -22,8 +22,7 @@ use std::{fs, path::Path};
 use blulib::{
     layout::IndexSet,
     storage::{
-        BlobId, BlobStore, Resolved, SegmentLimit, StorageGet, StoragePut, resolve,
-        resolve_with,
+        BlobId, BlobStore, Resolved, SegmentLimit, StorageGet, StoragePut, resolve, resolve_with,
     },
 };
 
@@ -40,7 +39,10 @@ fn small() -> SegmentLimit {
 
 /// Store `payloads` one at a time, returning the ids in the order stored.
 async fn put_all(blob: &Path, limit: SegmentLimit, payloads: &[Vec<u8>]) -> Vec<BlobId> {
-    let store = BlobStore::builder(blob).segment_limit(limit).open_writer().await
+    let store = BlobStore::builder(blob)
+        .segment_limit(limit)
+        .open_writer()
+        .await
         .unwrap();
 
     let mut ids = Vec::new();
@@ -157,7 +159,10 @@ async fn a_record_larger_than_the_limit_is_refused() {
     let limit = tiny();
 
     let big = payload(1, 8_192);
-    let store = BlobStore::builder(&blob).segment_limit(limit).open_writer().await
+    let store = BlobStore::builder(&blob)
+        .segment_limit(limit)
+        .open_writer()
+        .await
         .unwrap();
 
     let error = store
@@ -290,7 +295,10 @@ async fn a_sealed_segment_with_a_damaged_tail_is_refused_not_truncated() {
     let damaged_len = bytes.len();
     fs::write(sealed, &bytes).unwrap();
 
-    let error = BlobStore::builder(&blob).segment_limit(tiny()).open_writer().await
+    let error = BlobStore::builder(&blob)
+        .segment_limit(tiny())
+        .open_writer()
+        .await
         .unwrap_err();
     assert!(
         error.to_string().contains("sealed segment"),
@@ -420,7 +428,10 @@ async fn concurrent_writes_across_a_rollover_do_not_overlap() {
         .map(|i| payload(u8::try_from(i).unwrap(), 600 + i * 3))
         .collect();
     let store = std::sync::Arc::new(
-        BlobStore::builder(&blob).segment_limit(limit).open_writer().await
+        BlobStore::builder(&blob)
+            .segment_limit(limit)
+            .open_writer()
+            .await
             .unwrap(),
     );
 

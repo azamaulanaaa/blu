@@ -263,7 +263,10 @@ async fn a_missing_file_is_created_even_where_its_chunks_are_held_elsewhere() {
     let target = versions.client().await;
 
     // The shared chunks are genuinely held.
-    let store = BlobStore::builder(&versions.blob).open_reader().await.unwrap();
+    let store = BlobStore::builder(&versions.blob)
+        .open_reader()
+        .await
+        .unwrap();
     let snapshot = read_snapshot(&store, store.latest().unwrap().1).await;
     let probed = blulib::command::probe(&target, &snapshot, store)
         .await

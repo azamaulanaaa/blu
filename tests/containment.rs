@@ -41,9 +41,7 @@ impl Forged {
     async fn new(mutate: impl FnOnce(&mut Snapshot)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("store.bin");
-        let storage =
-            BlobStore::builder(&blob).open_writer().await
-                .unwrap();
+        let storage = BlobStore::builder(&blob).open_writer().await.unwrap();
 
         let mut snapshot = Snapshot::new(Timestamp { secs: 1, nanos: 0 });
         mutate(&mut snapshot);

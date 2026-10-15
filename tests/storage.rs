@@ -42,8 +42,7 @@ async fn a_stored_blob_reads_back_byte_for_byte() {
 
     let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 253) as u8).collect();
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store
         .put(
             &common::id_of(&payload),
@@ -65,8 +64,7 @@ async fn blobs_appended_in_sequence_do_not_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
 
     let mut ids = Vec::new();
     for i in 0..8u8 {
@@ -99,8 +97,7 @@ async fn an_empty_blob_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store
         .put(&common::id_of(&[]), common::reader(Vec::new()), 0)
         .await
@@ -121,8 +118,7 @@ async fn a_reader_shorter_than_the_declared_length_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
 
     // Claimed 1000 bytes, only 10 available.
     let error = store
@@ -142,8 +138,7 @@ async fn a_reader_longer_than_the_declared_length_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
 
     // Claimed 10 bytes, 1000 available. Accepting this would leave the extra
     // 990 bytes in the store, past the end of the record that claims them.
@@ -176,8 +171,7 @@ async fn content_that_does_not_hash_to_its_address_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
 
     let payload = vec![1u8; 100];
     // The address of something else entirely.
@@ -229,8 +223,7 @@ async fn a_blob_the_store_does_not_hold_is_rejected() {
 
     // A store that exists and is empty, so this is about the blob rather than
     // about the file being missing.
-    let _ = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let _ = BlobStore::builder(&blob).open_writer().await.unwrap();
     let store = BlobStore::builder(&blob).open_reader().await.unwrap();
 
     let absent = common::id_of(b"never stored");
@@ -260,8 +253,7 @@ async fn a_blob_cut_short_by_a_truncated_store_is_reported_missing() {
     let id = common::id_of(&payload);
     let len = common::len_of(&payload);
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store.put(&id, common::reader(payload), len).await.unwrap();
 
     // Chop the last segment in half, which lands inside the one record it holds.
@@ -300,8 +292,7 @@ async fn a_segment_shorter_than_its_index_is_refused_when_stored() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     let payload = common::noisy(200_000);
     let id = common::id_of(&payload);
     store
@@ -358,8 +349,7 @@ async fn a_file_that_is_not_a_store_is_refused_without_being_truncated() {
     );
 
     // Opening for writing refuses it too, and must leave it exactly as it was.
-    let error = BlobStore::builder(&path).open_writer().await
-        .unwrap_err();
+    let error = BlobStore::builder(&path).open_writer().await.unwrap_err();
     assert!(
         error
             .to_string()
@@ -402,8 +392,7 @@ async fn a_store_in_a_missing_directory_is_created() {
     let blob = dir.path().join("nested/deeper/store");
 
     let payload = vec![3u8; 10];
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store
         .put(
             &common::id_of(&payload),
@@ -438,8 +427,7 @@ async fn content_the_store_already_holds_is_not_written_again() {
     let payload = common::noisy(64 * 1024);
     let id = common::id_of(&payload);
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store
         .put(
             &id,
@@ -454,8 +442,7 @@ async fn content_the_store_already_holds_is_not_written_again() {
     let after_first = common::set_size(&blob);
 
     // The same content again, in a second run against the same store.
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store
         .put(
             &id,
@@ -489,8 +476,7 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
     let second = common::noisy(49_999);
     assert_ne!(first, second, "the fixtures must differ");
 
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store
         .put(
             &common::id_of(&first),
@@ -503,8 +489,7 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
     store.commit(&common::id_of(&first)).await.unwrap();
 
     // Reopen, as a second run does, so the index is rebuilt from the file.
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
     store
         .put(
             &common::id_of(&second),
@@ -547,10 +532,7 @@ async fn concurrent_uploads_do_not_overlap() {
 
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
-    let store = std::sync::Arc::new(
-        BlobStore::builder(&blob).open_writer().await
-            .unwrap(),
-    );
+    let store = std::sync::Arc::new(BlobStore::builder(&blob).open_writer().await.unwrap());
 
     // Uneven, and big enough that the copies genuinely overlap in time.
     //
@@ -632,10 +614,7 @@ async fn concurrent_uploads_do_not_overlap() {
 async fn a_failed_upload_leaves_the_rest_of_the_store_readable() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
-    let store = std::sync::Arc::new(
-        BlobStore::builder(&blob).open_writer().await
-            .unwrap(),
-    );
+    let store = std::sync::Arc::new(BlobStore::builder(&blob).open_writer().await.unwrap());
 
     // 64 blobs, and in the middle of them one that lies about its length.
     let mut tasks = Vec::new();
@@ -704,9 +683,7 @@ async fn a_store_does_not_print_its_index() {
     let few = {
         fs::write(source.join("a.bin"), common::noisy(60_000)).unwrap();
         common::run_backup(&source, &blob).await;
-        let store =
-            BlobStore::builder(&blob).open_writer().await
-                .unwrap();
+        let store = BlobStore::builder(&blob).open_writer().await.unwrap();
         format!("{store:?}")
     };
 
@@ -720,9 +697,7 @@ async fn a_store_does_not_print_its_index() {
     }
     common::run_backup(&source, &blob).await;
     let many = {
-        let store =
-            BlobStore::builder(&blob).open_writer().await
-                .unwrap();
+        let store = BlobStore::builder(&blob).open_writer().await.unwrap();
         format!("{store:?}")
     };
 

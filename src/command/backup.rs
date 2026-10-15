@@ -278,122 +278,282 @@ struct Walked {
     paths: Vec<PathBuf>,
 }
 
-/// Snapshot a directory tree and commit it to the store as a new version.
+/// Back up a directory tree into a store.
+///
+/// Start with [`BackupBuilder::new`]. Chain option methods. Call `run`.
 ///
 /// Deduplication is the store's business.
-/// A chunk whose content the store already holds is not written again.
-/// An unchanged file therefore costs nothing after the first time it is seen.
-/// So does a file that was last seen in any version rather than only the most
-/// recent.
-///
-/// `latest` is the stamp of the set's newest version, when the set holds one.
-/// The run stamps the new version with the run time. The run refuses a stamp
-/// older than `latest` before writing the snapshot. Equal stamps pass.
-///
-/// # Errors
-///
-/// Returns an error if `root` is not a directory.
-/// Returns an error if the tree cannot be walked.
-/// Returns an error if a file changes while it is being read.
-/// Returns an error if the new stamp predates `latest`.
-/// Returns an error if the store rejects a write, or if the run cannot be
-/// committed.
-/// A run that returns an error has written no commit record, so the store is
-/// left exactly as it was. The next run's recovery reclaims the space.
-/// The directory check is deliberately first.
-/// A root that is not a directory would otherwise be recorded as an entry with
-/// an empty path, which commits and is then unrestorable.
-#[instrument(level = "info", skip(storage, options), err)]
-pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
-    root: P,
-    options: Options,
-    storage: S,
+/// A chunk the store already holds is not written again.
+/// An unchanged file costs nothing after the first run.
+/// A file seen in any earlier version costs nothing either.
+#[derive(Debug)]
+pub struct BackupBuilder<S> {
+    root: PathBuf,
+    store: S,
+    exclude: Vec<PathBuf>,
+    chunker: reader::ChunkerConfig,
+    concurrency: usize,
     latest: Option<Timestamp>,
-) -> io::Result<Committed> {
-    Ok(run(root, options, storage, latest).await?.1)
 }
 
-/// Work out what a backup of `root` would write, and write none of it.
-///
-/// Everything a real backup does, in the same order and through the same code.
-/// The run walks the tree, cuts it into chunks, hashes and deduplicates them.
-/// The run builds and hashes the snapshot that would be committed.
-/// The only difference is where the chunks go.
-/// They go into a store that asks the set whether it holds them and keeps the
-/// answers.
-/// The figures are therefore the ones a real run would have printed rather than
-/// an estimate made beside one.
-///
-/// `store` is `None` for a location with no set behind it.
-/// That is the first backup of somewhere, and it is the case where a dry run has
-/// to answer "everything is new".
-/// A dry run must not fail the way [`StoreBuilder::open_reader`] would.
-/// Opening a set for writing to find out is not an option, because that *creates*
-/// it.
-///
-/// Nothing is created, not even the directory the set would have lived in, and no
-/// lock is taken.
-/// A plan can therefore run against a set another backup is holding the lock on.
-/// The cost is possibly planning against a set that moves under it.
-///
-/// The run stamps the planned version with the run time, like a real run.
-/// The run refuses a stamp older than the newest committed one, like a real run.
-///
-/// # Errors
-///
-/// As [`backup`]: a tree that cannot be walked or read, or a file that changes
-/// while it is being read.
-/// The run also fails if a set cannot answer what it holds.
-pub async fn backup_plan<P: AsRef<Path> + Debug>(
-    root: P,
-    options: Options,
-    store: Option<storage::BlobStore<storage::Read>>,
-) -> io::Result<BackupPlan> {
-    let latest = match store.as_ref() {
-        None => None,
-        Some(held) => match held.latest() {
-            None => None,
-            Some((version, _)) => Some(held.version_time(version).await?),
-        },
-    };
-
-    let asked = Arc::new(Mutex::new(Vec::new()));
-    let planned = Planned {
-        store,
-        asked: Arc::clone(&asked),
-    };
-
-    let (entries, committed) = run(root, options, planned, latest).await?;
-
-    // The snapshot is offered to the store like any other blob and is not a chunk
-    // of anything.
-    // It is dropped here rather than counted.
-    // It is identified by the hash the run committed it under.
-    // That hash is the one thing that run knows it is not.
-    let asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
-    let mut chunks = 0u64;
-    let mut held = 0u64;
-    let mut bytes = 0u64;
-    for ask in asked.iter().filter(|ask| ask.id != committed.snapshot) {
-        chunks = chunks.saturating_add(1);
-        if ask.held {
-            held = held.saturating_add(1);
-        } else {
-            bytes = bytes.saturating_add(ask.len);
+impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
+    /// Start a backup of `root` into `store`.
+    ///
+    /// The builder holds default options. Override them before running.
+    pub fn new(root: impl Into<PathBuf>, store: S) -> Self {
+        Self {
+            root: root.into(),
+            store,
+            exclude: Vec::new(),
+            chunker: reader::ChunkerConfig::default(),
+            concurrency: default_concurrency(),
+            latest: None,
         }
     }
 
-    Ok(BackupPlan {
-        version: committed.version,
-        snapshot: committed.snapshot,
-        files: entries.files,
-        dirs: entries.dirs,
-        links: entries.links,
-        chunks,
-        held,
-        fresh: chunks.saturating_sub(held),
-        bytes,
-    })
+    /// Leave these paths out of the backup.
+    ///
+    /// Paths compare after normalisation. Exclude the set under backup.
+    /// Reading a set while appending to it corrupts the run.
+    #[must_use]
+    pub fn exclude<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.exclude.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Cut files with `config`.
+    ///
+    /// The config shapes new chunks only. Old chunks keep their cuts.
+    #[must_use]
+    pub fn chunker(mut self, config: reader::ChunkerConfig) -> Self {
+        self.chunker = config;
+        self
+    }
+
+    /// Cut files with the named `profile`.
+    ///
+    /// The profile selects one of the tuned size sets. It replaces the chunker.
+    #[must_use]
+    pub fn profile(mut self, profile: reader::ChunkerProfile) -> Self {
+        self.chunker = profile.config();
+        self
+    }
+
+    /// Upload up to `n` chunks at once.
+    ///
+    /// Higher values overlap store round trips. The value clamps to 1..=32.
+    #[must_use]
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
+    }
+
+    /// Refuse a stamp older than `latest`.
+    ///
+    /// Pass the stamp of the set's newest version. Pass `None` first.
+    /// Equal stamps pass.
+    #[must_use]
+    pub fn latest(mut self, latest: Option<Timestamp>) -> Self {
+        self.latest = latest;
+        self
+    }
+
+    /// Replace every option with `options`.
+    ///
+    /// Later calls override single fields. Use a preset bundle and adjust it.
+    #[must_use]
+    pub fn options(mut self, options: Options) -> Self {
+        self.exclude = options.exclude;
+        self.chunker = options.chunker;
+        self.concurrency = options.concurrency;
+        self
+    }
+
+    /// Snapshot the tree and commit it as a new version.
+    ///
+    /// A run that returns an error commits nothing. The store stays as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `root` is not a directory.
+    /// Returns an error when the tree cannot be walked or read.
+    /// Returns an error when a file changes while the run reads it.
+    /// Returns an error when the new stamp predates `latest`.
+    /// Returns an error when the store rejects a write or a commit.
+    #[instrument(level = "info", skip(self), err)]
+    pub async fn run(self) -> io::Result<Committed> {
+        let options = Options {
+            exclude: self.exclude,
+            chunker: self.chunker,
+            concurrency: self.concurrency,
+        };
+        Ok(run(self.root, options, self.store, self.latest).await?.1)
+    }
+}
+
+/// Work out what a backup would write, and write nothing.
+///
+/// Start with [`BackupPlanBuilder::new`]. Chain option methods. Call `run`.
+///
+/// The plan walks the same tree with the same chunker.
+/// It asks the set what it holds and keeps none of it.
+/// Every figure matches the run a real backup would make.
+/// A plan that names two new chunks describes a set that grows by two chunks.
+/// A plan that names none describes a set that does not grow.
+///
+/// Nothing is created, not even the set directory. No lock is taken.
+/// A plan runs against a set that another backup holds locked.
+/// The set may move under the plan while it reads.
+#[derive(Debug)]
+pub struct BackupPlanBuilder {
+    root: PathBuf,
+    exclude: Vec<PathBuf>,
+    chunker: reader::ChunkerConfig,
+    concurrency: usize,
+    store: Option<storage::BlobStore<storage::Read>>,
+}
+
+impl BackupPlanBuilder {
+    /// Start a plan for `root`.
+    ///
+    /// The builder holds default options. Override them before running.
+    /// Attach the set with `store`. Without it everything reads as new.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            exclude: Vec::new(),
+            chunker: reader::ChunkerConfig::default(),
+            concurrency: default_concurrency(),
+            store: None,
+        }
+    }
+
+    /// Leave these paths out of the plan.
+    ///
+    /// Paths compare after normalisation. Exclude the set under backup.
+    #[must_use]
+    pub fn exclude<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.exclude.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Cut files with `config`.
+    ///
+    /// The config shapes the planned chunks. It must match the backup.
+    #[must_use]
+    pub fn chunker(mut self, config: reader::ChunkerConfig) -> Self {
+        self.chunker = config;
+        self
+    }
+
+    /// Cut files with the named `profile`.
+    ///
+    /// The profile selects one of the tuned size sets. It replaces the chunker.
+    #[must_use]
+    pub fn profile(mut self, profile: reader::ChunkerProfile) -> Self {
+        self.chunker = profile.config();
+        self
+    }
+
+    /// Upload up to `n` chunks at once.
+    ///
+    /// The value changes nothing in the figures. It clamps to 1..=32.
+    #[must_use]
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = n;
+        self
+    }
+
+    /// Compare against `store`.
+    ///
+    /// Pass the set under plan. Pass `None` for the first backup.
+    /// Without a store every chunk reads as new.
+    #[must_use]
+    pub fn store(mut self, store: Option<storage::BlobStore<storage::Read>>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Replace every option with `options`.
+    ///
+    /// Later calls override single fields. Use a preset bundle and adjust it.
+    #[must_use]
+    pub fn options(mut self, options: Options) -> Self {
+        self.exclude = options.exclude;
+        self.chunker = options.chunker;
+        self.concurrency = options.concurrency;
+        self
+    }
+
+    /// Work out the figures and write nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tree cannot be walked or read.
+    /// Returns an error when a file changes while the run reads it.
+    /// Returns an error when the set cannot answer what it holds.
+    #[instrument(level = "info", skip(self), err)]
+    pub async fn run(self) -> io::Result<BackupPlan> {
+        let latest = match self.store.as_ref() {
+            None => None,
+            Some(held) => match held.latest() {
+                None => None,
+                Some((version, _)) => Some(held.version_time(version).await?),
+            },
+        };
+
+        let options = Options {
+            exclude: self.exclude,
+            chunker: self.chunker,
+            concurrency: self.concurrency,
+        };
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let planned = Planned {
+            store: self.store,
+            asked: Arc::clone(&asked),
+        };
+
+        let (entries, committed) = run(self.root, options, planned, latest).await?;
+
+        // The snapshot is offered to the store like any other blob and is not a chunk
+        // of anything.
+        // It is dropped here rather than counted.
+        // It is identified by the hash the run committed it under.
+        // That hash is the one thing that run knows it is not.
+        let asked = asked.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut chunks = 0u64;
+        let mut held = 0u64;
+        let mut bytes = 0u64;
+        for ask in asked.iter().filter(|ask| ask.id != committed.snapshot) {
+            chunks = chunks.saturating_add(1);
+            if ask.held {
+                held = held.saturating_add(1);
+            } else {
+                bytes = bytes.saturating_add(ask.len);
+            }
+        }
+
+        Ok(BackupPlan {
+            version: committed.version,
+            snapshot: committed.snapshot,
+            files: entries.files,
+            dirs: entries.dirs,
+            links: entries.links,
+            chunks,
+            held,
+            fresh: chunks.saturating_sub(held),
+            bytes,
+        })
+    }
 }
 
 /// The run both entries to this module make, with or without a store underneath.

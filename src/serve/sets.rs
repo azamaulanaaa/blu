@@ -386,7 +386,10 @@ impl Sets {
         let _held = Arc::clone(&entry).lock_owned().await;
 
         let store = Arc::new(
-            BlobStore::builder(base).compression(compression).open_writer().await?,
+            BlobStore::builder(base)
+                .compression(compression)
+                .open_writer()
+                .await?,
         );
 
         Ok(work(store).await)

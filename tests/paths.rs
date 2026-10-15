@@ -73,7 +73,7 @@ async fn round_trip_preserves_paths_that_are_not_valid_utf8() {
 async fn a_path_this_platform_cannot_represent_is_refused() {
     use std::{ffi::OsString, path::PathBuf};
 
-    use blulib::command::{Options, backup};
+    use blulib::command::BackupBuilder;
     use blulib::storage::{BlobStore, Compression, SegmentLimit};
 
     let dir = tempfile::tempdir().unwrap();
@@ -97,10 +97,11 @@ async fn a_path_this_platform_cannot_represent_is_refused() {
     fs::write(PathBuf::from(&source).join(&raw), b"payload").unwrap();
 
     let blob = dir.path().join("store");
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
 
-    let error = backup(&source, Options::default(), store, None)
+    let error = BackupBuilder::new(&source, store)
+        .latest(None)
+        .run()
         .await
         .expect_err("a name this platform cannot write should be refused, not mangled");
 

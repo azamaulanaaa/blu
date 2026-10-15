@@ -145,8 +145,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("store");
 
-        let storage = crate::storage::BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+        let storage = crate::storage::BlobStore::builder(&blob)
+            .open_writer()
+            .await
+            .unwrap();
         let _ = storage;
 
         // A segment that exists but holds no commit record.

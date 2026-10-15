@@ -88,7 +88,7 @@
 use std::{fmt::Write as _, time::Instant};
 
 use blulib::{
-    command::{Options, backup},
+    command::{BackupBuilder, Options},
     layout::IndexSet,
     storage::BlobStore,
 };
@@ -228,12 +228,15 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
         let _ = std::fs::remove_file(store_segment(blob, segment));
     }
 
-    let storage =
-        BlobStore::builder(blob).open_writer().await
-            .expect("store");
+    let storage = BlobStore::builder(blob).open_writer().await.expect("store");
     let cpu_before = cpu_seconds();
     let started = Instant::now();
-    backup(src, options, storage, None).await.expect("backup");
+    BackupBuilder::new(src, storage)
+        .options(options)
+        .latest(None)
+        .run()
+        .await
+        .expect("backup");
     let wall = started.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu_before;
 

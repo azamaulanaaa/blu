@@ -2195,8 +2195,7 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
     Pack::write(&store, &plan, &old, 1, &at).await.unwrap();
     let pack = Pack::open(&at).unwrap();
 
-    let writing = BlobStore::builder(&built.blob).open_writer().await
-    .unwrap();
+    let writing = BlobStore::builder(&built.blob).open_writer().await.unwrap();
 
     let error = blulib::command::merge(&writing, &pack, blulib::command::MergeCompression::Keep)
         .await
@@ -2684,8 +2683,7 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
 
     let reopened = Pack::open(&at_damaged).unwrap();
     let received = built.dir.path().join("received");
-    let store = BlobStore::builder(&received).open_writer().await
-    .unwrap();
+    let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
     let error = blulib::command::merge(
         &store,
@@ -2751,8 +2749,7 @@ async fn a_flipped_payload_byte_is_refused_on_the_verbatim_path_too() {
 
     let reopened = Pack::open(&at_damaged).unwrap();
     let received = built.dir.path().join("received-keep");
-    let store = BlobStore::builder(&received).open_writer().await
-    .unwrap();
+    let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
     let error = blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
         .await
@@ -2882,8 +2879,7 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     );
 
     let received = built.dir.path().join("received-grown");
-    let store = BlobStore::builder(&received).open_writer().await
-    .unwrap();
+    let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
     blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
         .await
@@ -2986,7 +2982,7 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
         (blulib::command::MergeCompression::Reencode, false),
     ] {
         let name = format!("received-{expected_kept}");
-        let store = BlobStore::builder(&dir.path().join(&name))
+        let store = BlobStore::builder(dir.path().join(&name))
             // Off, so a re-encode has somewhere to go: every chunk raw.
             .compression(blulib::storage::Compression::Off)
             .open_writer()
@@ -2997,7 +2993,9 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
             .await
             .unwrap();
 
-        let reader = BlobStore::builder(&dir.path().join(&name)).open_reader().await
+        let reader = BlobStore::builder(dir.path().join(&name))
+            .open_reader()
+            .await
             .unwrap();
         for (id, stored) in &carried {
             let placement = reader.locate(id).unwrap();
@@ -3220,8 +3218,11 @@ async fn every_pack_form_restores_through_every_merge_form() {
 
         for (merge_form, merge_route, store_policy) in merge_forms() {
             let name = dir.path().join(format!("m-{pack_form}-{merge_form}"));
-            let store = BlobStore::builder(&name).compression(store_policy).open_writer().await
-            .unwrap();
+            let store = BlobStore::builder(&name)
+                .compression(store_policy)
+                .open_writer()
+                .await
+                .unwrap();
 
             blulib::command::merge(&store, &pack, merge_route)
                 .await
@@ -3304,8 +3305,11 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
         let name = dir.path().join(format!("received-{form}"));
 
         // Off, so what is recorded is the pack's choice and not the store's.
-        let store = BlobStore::builder(&name).compression(blulib::storage::Compression::Off).open_writer().await
-        .unwrap();
+        let store = BlobStore::builder(&name)
+            .compression(blulib::storage::Compression::Off)
+            .open_writer()
+            .await
+            .unwrap();
         blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)
             .await
             .unwrap();
@@ -3549,8 +3553,7 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
 
     let pack = Pack::open(&path).expect("the fixture is a pack this build can open");
     let received = built.dir.path().join("received");
-    let store = BlobStore::builder(&received).open_writer().await
-    .unwrap();
+    let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
     let error = blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)
         .await

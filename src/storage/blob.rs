@@ -576,6 +576,7 @@ impl<C: Compressor> StoreBuilder<C> {
     /// Cap each segment at `limit` bytes.
     ///
     /// The limit shapes new segments only. Old segments keep their size.
+    #[must_use]
     pub fn segment_limit(mut self, limit: SegmentLimit) -> Self {
         self.limit = limit;
         self

@@ -212,7 +212,9 @@ async fn a_segment_filed_under_the_wrong_number_is_refused() {
     // Two layers refusing the same file is the point.
     // The index check is not the only thing standing between a misfiled segment
     // and a wrong snapshot.
-    let err = BlobStore::builder(&blob).open_reader().await
+    let err = BlobStore::builder(&blob)
+        .open_reader()
+        .await
         .expect_err("a set with a misfiled segment must not open");
     let why = err.to_string();
     assert!(

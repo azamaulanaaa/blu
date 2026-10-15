@@ -19,7 +19,7 @@ mod restore;
 mod verify;
 
 pub use apply::{Applied, Options as ApplyOptions, apply};
-pub use backup::{BackupPlan, Committed, Options, backup, backup_plan};
+pub use backup::{BackupBuilder, BackupPlan, BackupPlanBuilder, Committed, Options};
 pub use filter::Filter;
 pub use history::{Detail, Event, Status, report};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};

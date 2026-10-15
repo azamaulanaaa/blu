@@ -35,7 +35,6 @@ use std::{
 };
 
 use blulib::{
-    command::Options,
     metadata::Snapshot,
     pack::{Pack, Range, Source, VirtualPack},
     storage::{BlobStore, Compression, Plan, SegmentLimit, StorageGet},
@@ -214,14 +213,14 @@ async fn a_delta_virtual_pack_is_the_written_delta() {
 
     // Change one file, and back up again.
     fs::write(source.join("f0.bin"), common::noisy(45_000)).unwrap();
-    let storage =
-        BlobStore::builder(&blob).open_writer().await
-            .unwrap();
+    let storage = BlobStore::builder(&blob).open_writer().await.unwrap();
     let latest = match storage.latest() {
         None => None,
         Some((version, _)) => storage.version_time(version).await.ok(),
     };
-    blulib::command::backup(&source, Options::default(), storage, latest)
+    blulib::command::BackupBuilder::new(&source, storage)
+        .latest(latest)
+        .run()
         .await
         .unwrap();
 
@@ -315,10 +314,14 @@ async fn a_set_that_rolled_over_a_segment_produces_the_same_bytes() {
     }
 
     let blob = dir.path().join("store");
-    let storage =
-        BlobStore::builder(&blob).segment_limit(SegmentLimit::new(50_000)).open_writer().await
-            .unwrap();
-    blulib::command::backup(&source, Options::default(), storage, None)
+    let storage = BlobStore::builder(&blob)
+        .segment_limit(SegmentLimit::new(50_000))
+        .open_writer()
+        .await
+        .unwrap();
+    blulib::command::BackupBuilder::new(&source, storage)
+        .latest(None)
+        .run()
         .await
         .unwrap();
 

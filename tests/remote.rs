@@ -510,7 +510,9 @@ async fn a_listing_of_a_set_that_exists_holds_every_version_the_server_names() {
     let dir = tempfile::tempdir().unwrap();
     let (root, set) = served_three_versions(dir.path()).await;
 
-    let storage = blulib::storage::BlobStore::builder(&set).open_reader().await
+    let storage = blulib::storage::BlobStore::builder(&set)
+        .open_reader()
+        .await
         .unwrap();
 
     let versions = storage.versions().unwrap();

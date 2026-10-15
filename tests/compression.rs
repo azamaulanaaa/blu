@@ -29,8 +29,7 @@ use std::{borrow::Cow, fs, path::Path};
 use blulib::{
     command::load_snapshot,
     storage::{
-        BlobStore, Codec, Compression, Compressor, Plan, Read, StorageGet,
-        StoragePut, Write,
+        BlobStore, Codec, Compression, Compressor, Plan, Read, StorageGet, StoragePut, Write,
     },
 };
 
@@ -134,7 +133,10 @@ fn compressible(len: usize) -> Vec<u8> {
 
 /// A store opened for writing under one policy.
 async fn writable(blob: &Path, compression: Compression) -> BlobStore<Write> {
-    BlobStore::builder(blob).compression(compression).open_writer().await
+    BlobStore::builder(blob)
+        .compression(compression)
+        .open_writer()
+        .await
         .unwrap()
 }
 
@@ -228,8 +230,11 @@ async fn a_write_policy_from_outside_the_crate_is_taken_and_respected() {
     let small = compressible(2_000);
     let large = compressible(200_000);
 
-    let store = BlobStore::builder(&blob).compression(BigPayloadsOnly { min_bytes: 100_000 }).open_writer().await
-    .unwrap();
+    let store = BlobStore::builder(&blob)
+        .compression(BigPayloadsOnly { min_bytes: 100_000 })
+        .open_writer()
+        .await
+        .unwrap();
 
     let small_id = put(&store, &small).await;
     let large_id = put(&store, &large).await;
@@ -275,7 +280,10 @@ async fn a_compressor_that_grows_its_payload_cannot_grow_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).compression(AlwaysGrows).open_writer().await
+    let store = BlobStore::builder(&blob)
+        .compression(AlwaysGrows)
+        .open_writer()
+        .await
         .unwrap();
 
     // The payload is incompressible on purpose. The padding has to be what tips
@@ -318,7 +326,10 @@ async fn bytes_that_are_not_the_payload_are_not_stored_under_its_name() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).compression(Truncates).open_writer().await
+    let store = BlobStore::builder(&blob)
+        .compression(Truncates)
+        .open_writer()
+        .await
         .unwrap();
 
     let payload = incompressible(9, 200_000);
@@ -365,7 +376,10 @@ async fn a_raw_payload_is_stored_under_its_own_length() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).compression(Compression::Off).open_writer().await
+    let store = BlobStore::builder(&blob)
+        .compression(Compression::Off)
+        .open_writer()
+        .await
         .unwrap();
 
     let payload = compressible(120_000);
@@ -425,7 +439,10 @@ async fn a_frame_that_saved_nothing_is_not_stored() {
     let dir = tempfile::tempdir().unwrap();
     let blob = dir.path().join("store");
 
-    let store = BlobStore::builder(&blob).compression(MatchesSize).open_writer().await
+    let store = BlobStore::builder(&blob)
+        .compression(MatchesSize)
+        .open_writer()
+        .await
         .unwrap();
 
     // The payload is compressible on purpose. The frame has to be long enough to

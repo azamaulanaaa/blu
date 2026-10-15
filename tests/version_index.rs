@@ -30,9 +30,7 @@ use std::fs;
 use blulib::{
     layout::IndexSet,
     metadata::Timestamp,
-    storage::{
-        BlobId, BlobStore, Read, Resolved, VersionIndex, resolve,
-    },
+    storage::{BlobId, BlobStore, Read, Resolved, VersionIndex, resolve},
 };
 
 /// A set with `versions` versions in it, and a store handle for it.
@@ -410,12 +408,13 @@ async fn the_index_files_can_all_be_deleted_and_rebuilt() {
     }
 
     // And they can be rebuilt from the store.
-    let written =
-        BlobStore::builder(&blob).open_writer().await
-            .unwrap()
-            .write_index_files()
-            .await
-            .unwrap();
+    let written = BlobStore::builder(&blob)
+        .open_writer()
+        .await
+        .unwrap()
+        .write_index_files()
+        .await
+        .unwrap();
     assert_eq!(written, 4);
 
     assert_eq!(set.indexed_versions().unwrap(), vec![1, 2, 3, 4]);
@@ -447,7 +446,10 @@ async fn a_rebuilt_index_resolves_to_the_right_commit() {
         common::run_backup_limited(&source, &blob, small).await;
     }
 
-    let store = BlobStore::builder(&blob).segment_limit(small).open_writer().await
+    let store = BlobStore::builder(&blob)
+        .segment_limit(small)
+        .open_writer()
+        .await
         .unwrap();
     assert!(store.segment_count() > 1, "the set should have rolled over");
 

@@ -66,7 +66,7 @@ use std::{
 };
 
 use blulib::{
-    command::{Options, backup, restore},
+    command::{BackupBuilder, Options, restore},
     layout::IndexSet,
     storage::BlobStore,
 };
@@ -139,15 +139,22 @@ fn bench_backup(c: &mut Criterion) {
                                 std::fs::remove_file(IndexSet::new(&blob).segment_path(segment));
                         }
 
-                        let storage = BlobStore::builder(&blob).open_writer().await
-                        .expect("store");
+                        let storage = BlobStore::builder(&blob)
+                            .open_writer()
+                            .await
+                            .expect("store");
                         let options = Options {
                             concurrency,
                             ..Options::default()
                         };
 
                         let started = Instant::now();
-                        let committed = backup(&src, options, storage, None).await.expect("backup");
+                        let committed = BackupBuilder::new(&src, storage)
+                            .options(options)
+                            .latest(None)
+                            .run()
+                            .await
+                            .expect("backup");
                         elapsed += started.elapsed();
 
                         black_box(committed.version);
@@ -170,10 +177,13 @@ fn bench_restore(c: &mut Criterion) {
     let rt = runtime();
 
     let committed = rt.block_on(async {
-        let storage =
-            BlobStore::builder(&blob).open_writer().await
-                .expect("store");
-        backup(&src, Options::default(), storage, None)
+        let storage = BlobStore::builder(&blob)
+            .open_writer()
+            .await
+            .expect("store");
+        BackupBuilder::new(&src, storage)
+            .latest(None)
+            .run()
             .await
             .expect("backup")
     });
@@ -190,7 +200,10 @@ fn bench_restore(c: &mut Criterion) {
                     let destination = dir.path().join("out");
                     let _ = std::fs::remove_dir_all(&destination);
 
-                    let storage = BlobStore::builder(&blob).open_reader().await.expect("store");
+                    let storage = BlobStore::builder(&blob)
+                        .open_reader()
+                        .await
+                        .expect("store");
 
                     let started = Instant::now();
                     restore(&destination, committed.snapshot, storage)
@@ -221,16 +234,22 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
     let rt = runtime();
 
     let committed = rt.block_on(async {
-        let storage =
-            BlobStore::builder(&blob).open_writer().await
-                .expect("store");
-        backup(&src, Options::default(), storage, None)
+        let storage = BlobStore::builder(&blob)
+            .open_writer()
+            .await
+            .expect("store");
+        BackupBuilder::new(&src, storage)
+            .latest(None)
+            .run()
             .await
             .expect("backup")
     });
 
     rt.block_on(async {
-        let storage = BlobStore::builder(&blob).open_reader().await.expect("store");
+        let storage = BlobStore::builder(&blob)
+            .open_reader()
+            .await
+            .expect("store");
         restore(&out, committed.snapshot, storage)
             .await
             .expect("restore");

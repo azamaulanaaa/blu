@@ -80,20 +80,18 @@ async fn round_trip_recreates_hard_links() {
 /// Refusing up front is the only point at which this is cheap to report.
 #[tokio::test]
 async fn a_backup_root_that_is_a_file_is_refused() {
-    use blulib::{
-        command::{Options, backup},
-        storage::BlobStore,
-    };
+    use blulib::{command::BackupBuilder, storage::BlobStore};
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("notes.md");
     fs::write(&file, b"not a tree").unwrap();
 
     let blob = dir.path().join("store.bin");
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
 
-    let error = backup(&file, Options::default(), store, None)
+    let error = BackupBuilder::new(&file, store)
+        .latest(None)
+        .run()
         .await
         .expect_err("a file is not a tree, and backing one up records an empty path");
     let message = error.to_string();
@@ -112,10 +110,7 @@ async fn a_backup_root_that_is_a_file_is_refused() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_backup_root_that_is_a_symlink_to_a_directory_is_followed() {
-    use blulib::{
-        command::{Options, backup},
-        storage::BlobStore,
-    };
+    use blulib::{command::BackupBuilder, storage::BlobStore};
 
     let dir = tempfile::tempdir().unwrap();
     let real = dir.path().join("realdir");
@@ -126,9 +121,10 @@ async fn a_backup_root_that_is_a_symlink_to_a_directory_is_followed() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
     let blob = dir.path().join("store.bin");
-    let store = BlobStore::builder(&blob).open_writer().await
-        .unwrap();
-    let committed = backup(&link, Options::default(), store, None)
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
+    let committed = BackupBuilder::new(&link, store)
+        .latest(None)
+        .run()
         .await
         .expect("a symlink to a directory names a directory");
 

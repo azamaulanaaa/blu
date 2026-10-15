@@ -118,9 +118,10 @@ async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
     let source = tree(dir);
 
     let blob = dir.join("local");
-    let store = BlobStore::builder(&blob).open_writer().await
-    .unwrap();
-    blulib::command::backup(&source, blulib::command::Options::default(), store, None)
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
+    blulib::command::BackupBuilder::new(&source, store)
+        .latest(None)
+        .run()
         .await
         .unwrap();
 
@@ -501,14 +502,15 @@ async fn a_failed_push_leaves_no_upload_on_the_server() {
 /// Opens for writing each call, so two calls publish two versions. Returns
 /// the pack bytes of the version just published.
 async fn pack_version(source: &Path, blob: &Path) -> Vec<u8> {
-    let store = BlobStore::builder(blob).open_writer().await
-    .unwrap();
+    let store = BlobStore::builder(blob).open_writer().await.unwrap();
 
     let latest = match store.latest() {
         None => None,
         Some((version, _)) => store.version_time(version).await.ok(),
     };
-    blulib::command::backup(source, blulib::command::Options::default(), store, latest)
+    blulib::command::BackupBuilder::new(source, store)
+        .latest(latest)
+        .run()
         .await
         .unwrap();
 

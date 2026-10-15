@@ -154,15 +154,16 @@ fn compressible_tree(dir: &Path, files: usize, size: usize) -> PathBuf {
 
 /// Back a tree up into a set at `blob`, and return the set.
 async fn backup(source: &Path, blob: &Path) -> blulib::storage::BlobId {
-    let storage = BlobStore::builder(blob).open_writer().await
-    .unwrap();
+    let storage = BlobStore::builder(blob).open_writer().await.unwrap();
 
     let latest: Option<Timestamp> = match storage.latest() {
         None => None,
         Some((version, _)) => storage.version_time(version).await.ok(),
     };
 
-    blulib::command::backup(source, blulib::command::Options::default(), storage, latest)
+    blulib::command::BackupBuilder::new(source, storage)
+        .latest(latest)
+        .run()
         .await
         .unwrap()
         .snapshot
@@ -2016,8 +2017,7 @@ async fn a_push_then_a_pull_round_trips_into_a_second_set() {
 
     // And merge it into a local set that had nothing.
     let mirror = dir.path().join("mirror");
-    let storage = BlobStore::builder(&mirror).open_writer().await
-    .unwrap();
+    let storage = BlobStore::builder(&mirror).open_writer().await.unwrap();
 
     let merged = blulib::command::merge(
         &storage,
@@ -2248,7 +2248,9 @@ async fn two_merges_into_one_set_are_serialised() {
     );
 
     // And the set is still a set that opens, which a scan check establishes.
-    let store = BlobStore::builder(root.join("shared")).open_reader().await
+    let store = BlobStore::builder(root.join("shared"))
+        .open_reader()
+        .await
         .unwrap();
     assert_eq!(store.versions().unwrap().len(), 2);
 }
@@ -2309,7 +2311,9 @@ async fn concurrent_merges_race_the_tip_and_leave_a_consistent_set() {
 
     // The set holds what committed, and opens cleanly. Interleaved records
     // would leave a set that fails to open.
-    let store = BlobStore::builder(root.join("shared")).open_reader().await
+    let store = BlobStore::builder(root.join("shared"))
+        .open_reader()
+        .await
         .unwrap();
     assert_eq!(store.versions().unwrap().len(), committed);
 
@@ -2553,20 +2557,16 @@ async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
 
     // Version 2: change one file, back up again, and push it too.
     fs::write(source.join("f0.bin"), common::noisy(60_000)).unwrap();
-    let storage = BlobStore::builder(&blob).open_writer().await
-    .unwrap();
+    let storage = BlobStore::builder(&blob).open_writer().await.unwrap();
     let latest: Option<Timestamp> = match storage.latest() {
         None => None,
         Some((version, _)) => storage.version_time(version).await.ok(),
     };
-    blulib::command::backup(
-        &source,
-        blulib::command::Options::default(),
-        storage,
-        latest,
-    )
-    .await
-    .unwrap();
+    blulib::command::BackupBuilder::new(&source, storage)
+        .latest(latest)
+        .run()
+        .await
+        .unwrap();
 
     let pack_path = dir.path().join("v2.pack");
     pack(&blob, &pack_path).await;
@@ -2603,7 +2603,9 @@ async fn a_delta_pack_over_http_is_smaller_than_the_full_one() {
         .base()
         .expect("the delta's header must name its base");
 
-    let store = BlobStore::builder(root.join("docs")).open_reader().await
+    let store = BlobStore::builder(root.join("docs"))
+        .open_reader()
+        .await
         .unwrap();
     assert_eq!(
         base,
@@ -2724,7 +2726,9 @@ async fn history_endpoint_answers_same_events_as_local() {
     );
 
     // The library's own report over the same set, for the same path.
-    let store = BlobStore::builder(root.join("docs")).open_reader().await
+    let store = BlobStore::builder(root.join("docs"))
+        .open_reader()
+        .await
         .unwrap();
     let versions = store.versions().unwrap();
     let mut named = Vec::new();

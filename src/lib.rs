@@ -33,27 +33,23 @@
 //! ```no_run
 //! # async fn example() -> std::io::Result<()> {
 //! use blulib::{
-//!     command::{Options, backup, lock_destination, restore},
-//!     storage::{BlobStore, Compression, SegmentLimit},
+//!     command::{BackupBuilder, lock_destination, restore},
+//!     storage::BlobStore,
 //! };
 //!
-//! // The claim excludes other runs from this destination. A backup takes no lock
-//! // of its own, so taking it is the caller's job — and this example was not
-//! // doing it, which left a reader following it with two backups that would
-//! // interleave if they happened to overlap.
+//! // The claim excludes other runs from this destination. A restore takes no
+//! // lock of its own, so taking it is the caller's job.
 //! let _claim = lock_destination(std::path::Path::new("~/Pictures-restored"))?;
 //!
-//! // First backup. Four gibibytes per segment and zstd level 1, both the defaults.
-//! let store =
-//!     BlobStore::builder("photos").open_writer().await?;
-//! let first = backup("~/Pictures", Options::default(), store, None).await?;
+//! // First backup. Default policies: four gibibytes per segment, zstd level 1.
+//! let store = BlobStore::builder("photos").open_writer().await?;
+//! let first = BackupBuilder::new("~/Pictures", store).latest(None).run().await?;
 //!
 //! // Later backup. Nothing new to store means nothing is written.
-//! let store =
-//!     BlobStore::builder("photos").open_writer().await?;
-//! backup("~/Pictures", Options::default(), store, None).await?;
+//! let store = BlobStore::builder("photos").open_writer().await?;
+//! BackupBuilder::new("~/Pictures", store).latest(None).run().await?;
 //!
-//! // A read-only store takes no segment limit, because a read never rolls over.
+//! // A read-only open takes no policies. A read never rolls over.
 //! let store = BlobStore::builder("photos").open_reader().await?;
 //! restore("~/Pictures-restored", first.snapshot, store).await?;
 //! # Ok(())

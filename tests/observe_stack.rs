@@ -72,7 +72,6 @@ mod common;
 use std::{fs, path::Path, sync::OnceLock, time::Duration};
 
 use blulib::{
-    command::Options,
     metadata::Snapshot,
     pack::Pack,
     serve::{JobId, Jobs, Json},
@@ -381,11 +380,14 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
         // span — and the work is a real `blu` command.
         let (done, finished) = tokio::sync::oneshot::channel();
         let id = jobs().spawn("merge", move |_handle| async move {
-            let storage =
-                BlobStore::builder(&blob).open_writer().await
-                    .expect("a fresh set opens for writing");
+            let storage = BlobStore::builder(&blob)
+                .open_writer()
+                .await
+                .expect("a fresh set opens for writing");
 
-            let committed = blulib::command::backup(&source, Options::default(), storage, None)
+            let committed = blulib::command::BackupBuilder::new(&source, storage)
+                .latest(None)
+                .run()
                 .await
                 .expect("the backup should commit");
 

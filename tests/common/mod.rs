@@ -28,7 +28,7 @@ pub(crate) mod http;
 pub(crate) mod server;
 
 use blulib::{
-    command::{Committed, Options, backup, restore},
+    command::{BackupBuilder, Committed, Options, restore},
     layout::IndexSet,
     storage::{BlobId, BlobStore, SegmentLimit, StreamReadSeeker},
 };
@@ -234,11 +234,14 @@ async fn latest_of<C: blulib::storage::Compressor>(
 /// Back up `source` with specific options, for tests that need to pin a knob the
 /// defaults would otherwise choose.
 pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
-    let storage =
-        BlobStore::builder(blob).open_writer().await
-            .unwrap();
+    let storage = BlobStore::builder(blob).open_writer().await.unwrap();
     let latest = latest_of(&storage).await;
-    backup(source, opts, storage, latest).await.unwrap()
+    BackupBuilder::new(source, storage)
+        .options(opts)
+        .latest(latest)
+        .run()
+        .await
+        .unwrap()
 }
 
 /// Back up `source` into a store with a given segment limit.
@@ -252,10 +255,15 @@ pub(crate) async fn run_backup_limited(
     blob: &Path,
     limit: SegmentLimit,
 ) -> Committed {
-    let storage = BlobStore::builder(blob).segment_limit(limit).open_writer().await
+    let storage = BlobStore::builder(blob)
+        .segment_limit(limit)
+        .open_writer()
+        .await
         .unwrap();
     let latest = latest_of(&storage).await;
-    backup(source, Options::default(), storage, latest)
+    BackupBuilder::new(source, storage)
+        .latest(latest)
+        .run()
         .await
         .unwrap()
 }
@@ -276,10 +284,15 @@ pub(crate) async fn run_backup_compressed(
     blob: &Path,
     compression: blulib::storage::Compression,
 ) -> Committed {
-    let storage = BlobStore::builder(blob).compression(compression).open_writer().await
+    let storage = BlobStore::builder(blob)
+        .compression(compression)
+        .open_writer()
+        .await
         .unwrap();
     let latest = latest_of(&storage).await;
-    backup(source, Options::default(), storage, latest)
+    BackupBuilder::new(source, storage)
+        .latest(latest)
+        .run()
         .await
         .unwrap()
 }
