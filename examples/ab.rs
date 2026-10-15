@@ -90,7 +90,7 @@ use std::{fmt::Write as _, time::Instant};
 use blulib::{
     command::{Options, backup},
     layout::IndexSet,
-    storage::{BlobStore, Compression, SegmentLimit},
+    storage::BlobStore,
 };
 
 /// Files in the tree. Enough for per-file costs to show, small enough that a
@@ -229,8 +229,7 @@ async fn time_backup(src: &std::path::Path, blob: &std::path::Path, options: Opt
     }
 
     let storage =
-        BlobStore::open_for_writing(blob, SegmentLimit::default(), Compression::default())
-            .await
+        BlobStore::builder(blob).open_writer().await
             .expect("store");
     let cpu_before = cpu_seconds();
     let started = Instant::now();

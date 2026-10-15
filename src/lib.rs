@@ -45,16 +45,16 @@
 //!
 //! // First backup. Four gibibytes per segment and zstd level 1, both the defaults.
 //! let store =
-//!     BlobStore::open_for_writing("photos", SegmentLimit::default(), Compression::default()).await?;
+//!     BlobStore::builder("photos").open_writer().await?;
 //! let first = backup("~/Pictures", Options::default(), store, None).await?;
 //!
 //! // Later backup. Nothing new to store means nothing is written.
 //! let store =
-//!     BlobStore::open_for_writing("photos", SegmentLimit::default(), Compression::default()).await?;
+//!     BlobStore::builder("photos").open_writer().await?;
 //! backup("~/Pictures", Options::default(), store, None).await?;
 //!
 //! // A read-only store takes no segment limit, because a read never rolls over.
-//! let store = BlobStore::open_for_reading("photos").await?;
+//! let store = BlobStore::builder("photos").open_reader().await?;
 //! restore("~/Pictures-restored", first.snapshot, store).await?;
 //! # Ok(())
 //! # }

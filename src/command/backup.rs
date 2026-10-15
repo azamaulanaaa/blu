@@ -327,7 +327,7 @@ pub async fn backup<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 /// `store` is `None` for a location with no set behind it.
 /// That is the first backup of somewhere, and it is the case where a dry run has
 /// to answer "everything is new".
-/// A dry run must not fail the way [`storage::BlobStore::open_for_reading`] would.
+/// A dry run must not fail the way [`StoreBuilder::open_reader`] would.
 /// Opening a set for writing to find out is not an option, because that *creates*
 /// it.
 ///

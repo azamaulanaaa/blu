@@ -646,10 +646,7 @@ mod tests {
     async fn call_a_real_instrumented_function() {
         // Fails, because the path is not a store. The span is made either way,
         // which is the whole point: this is about the callsite, not the result.
-        let _ = crate::storage::BlobStore::<crate::storage::Read>::open_for_reading(
-            "no/such/set/anywhere",
-        )
-        .await;
+        let _ = crate::storage::BlobStore::builder("no/such/set/anywhere").open_reader().await;
     }
 
     /// Whether the progress filter would let this callsite through.
@@ -768,7 +765,7 @@ mod tests {
         // is the callsite that has to be admitted for the walk to reach the job
         // span at all. Its name is the function's; its target is its module.
         assert!(
-            names.contains(&"open_for_reading"),
+            names.contains(&"open_reader"),
             "the instrumented function's own span must have been created between \
              the job span and the report: {names:?}"
         );

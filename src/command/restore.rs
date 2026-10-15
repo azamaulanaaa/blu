@@ -200,7 +200,7 @@ pub async fn restore_filtered<P: AsRef<Path>, S: storage::StorageGet + 'static>(
     // What is safe is moving each of them off the runtime. Both are plain
     // synchronous filesystem work in an async function. Every `symlink`, `link`
     // and `set_permissions` they make blocks a worker thread that other tasks
-    // need. `open` and `open_for_reading` already send their scans to
+    // need. `open` and `open_reader` already send their scans to
     // `spawn_blocking` for the same reason this module is careful about
     // elsewhere. A tree of many links is where that shows.
     let for_links = root.to_path_buf();

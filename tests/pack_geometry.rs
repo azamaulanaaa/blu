@@ -136,7 +136,7 @@ async fn a_full_virtual_pack_is_the_written_pack_byte_for_byte() {
     let dir = tempfile::tempdir().unwrap();
     let (_, blob) = built(dir.path(), 4, 20_000).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 
@@ -175,7 +175,7 @@ async fn a_served_pack_opens() {
     let dir = tempfile::tempdir().unwrap();
     let (_, blob) = built(dir.path(), 4, 20_000).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 
@@ -208,15 +208,14 @@ async fn a_delta_virtual_pack_is_the_written_delta() {
 
     // The base is version 1, captured BEFORE the rewrite, so `since` has a real
     // overlap to remove.
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let base_id = store.latest().unwrap().1;
     let base_snapshot = snapshot_of(&store).await;
 
     // Change one file, and back up again.
     fs::write(source.join("f0.bin"), common::noisy(45_000)).unwrap();
     let storage =
-        BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-            .await
+        BlobStore::builder(&blob).open_writer().await
             .unwrap();
     let latest = match storage.latest() {
         None => None,
@@ -226,7 +225,7 @@ async fn a_delta_virtual_pack_is_the_written_delta() {
         .await
         .unwrap();
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let full = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
     let delta_plan = full.since(&snapshot, &base_snapshot);
@@ -281,7 +280,7 @@ async fn a_compressed_set_produces_the_same_bytes() {
     let blob = dir.path().join("store");
     common::run_backup_compressed(&source, &blob, Compression::Zstd { level: 9 }).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 
@@ -317,8 +316,7 @@ async fn a_set_that_rolled_over_a_segment_produces_the_same_bytes() {
 
     let blob = dir.path().join("store");
     let storage =
-        BlobStore::open_for_writing(&blob, SegmentLimit::new(50_000), Compression::default())
-            .await
+        BlobStore::builder(&blob).segment_limit(SegmentLimit::new(50_000)).open_writer().await
             .unwrap();
     blulib::command::backup(&source, Options::default(), storage, None)
         .await
@@ -329,7 +327,7 @@ async fn a_set_that_rolled_over_a_segment_produces_the_same_bytes() {
         "this set must have rolled over for the test to mean anything"
     );
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 
@@ -356,7 +354,7 @@ async fn needed_agrees_with_the_written_packs_needed() {
     let dir = tempfile::tempdir().unwrap();
     let (_, blob) = built(dir.path(), 6, 20_000).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 
@@ -397,7 +395,7 @@ async fn a_fetch_plan_always_covers_what_opens_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let (_, blob) = built(dir.path(), 4, 20_000).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 
@@ -445,7 +443,7 @@ async fn a_client_can_fetch_only_the_chunks_it_is_missing() {
     let dir = tempfile::tempdir().unwrap();
     let (_, blob) = built(dir.path(), 8, 20_000).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 
@@ -531,7 +529,7 @@ async fn any_range_out_of_a_virtual_pack_reassembles_to_the_written_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let (_, blob) = built(dir.path(), 5, 20_000).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&store).await;
     let snapshot = snapshot_of(&store).await;
 

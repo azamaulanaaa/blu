@@ -68,7 +68,7 @@ use std::{
 use blulib::{
     command::{Options, backup, restore},
     layout::IndexSet,
-    storage::{BlobStore, Compression, SegmentLimit},
+    storage::BlobStore,
 };
 use criterion::{Criterion, Throughput};
 use tempfile::TempDir;
@@ -139,12 +139,7 @@ fn bench_backup(c: &mut Criterion) {
                                 std::fs::remove_file(IndexSet::new(&blob).segment_path(segment));
                         }
 
-                        let storage = BlobStore::open_for_writing(
-                            &blob,
-                            SegmentLimit::default(),
-                            Compression::default(),
-                        )
-                        .await
+                        let storage = BlobStore::builder(&blob).open_writer().await
                         .expect("store");
                         let options = Options {
                             concurrency,
@@ -176,8 +171,7 @@ fn bench_restore(c: &mut Criterion) {
 
     let committed = rt.block_on(async {
         let storage =
-            BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-                .await
+            BlobStore::builder(&blob).open_writer().await
                 .expect("store");
         backup(&src, Options::default(), storage, None)
             .await
@@ -196,7 +190,7 @@ fn bench_restore(c: &mut Criterion) {
                     let destination = dir.path().join("out");
                     let _ = std::fs::remove_dir_all(&destination);
 
-                    let storage = BlobStore::open_for_reading(&blob).await.expect("store");
+                    let storage = BlobStore::builder(&blob).open_reader().await.expect("store");
 
                     let started = Instant::now();
                     restore(&destination, committed.snapshot, storage)
@@ -228,8 +222,7 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
 
     let committed = rt.block_on(async {
         let storage =
-            BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-                .await
+            BlobStore::builder(&blob).open_writer().await
                 .expect("store");
         backup(&src, Options::default(), storage, None)
             .await
@@ -237,7 +230,7 @@ fn the_throughput_benchmark_restores_what_it_backed_up() {
     });
 
     rt.block_on(async {
-        let storage = BlobStore::open_for_reading(&blob).await.expect("store");
+        let storage = BlobStore::builder(&blob).open_reader().await.expect("store");
         restore(&out, committed.snapshot, storage)
             .await
             .expect("restore");

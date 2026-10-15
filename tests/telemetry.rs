@@ -62,11 +62,11 @@ use std::{
 };
 
 /// The span name a command that writes a set produces.
-const WRITE_SPAN: &[u8] = b"open_for_writing";
+const WRITE_SPAN: &[u8] = b"open_writer";
 
 /// The span name a command that only reads a set produces — and a command that
 /// failed before it could write one.
-const READ_SPAN: &[u8] = b"open_for_reading";
+const READ_SPAN: &[u8] = b"open_reader";
 
 /// The counter a backup's cut tree is reported through.
 ///

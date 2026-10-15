@@ -55,7 +55,7 @@ async fn built(dir: tempfile::TempDir, source: std::path::PathBuf) -> Built {
     let blob = dir.path().join("store");
     let committed = common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let mut reader = store.get(&committed.snapshot).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
@@ -80,7 +80,7 @@ impl Built {
 
     /// A pack of this version.
     async fn pack(&self) -> Pack {
-        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let store = BlobStore::builder(&self.blob).open_reader().await.unwrap();
         Pack::write(
             &store,
             &self.plan,
@@ -104,7 +104,7 @@ impl Built {
 
     /// Probe `root` against this version, reading chunks from the store.
     async fn probe(&self, root: &Path) -> blulib::command::Probed {
-        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let store = BlobStore::builder(&self.blob).open_reader().await.unwrap();
         probe(root, &self.snapshot, store).await.unwrap()
     }
 
@@ -118,7 +118,7 @@ impl Built {
         root: &Path,
         established: &blulib::command::Established<'_>,
     ) -> (blulib::command::Probed, usize) {
-        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let store = BlobStore::builder(&self.blob).open_reader().await.unwrap();
         let counting = Counting {
             inner: store,
             reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),

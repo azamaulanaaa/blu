@@ -142,7 +142,7 @@ struct Reservation {
 /// read in exactly one place, the hand-written `Debug`. That is all it is for.
 ///
 /// Not sealed, and deliberately. Nothing constructs a `BlobStore` except
-/// [`BlobStore::open_for_writing`] and [`BlobStore::open_for_reading`]. Both of
+/// [`StoreBuilder::open_writer`] and [`StoreBuilder::open_reader`]. Both of
 /// them fix the mode. An implementation outside this crate therefore cannot
 /// produce an instantiation that means anything. Sealing it would be a bound no
 /// caller could satisfy and a restriction nothing needed.
@@ -153,8 +153,8 @@ pub trait WriteMode: Send + Sync + 'static {
 
 /// A store a run may append to. The yes to "may this handle write?".
 ///
-/// Ask for one with [`BlobStore::open_for_writing`], which requires the write
-/// policies and so cannot be confused with the other constructor.
+/// Ask for one with [`BlobStore::builder`] plus `open_writer`, which requires the write
+/// policies and so cannot be confused with the other open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Write;
 
@@ -166,7 +166,7 @@ impl WriteMode for Write {
 /// promise, so a restore path holding one cannot append and the mistake will not
 /// compile.
 ///
-/// Ask for one with [`BlobStore::open_for_reading`].
+/// Ask for one with [`BlobStore::builder`] plus `open_reader`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Read;
 
@@ -193,7 +193,7 @@ impl WriteMode for Read {
 /// be holding one policy while a caller believes it is writing under another. A
 /// reader is not generic over the policy at all. The reader consults no policy,
 /// because the codec byte in each record says how that record was written.
-/// [`BlobStore::open_for_reading`] is a [`Compression`] store whatever else exists.
+/// [`BlobStore::builder`] opens a reader with [`Compression`] whatever else exists.
 /// That is the honest answer. There is nothing on the reading side to configure.
 pub struct BlobStore<W: WriteMode, C: Compressor = Compression> {
     /// The set this store is, which is how its segments are named and found.
@@ -545,37 +545,64 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
     }
 }
 
-impl<C: Compressor> BlobStore<Write, C> {
-    /// Open a set for writing, creating its first segment and recovering it if
-    /// necessary.
+/// Build a store open with chosen policies.
+///
+/// Call [`BlobStore::builder`] with the set path. Chain policy methods.
+/// Call `open_writer` or `open_reader` to finish.
+///
+/// A reader ignores both policies. A read never rolls a segment.
+/// A read decodes each record by its own codec byte.
+#[derive(Debug, Clone)]
+pub struct StoreBuilder<C = Compression> {
+    path: PathBuf,
+    limit: SegmentLimit,
+    compression: C,
+}
+
+impl StoreBuilder<Compression> {
+    /// Start a builder for the set at `path`.
     ///
-    /// Runs the recovery scan on a blocking thread. The scan is proportional to
-    /// the record count, so it runs long enough on a large set to stall the async
-    /// pool.
+    /// The builder holds default policies. Override them before opening.
+    pub fn new<P: Into<PathBuf>>(path: P) -> Self {
+        Self {
+            path: path.into(),
+            limit: SegmentLimit::default(),
+            compression: Compression::default(),
+        }
+    }
+}
+
+impl<C: Compressor> StoreBuilder<C> {
+    /// Cap each segment at `limit` bytes.
+    ///
+    /// The limit shapes new segments only. Old segments keep their size.
+    pub fn segment_limit(mut self, limit: SegmentLimit) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Encode new payloads with `compression`.
+    ///
+    /// The policy shapes new records only. Old records keep their codec.
+    pub fn compression<N: Compressor>(self, compression: N) -> StoreBuilder<N> {
+        StoreBuilder {
+            path: self.path,
+            limit: self.limit,
+            compression,
+        }
+    }
+
+    /// Open the set for writing.
+    ///
+    /// Create the set when it does not exist. Recover its tail when it does.
     ///
     /// # Errors
     ///
-    /// Returns an error if the containing directory or a segment cannot be created.
-    /// One cause is that the path is a directory. Another cause is that the caller
-    /// lacks permission. Returns an error if a segment exists but is not a store
-    /// that this build understands. The code reports that case rather than repairing
-    /// it, because a store written by another version is a backup and not a broken
-    /// file. Returns an error if the set is missing a segment in the middle.
-    /// Returns an error if a *sealed* segment has a tail that does not verify. That
-    /// is corruption, and the code never truncates it.
-    ///
-    /// `compression` is any [`Compressor`], so this is where a caller outside this
-    /// crate brings its own write policy. Which policy it is does not travel with
-    /// the store. Every record names the codec it was written with. A set opened
-    /// later under a different policy still reads back. A set read by a build that
-    /// has never heard of either policy still reads back.
+    /// Returns an error when the set cannot be created or read.
+    /// Returns an error when a sealed segment holds a broken tail.
     #[instrument(skip_all, err)]
-    pub async fn open_for_writing<P: Into<PathBuf> + Debug>(
-        path: P,
-        limit: SegmentLimit,
-        compression: C,
-    ) -> io::Result<Self> {
-        let set = IndexSet::new(path.into());
+    pub async fn open_writer(self) -> io::Result<BlobStore<Write, C>> {
+        let set = IndexSet::new(self.path);
 
         if let Some(parent) = set.base().parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).await?;
@@ -592,7 +619,7 @@ impl<C: Compressor> BlobStore<Write, C> {
             .append
             .ok_or_else(|| io::Error::other("a writing store has no segment to write into"))?;
 
-        Ok(Self {
+        Ok(BlobStore {
             set,
             segments: scanned.segments,
             contents: Mutex::new(Contents {
@@ -601,38 +628,31 @@ impl<C: Compressor> BlobStore<Write, C> {
                 commits_per_segment: scanned.commits_per_segment,
             }),
             reserved: Mutex::new(reserved),
-            limit,
-            compression,
+            limit: self.limit,
+            compression: self.compression,
             dirty: Mutex::new(Vec::new()),
             mode: PhantomData,
         })
     }
-}
 
-impl BlobStore<Read, Compression> {
-    /// Open a set for reading.
+    /// Open the set for reading.
     ///
-    /// The set must already exist and must be a store. A path that is not one is
-    /// an error, not an empty set. A mistyped name therefore cannot come back as
-    /// "no versions".
-    ///
-    /// This constructor takes no `SegmentLimit`, unlike the writing constructor.
-    /// A read never rolls over. No record depends on where a segment boundary fell.
+    /// Refuse a path that holds no set. A mistyped name never reads as empty.
     ///
     /// # Errors
     ///
-    /// Returns an error if the set does not exist, cannot be read, is missing a
-    /// segment, or was written by an incompatible build.
+    /// Returns an error when the set does not exist or cannot be read.
+    /// Returns an error when a segment is missing or unreadable.
     #[instrument(skip_all, err)]
-    pub async fn open_for_reading<P: Into<PathBuf> + Debug>(path: P) -> io::Result<Self> {
-        let set = IndexSet::new(path.into());
+    pub async fn open_reader(self) -> io::Result<BlobStore<Read, Compression>> {
+        let set = IndexSet::new(self.path);
 
         let scan_set = set.clone();
         let scanned = tokio::task::spawn_blocking(move || read_only_scan(&scan_set))
             .await
             .map_err(|join| io::Error::other(format!("the store scan failed: {join}")))??;
 
-        Ok(Self {
+        Ok(BlobStore {
             set,
             segments: scanned.segments,
             contents: Mutex::new(Contents {
@@ -647,7 +667,7 @@ impl BlobStore<Read, Compression> {
                 segment: u32::MAX,
                 offset: 0,
             })),
-            // Both fields are shared with the writing constructor, and only that
+            // Both fields are shared with the writing open, and only that
             // one consults them. Neither field has a value worth recording on a
             // read. A read never rolls over, and never compresses anything. The
             // compressor is [`Compression`] rather than a parameter for the reason
@@ -658,6 +678,16 @@ impl BlobStore<Read, Compression> {
             dirty: Mutex::new(Vec::new()),
             mode: PhantomData,
         })
+    }
+}
+
+impl BlobStore<Write, Compression> {
+    /// Start a builder for the set at `path`.
+    ///
+    /// The builder holds default policies. Override them before opening.
+    /// Call `open_writer` to write. Call `open_reader` to read.
+    pub fn builder<P: Into<PathBuf>>(path: P) -> StoreBuilder<Compression> {
+        StoreBuilder::new(path)
     }
 }
 
@@ -1092,7 +1122,7 @@ impl<C: Compressor> BlobStore<Write, C> {
     ///
     /// `create_segment` opens a file, writes six bytes to it and `fsync`s. All
     /// three are blocking. The audit flagged that for `spawn_blocking`, and the
-    /// flag is the right instinct. `open` and `open_for_reading` both send their
+    /// flag is the right instinct. `open` and `open_reader` both send their
     /// *scan* to a blocking thread. The scan is what this module is careful about.
     ///
     /// The scan cannot be done here without giving up the property that makes this

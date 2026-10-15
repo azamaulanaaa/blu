@@ -1472,7 +1472,7 @@ async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<(
     let _lock = if dry_run { None } else { Some(set.lock()?) };
 
     if dry_run {
-        let store = storage::BlobStore::open_for_reading(set.base()).await?;
+        let store = storage::BlobStore::builder(set.base()).open_reader().await?;
         let versions = store.versions()?;
 
         // `write_index_files` writes one file per version that it can resolve a
@@ -1503,12 +1503,7 @@ async fn run_reindex(name: &std::path::Path, dry_run: bool) -> std::io::Result<(
         return Ok(());
     }
 
-    let store = storage::BlobStore::open_for_writing(
-        set.base(),
-        storage::SegmentLimit::default(),
-        storage::Compression::default(),
-    )
-    .await?;
+    let store = storage::BlobStore::builder(set.base()).open_writer().await?;
 
     let versions = store.versions()?;
     let written = store.write_index_files().await?;
@@ -1575,7 +1570,7 @@ async fn run_versions(name: &std::path::Path, numbers_only: bool) -> std::io::Re
     // system returns for a file that has gone. So a segment removed between that
     // check and the open would have been swallowed too. Then `blu versions`
     // would exit 0 having printed nothing about a set that was being deleted.
-    let store = storage::BlobStore::open_for_reading(set.base()).await?;
+    let store = storage::BlobStore::builder(set.base()).open_reader().await?;
 
     for version in versions {
         // Through the store, which checks the file against itself. An index that
@@ -1680,7 +1675,7 @@ async fn run_history(
         ));
     }
 
-    let store = storage::BlobStore::open_for_reading(set.base()).await?;
+    let store = storage::BlobStore::builder(set.base()).open_reader().await?;
     let versions = store.versions()?;
     let mut named = Vec::with_capacity(versions.len());
     for version in versions {
@@ -1965,7 +1960,7 @@ async fn run_backup(
         let existing = if segments.is_empty() {
             None
         } else {
-            Some(storage::BlobStore::open_for_reading(set.base()).await?)
+            Some(storage::BlobStore::builder(set.base()).open_reader().await?)
         };
         let fresh = existing.is_none();
 
@@ -1977,7 +1972,7 @@ async fn run_backup(
 
     // Opening discards a torn tail in the last segment. A torn tail is an
     // unfinished run, not data.
-    let store = storage::BlobStore::open_for_writing(set.base(), limit, compression).await?;
+    let store = storage::BlobStore::builder(set.base()).segment_limit(limit).compression(compression).open_writer().await?;
 
     if let Some(previous) = store.versions()?.last() {
         tracing::debug!(previous, name = %set.base().display(), "deduplicating against the store");
@@ -2510,7 +2505,7 @@ async fn run_restore(
     files: &[std::path::PathBuf],
 ) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::open_for_reading(set.base()).await?;
+    let store = storage::BlobStore::builder(set.base()).open_reader().await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(
@@ -2843,7 +2838,7 @@ fn absolutise(path: &std::path::Path) -> std::path::PathBuf {
 /// Check a version's chunks against their recorded hashes.
 async fn run_verify(name: &std::path::Path, version: Option<u32>) -> std::io::Result<()> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::open_for_reading(set.base()).await?;
+    let store = storage::BlobStore::builder(set.base()).open_reader().await?;
     let (version, snapshot) = select_version(&set, &store, version)?;
 
     tracing::info!(name = %set.base().display(), version, "verifying");
@@ -3780,7 +3775,7 @@ async fn write_pack(
     dry_run: bool,
 ) -> std::io::Result<(u32, blulib::command::Packed)> {
     let set = IndexSet::new(name);
-    let store = storage::BlobStore::open_for_reading(set.base()).await?;
+    let store = storage::BlobStore::builder(set.base()).open_reader().await?;
     let (version, snapshot_id) = select_version(&set, &store, version)?;
 
     tracing::info!(
@@ -3877,7 +3872,7 @@ async fn run_merge(
         let existing = if set.segments()?.is_empty() {
             None
         } else {
-            Some(storage::BlobStore::open_for_reading(set.base()).await?)
+            Some(storage::BlobStore::builder(set.base()).open_reader().await?)
         };
         let fresh = existing.is_none();
 
@@ -3918,12 +3913,7 @@ async fn run_merge(
     }
 
     let _lock = set.lock()?;
-    let store = storage::BlobStore::open_for_writing(
-        set.base(),
-        storage::SegmentLimit::default(),
-        compression.policy(),
-    )
-    .await?;
+    let store = storage::BlobStore::builder(set.base()).compression(compression.policy()).open_writer().await?;
 
     // Before the already-merged answer below, because that answer is about
     // the set and this is about the pack. A pre-check that reports "already

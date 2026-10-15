@@ -49,7 +49,7 @@ use std::{
 use blulib::{
     client::{Kind, MergeCompression, Merged, Outcome, Remote, State},
     pack::Pack,
-    storage::{BlobId, BlobStore, Compression, Plan, StorageGet as _},
+    storage::{BlobId, BlobStore, Plan, StorageGet as _},
 };
 use common::server::Server;
 use tokio::io::AsyncReadExt as _;
@@ -118,18 +118,13 @@ async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
     let source = tree(dir);
 
     let blob = dir.join("local");
-    let store = BlobStore::open_for_writing(
-        &blob,
-        blulib::storage::SegmentLimit::default(),
-        Compression::default(),
-    )
-    .await
+    let store = BlobStore::builder(&blob).open_writer().await
     .unwrap();
     blulib::command::backup(&source, blulib::command::Options::default(), store, None)
         .await
         .unwrap();
 
-    let reader = BlobStore::open_for_reading(&blob).await.unwrap();
+    let reader = BlobStore::builder(&blob).open_reader().await.unwrap();
     let (version, snapshot_id) = reader.latest().unwrap();
 
     let mut buffer = Vec::new();
@@ -506,12 +501,7 @@ async fn a_failed_push_leaves_no_upload_on_the_server() {
 /// Opens for writing each call, so two calls publish two versions. Returns
 /// the pack bytes of the version just published.
 async fn pack_version(source: &Path, blob: &Path) -> Vec<u8> {
-    let store = BlobStore::open_for_writing(
-        blob,
-        blulib::storage::SegmentLimit::default(),
-        Compression::default(),
-    )
-    .await
+    let store = BlobStore::builder(blob).open_writer().await
     .unwrap();
 
     let latest = match store.latest() {
@@ -522,7 +512,7 @@ async fn pack_version(source: &Path, blob: &Path) -> Vec<u8> {
         .await
         .unwrap();
 
-    let reader = BlobStore::open_for_reading(blob).await.unwrap();
+    let reader = BlobStore::builder(blob).open_reader().await.unwrap();
     let (version, snapshot_id) = reader.latest().unwrap();
 
     let mut buffer = Vec::new();

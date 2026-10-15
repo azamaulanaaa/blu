@@ -31,8 +31,7 @@ use super::record::Codec;
 /// and the one this crate ships. A caller with its own policy implements this trait
 /// instead. That policy may set a size threshold, a level of its own, or a rule
 /// about which payloads are worth a frame. The caller hands it to
-/// [`BlobStore::open_for_writing`](super::BlobStore::open_for_writing). The store
-/// stays unchanged.
+/// [`StoreBuilder::open_writer`]. The store stays unchanged.
 ///
 /// What a caller cannot do through this trait is add a codec. [`Codec`] has two
 /// arms and the store decodes one of them. A policy is therefore a choice about
@@ -237,20 +236,16 @@ impl Decompressor for Zstd {
 /// use blulib::storage::{BlobStore, Compression, SegmentLimit};
 ///
 /// // The defaults: zstd level 1, four gibibytes per segment.
-/// let store = BlobStore::open_for_writing(
-///     "photos",
-///     SegmentLimit::default(),
-///     Compression::default(),
-/// ).await?;
+/// let store = BlobStore::builder("photos").open_writer().await?;
 ///
 /// // Or not. Both are write policies, and a set written under one reads back
 /// // under the other: a compressed record says so in its own header, and which
 /// // records are compressed is a question each record answers for itself.
-/// let store = BlobStore::open_for_writing(
-///     "photos",
-///     SegmentLimit::new(64 * 1024 * 1024),
-///     Compression::Off,
-/// ).await?;
+/// let store = BlobStore::builder("photos")
+///     .segment_limit(SegmentLimit::new(64 * 1024 * 1024))
+///     .compression(Compression::Off)
+///     .open_writer()
+///     .await?;
 /// # Ok(())
 /// # }
 /// ```

@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use blulib::{
     layout::IndexSet,
-    storage::{BlobStore, Compression, SegmentLimit, StoragePut, Write},
+    storage::{BlobStore, StoragePut, Write},
 };
 
 const CHUNK: usize = 64 * 1024;
@@ -112,12 +112,7 @@ async fn main() {
             let _ = std::fs::remove_file(IndexSet::new(&store_path).segment_path(segment));
         }
         let store = std::sync::Arc::new(
-            BlobStore::open_for_writing(
-                &store_path,
-                SegmentLimit::default(),
-                Compression::default(),
-            )
-            .await
+            BlobStore::builder(&store_path).open_writer().await
             .expect("store"),
         );
         put_all(store.clone()).await;
@@ -132,12 +127,7 @@ async fn main() {
             let _ = std::fs::remove_file(IndexSet::new(&store_path).segment_path(segment));
         }
         let store = std::sync::Arc::new(
-            BlobStore::open_for_writing(
-                &store_path,
-                SegmentLimit::default(),
-                Compression::default(),
-            )
-            .await
+            BlobStore::builder(&store_path).open_writer().await
             .expect("store"),
         );
         store_times.push(put_all(store.clone()).await);

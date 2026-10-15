@@ -34,7 +34,7 @@ use tokio::io::AsyncReadExt;
 
 /// A set's latest snapshot, read from the store and decoded.
 async fn snapshot_of(blob: &Path) -> Snapshot {
-    let store = BlobStore::open_for_reading(blob).await.unwrap();
+    let store = BlobStore::builder(blob).open_reader().await.unwrap();
     let id = store.latest().unwrap().1;
     let mut reader = store.get(&id).await.unwrap();
     let mut buffer = Vec::new();
@@ -46,7 +46,7 @@ async fn snapshot_of(blob: &Path) -> Snapshot {
 /// The BLAKE3 of a set's latest snapshot. This is what a pack of that version
 /// names.
 async fn snapshot_id(blob: &Path) -> blulib::storage::BlobId {
-    let store = BlobStore::open_for_reading(blob).await.unwrap();
+    let store = BlobStore::builder(blob).open_reader().await.unwrap();
 
     let id = store.latest().unwrap().1;
     let mut reader = store.get(&id).await.unwrap();
@@ -58,7 +58,7 @@ async fn snapshot_id(blob: &Path) -> blulib::storage::BlobId {
 
 /// The plan for a set's latest version, and the chunk hashes it names.
 async fn plan_of(blob: &Path) -> Plan {
-    let store = BlobStore::open_for_reading(blob).await.unwrap();
+    let store = BlobStore::builder(blob).open_reader().await.unwrap();
 
     let snapshot = snapshot_of(blob).await;
 
@@ -82,7 +82,7 @@ struct Built {
 impl Built {
     /// Write a pack of this version to `at`, and return it.
     async fn pack(&self, at: &Path) -> Pack {
-        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let store = BlobStore::builder(&self.blob).open_reader().await.unwrap();
         let snapshot = snapshot_of(&self.blob).await;
 
         Pack::write(&store, &self.plan, &snapshot, self.version, at)
@@ -98,7 +98,7 @@ impl Built {
 /// than worked out here. A helper that invented the number would be the thing the
 /// header exists to make impossible to get wrong quietly.
 async fn pack(blob: &Path, at: &Path) -> Pack {
-    let store = BlobStore::open_for_reading(blob).await.unwrap();
+    let store = BlobStore::builder(blob).open_reader().await.unwrap();
     let plan = plan_of(blob).await;
     let snapshot = snapshot_of(blob).await;
 
@@ -148,7 +148,7 @@ async fn a_pack_holds_its_versions_chunks() {
 
     assert_eq!(pack.len(), built.plan.len());
 
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let mut file = fs::File::open(&path).unwrap();
 
     let mut at = 0u64;
@@ -361,7 +361,7 @@ async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
     );
 
     // Every chunk resolves to its own entry, and to its own bytes.
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     for planned in built.plan.chunks() {
         let located = pack
             .locate(&planned.id)
@@ -481,7 +481,7 @@ async fn a_patch_is_one_range_on_a_tree_that_is_not_a_special_case() {
 
     let v2 = plan_of(&blob).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let snapshot = snapshot_of(&blob).await;
     let pack = Pack::write(&store, &v2, &snapshot, 2, &dir.path().join("v2.pack"))
         .await
@@ -782,7 +782,7 @@ async fn a_pack_that_fails_to_write_leaves_the_one_that_was_there() {
     // either. The rename consumed it.
     built.pack(&path).await;
 
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let snapshot = snapshot_of(&built.blob).await;
 
     // The test runs once per codec that the fixture holds. The refusal names
@@ -1151,7 +1151,7 @@ async fn an_index_and_a_record_header_cannot_disagree() {
     }
     common::run_backup_compressed(&source, &blob, blulib::storage::Compression::zstd(1)).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&blob).await;
     let path = dir.path().join("v1.pack");
     let pack = Pack::write(&store, &plan, &snapshot_of(&blob).await, 1, &path)
@@ -1288,7 +1288,7 @@ async fn a_future_pack_format_is_named_rather_than_misread() {
 #[tokio::test]
 async fn a_pack_records_the_version_it_was_packed_from() {
     let built = build(3, 100_000).await;
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let snapshot = snapshot_of(&built.blob).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
     let base = common::id_of(&[7u8; 32]);
@@ -1765,7 +1765,7 @@ async fn a_pack_of_an_empty_version_opens() {
     let blob = dir.path().join("store");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let plan = plan_of(&blob).await;
     assert!(plan.is_empty(), "an empty tree should plan to no chunks");
 
@@ -1898,7 +1898,7 @@ async fn a_pack_yields_the_bytes_a_store_would() {
     let path = built.dir.path().join("v1.pack");
     let pack = built.pack(&path).await;
 
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
 
     for planned in built.plan.chunks() {
         let mut from_pack = pack.get(&planned.id).await.unwrap();
@@ -2181,7 +2181,7 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
     fs::write(source.join("f0.bin"), common::noisy(110_000)).unwrap();
     common::run_backup(&source, &built.blob).await;
 
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let tip = store.version_time(2).await.unwrap();
 
     // The first version restamped an hour before the tip.
@@ -2195,12 +2195,7 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
     Pack::write(&store, &plan, &old, 1, &at).await.unwrap();
     let pack = Pack::open(&at).unwrap();
 
-    let writing = BlobStore::open_for_writing(
-        &built.blob,
-        blulib::storage::SegmentLimit::default(),
-        blulib::storage::Compression::default(),
-    )
-    .await
+    let writing = BlobStore::builder(&built.blob).open_writer().await
     .unwrap();
 
     let error = blulib::command::merge(&writing, &pack, blulib::command::MergeCompression::Keep)
@@ -2236,7 +2231,7 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
 
     // The base pack is written *before* the update. `snapshot_of` reads the newest
     // version. After a later backup that would be the other one.
-    let first = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let first = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let v1 = snapshot_of(&built.blob).await;
     let v1_full = Plan::from_snapshot(&v1, |id| first.locate(id)).unwrap();
     let v1_pack = Pack::write(&first, &v1_full, &v1, 1, &built.dir.path().join("v1.pack"))
@@ -2253,7 +2248,7 @@ async fn a_delta_pack_carries_a_client_up_from_the_version_it_names() {
     fs::write(source.join("f2.bin"), common::untagged_stream(99, 260_000)).unwrap();
     common::run_backup(&source, &built.blob).await;
 
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let v2 = snapshot_of(&built.blob).await;
     let full = Plan::from_snapshot(&v2, |id| store.locate(id)).unwrap();
     let delta = full.since(&v2, &v1);
@@ -2320,7 +2315,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     let source = built.dir.path().join("source");
     let client = built.dir.path().join("client");
 
-    let first = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let first = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let v1 = snapshot_of(&built.blob).await;
     let v1_pack = Pack::write(
         &first,
@@ -2335,7 +2330,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     // Move the client to version 2. That is one update past the delta's base.
     fs::write(source.join("f0.bin"), common::untagged_stream(11, 240_000)).unwrap();
     common::run_backup(&source, &built.blob).await;
-    let second = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let second = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let v2 = snapshot_of(&built.blob).await;
     let v2_pack = Pack::write(
         &second,
@@ -2357,7 +2352,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
     // Version 3, and a delta for a client on version 1.
     fs::write(source.join("f1.bin"), common::untagged_stream(12, 250_000)).unwrap();
     common::run_backup(&source, &built.blob).await;
-    let third = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let third = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let v3 = snapshot_of(&built.blob).await;
     let full = Plan::from_snapshot(&v3, |id| third.locate(id)).unwrap();
     let delta = full.since(&v2, &v1);
@@ -2417,7 +2412,7 @@ async fn a_delta_pack_refuses_a_client_that_is_not_on_its_base() {
 #[tokio::test]
 async fn a_full_pack_names_no_base_and_a_delta_names_one() {
     let built = build(4, 150_000).await;
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let snapshot = snapshot_of(&built.blob).await;
     let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
 
@@ -2460,7 +2455,7 @@ async fn a_delta_is_a_function_of_the_two_versions() {
     fs::write(source.join("f1.bin"), common::untagged_stream(31, 190_000)).unwrap();
     common::run_backup(&source, &built.blob).await;
 
-    let store = BlobStore::open_for_reading(&built.blob).await.unwrap();
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
     let v2 = snapshot_of(&built.blob).await;
     let full = Plan::from_snapshot(&v2, |id| store.locate(id)).unwrap();
 
@@ -2689,12 +2684,7 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
 
     let reopened = Pack::open(&at_damaged).unwrap();
     let received = built.dir.path().join("received");
-    let store = BlobStore::open_for_writing(
-        &received,
-        blulib::storage::SegmentLimit::default(),
-        blulib::storage::Compression::default(),
-    )
-    .await
+    let store = BlobStore::builder(&received).open_writer().await
     .unwrap();
 
     let error = blulib::command::merge(
@@ -2761,12 +2751,7 @@ async fn a_flipped_payload_byte_is_refused_on_the_verbatim_path_too() {
 
     let reopened = Pack::open(&at_damaged).unwrap();
     let received = built.dir.path().join("received-keep");
-    let store = BlobStore::open_for_writing(
-        &received,
-        blulib::storage::SegmentLimit::default(),
-        blulib::storage::Compression::default(),
-    )
-    .await
+    let store = BlobStore::builder(&received).open_writer().await
     .unwrap();
 
     let error = blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
@@ -2897,12 +2882,7 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     );
 
     let received = built.dir.path().join("received-grown");
-    let store = BlobStore::open_for_writing(
-        &received,
-        blulib::storage::SegmentLimit::default(),
-        blulib::storage::Compression::default(),
-    )
-    .await
+    let store = BlobStore::builder(&received).open_writer().await
     .unwrap();
 
     blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
@@ -2964,7 +2944,7 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
     let origin = dir.path().join("origin");
     common::run_backup(&source, &origin).await;
     let pack = Pack::write(
-        &BlobStore::open_for_reading(&origin).await.unwrap(),
+        &BlobStore::builder(&origin).open_reader().await.unwrap(),
         &plan_of(&origin).await,
         &snapshot_of(&origin).await,
         1,
@@ -3006,21 +2986,18 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
         (blulib::command::MergeCompression::Reencode, false),
     ] {
         let name = format!("received-{expected_kept}");
-        let store = BlobStore::open_for_writing(
-            &dir.path().join(&name),
-            blulib::storage::SegmentLimit::default(),
+        let store = BlobStore::builder(&dir.path().join(&name))
             // Off, so a re-encode has somewhere to go: every chunk raw.
-            blulib::storage::Compression::Off,
-        )
-        .await
-        .unwrap();
+            .compression(blulib::storage::Compression::Off)
+            .open_writer()
+            .await
+            .unwrap();
 
         blulib::command::merge(&store, &pack, compression)
             .await
             .unwrap();
 
-        let reader = BlobStore::open_for_reading(&dir.path().join(&name))
-            .await
+        let reader = BlobStore::builder(&dir.path().join(&name)).open_reader().await
             .unwrap();
         for (id, stored) in &carried {
             let placement = reader.locate(id).unwrap();
@@ -3169,7 +3146,7 @@ async fn packed_with(
     at: &Path,
     compression: Option<blulib::storage::Compression>,
 ) -> Pack {
-    let store = BlobStore::open_for_reading(blob).await.unwrap();
+    let store = BlobStore::builder(blob).open_reader().await.unwrap();
     let snapshot = snapshot_of(blob).await;
     // sanity: the version resolves at all, so a later failure is about the option.
     assert!(
@@ -3243,12 +3220,7 @@ async fn every_pack_form_restores_through_every_merge_form() {
 
         for (merge_form, merge_route, store_policy) in merge_forms() {
             let name = dir.path().join(format!("m-{pack_form}-{merge_form}"));
-            let store = BlobStore::open_for_writing(
-                &name,
-                blulib::storage::SegmentLimit::default(),
-                store_policy,
-            )
-            .await
+            let store = BlobStore::builder(&name).compression(store_policy).open_writer().await
             .unwrap();
 
             blulib::command::merge(&store, &pack, merge_route)
@@ -3261,7 +3233,7 @@ async fn every_pack_form_restores_through_every_merge_form() {
             // it against the hash it is addressed by. That hash is the store's own
             // statement that what it holds is what it says it holds. That is the
             // property the verbatim paths keep while skipping the encode.
-            let reopened = BlobStore::open_for_reading(&name).await.unwrap();
+            let reopened = BlobStore::builder(&name).open_reader().await.unwrap();
             let report = blulib::command::verify(reopened.snapshot(1).unwrap(), reopened)
                 .await
                 .unwrap_or_else(|e| panic!("{pack_form} into {merge_form} should verify: {e}"));
@@ -3332,18 +3304,13 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
         let name = dir.path().join(format!("received-{form}"));
 
         // Off, so what is recorded is the pack's choice and not the store's.
-        let store = BlobStore::open_for_writing(
-            &name,
-            blulib::storage::SegmentLimit::default(),
-            blulib::storage::Compression::Off,
-        )
-        .await
+        let store = BlobStore::builder(&name).compression(blulib::storage::Compression::Off).open_writer().await
         .unwrap();
         blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)
             .await
             .unwrap();
 
-        let reader = BlobStore::open_for_reading(&name).await.unwrap();
+        let reader = BlobStore::builder(&name).open_reader().await.unwrap();
         for (id, held_codec) in &held {
             let placement = reader.locate(id).unwrap();
             if expected_frames && *held_codec == Codec::Zstd {
@@ -3410,7 +3377,7 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
 
     let mut payloads = Vec::new();
     for (form, compression) in pack_forms() {
-        let store = BlobStore::open_for_reading(&origin).await.unwrap();
+        let store = BlobStore::builder(&origin).open_reader().await.unwrap();
         let snapshot = snapshot_of(&origin).await;
         let version = blulib::command::Version {
             number: 1,
@@ -3582,12 +3549,7 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
 
     let pack = Pack::open(&path).expect("the fixture is a pack this build can open");
     let received = built.dir.path().join("received");
-    let store = BlobStore::open_for_writing(
-        &received,
-        blulib::storage::SegmentLimit::default(),
-        blulib::storage::Compression::default(),
-    )
-    .await
+    let store = BlobStore::builder(&received).open_writer().await
     .unwrap();
 
     let error = blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)

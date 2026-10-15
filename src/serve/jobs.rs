@@ -32,12 +32,12 @@
 //! **And it needs no rollback, which is the property that makes this safe.** A
 //! store is append-only with one commit record at the end of a run. An aborted
 //! merge published no version, and left a torn tail that the next
-//! `open_for_writing` reclaims. So a cancelled merge leaves no half-version and
+//! `open_writer` reclaims. So a cancelled merge leaves no half-version and
 //! nothing to undo.
 //!
 //! One honest limit, repeated from the oracle's analysis because it is the kind
-//! of thing that is easy to promise and hard to deliver: `open_for_writing` and
-//! `open_for_reading` each scan inside `spawn_blocking`, and aborting a task
+//! of thing that is easy to promise and hard to deliver: `open_writer` and
+//! `open_reader` each scan inside `spawn_blocking`, and aborting a task
 //! does not cancel a blocking task. A cancel issued during the open takes effect
 //! when the scan returns. The scan is over record *headers*, so it is bounded by
 //! record count rather than by set size.

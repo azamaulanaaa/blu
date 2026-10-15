@@ -22,7 +22,7 @@ async fn an_intact_snapshot_verifies_clean() {
     let blob = dir.path().join("store.bin");
     let committed = common::run_backup(&source, &blob).await;
 
-    let storage = BlobStore::open_for_reading(&blob).await.unwrap();
+    let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
     let report = verify(committed.snapshot, storage).await.unwrap();
 
     assert!(report.is_ok(), "unexpected failures: {:?}", report.failures);
@@ -46,7 +46,7 @@ async fn a_flipped_byte_in_the_store_is_detected() {
     bytes[offset as usize] ^= 0xff;
     fs::write(&segment, &bytes).unwrap();
 
-    let storage = BlobStore::open_for_reading(&blob).await.unwrap();
+    let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
     let report = verify(committed.snapshot, storage).await.unwrap();
 
     assert!(!report.is_ok(), "corruption went undetected");
@@ -102,7 +102,7 @@ async fn a_store_truncated_before_its_snapshot_is_refused() {
     let bytes = fs::read(&segment).unwrap();
     fs::write(&segment, &bytes[..bytes.len() - 50_000]).unwrap();
 
-    let error = BlobStore::open_for_reading(&blob).await.unwrap_err();
+    let error = BlobStore::builder(&blob).open_reader().await.unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(
@@ -127,7 +127,7 @@ async fn restore_refuses_to_run_against_a_corrupt_store() {
     fs::write(&segment, &bytes).unwrap();
 
     let destination = dir.path().join("restored");
-    let storage = BlobStore::open_for_reading(&blob).await.unwrap();
+    let storage = BlobStore::builder(&blob).open_reader().await.unwrap();
     let error = restore(&destination, committed.snapshot, storage)
         .await
         .unwrap_err();

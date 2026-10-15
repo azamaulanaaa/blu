@@ -76,7 +76,7 @@ use blulib::{
     metadata::Snapshot,
     pack::Pack,
     serve::{JobId, Jobs, Json},
-    storage::{BlobStore, Compression, Plan, SegmentLimit, StorageGet},
+    storage::{BlobStore, Plan, StorageGet},
     telemetry::Config,
 };
 use common::http::Request;
@@ -382,8 +382,7 @@ fn a_job_reports_through_the_span_its_own_command_opens() {
         let (done, finished) = tokio::sync::oneshot::channel();
         let id = jobs().spawn("merge", move |_handle| async move {
             let storage =
-                BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-                    .await
+                BlobStore::builder(&blob).open_writer().await
                     .expect("a fresh set opens for writing");
 
             let committed = blulib::command::backup(&source, Options::default(), storage, None)
@@ -506,7 +505,7 @@ async fn a_pack(dir: &Path) -> Vec<u8> {
     let blob = dir.join("local");
     common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let (version, snapshot_id) = store.latest().unwrap();
 
     let mut reader = store.get(&snapshot_id).await.unwrap();

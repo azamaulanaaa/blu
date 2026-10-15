@@ -19,14 +19,14 @@ use std::fs;
 use blulib::{
     command::{Options, backup},
     metadata::Timestamp,
-    storage::{BlobId, BlobStore, Compression, SegmentLimit, StorageGet},
+    storage::{BlobId, BlobStore, StorageGet},
 };
 
 /// Read a snapshot back out of a store.
 async fn snapshot(blob: &std::path::Path, id: &BlobId) -> blulib::metadata::Snapshot {
     use tokio::io::AsyncReadExt;
 
-    let storage = BlobStore::open_for_reading(blob).await.unwrap();
+    let storage = BlobStore::builder(blob).open_reader().await.unwrap();
     let mut reader = storage.get(id).await.unwrap();
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
@@ -443,8 +443,7 @@ async fn a_version_older_than_the_latest_one_is_refused() {
     common::run_backup(&source, &blob).await;
 
     let storage =
-        BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-            .await
+        BlobStore::builder(&blob).open_writer().await
             .unwrap();
     let future = Timestamp {
         secs: 9_999_999_999,
@@ -460,7 +459,7 @@ async fn a_version_older_than_the_latest_one_is_refused() {
         "the refusal should name the act, got: {error}"
     );
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     assert_eq!(
         store.versions().unwrap().len(),
         1,
@@ -481,13 +480,12 @@ async fn a_version_stamped_at_the_latest_time_commits() {
     let blob = dir.path().join("store");
     let first = common::run_backup(&source, &blob).await;
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     let latest = store.version_time(1).await.unwrap();
 
     fs::write(source.join("b.bin"), b"second").unwrap();
     let storage =
-        BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-            .await
+        BlobStore::builder(&blob).open_writer().await
             .unwrap();
     let second = backup(&source, Options::default(), storage, Some(latest))
         .await

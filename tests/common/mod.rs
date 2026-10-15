@@ -30,7 +30,7 @@ pub(crate) mod server;
 use blulib::{
     command::{Committed, Options, backup, restore},
     layout::IndexSet,
-    storage::{BlobId, BlobStore, Compression, SegmentLimit, StreamReadSeeker},
+    storage::{BlobId, BlobStore, SegmentLimit, StreamReadSeeker},
 };
 
 /// An empty source tree inside `dir`, ready to be written into.
@@ -235,8 +235,7 @@ async fn latest_of<C: blulib::storage::Compressor>(
 /// defaults would otherwise choose.
 pub(crate) async fn run_backup_with(source: &Path, blob: &Path, opts: Options) -> Committed {
     let storage =
-        BlobStore::open_for_writing(blob, SegmentLimit::default(), Compression::default())
-            .await
+        BlobStore::builder(blob).open_writer().await
             .unwrap();
     let latest = latest_of(&storage).await;
     backup(source, opts, storage, latest).await.unwrap()
@@ -253,8 +252,7 @@ pub(crate) async fn run_backup_limited(
     blob: &Path,
     limit: SegmentLimit,
 ) -> Committed {
-    let storage = BlobStore::open_for_writing(blob, limit, Compression::default())
-        .await
+    let storage = BlobStore::builder(blob).segment_limit(limit).open_writer().await
         .unwrap();
     let latest = latest_of(&storage).await;
     backup(source, Options::default(), storage, latest)
@@ -264,7 +262,7 @@ pub(crate) async fn run_backup_limited(
 
 /// Restore the snapshot named by `snapshot` from the store at `blob`.
 pub(crate) async fn run_restore(blob: &Path, snapshot: BlobId, destination: &Path) {
-    let storage = BlobStore::open_for_reading(blob).await.unwrap();
+    let storage = BlobStore::builder(blob).open_reader().await.unwrap();
     restore(destination, snapshot, storage).await.unwrap();
 }
 
@@ -278,8 +276,7 @@ pub(crate) async fn run_backup_compressed(
     blob: &Path,
     compression: blulib::storage::Compression,
 ) -> Committed {
-    let storage = BlobStore::open_for_writing(blob, SegmentLimit::default(), compression)
-        .await
+    let storage = BlobStore::builder(blob).compression(compression).open_writer().await
         .unwrap();
     let latest = latest_of(&storage).await;
     backup(source, Options::default(), storage, latest)
@@ -289,7 +286,7 @@ pub(crate) async fn run_backup_compressed(
 
 /// Restore one specific version of a set.
 pub(crate) async fn run_restore_version(blob: &Path, destination: &Path, version: u32) {
-    let storage = BlobStore::open_for_reading(blob).await.unwrap();
+    let storage = BlobStore::builder(blob).open_reader().await.unwrap();
     let snapshot = storage.snapshot(version).unwrap();
     restore(destination, snapshot, storage).await.unwrap();
 }

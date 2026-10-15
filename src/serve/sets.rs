@@ -21,7 +21,7 @@
 //! own jobs.
 //!
 //! **Reading does not need a mutex, but it does need invalidation.**
-//! `open_for_reading` runs a scan over every record header in every segment. That
+//! `open_reader` runs a scan over every record header in every segment. That
 //! is O(set), per request, which is the wrong shape for a server — so reads share
 //! a handle. But a shared handle's `contents` map is built once at open and never
 //! refreshed, so a handle cached across a merge would answer a version listing
@@ -312,7 +312,7 @@ impl Sets {
             return Ok(existing);
         }
 
-        let store = Arc::new(BlobStore::open_for_reading(base).await?);
+        let store = Arc::new(BlobStore::builder(base).open_reader().await?);
 
         let mut map = Self::locked(&self.reads, "reader")?;
         // Re-checked under the lock. Two requests for a set that is not yet
@@ -344,11 +344,11 @@ impl Sets {
     ///
     /// The handle is opened **while the mutex is held**, every time, and then
     /// dropped. That is deliberate, and it is cheaper than it sounds: the
-    /// expensive part of `open_for_writing` is one scan, and a merge is one
+    /// expensive part of `open_writer` is one scan, and a merge is one
     /// request. Caching a writable handle would trade a correctness argument for
     /// a scan that happens once per merge rather than once per request, and the
     /// correctness argument is the one this file exists to make:
-    /// `open_for_writing` takes its reservation from the end of the last valid
+    /// `open_writer` takes its reservation from the end of the last valid
     /// record, so two handles for the same set each believe they own the append
     /// offset and would interleave records into the same segment.
     ///
@@ -386,8 +386,7 @@ impl Sets {
         let _held = Arc::clone(&entry).lock_owned().await;
 
         let store = Arc::new(
-            BlobStore::open_for_writing(base, crate::storage::SegmentLimit::default(), compression)
-                .await?,
+            BlobStore::builder(base).compression(compression).open_writer().await?,
         );
 
         Ok(work(store).await)

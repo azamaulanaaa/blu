@@ -145,12 +145,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("store");
 
-        let storage = crate::storage::BlobStore::open_for_writing(
-            &blob,
-            crate::storage::SegmentLimit::default(),
-            crate::storage::Compression::default(),
-        )
-        .await
+        let storage = crate::storage::BlobStore::builder(&blob).open_writer().await
         .unwrap();
         let _ = storage;
 

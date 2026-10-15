@@ -68,7 +68,7 @@ impl Versions {
 
     /// A pack of the newest version, written into the temp dir.
     async fn pack(&self) -> Pack {
-        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let store = BlobStore::builder(&self.blob).open_reader().await.unwrap();
         let (version, id) = store.latest().unwrap();
 
         let snapshot = read_snapshot(&store, id).await;
@@ -88,7 +88,7 @@ impl Versions {
     /// A fresh directory holding the newest version, as a client would have it.
     async fn client(&self) -> std::path::PathBuf {
         let client = self.dir.path().join("client");
-        let store = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let store = BlobStore::builder(&self.blob).open_reader().await.unwrap();
         common::run_restore(&self.blob, store.latest().unwrap().1, &client).await;
         client
     }
@@ -263,7 +263,7 @@ async fn a_missing_file_is_created_even_where_its_chunks_are_held_elsewhere() {
     let target = versions.client().await;
 
     // The shared chunks are genuinely held.
-    let store = BlobStore::open_for_reading(&versions.blob).await.unwrap();
+    let store = BlobStore::builder(&versions.blob).open_reader().await.unwrap();
     let snapshot = read_snapshot(&store, store.latest().unwrap().1).await;
     let probed = blulib::command::probe(&target, &snapshot, store)
         .await

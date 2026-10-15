@@ -31,7 +31,7 @@ use blulib::{
     layout::IndexSet,
     metadata::Timestamp,
     storage::{
-        BlobId, BlobStore, Compression, Read, Resolved, SegmentLimit, VersionIndex, resolve,
+        BlobId, BlobStore, Read, Resolved, VersionIndex, resolve,
     },
 };
 
@@ -48,7 +48,7 @@ async fn set_with_versions(
         common::run_backup(&source, &blob).await;
     }
 
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     (blob, store)
 }
 
@@ -210,7 +210,7 @@ async fn a_missing_index_is_absent_rather_than_an_error() {
 
     // The version is still there, which is the whole point of the file being a
     // cache.
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     assert!(store.snapshot(2).is_ok());
 }
 
@@ -337,7 +337,7 @@ async fn an_index_names_the_segment_the_snapshot_is_in() {
         common::run_backup_limited(&source, &rolled, small).await;
     }
 
-    let store = BlobStore::open_for_reading(&rolled).await.unwrap();
+    let store = BlobStore::builder(&rolled).open_reader().await.unwrap();
     assert!(store.segment_count() > 1, "the set should have rolled over");
 
     let rolled_set = IndexSet::new(&rolled);
@@ -404,15 +404,14 @@ async fn the_index_files_can_all_be_deleted_and_rebuilt() {
 
     // Versions still exist. Nothing was lost, because the store never depended on
     // these files.
-    let reopened = BlobStore::open_for_reading(&blob).await.unwrap();
+    let reopened = BlobStore::builder(&blob).open_reader().await.unwrap();
     for (i, version) in (1..=4u32).enumerate() {
         assert_eq!(reopened.snapshot(version).unwrap(), before[i]);
     }
 
     // And they can be rebuilt from the store.
     let written =
-        BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-            .await
+        BlobStore::builder(&blob).open_writer().await
             .unwrap()
             .write_index_files()
             .await
@@ -448,8 +447,7 @@ async fn a_rebuilt_index_resolves_to_the_right_commit() {
         common::run_backup_limited(&source, &blob, small).await;
     }
 
-    let store = BlobStore::open_for_writing(&blob, small, Compression::default())
-        .await
+    let store = BlobStore::builder(&blob).segment_limit(small).open_writer().await
         .unwrap();
     assert!(store.segment_count() > 1, "the set should have rolled over");
 
@@ -599,7 +597,7 @@ async fn an_index_path_that_is_a_directory_is_treated_as_no_index() {
 
     // The store's own commit log still knows the version, which is the point of
     // not making the index authoritative.
-    let store = BlobStore::open_for_reading(&blob).await.unwrap();
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
     assert_eq!(
         store.snapshot(2).unwrap(),
         indexed[1].snapshot,

@@ -799,8 +799,7 @@ async fn a_compression_level_outside_zero_to_nine_is_refused() {
     }
 
     // 0 stored the payload raw, which is what it claims to mean.
-    let store = BlobStore::open_for_reading(dir.path().join("store0"))
-        .await
+    let store = BlobStore::builder(dir.path().join("store0")).open_reader().await
         .unwrap();
     let id = store.latest().unwrap().1;
     let placement = store.locate(&id).unwrap();
@@ -938,7 +937,7 @@ async fn a_chunk_profile_is_the_chunking_and_default_is_the_flagless_run() {
 /// what the snapshot refers to. A record is also the snapshot itself and every
 /// commit. The file therefore holds more records than the version has chunks.
 async fn chunk_count(base: &Path) -> usize {
-    let store = BlobStore::open_for_reading(base).await.unwrap();
+    let store = BlobStore::builder(base).open_reader().await.unwrap();
     let snapshot = load_snapshot(&store, store.latest().unwrap().1)
         .await
         .unwrap();
@@ -951,7 +950,7 @@ async fn chunk_count(base: &Path) -> usize {
 /// Comparing the recorded tree rather than the hash says whether the runs
 /// cut the tree the same way.
 async fn recorded_snapshot(base: &Path) -> blulib::metadata::Snapshot {
-    let store = BlobStore::open_for_reading(base).await.unwrap();
+    let store = BlobStore::builder(base).open_reader().await.unwrap();
     load_snapshot(&store, store.latest().unwrap().1)
         .await
         .unwrap()
@@ -2785,7 +2784,7 @@ fn a_dry_backup_of_a_new_location_creates_nothing_and_plans_every_chunk() {
     let report = ok(dir.path(), &["backup", "src", "snap", "--dry-run"]);
 
     // Nothing at all. The set's directory does not exist and must not be made.
-    // `open_for_writing` creates segment 0 for a set with none. So a dry run that
+    // `open_writer` creates segment 0 for a set with none. So a dry run that
     // opened the store the way a backup does would leave an empty store behind. It
     // would also report a first version in it.
     assert_eq!(

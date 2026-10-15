@@ -301,7 +301,7 @@ impl IndexSet {
     ///
     /// The same reasoning retired `AsyncReadSeek`'s proposed `pub(crate)` and
     /// `BlobStore<true>`'s proposed `Read`/`Write` in reverse. That one counted
-    /// 15 sites after `open_for_writing` removed the rest. The change was done.
+    /// 15 sites after `open_writer` removed the rest. The change was done.
     /// What is left here is what it was before.
     ///
     /// The argument is recorded on the two functions whose signatures are the

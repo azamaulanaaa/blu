@@ -104,7 +104,7 @@ pub async fn load_snapshot<S: storage::StorageGet>(
     // A corrupt snapshot and a store that cannot be read are both
     // `InvalidData`.
     // They are told apart by *where* the refusal happens.
-    // `BlobStore::open_for_reading` refuses a store it cannot read whole,
+    // `StoreBuilder::open_reader` refuses a store it cannot read whole,
     // before any snapshot is decoded.
     // `tests/verify.rs` pins that.
     // Moving the distinction into the kind would mean choosing between them

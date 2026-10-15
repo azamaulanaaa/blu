@@ -25,7 +25,7 @@ use std::{
 use blulib::{
     command::restore,
     metadata::{Attributes, Dir, File, FileChunk, Link, Snapshot, Timestamp},
-    storage::{BlobId, BlobStore, Compression, SegmentLimit, StoragePut},
+    storage::{BlobId, BlobStore, StoragePut},
 };
 
 /// A store holding a forged snapshot, and the hash it is under.
@@ -42,8 +42,7 @@ impl Forged {
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("store.bin");
         let storage =
-            BlobStore::open_for_writing(&blob, SegmentLimit::default(), Compression::default())
-                .await
+            BlobStore::builder(&blob).open_writer().await
                 .unwrap();
 
         let mut snapshot = Snapshot::new(Timestamp { secs: 1, nanos: 0 });
@@ -88,7 +87,7 @@ impl Forged {
 
     /// Restore into `dest`, and report the error if it refused.
     async fn restore_into(&self, dest: &Path) -> Result<(), String> {
-        let storage = BlobStore::open_for_reading(&self.blob).await.unwrap();
+        let storage = BlobStore::builder(&self.blob).open_reader().await.unwrap();
         match restore(dest, self.snapshot, storage).await {
             Ok(_) => Ok(()),
             Err(e) => Err(e.to_string()),

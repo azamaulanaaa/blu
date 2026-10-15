@@ -60,7 +60,7 @@ mod operator;
 mod tls;
 
 pub use backend::{AsyncReadSeek, StorageGet, StoragePut, StreamReadSeeker};
-pub use blob::{BlobStore, Read, Write, WriteMode};
+pub use blob::{BlobStore, Read, StoreBuilder, Write, WriteMode};
 pub use compression::{Compression, Compressor, Decompressor, MAX_COMPRESSION_LEVEL, Zstd};
 pub use error::{at, at_async};
 pub use hash::BlobId;
