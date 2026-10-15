@@ -134,7 +134,7 @@ On Linux blu keeps `user` extended attributes and POSIX access lists. It skips `
 
 blu does not preserve hard links outside the tree. It skips device nodes, named pipes, and sockets, and it reports each skip. Opening a FIFO for reading waits for a writer, so reading one would stall the run.
 
-An unprivileged restore cannot set owners it does not hold. It reports those entries, writes everything else, and still succeeds. Re-run as root to set them.
+An unprivileged restore cannot set owners it does not hold. It reports those entries, writes everything else, and still succeeds. Re-run as root to set them. A restore to a filesystem without attribute support cannot set extended attributes. It reports those entries, writes everything else, and still succeeds.
 
 ## Telemetry
 
@@ -181,7 +181,7 @@ RestoreBuilder::new("~/Documents-restored", first.snapshot, store)
 | Record | 2 |
 | Pack | 7 |
 
-This build reads only stores it wrote. It refuses older stores instead of converting them. A pack is derived output. Re-run `pack` to rebuild one from the current set.
+This build reads only stores it wrote. It refuses older stores instead of converting them. Snapshot 6 adds extended attributes and access lists. A store written before them needs a fresh backup. A pack is derived output. Re-run `pack` to rebuild one from the current set.
 
 ```console
 $ blu pack set v8.pack --version 8
