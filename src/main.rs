@@ -6,9 +6,10 @@ use std::process::ExitCode;
 
 use blulib::{
     command::{
-        ApplyOptions, BackupBuilder, BackupPlan, BackupPlanBuilder, MergePlan, Merged,
-        PARTIAL_SUFFIX, PREVIOUS_SUFFIX, Planned, RestoreBuilder, RestorePlan, RestorePlanBuilder,
-        apply, load_snapshot, lock_destination, merge, merge_plan, verify, version_holding,
+        ApplyOptions, BackupBuilder, BackupPlan, BackupPlanBuilder, MergeBuilder, MergePlan,
+        MergePlanBuilder, Merged, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, PackBuilder, Planned,
+        RestoreBuilder, RestorePlan, RestorePlanBuilder, apply, lock_destination, verify,
+        version_holding,
     },
     layout::IndexSet,
     metadata::Timestamp,
@@ -3808,7 +3809,7 @@ async fn write_pack(
     let store = storage::BlobStore::builder(set.base())
         .open_reader()
         .await?;
-    let (version, snapshot_id) = select_version(&set, &store, version)?;
+    let (version, _) = select_version(&set, &store, version)?;
 
     tracing::info!(
         name = %set.base().display(),
@@ -3820,42 +3821,18 @@ async fn write_pack(
         "packing"
     );
 
-    // The decoded snapshot is needed on both paths. The plan is resolved
-    // from it rather than from the store's records. A dry run that counted
-    // records would be counting the wrong thing.
-    let snapshot = load_snapshot(&store, snapshot_id).await?;
-
-    // A delta is the same pack with fewer chunks in it. The base that it
-    // assumes is part of what has to be worked out before the contents are. The
-    // base decides which chunks survive. It is also what an apply later checks
-    // the destination against.
-    let base = match from {
-        None => None,
-        Some(base_version) => {
-            let (base_version, base_id) = select_version(&set, &store, Some(base_version))?;
-            Some(blulib::command::Base {
-                version: base_version,
-                id: base_id,
-                snapshot: load_snapshot(&store, base_id).await?,
-            })
-        }
-    };
-
-    let packed = blulib::command::pack(
-        &store,
-        &blulib::command::Version {
-            number: version,
-            snapshot,
-        },
-        |id| store.locate(id),
-        base,
-        out,
-        blulib::command::PackOptions {
-            dry_run,
-            compression: compression.pack_policy(),
-        },
-    )
-    .await?;
+    let mut packing = PackBuilder::new(&store, out).version(version);
+    if let Some(base) = from {
+        let (base, _) = select_version(&set, &store, Some(base))?;
+        packing = packing.from(base);
+    }
+    if let Some(policy) = compression.pack_policy() {
+        packing = packing.compression(policy);
+    }
+    if dry_run {
+        packing = packing.dry_run();
+    }
+    let packed = packing.run().await?;
 
     Ok((version, packed))
 }
@@ -3912,7 +3889,10 @@ async fn run_merge(
         };
         let fresh = existing.is_none();
 
-        let planned = merge_plan(&pack, existing.as_ref()).await?;
+        let planned = MergePlanBuilder::new(&pack)
+            .store(existing.as_ref())
+            .run()
+            .await?;
 
         // Only when there is going to be a merge to warn about. A pack that the
         // set already holds publishes nothing. So telling the user what version
@@ -3989,7 +3969,10 @@ async fn run_merge(
     // list.
     warn_behind_tip(&set, &pack, &store)?;
 
-    let merged = merge(&store, &pack, compression.route()).await?;
+    let merged = MergeBuilder::new(&store, &pack)
+        .mode(compression.route())
+        .run()
+        .await?;
 
     match merged {
         Merged::Committed { version, plan } => {

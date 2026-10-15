@@ -960,7 +960,9 @@ async fn merge_into(
             let _claim = set.lock().map_err(reason)?;
 
             let pack = uploads.open(upload).map_err(reason)?;
-            crate::command::merge(&store, &pack, spec.route())
+            crate::command::MergeBuilder::new(&store, &pack)
+                .mode(spec.route())
+                .run()
                 .await
                 .map_err(reason)
         })

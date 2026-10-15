@@ -2019,13 +2019,11 @@ async fn a_push_then_a_pull_round_trips_into_a_second_set() {
     let mirror = dir.path().join("mirror");
     let storage = BlobStore::builder(&mirror).open_writer().await.unwrap();
 
-    let merged = blulib::command::merge(
-        &storage,
-        &Pack::open(&fetched).unwrap(),
-        blulib::command::MergeCompression::Keep,
-    )
-    .await
-    .unwrap();
+    let merged = blulib::command::MergeBuilder::new(&storage, &Pack::open(&fetched).unwrap())
+        .mode(blulib::command::MergeCompression::Keep)
+        .run()
+        .await
+        .unwrap();
 
     let blulib::command::Merged::Committed { version, .. } = merged else {
         panic!("the mirror set had nothing, so this must be a commit");

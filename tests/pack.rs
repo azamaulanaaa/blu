@@ -2197,7 +2197,9 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
 
     let writing = BlobStore::builder(&built.blob).open_writer().await.unwrap();
 
-    let error = blulib::command::merge(&writing, &pack, blulib::command::MergeCompression::Keep)
+    let error = blulib::command::MergeBuilder::new(&writing, &pack)
+        .mode(blulib::command::MergeCompression::Keep)
+        .run()
         .await
         .expect_err("a pack older than the tip should be refused");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -2211,7 +2213,9 @@ async fn a_merge_refuses_a_pack_older_than_the_tip() {
         "a refused merge must not have published a version"
     );
 
-    let planned = blulib::command::merge_plan(&pack, Some(&store))
+    let planned = blulib::command::MergePlanBuilder::new(&pack)
+        .store(Some(&store))
+        .run()
         .await
         .expect_err("a dry run should refuse the same pack");
     assert_eq!(planned.kind(), std::io::ErrorKind::InvalidData);
@@ -2685,13 +2689,11 @@ async fn a_record_whose_payload_byte_is_flipped_is_refused() {
     let received = built.dir.path().join("received");
     let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
-    let error = blulib::command::merge(
-        &store,
-        &reopened,
-        blulib::command::MergeCompression::Reencode,
-    )
-    .await
-    .expect_err("a merge of a pack with a flipped payload byte should be refused");
+    let error = blulib::command::MergeBuilder::new(&store, &reopened)
+        .mode(blulib::command::MergeCompression::Reencode)
+        .run()
+        .await
+        .expect_err("a merge of a pack with a flipped payload byte should be refused");
     assert!(
         error.to_string().contains("does not hash to"),
         "a flipped payload byte must be caught by the chunk hash, not by the codec, got: {error}"
@@ -2751,7 +2753,9 @@ async fn a_flipped_payload_byte_is_refused_on_the_verbatim_path_too() {
     let received = built.dir.path().join("received-keep");
     let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
-    let error = blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
+    let error = blulib::command::MergeBuilder::new(&store, &reopened)
+        .mode(blulib::command::MergeCompression::Keep)
+        .run()
         .await
         .expect_err("`keep` must not be a promise to believe the pack");
     assert!(
@@ -2881,7 +2885,9 @@ async fn a_frame_no_smaller_than_its_content_is_stored_raw() {
     let received = built.dir.path().join("received-grown");
     let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
-    blulib::command::merge(&store, &reopened, blulib::command::MergeCompression::Keep)
+    blulib::command::MergeBuilder::new(&store, &reopened)
+        .mode(blulib::command::MergeCompression::Keep)
+        .run()
         .await
         .expect("a merge carrying a frame that lost is not a failure");
 
@@ -2989,7 +2995,9 @@ async fn keep_carries_the_packs_records_across_and_a_level_does_not() {
             .await
             .unwrap();
 
-        blulib::command::merge(&store, &pack, compression)
+        blulib::command::MergeBuilder::new(&store, &pack)
+            .mode(compression)
+            .run()
             .await
             .unwrap();
 
@@ -3153,22 +3161,11 @@ async fn packed_with(
             .is_empty()
     );
 
-    blulib::command::pack(
-        &store,
-        &blulib::command::Version {
-            number: 1,
-            snapshot,
-        },
-        |id| store.locate(id),
-        None,
-        at,
-        blulib::command::PackOptions {
-            dry_run: false,
-            compression,
-        },
-    )
-    .await
-    .unwrap();
+    let mut packing = blulib::command::PackBuilder::new(&store, at);
+    if let Some(policy) = compression {
+        packing = packing.compression(policy);
+    }
+    packing.run().await.unwrap();
 
     Pack::open(at).unwrap()
 }
@@ -3224,7 +3221,9 @@ async fn every_pack_form_restores_through_every_merge_form() {
                 .await
                 .unwrap();
 
-            blulib::command::merge(&store, &pack, merge_route)
+            blulib::command::MergeBuilder::new(&store, &pack)
+                .mode(merge_route)
+                .run()
                 .await
                 .unwrap_or_else(|e| {
                     panic!("a pack built as {pack_form} must merge as {merge_form}: {e}")
@@ -3310,7 +3309,9 @@ async fn keep_carries_the_frames_across_and_zero_does_not() {
             .open_writer()
             .await
             .unwrap();
-        blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)
+        blulib::command::MergeBuilder::new(&store, &pack)
+            .mode(blulib::command::MergeCompression::Keep)
+            .run()
             .await
             .unwrap();
 
@@ -3382,26 +3383,13 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
     let mut payloads = Vec::new();
     for (form, compression) in pack_forms() {
         let store = BlobStore::builder(&origin).open_reader().await.unwrap();
-        let snapshot = snapshot_of(&origin).await;
-        let version = blulib::command::Version {
-            number: 1,
-            snapshot,
-        };
         let at = dir.path().join(format!("v-{form}.pack"));
 
-        let plan = blulib::command::pack(
-            &store,
-            &version,
-            |id| store.locate(id),
-            None,
-            &at,
-            blulib::command::PackOptions {
-                dry_run: true,
-                compression,
-            },
-        )
-        .await
-        .unwrap();
+        let mut planning = blulib::command::PackBuilder::new(&store, &at).dry_run();
+        if let Some(policy) = compression {
+            planning = planning.compression(policy);
+        }
+        let plan = planning.run().await.unwrap();
 
         assert_eq!(
             plan.bytes, None,
@@ -3416,19 +3404,11 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
             "a dry pack as {form} wrote the file it was asked about"
         );
 
-        let run = blulib::command::pack(
-            &store,
-            &version,
-            |id| store.locate(id),
-            None,
-            &at,
-            blulib::command::PackOptions {
-                dry_run: false,
-                compression,
-            },
-        )
-        .await
-        .unwrap();
+        let mut packing = blulib::command::PackBuilder::new(&store, &at);
+        if let Some(policy) = compression {
+            packing = packing.compression(policy);
+        }
+        let run = packing.run().await.unwrap();
 
         assert!(
             at.exists(),
@@ -3555,7 +3535,9 @@ async fn a_record_claiming_more_content_than_a_chunk_can_hold_is_refused_first()
     let received = built.dir.path().join("received");
     let store = BlobStore::builder(&received).open_writer().await.unwrap();
 
-    let error = blulib::command::merge(&store, &pack, blulib::command::MergeCompression::Keep)
+    let error = blulib::command::MergeBuilder::new(&store, &pack)
+        .mode(blulib::command::MergeCompression::Keep)
+        .run()
         .await
         .expect_err("a chunk claiming more content than the chunker produces must be refused");
     assert!(
@@ -3597,4 +3579,64 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
         }
         out.push(byte | 0x80);
     }
+}
+
+/// The pack builder writes a delta against the named base version.
+///
+/// Version 2 packed from base 1 carries fewer chunks than the full pack.
+/// The header names base 1. The delta refuses an empty set.
+/// The full pack lands there as version 1.
+#[tokio::test]
+async fn pack_builder_writes_delta_against_named_base() {
+    use blulib::command::{MergeBuilder, PackBuilder};
+
+    let built = build(6, 200_000).await;
+    let source = built.dir.path().join("source");
+    fs::write(source.join("f2.bin"), common::untagged_stream(99, 260_000)).unwrap();
+    common::run_backup(&source, &built.blob).await;
+
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
+    let full_at = built.dir.path().join("full.pack");
+    let full = PackBuilder::new(&store, &full_at)
+        .version(2)
+        .run()
+        .await
+        .unwrap();
+
+    let delta_at = built.dir.path().join("delta.pack");
+    let delta = PackBuilder::new(&store, &delta_at)
+        .version(2)
+        .from(1)
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(delta.base, Some(1), "the header names its base");
+    assert_eq!(delta.of, full.of, "both packs describe version 2");
+    assert!(
+        delta.chunks < full.chunks,
+        "the delta carries fewer chunks: {} of {}",
+        delta.chunks,
+        full.chunks
+    );
+
+    // The delta refuses a set that holds no base.
+    let bare = built.dir.path().join("bare");
+    let writing = BlobStore::builder(&bare).open_writer().await.unwrap();
+    let delta_pack = Pack::open(&delta_at).unwrap();
+    MergeBuilder::new(&writing, &delta_pack)
+        .run()
+        .await
+        .expect_err("a delta needs its base in the set");
+
+    // The full pack lands there instead.
+    let full_pack = Pack::open(&full_at).unwrap();
+    let merged = MergeBuilder::new(&writing, &full_pack).run().await.unwrap();
+    assert!(
+        matches!(
+            merged,
+            blulib::command::Merged::Committed { version: 1, .. }
+        ),
+        "the first merge publishes version 1, got: {merged:?}"
+    );
 }

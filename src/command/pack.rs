@@ -44,19 +44,159 @@
 //! will keep the sender's frames.
 //! The price is paid only when asked for.
 
-use std::{collections::HashMap, io, path::Path};
+use std::{
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+};
 
 use tokio::io::AsyncReadExt as _;
+use tracing::instrument;
 
 use crate::{
+    command::load_snapshot,
     metadata::Snapshot,
     pack::{Pack, StorageStored, Stored},
-    storage::{self, BlobId, Codec, Compressor as _, Placement, Plan, StorageGet},
+    storage::{
+        self, BlobId, BlobStore, Codec, Compressor as _, Placement, Plan, StorageGet, WriteMode,
+    },
 };
+
+/// Write one version's chunks to a single file.
+///
+/// Start with [`PackBuilder::new`]. Pin a version with `version`.
+/// Pack a delta with `from`. Re-encode with `compression`.
+/// Preview with `dry_run`. Call `run`.
+///
+/// A pack carries its own file table. It needs nothing else to travel.
+/// A full pack suits any set. A delta suits a holder of its base.
+/// The base decides which chunks survive. Nothing about the format changes.
+///
+/// Keeping the stored form is the default. Copying a compressed set's frames
+/// is what makes packing one cheap. Re-encoding decodes every chunk first.
+/// That work pays only when delivery wants it.
+#[derive(Debug)]
+pub struct PackBuilder<'a, W: WriteMode, C: storage::Compressor> {
+    store: &'a BlobStore<W, C>,
+    out: PathBuf,
+    version: Option<u32>,
+    base: Option<u32>,
+    compression: Option<storage::Compression>,
+    dry_run: bool,
+}
+
+impl<'a, W: WriteMode, C: storage::Compressor> PackBuilder<'a, W, C> {
+    /// Start a pack from `store` into `out`.
+    ///
+    /// The builder packs the latest version as a full pack. Narrow it below.
+    /// `out` is overwritten when the run writes.
+    #[must_use]
+    pub fn new(store: &'a BlobStore<W, C>, out: impl Into<PathBuf>) -> Self {
+        Self {
+            store,
+            out: out.into(),
+            version: None,
+            base: None,
+            compression: None,
+            dry_run: false,
+        }
+    }
+
+    /// Pack this version number.
+    ///
+    /// Without it the run packs the latest version. The set must hold one.
+    #[must_use]
+    pub fn version(mut self, version: u32) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    /// Pack only what this version's holder lacks.
+    ///
+    /// The file carries the same version with fewer chunks. The header records
+    /// the assumption. An apply refuses a reader that holds another base.
+    #[must_use]
+    pub fn from(mut self, base: u32) -> Self {
+        self.base = Some(base);
+        self
+    }
+
+    /// Encode each record under `policy`.
+    ///
+    /// Without it the run keeps the form the set holds. `Off` writes content
+    /// raw. A level writes a fresh zstd frame at that level.
+    #[must_use]
+    pub fn compression(mut self, policy: storage::Compression) -> Self {
+        self.compression = Some(policy);
+        self
+    }
+
+    /// Work out what the pack would hold, and write none of it.
+    ///
+    /// The run resolves every chunk and locates it. It writes no file.
+    /// The size on disk and the content hash stay empty. Both describe a file
+    /// that does not exist yet.
+    #[must_use]
+    pub fn dry_run(mut self) -> Self {
+        self.dry_run = true;
+        self
+    }
+
+    /// Write the pack, or work out what it would hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the set holds no such version.
+    /// Returns an error when the store cannot resolve a chunk the version names.
+    /// Returns an error when a chunk cannot be decoded or re-encoded.
+    /// Returns an error when the file cannot be written, outside a dry run.
+    #[instrument(level = "info", skip(self), err)]
+    pub async fn run(self) -> io::Result<Packed> {
+        let store = self.store;
+
+        let (number, snapshot_id) = match self.version {
+            Some(number) => (number, store.snapshot(number)?),
+            None => store.latest().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the set holds no versions, so there is nothing to pack",
+                )
+            })?,
+        };
+        let snapshot = load_snapshot(store, snapshot_id).await?;
+
+        let base = match self.base {
+            None => None,
+            Some(number) => {
+                let id = store.snapshot(number)?;
+                Some(Base {
+                    version: number,
+                    id,
+                    snapshot: load_snapshot(store, id).await?,
+                })
+            }
+        };
+
+        let version = Version { number, snapshot };
+
+        pack(
+            store,
+            &version,
+            |id| store.locate(id),
+            base,
+            &self.out,
+            Options {
+                dry_run: self.dry_run,
+                compression: self.compression,
+            },
+        )
+        .await
+    }
+}
 
 /// Knobs for a single [`pack`] run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Options {
+struct Options {
     /// Work out what a pack would contain, and write none of it.
     ///
     /// Off by default, and the default is the decision.
@@ -155,7 +295,7 @@ pub struct Version {
 /// A compressed set's pack is therefore smaller than its content.
 /// The figure is the bytes a fetch would actually move.
 ///
-/// **It follows the [`Options::compression`] the run was given. That is the
+/// **It follows the [`PackBuilder::compression`] the run was given. That is the
 /// resolution of what the figure means under a non-default one.**
 /// It is not a property of the version and never was.
 /// It counts the records *this run writes*.
@@ -233,10 +373,10 @@ pub struct Packed {
 /// Returns an error if the store cannot resolve a chunk the version names.
 /// Returns an error if a snapshot cannot be recorded on this platform.
 /// Returns an error if a chunk cannot be decoded or re-encoded into the form
-/// [`Options::compression`] asks for.
+/// [`PackBuilder::compression`] asks for.
 /// Returns an error if the file cannot be written, unless `options.dry_run` is
 /// set.
-pub async fn pack<S, F>(
+async fn pack<S, F>(
     store: &S,
     version: &Version,
     mut locate: F,
@@ -373,7 +513,7 @@ where
     Ok(report)
 }
 
-/// Where a pack's records come from, decided by [`Options::compression`].
+/// Where a pack's records come from, decided by [`PackBuilder::compression`].
 ///
 /// A type rather than a branch at the call site, because this function has two
 /// callers of the writer: a full pack and a delta.

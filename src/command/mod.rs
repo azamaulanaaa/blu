@@ -24,10 +24,10 @@ pub use filter::Filter;
 pub use history::{Detail, Event, Status, report};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use merge::{
-    Compression as MergeCompression, MergePlan, Merged, Planned, establish_base, merge, merge_plan,
-    version_holding,
+    Compression as MergeCompression, MergeBuilder, MergePlan, MergePlanBuilder, Merged, Planned,
+    establish_base, version_holding,
 };
-pub use pack::{Base, Options as PackOptions, Packed, Version, pack};
+pub use pack::{Base, PackBuilder, Packed, Version};
 pub use probe::{Established, Mislength, Mismatch, Probed, Unheld, probe, probe_skipping};
 pub use restore::{
     DestinationLock, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, RestoreBuilder, RestorePlan,

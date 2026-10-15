@@ -336,43 +336,127 @@ pub enum Compression {
     Reencode,
 }
 
-/// Apply `pack` into the set at `store` as a new version.
+/// Apply a pack into a set as a new version.
 ///
-/// The store is a concrete [`BlobStore`](storage::BlobStore) rather than a bare
-/// [`StoragePut`](storage::StoragePut), and that is not a narrowing for taste.
-/// A merge has to answer "which versions does this set hold".
-/// It uses that answer to check a delta's base and to report what the merge would
-/// have committed.
-/// That question is about a set's commit list, which the storage traits do not
-/// carry and could not.
-/// A `StoragePut` may be any backend at all.
-/// The store is also what lets the counts below come from the store's own index
-/// rather than from what `put` happened to decide.
+/// Start with [`MergeBuilder::new`]. Set the write path with `mode`.
+/// Call `run`.
 ///
-/// `compression` chooses between [`StoragePut::put_stored`] and
-/// [`StoragePut::put`] per chunk, and changes nothing else.
-/// The same chunks are read, the same hashes are checked, and the same figures
-/// are reported.
-/// [`MergePlan::bytes`] counts content rather than stored bytes.
+/// The set keeps the version the pack carries. Nothing else is consulted.
+/// The pack carries its own file table. There is no second file to keep
+/// in step with the first.
 ///
-/// # Errors
+/// Keeping the stored form is the default. A chunk that reached the source
+/// set as a frame lands as that frame. The store still decodes and hashes
+/// every chunk on the way in. A damaged pack is refused before it commits.
+/// Re-encoding decodes each chunk and stores it under the set's own policy.
 ///
-/// Returns an error if the pack's snapshot cannot be read, does not hash to the
-/// one its header names, or does not decode.
-/// Returns an error if the pack is a delta and no committed version of the set
-/// names its base.
-/// Returns an error if a chunk the version reads is in neither the pack nor the
-/// set.
-/// Returns an error if a chunk the pack does hold does not hash to the hash it is
-/// addressed by.
-/// Both [`StoragePut::put`] and [`StoragePut::put_stored`] check that hash per
-/// record.
-/// Returns an error if the set cannot be written or committed.
+/// Merging the same pack twice writes nothing. The run names the version
+/// that already holds the snapshot. A retried transfer stays answerable.
+#[derive(Debug)]
+pub struct MergeBuilder<'a, C: storage::Compressor> {
+    store: &'a storage::BlobStore<storage::Write, C>,
+    pack: &'a Pack,
+    mode: Compression,
+}
+
+impl<'a, C: storage::Compressor> MergeBuilder<'a, C> {
+    /// Start a merge of `pack` into `store`.
+    ///
+    /// The builder keeps stored forms. Change the write path with `mode`.
+    #[must_use]
+    pub fn new(store: &'a storage::BlobStore<storage::Write, C>, pack: &'a Pack) -> Self {
+        Self {
+            store,
+            pack,
+            mode: Compression::Keep,
+        }
+    }
+
+    /// Store each chunk through `mode`.
+    ///
+    /// `Keep` writes the form the pack carries. `Reencode` decodes each chunk
+    /// and stores it under the set's own policy. The figures match either way.
+    #[must_use]
+    pub fn mode(mut self, mode: Compression) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Merge the pack and publish the version.
+    ///
+    /// A failure before the commit record publishes nothing. There is no
+    /// rollback because there is nothing to undo. Unreferenced records cost
+    /// space and no correctness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pack's snapshot cannot be read or decoded.
+    /// Returns an error when the pack is a delta whose base the set lacks.
+    /// Returns an error when a chunk the version reads is in neither source.
+    /// Returns an error when a chunk does not hash to the hash it names.
+    /// Returns an error when the set cannot be written or committed.
+    #[instrument(level = "info", skip_all, err)]
+    pub async fn run(self) -> io::Result<Merged> {
+        merge(self.store, self.pack, self.mode).await
+    }
+}
+
+/// Work out what a merge would store, and store none of it.
 ///
-/// A failure before the commit record leaves the set with no new version. See
-/// this module's docs on why there is no rollback.
-#[instrument(level = "info", skip_all, err)]
-pub async fn merge<C: storage::Compressor>(
+/// Start with [`MergePlanBuilder::new`]. Attach the set with `store`.
+/// Call `run`.
+///
+/// The plan resolves the snapshot against the set and the pack together.
+/// A chunk neither holds refuses the plan before anything is written.
+/// Every chunk about to be stored is read out of the pack and hashed.
+/// A plan refuses what a merge refuses and costs what a merge costs.
+///
+/// Nothing is created, not even the set directory. No lock is taken.
+/// A delta is refused for a set that does not hold its base.
+/// The figures count content, not stored bytes, so they match under
+/// every write path.
+#[derive(Debug)]
+pub struct MergePlanBuilder<'a, C: storage::Compressor> {
+    pack: &'a Pack,
+    store: Option<&'a storage::BlobStore<storage::Read, C>>,
+}
+
+impl<'a, C: storage::Compressor> MergePlanBuilder<'a, C> {
+    /// Start a plan for `pack`.
+    ///
+    /// Without a store every chunk reads as new. That is the first version
+    /// arriving somewhere. Attach the set with `store` to compare against it.
+    #[must_use]
+    pub fn new(pack: &'a Pack) -> Self {
+        Self { pack, store: None }
+    }
+
+    /// Compare against `store`.
+    ///
+    /// Pass `None` for a name with nothing behind it. A dry run that created
+    /// the set to learn that would break its own promise.
+    #[must_use]
+    pub fn store(mut self, store: Option<&'a storage::BlobStore<storage::Read, C>>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Work out the figures and store nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pack's snapshot cannot be read or decoded.
+    /// Returns an error when the pack is a delta whose base the set lacks.
+    /// Returns an error when a chunk the version reads is in neither source.
+    /// Returns an error when a chunk about to be stored does not hash to it.
+    #[instrument(level = "info", skip_all, err)]
+    pub async fn run(self) -> io::Result<Planned> {
+        merge_plan(self.pack, self.store).await
+    }
+}
+
+/// Merge the pack into the store, keeping or re-encoding each chunk.
+async fn merge<C: storage::Compressor>(
     store: &storage::BlobStore<storage::Write, C>,
     pack: &Pack,
     compression: Compression,
@@ -567,36 +651,7 @@ pub async fn merge<C: storage::Compressor>(
 }
 
 /// Say what merging `pack` into `set` would store, and store none of it.
-///
-/// `set` is `None` for a name with no set behind it.
-/// That is the first version arriving somewhere, and it is the case where
-/// this has to answer "everything is new".
-/// A dry run must not fail the way opening a store for reading would.
-/// Opening for writing to find out is not an option, because that *creates*
-/// the set.
-/// A dry run that created one would be the one thing it promised not to do.
-///
-/// The plan is the one a real merge builds, with the same resolution against
-/// the same two sources.
-/// Every chunk that would be written is read out of the pack and hashed.
-/// `put` is what performs that check on the real path.
-/// A plan that skipped it would report success for a pack a real merge
-/// refuses.
-/// This therefore costs what the merge costs and mutates nothing.
-///
-/// **It takes no [`Compression`], and reports the same figures under every
-/// one.**
-/// A chunk is hashed as content whichever path stores it.
-/// The check a plan makes is the check both paths make.
-/// [`MergePlan::bytes`] counts content rather than stored bytes.
-/// There is nothing about the encoding for a plan to decide differently.
-///
-/// # Errors
-///
-/// As [`merge`], and for the same reasons at the same points.
-/// A delta whose base the set does not hold is refused by a plan too.
-/// The plan is what would decide that.
-pub async fn merge_plan<C: storage::Compressor>(
+async fn merge_plan<C: storage::Compressor>(
     pack: &Pack,
     set: Option<&storage::BlobStore<storage::Read, C>>,
 ) -> io::Result<Planned> {
