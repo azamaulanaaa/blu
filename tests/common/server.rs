@@ -244,21 +244,154 @@ impl Drop for Stub {
     }
 }
 
-/// Read a request head and throw it away.
+/// A socket that guards one bearer token.
+///
+/// It reads each request head and checks the Authorization header.
+/// A request carrying `Authorization: Bearer <expected>` receives `body`
+/// with `200`.
+/// Any other request receives a `401` problem document.
+/// The proxy owns auth.
+/// This stub stands in for the proxy.
+/// Enough HTTP/1.1 to satisfy `awc`, and nothing else.
+pub(crate) struct Guarded {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+}
+
+impl Guarded {
+    /// Answer `body` when the bearer matches, else answer `401`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a loopback port cannot be bound. Nothing is left to assert
+    /// about if it cannot be.
+    pub(crate) fn guarding(body: &str, expected: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port for the guard");
+        let address = listener.local_addr().expect("the guard's own address");
+
+        listener
+            .set_nonblocking(true)
+            .expect("the guard's accept to be non-blocking");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&stop);
+
+        let good = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let denied_body = r#"{"type":"about:blank","title":"unauthorized","status":401,"detail":"missing or wrong bearer token"}"#;
+        let denied = format!(
+            "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{denied_body}",
+            denied_body.len()
+        );
+        let expected = expected.to_string();
+
+        thread::spawn(move || {
+            while !finished.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let head = read_head_bytes(&mut stream);
+                        let answer = if bearer_of(&head) == Some(expected.as_str()) {
+                            &good
+                        } else {
+                            &denied
+                        };
+                        let _ = stream.write_all(answer.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        Self { address, stop }
+    }
+
+    /// Where it is listening.
+    pub(crate) fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for Guarded {
+    /// Stop answering.
+    ///
+    /// The port is released when the thread returns and drops the listener, and
+    /// the flag is what makes it return. Bounded by the poll interval rather
+    /// than joined, because nothing a test asserts on depends on the thread
+    /// having stopped by the time the next line runs.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Read a request head and hand back its bytes.
 ///
 /// Read rather than ignored, because a client writing a request into a socket
 /// nobody is reading gets `EPIPE` on some platforms and a short write on
-/// others — either of which would make this stub test the client's write
-/// rather than its parse.
-fn read_head(stream: &mut std::net::TcpStream) {
+/// others.
+fn read_head_bytes(stream: &mut std::net::TcpStream) -> Vec<u8> {
     use std::io::Read as _;
 
     let mut seen = Vec::new();
     let mut byte = [0_u8; 1];
     while !seen.ends_with(b"\r\n\r\n") {
         match stream.read(&mut byte) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return seen,
             Ok(_) => seen.push(byte[0]),
         }
+        if seen.len() > 64 * 1024 {
+            return seen;
+        }
     }
+    seen
+}
+
+/// Read a request head and throw it away.
+///
+/// Read rather than ignored, because a client writing a request into a socket
+/// nobody is reading gets `EPIPE` on some platforms and a short write on
+/// others.
+/// Either outcome would make this stub test the client write
+/// rather than its parse.
+fn read_head(stream: &mut std::net::TcpStream) {
+    let _ = read_head_bytes(stream);
+}
+
+/// Read the bearer token out of a request head.
+///
+/// The header name and the scheme match without case.
+/// The token itself matches exactly.
+/// A missing or malformed header yields `None`.
+fn bearer_of(head: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(head).ok()?;
+
+    for line in text.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let value = value.trim();
+        let Some((scheme, token)) = value.split_once(|c: char| c.is_ascii_whitespace()) else {
+            continue;
+        };
+        if !scheme.eq_ignore_ascii_case("Bearer") {
+            continue;
+        }
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        return Some(token);
+    }
+
+    None
 }

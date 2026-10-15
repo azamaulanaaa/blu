@@ -42,7 +42,7 @@ use std::{
     process::{Command, Output},
 };
 
-use common::server::{Server, Stub};
+use common::server::{Guarded, Server, Stub};
 
 /// The address a server printed: the server half of a serve TARGET.
 fn remote_of(server: &Server) -> String {
@@ -592,4 +592,85 @@ async fn a_serve_target_lists_what_the_local_path_lists_and_old_flags_fail() {
             "a refused listing prints nothing on stdout, as any other refusal does"
         );
     }
+}
+
+/// Run the binary with one extra environment variable.
+fn blu_with_env(dir: &Path, args: &[&str], name: &str, value: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_blu"))
+        .current_dir(dir)
+        .args(args)
+        .env(name, value)
+        .output()
+        .expect("failed to run the blu binary")
+}
+
+#[tokio::test]
+async fn forward_bearer_token_to_proxy() {
+    // The proxy guards with a bearer token.
+    // The client forwards --token as Authorization Bearer.
+    // Without the header the proxy answers 401.
+    let dir = tempfile::tempdir().unwrap();
+    let guard = Guarded::guarding(r#"{"versions":[]}"#, "test-jwt-value");
+    let address = format!("http://{}", guard.address());
+    let target = serve_target(&address);
+
+    let output = blu(
+        dir.path(),
+        &["--token", "test-jwt-value", "versions", &target],
+    );
+    assert!(
+        output.status.success(),
+        "a guarded proxy must accept the forwarded token\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        Vec::<u8>::new(),
+        "an empty listing prints nothing on stdout"
+    );
+
+    let denied = blu(dir.path(), &["versions", &target]);
+    assert!(
+        !denied.status.success(),
+        "a request without the token must fail"
+    );
+    assert_eq!(denied.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&denied.stderr).into_owned();
+    assert!(
+        said.contains("bearer token"),
+        "the 401 must name the missing token: {said}"
+    );
+
+    let wrong = blu(dir.path(), &["--token", "wrong-value", "versions", &target]);
+    assert!(
+        !wrong.status.success(),
+        "a request with a wrong token must fail"
+    );
+    let said = String::from_utf8_lossy(&wrong.stderr).into_owned();
+    assert!(
+        said.contains("bearer token"),
+        "a wrong token must read as a refusal: {said}"
+    );
+}
+
+#[tokio::test]
+async fn read_token_from_environment() {
+    // BLU_TOKEN selects the same token as --token.
+    // The flag wins when both name one, but either alone works.
+    let dir = tempfile::tempdir().unwrap();
+    let guard = Guarded::guarding(r#"{"versions":[]}"#, "env-jwt-value");
+    let address = format!("http://{}", guard.address());
+    let target = serve_target(&address);
+
+    let output = blu_with_env(
+        dir.path(),
+        &["versions", &target],
+        "BLU_TOKEN",
+        "env-jwt-value",
+    );
+    assert!(
+        output.status.success(),
+        "the client must read BLU_TOKEN\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
