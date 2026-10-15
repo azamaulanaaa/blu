@@ -34,7 +34,10 @@
 //! * `remote` parses a remote address without connecting. The connection
 //!   arrives with the operator backend.
 //! * `operator` builds that backend from an address and the environment.
-//!   It speaks `file://`, `sftp://`, `ftp://` and `s3://` in every build.
+//!   The operator speaks `file://`, `ftp://` and `s3://` in every build.
+//!   The operator speaks `sftp://` on unix builds only.
+//!   `sftp://` needs `openssh`.
+//!   `openssh` works on unix only.
 //! * `tls` installs the HTTPS transport for the operator.
 //!   Plain HTTP passes through.
 //!   HTTPS verifies against the system roots.

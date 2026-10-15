@@ -3,7 +3,12 @@
 //! Keyed backends over the network, through `OpenDAL`.
 //!
 //! Three schemes share one trait implementation.
-//! The operator speaks them all.
+//! The operator speaks all three schemes on unix.
+//! On other platforms the operator speaks `s3://` and `ftp://`.
+//! `sftp://` needs `openssh`.
+//! `openssh` works on unix only.
+//! On other platforms `connect` fails with `Unsupported`.
+//! The failure occurs before the operator reads any configuration.
 //! [`crate::storage::AsyncObjectStore`] is the only shape the mirror needs.
 //!
 //! Configuration arrives through the environment.
@@ -70,6 +75,8 @@ const COPY_CHUNK: u64 = 4 * 1024 * 1024;
 ///   `BLU_SFTP_KEY` names the key file and is required.
 ///   This backend speaks key auth only.
 ///   Host keys stay strict.
+///   This backend works on unix only.
+///   On other platforms `connect` fails with `Unsupported`.
 ///
 /// The call returns `InvalidInput` and names the missing piece.
 /// The call never guesses.
@@ -102,7 +109,16 @@ fn config_for(url: &RemoteUrl) -> io::Result<(&'static str, Vec<(String, String)
     match url.scheme() {
         RemoteScheme::S3 => Ok((services::S3_SCHEME, s3_config(url)?)),
         RemoteScheme::Ftp => Ok((services::FTP_SCHEME, ftp_config(url))),
+        #[cfg(unix)]
         RemoteScheme::Sftp => Ok((services::SFTP_SCHEME, sftp_config(url)?)),
+        // TODO(sftp-windows): support sftp:// on Windows by bypassing opendal
+        // (blocked upstream: apache/opendal#2963) with a cross-platform
+        // backend such as russh + russh-sftp implementing AsyncObjectStore.
+        #[cfg(not(unix))]
+        RemoteScheme::Sftp => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "sftp:// needs a unix build. This build speaks file://, ftp://, and s3:// only",
+        )),
         RemoteScheme::File => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "file:// stores need no operator: they are local directories",
@@ -206,6 +222,9 @@ fn ftp_config(url: &RemoteUrl) -> Vec<(String, String)> {
 /// The host comes from the address.
 /// The identity is required.
 /// This backend speaks key auth only.
+/// Unix builds include this backend.
+/// Other builds exclude it.
+#[cfg(unix)]
 fn sftp_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
     let (user, host) = split_user(url.location());
 
@@ -548,12 +567,25 @@ mod tests {
     /// Refuse missing configuration before transfer.
     ///
     /// No network runs here.
-    /// The builder refuses and never dials.
-    /// The test reads the environment and never writes it.
+    /// The builder refuses the configuration.
+    /// The builder never dials.
+    /// The test reads the environment.
+    /// The test never writes the environment.
     #[test]
     fn refuse_missing_configuration() {
+        {
+            let (address, fragment) = ("s3://bucket/a", "BLU_S3_ENDPOINT");
+            let url = RemoteUrl::parse(address).unwrap();
+            let error = connect(&url).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                error.to_string().contains(fragment),
+                "{address} must name {fragment}: {error}"
+            );
+        }
+
+        #[cfg(unix)]
         for (address, fragment) in [
-            ("s3://bucket/a", "BLU_S3_ENDPOINT"),
             ("sftp://host/a", "user"),
             ("sftp://user@host/a", "BLU_SFTP_KEY"),
         ] {
@@ -563,6 +595,17 @@ mod tests {
             assert!(
                 error.to_string().contains(fragment),
                 "{address} must name {fragment}: {error}"
+            );
+        }
+
+        #[cfg(not(unix))]
+        for address in ["sftp://host/a", "sftp://user@host/a"] {
+            let url = RemoteUrl::parse(address).unwrap();
+            let error = connect(&url).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported,
+                "{address} needs a unix build: {error}"
             );
         }
     }

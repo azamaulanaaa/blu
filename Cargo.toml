@@ -259,8 +259,12 @@ tracing-opentelemetry = { version = "0.32", default-features = false }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls"] }
 # Keyed stores beyond `file://` (`src/storage/operator.rs`).
 #
-# Always built, so every build speaks `file://`, `sftp://`, `ftp://`,
-# and `s3://`.
+# Every build speaks `file://`, `ftp://`, and `s3://`.
+# Unix builds also speak `sftp://`.
+# `services-sftp` pulls `openssh`, which is unix-only
+# (`compile_error!("This crate can only be used on unix")`)
+# and breaks Windows builds, so it lives in the `cfg(unix)` dependency
+# below rather than here.
 # Configuration still arrives through the environment.
 # A missing endpoint or identity still fails before the first byte moves.
 #
@@ -273,7 +277,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 # `default-features = false` keeps unused layers out.
 # Retry and timeout stay because a network fails mid-run.
 # The tokio executor stays because the mirror awaits the operator on it.
-opendal = { version = "0.59", default-features = false, features = ["services-memory", "services-s3", "services-ftp", "services-sftp", "executors-tokio", "layers-retry", "layers-timeout"] }
+opendal = { version = "0.59", default-features = false, features = ["services-memory", "services-s3", "services-ftp", "executors-tokio", "layers-retry", "layers-timeout"] }
 # HTTP transport for the operator above.
 # The TLS transport in `src/storage/tls.rs` wraps it for HTTPS.
 # Plain HTTP passes through.
@@ -296,6 +300,15 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = { version = "0.8" }
+
+[target.'cfg(unix)'.dependencies]
+# SFTP backend for unix builds only.
+# `services-sftp` pulls `openssh`, which is unix-only and fails Windows
+# builds, so this stays out of `[dependencies]` above.
+# TODO(sftp-windows): support sftp:// on Windows by bypassing opendal
+# (blocked upstream: apache/opendal#2963) with a cross-platform backend
+# such as russh + russh-sftp implementing AsyncObjectStore.
+opendal = { version = "0.59", default-features = false, features = ["services-sftp"] }
 
 [features]
 # Windows file identity, needed to detect hard links there.
