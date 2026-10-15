@@ -880,7 +880,7 @@ async fn apply_with_files_and_prune_scopes_removal() {
     );
 }
 
-/// The apply builder previews with dry_run and prunes extras on request.
+/// The apply builder previews with `dry_run` and prunes extras on request.
 ///
 /// A dry run changes nothing and still names the extra file. A prune run
 /// removes it. Both runs report the same file count for the version.
