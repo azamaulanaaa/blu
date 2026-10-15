@@ -76,14 +76,12 @@
 //! * **No sampling.** Nothing here configures a sampler, so the SDK's default
 //!   applies: every span is recorded. A sampled-out span is a span nobody can
 //!   debug, and this is a tool an operator turns on to look at one run.
-//! * **No TLS in the default build.** `--features telemetry-tls` turns on
-//!   `rustls` — with the operating system's trust store, through
-//!   `opentelemetry-otlp`'s `reqwest-rustls` — for the exporter, and changes
-//!   nothing else: no endpoint, no span and no flag behaves differently. Without
-//!   it an `https://` endpoint fails to connect rather than quietly
-//!   downgrading, which is the same refusal
-//!   [`blu versions`](crate::client) of an `https://` serve target makes. See
-//!   the `opentelemetry-otlp` entry in `Cargo.toml`.
+//! * TLS is always built.
+//!   The exporter speaks plain HTTP and verified HTTPS.
+//!   It verifies HTTPS against the system roots.
+//!   It uses rustls with ring.
+//!   It never downgrades HTTPS before plain HTTP.
+//!   See the `opentelemetry-otlp` entry in `Cargo.toml`.
 //! * **No logs signal.** `opentelemetry`'s `logs` feature is off on every crate
 //!   in this graph and nothing bridges a `tracing` *event* into an OpenTelemetry
 //!   log record. Diagnostics stay on stderr, filtered by `RUST_LOG`, `--verbose`
