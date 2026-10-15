@@ -165,8 +165,13 @@ fn each_backup_claims_the_next_version() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
 
-    for _ in 0..3 {
+    // An unchanged tree commits no new version, so each round changes the
+    // tree first. Three changed backups leave three versions.
+    let mut expected = Vec::new();
+    for round in 0..3 {
         ok(dir.path(), &["backup", "src", "snap"]);
+        expected.push(common::describe(&dir.path().join("src")));
+        fs::write(dir.path().join("src/tick.bin"), noisy(1_000 + round * 100)).unwrap();
     }
 
     // The versions are commit records inside the one store file. Three backups
@@ -181,7 +186,8 @@ fn each_backup_claims_the_next_version() {
 
     // And the numbering a user asks for with --version resolves to each of
     // them, oldest first.
-    for version in 1..=3 {
+    for (index, tree) in expected.iter().enumerate() {
+        let version = index + 1;
         ok(
             dir.path(),
             &[
@@ -193,8 +199,8 @@ fn each_backup_claims_the_next_version() {
             ],
         );
         assert_eq!(
-            common::describe(&dir.path().join("src")),
-            common::describe(&dir.path().join(format!("out{version}"))),
+            tree,
+            &common::describe(&dir.path().join(format!("out{version}"))),
             "version {version} did not restore the tree it recorded"
         );
     }
@@ -231,8 +237,13 @@ fn index_files(dir: &std::path::Path, set: &str) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// A second backup of an unchanged tree writes nothing.
+///
+/// The run reports the tip version.
+/// The segment file does not grow.
+/// The version list still holds one version.
 #[test]
-fn a_second_backup_of_an_unchanged_tree_uploads_only_its_snapshot() {
+fn a_second_backup_of_an_unchanged_tree_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
 
@@ -241,15 +252,60 @@ fn a_second_backup_of_an_unchanged_tree_uploads_only_its_snapshot() {
         .unwrap()
         .len();
 
-    ok(dir.path(), &["backup", "src", "snap"]);
+    let report = ok(dir.path(), &["backup", "src", "snap"]);
     let after_second = fs::metadata(dir.path().join("snap.0000.bin"))
         .unwrap()
         .len();
 
-    let growth = after_second - after_first;
     assert!(
-        growth < 8 * 1024,
-        "the store grew by {growth} bytes, so chunk data was uploaded again"
+        report.contains("already at version 1") && report.contains("Nothing to do"),
+        "an unchanged tree should report the tip version: {report}"
+    );
+    assert_eq!(
+        after_second,
+        after_first,
+        "the store grew by {} bytes on an unchanged tree",
+        after_second.saturating_sub(after_first),
+    );
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        1,
+        "an unchanged tree publishes no version"
+    );
+}
+
+/// A changed tree still commits after an unchanged backup.
+///
+/// The skip must not stick.
+/// A cron job that saw nothing to do must still record the next change.
+#[test]
+fn a_changed_tree_commits_after_an_unchanged_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    build_tree(dir.path());
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    let skipped = ok(dir.path(), &["backup", "src", "snap"]);
+    assert!(
+        skipped.contains("already at version 1"),
+        "the second run should have found nothing to do: {skipped}"
+    );
+
+    fs::write(dir.path().join("src/large.bin"), b"replaced").unwrap();
+    ok(dir.path(), &["backup", "src", "snap"]);
+    assert_eq!(
+        count_entries(dir.path(), "snap"),
+        2,
+        "the change after the skip should publish version 2"
+    );
+
+    ok(
+        dir.path(),
+        &["restore", "from-v1", "snap", "--version", "1"],
+    );
+    assert_eq!(
+        fs::read(dir.path().join("from-v1/large.bin")).unwrap(),
+        noisy(120_000),
+        "version 1 should hold the original contents"
     );
 }
 
@@ -489,7 +545,10 @@ fn an_unfinished_run_leaves_the_previous_version_intact() {
         "a damaged segment should be reported rather than repaired, got: {refused}"
     );
 
-    // The next run truncates the torn tail and the version is back.
+    // The next run truncates the torn tail and records the tree.
+    // The tree changed below, so the recovery publishes version 2.
+    // An unchanged tree would report the tip and publish nothing.
+    fs::write(dir.path().join("src/tick.bin"), noisy(2_000)).unwrap();
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(
         count_entries(dir.path(), "snap"),
@@ -514,8 +573,13 @@ fn the_version_index_can_be_rebuilt_from_nothing() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());
 
-    for _ in 0..3 {
+    // An unchanged tree commits no new version, so each round changes the
+    // tree first. Three changed backups leave three versions.
+    let mut expected = Vec::new();
+    for round in 0..3 {
         ok(dir.path(), &["backup", "src", "snap"]);
+        expected.push(common::describe(&dir.path().join("src")));
+        fs::write(dir.path().join("src/tick.bin"), noisy(1_000 + round * 100)).unwrap();
     }
     assert_eq!(count_entries(dir.path(), "snap"), 3);
 
@@ -532,8 +596,9 @@ fn the_version_index_can_be_rebuilt_from_nothing() {
     // But the versions are still restorable, which is the whole claim.
     ok(dir.path(), &["restore", "out", "snap", "--version", "2"]);
     assert_eq!(
-        common::describe(&dir.path().join("src")),
-        common::describe(&dir.path().join("out"))
+        &expected[1],
+        &common::describe(&dir.path().join("out")),
+        "version 2 did not restore the tree it recorded"
     );
 
     // And one command brings the listing back.
@@ -547,8 +612,9 @@ fn the_version_index_can_be_rebuilt_from_nothing() {
     // Which resolve, not merely exist.
     ok(dir.path(), &["restore", "out2", "snap", "--version", "1"]);
     assert_eq!(
-        common::describe(&dir.path().join("src")),
-        common::describe(&dir.path().join("out2"))
+        &expected[0],
+        &common::describe(&dir.path().join("out2")),
+        "version 1 did not restore the tree it recorded"
     );
 }
 
@@ -660,11 +726,17 @@ fn a_backup_set_can_live_in_a_subdirectory() {
     build_tree(dir.path());
 
     ok(dir.path(), &["backup", "src", "data/deep/snap"]);
-    ok(dir.path(), &["backup", "src", "data/deep/snap"]);
+    let report = ok(dir.path(), &["backup", "src", "data/deep/snap"]);
     ok(dir.path(), &["restore", "out", "data/deep/snap"]);
 
+    // The second run found nothing to do. The set placement is what this
+    // test is about, and one version is the whole of it.
+    assert!(
+        report.contains("already at version 1"),
+        "the second run should report the tip: {report}"
+    );
     assert!(dir.path().join("data/deep/snap.0000.bin").is_file());
-    assert_eq!(count_entries(dir.path(), "data/deep/snap"), 2);
+    assert_eq!(count_entries(dir.path(), "data/deep/snap"), 1);
     assert_eq!(
         common::describe(&dir.path().join("src")),
         common::describe(&dir.path().join("out"))
@@ -2883,10 +2955,13 @@ fn a_dry_backup_of_an_unchanged_set_reports_nothing_to_store_and_grows_nothing()
         "every chunk is one the set already holds: {report}"
     );
     assert!(figures[3] > 0, "a tree this size has chunks: {report}");
+    assert!(
+        report.contains("already at version 1"),
+        "a dry run of an unchanged tree should name the tip: {report}"
+    );
 
-    // The version it would commit is the next one. Each run stamps its own
-    // time, so the planned hash is not the committed one. The version number
-    // is what the two agree on.
+    // The version list still holds one version.
+    // A dry run publishes nothing, and neither does the real run it plans.
     ok(dir.path(), &["backup", "src", "snap"]);
     assert_eq!(
         ok(dir.path(), &["versions", "snap", "--numbers-only"])
@@ -2894,12 +2969,12 @@ fn a_dry_backup_of_an_unchanged_set_reports_nothing_to_store_and_grows_nothing()
             .next_back()
             .unwrap_or_default()
             .trim(),
-        "2",
-        "the next backup should have committed version 2"
+        "1",
+        "an unchanged backup should keep version 1"
     );
     assert_eq!(
         count_entries(dir.path(), "snap"),
-        2,
+        1,
         "the dry run should not have published anything"
     );
 }

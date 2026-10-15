@@ -6,10 +6,10 @@ use std::process::ExitCode;
 
 use blulib::{
     command::{
-        ApplyBuilder, ApplyOptions, BackupBuilder, BackupPlan, BackupPlanBuilder, MergeBuilder,
-        MergePlan, MergePlanBuilder, Merged, PARTIAL_SUFFIX, PREVIOUS_SUFFIX, PackBuilder, Planned,
-        RestoreBuilder, RestorePlan, RestorePlanBuilder, VerifyBuilder, lock_destination,
-        version_holding,
+        ApplyBuilder, ApplyOptions, BackedUp, BackupBuilder, BackupPlan, BackupPlanBuilder,
+        MergeBuilder, MergePlan, MergePlanBuilder, Merged, PARTIAL_SUFFIX, PREVIOUS_SUFFIX,
+        PackBuilder, Planned, Previous, RestoreBuilder, RestorePlan, RestorePlanBuilder,
+        VerifyBuilder, load_snapshot, lock_destination, tip_with_same_tree, version_holding,
     },
     layout::IndexSet,
     metadata::Timestamp,
@@ -1911,6 +1911,27 @@ fn parse_keep_or_level(what: &str) -> Result<KeepOrLevel, String> {
 /// ignores it, which is the whole of the local path's involvement with a remote
 /// backup: the number is there for the push that follows, which packs *that*
 /// version rather than whichever one is newest when the push gets there.
+/// The tip version with its decoded tree, for the unchanged check.
+///
+/// Read under the lock with everything else that inspects the set.
+/// A fresh set holds nothing.
+/// A run passes this back as `previous`.
+async fn backup_previous(
+    store: &storage::BlobStore<storage::Write>,
+) -> std::io::Result<Option<Previous>> {
+    let Some((version, snapshot)) = store.latest() else {
+        return Ok(None);
+    };
+
+    let tree = load_snapshot(store, snapshot).await?;
+
+    Ok(Some(Previous {
+        version,
+        snapshot,
+        tree,
+    }))
+}
+
 async fn run_backup(
     source: &std::path::Path,
     name: &std::path::Path,
@@ -1918,7 +1939,7 @@ async fn run_backup(
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
     dry_run: bool,
-) -> std::io::Result<Option<u32>> {
+) -> std::io::Result<Option<BackedUp>> {
     let set = IndexSet::new(name);
 
     // The store is append-only with one commit point at the end of a run. So two
@@ -2006,30 +2027,46 @@ async fn run_backup(
 
     let segments = store.segment_count();
 
-    // The stamp the new version must not predate. Read under the lock with
-    // everything else that inspects the set's commit list.
-    let latest = match store.latest() {
-        None => None,
-        Some((version, _)) => Some(store.version_time(version).await?),
-    };
+    // The tip before the run, for the unchanged check.
+    // Read under the lock with everything else that inspects the set.
+    let previous = backup_previous(&store).await?;
 
-    let committed = BackupBuilder::new(source, store)
+    // The stamp the new version must not predate.
+    // The tip tree carries it.
+    let latest: Option<Timestamp> = previous.as_ref().map(|held| held.tree.taken_at);
+
+    let outcome = BackupBuilder::new(source, store)
         .exclude(exclude)
         .chunker(chunker)
         .latest(latest)
+        .previous(previous)
         .run()
         .await?;
 
-    tracing::info!(
-        name = %set.base().display(),
-        version = committed.version(),
-        snapshot = %&committed.snapshot(),
-        store = %set.base().display(),
-        segments,
-        "backup complete"
-    );
+    match &outcome {
+        BackedUp::Committed(committed) => {
+            tracing::info!(
+                name = %set.base().display(),
+                version = committed.version(),
+                snapshot = %&committed.snapshot(),
+                store = %set.base().display(),
+                segments,
+                "backup complete"
+            );
+        }
+        BackedUp::Already { version, snapshot } => {
+            tracing::info!(
+                name = %set.base().display(),
+                version,
+                snapshot = %snapshot,
+                "backup: the tree is unchanged, nothing to do"
+            );
 
-    Ok(Some(committed.version()))
+            say!("already at version {version}: the tree is unchanged. Nothing to do")?;
+        }
+    }
+
+    Ok(Some(outcome))
 }
 
 /// Say what a backup would have stored, on stdout, and that it stored nothing.
@@ -2040,11 +2077,19 @@ async fn run_backup(
 fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io::Result<()> {
     tracing::info!(name = %set.base().display(), "dry run: nothing was written");
 
-    say!(
-        "dry run: version {} would be committed, snapshot {}",
-        plan.version,
-        plan.snapshot
-    )?;
+    if plan.unchanged {
+        say!(
+            "dry run: already at version {}, snapshot {}",
+            plan.version,
+            plan.snapshot
+        )?;
+    } else {
+        say!(
+            "dry run: version {} would be committed, snapshot {}",
+            plan.version,
+            plan.snapshot
+        )?;
+    }
     say!(
         "dry run: {} files, {} dirs, {} links, {} chunks ({} new, {} already held), \
          {} bytes to store",
@@ -3194,10 +3239,24 @@ async fn run_backup_stored(
     if dry_run {
         return Ok(());
     }
-    let Some(version) = committed else {
+    let Some(outcome) = committed else {
         return Err(std::io::Error::other(
             "a backup that stored nothing published no version",
         ));
+    };
+
+    let version = match &outcome {
+        BackedUp::Committed(committed) => committed.version(),
+        BackedUp::Already { version, .. } => {
+            tracing::info!(
+                set = %target.set,
+                store = %target.url,
+                version,
+                "backup: the tree is unchanged, nothing to push"
+            );
+
+            return Ok(());
+        }
     };
 
     let stats = storage::push_to_remote_async(&staging, &backend).await?;
@@ -3248,12 +3307,24 @@ async fn run_backup_serve(
     let pack_path = work.join("push.pack");
 
     let result = async {
-        let committed =
+        let outcome =
             run_backup(source, &staging, segment_size, compression, profile, false).await?;
-        let Some(version) = committed else {
+        let Some(outcome) = outcome else {
             return Err(std::io::Error::other(
                 "a backup that stored nothing published no version",
             ));
+        };
+        let version = match &outcome {
+            BackedUp::Committed(committed) => committed.version(),
+            BackedUp::Already { version, .. } => {
+                tracing::info!(
+                    set,
+                    version,
+                    "backup: the tree is unchanged, nothing to push"
+                );
+
+                return Ok(());
+            }
         };
         // `keep`, and not a level. `backup --compression-level` is the policy
         // the temporary set is opened with — what this machine staged — and it
@@ -3901,6 +3972,22 @@ async fn run_merge(
     // against the store that this run writes to. That is the check that counts.
     // This check is what lets the report be right.
     if let Some(version) = version_holding(&store, &pack.snapshot_id())? {
+        tracing::info!(
+            name = %set.base().display(),
+            version,
+            "merge: already merged, nothing to do"
+        );
+
+        return report_already_merged(&set, version);
+    }
+
+    // A pack rebuilt from an unchanged tree carries a new stamp.
+    // Its hash never matches, but its tree can.
+    // Report the tip before warning about the pack version.
+    // A same-tree pack publishes nothing, so the warning would be wrong.
+    if let Ok(tree) = pack.snapshot()
+        && let Some(version) = tip_with_same_tree(&store, &tree).await
+    {
         tracing::info!(
             name = %set.base().display(),
             version,
