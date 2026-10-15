@@ -164,14 +164,14 @@ let first = BackupBuilder::new("~/Documents", store)
     .await?;
 
 let store = BlobStore::builder("docs").open_reader().await?;
-RestoreBuilder::new("~/Documents-restored", first.snapshot, store)
+RestoreBuilder::new("~/Documents-restored", first.snapshot(), store)
     .run()
     .await?;
 # Ok(())
 # }
 ```
 
-`BackupBuilder::run` returns the version number and the snapshot hash. `store.versions()` and `store.snapshot(n)` address versions directly. See `docs.rs` output for `PackBuilder`, `ApplyBuilder`, and `MergeBuilder`.
+`BackupBuilder::run` reports what the run did. A new version comes back as `Committed` with its number and snapshot hash. An unchanged tree comes back as `Already` with the tip it matched. `store.versions()` and `store.snapshot(n)` address versions directly. A cron job runs the same backup on a schedule. An unchanged run writes nothing and keeps its version. See `docs.rs` output for `PackBuilder`, `ApplyBuilder`, and `MergeBuilder`.
 
 ## Formats
 
