@@ -33,9 +33,11 @@
 //!   The store scans staging only, never the backend.
 //! * `remote` parses a remote address without connecting. The connection
 //!   arrives with the operator backend.
-//! * `operator` builds that backend from an address and the environment,
-//!   behind `--features remote`. Without the feature this module is absent
-//!   and every non-`file://` scheme fails closed.
+//! * `operator` builds that backend from an address and the environment.
+//!   It speaks `file://`, `sftp://`, `ftp://` and `s3://` in every build.
+//! * `tls` installs the HTTPS transport for the operator.
+//!   Plain HTTP passes through.
+//!   HTTPS verifies against the system roots.
 
 mod backend;
 mod blob;
@@ -51,9 +53,7 @@ mod remote;
 mod segment;
 mod version_index;
 
-#[cfg(feature = "remote")]
 mod operator;
-#[cfg(feature = "remote-tls")]
 mod tls;
 
 pub use backend::{AsyncReadSeek, StorageGet, StoragePut, StreamReadSeeker};
@@ -67,7 +67,6 @@ pub use mirror::{
     push_to_remote_async, staging_set_path,
 };
 pub use object::{AsyncObjectStore, LocalDirStore, MemoryStore, ObjectStore};
-#[cfg(feature = "remote")]
 pub use operator::connect;
 pub use plan::{Plan, PlannedChunk};
 pub use record::Codec;

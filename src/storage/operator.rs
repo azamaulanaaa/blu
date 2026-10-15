@@ -2,26 +2,33 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Keyed backends over the network, through `OpenDAL`.
 //!
-//! Gated behind `--features remote`: without it this module does not exist
-//! and every non-`file://` scheme fails closed. Three schemes share one trait
-//! implementation: the operator speaks them all, and
+//! Three schemes share one trait implementation.
+//! The operator speaks them all.
 //! [`crate::storage::AsyncObjectStore`] is the only shape the mirror needs.
 //!
-//! Configuration arrives through the environment, one variable per endpoint
-//! or secret, named below. Nothing is guessed: a missing endpoint or identity
-//! fails here, before the first byte moves.
+//! Configuration arrives through the environment.
+//! One variable names each endpoint or secret.
+//! Nothing is guessed.
+//! A missing endpoint or identity fails before the first byte moves.
 //!
-//! Durability differs per service, and the code does not paper over it. S3
-//! finishes a write atomically on close. `FTP` uploads are
-//! best-effort mid-transfer: a torn object fails the run, and the next run's
-//! divergence check reports it rather than merging with it. Either way the
-//! local staging copy stays atomic: downloads land beside the target and
-//! rename into place. A crash loses the fresh copy, which the next pull
-//! re-fetches.
+//! The S3 transport speaks plain HTTP and verified HTTPS.
+//! It verifies HTTPS against the system roots.
+//! `ftp://` and `sftp://` never touch HTTP.
 //!
-//! Retries and timeouts wrap every operator: three attempts, thirty seconds
-//! per operation and per stream — the same thirty seconds the client allows a
-//! server before calling it a failure.
+//! Durability differs per service.
+//! S3 finishes a write atomically on close.
+//! `FTP` uploads are best-effort mid-transfer.
+//! A torn object fails the run.
+//! The next run reports the torn object rather than merging with it.
+//! The local staging copy stays atomic either way.
+//! Downloads land beside the target and rename into place.
+//! A crash loses the fresh copy.
+//! The next pull re-fetches the copy.
+//!
+//! Retries and timeouts wrap every operator.
+//! Each operator tries three times.
+//! Each operation allows thirty seconds.
+//! Each stream allows thirty seconds.
 
 use std::io;
 
@@ -38,38 +45,44 @@ const COPY_CHUNK: u64 = 4 * 1024 * 1024;
 
 /// Build an operator for `url`.
 ///
-/// Reads endpoints and secrets from the environment, per scheme:
+/// The call reads endpoints and secrets from the environment.
 ///
-/// - `s3://bucket[/prefix]`: `BLU_S3_ENDPOINT` names the endpoint and is
-///   required. `BLU_S3_REGION` overrides the region.
-///   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` name the identity and
-///   travel together: one without the other is a typo, and fails.
-///   `AWS_SESSION_TOKEN` extends them. Without any of the three, the request
-///   goes unsigned: public buckets answer, private ones refuse.
-/// - `ftp://[user@]host[:port][/prefix]`: the user comes from the address or
-///   `BLU_FTP_USER`, defaulting to `anonymous`. The password comes from
-///   `BLU_FTP_PASSWORD` and defaults to empty.
-/// - `sftp://[user@]host[:port][/prefix]`: the user comes from the address or
-///   `BLU_SFTP_USER` and is required. The key file comes from
-///   `BLU_SFTP_KEY` and is required: this backend speaks key auth only.
+/// Use these variables per scheme.
+///
+/// - `s3://bucket[/prefix]` uses `BLU_S3_ENDPOINT` for the endpoint.
+///   The endpoint is required.
+///   It accepts `http://` and `https://`.
+///   It verifies HTTPS against the system roots.
+///   `BLU_S3_REGION` overrides the region.
+///   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` name the identity.
+///   The two travel together.
+///   One without the other fails.
+///   `AWS_SESSION_TOKEN` extends them.
+///   Without any of the three the request goes unsigned.
+///   Public buckets answer unsigned requests.
+///   Private buckets refuse unsigned requests.
+/// - `ftp://[user@]host[:port][/prefix]` uses the address user or `BLU_FTP_USER`.
+///   The user defaults to `anonymous`.
+///   `BLU_FTP_PASSWORD` names the password.
+///   The password defaults to empty.
+/// - `sftp://[user@]host[:port][/prefix]` uses the address user or `BLU_SFTP_USER`.
+///   The user is required.
+///   `BLU_SFTP_KEY` names the key file and is required.
+///   This backend speaks key auth only.
 ///   Host keys stay strict.
 ///
-/// `https://` endpoints need `--features remote-tls`, and fail
-/// closed without it. With the feature they build like anything else.
-///
-/// Returns `InvalidInput` naming the missing piece. Never guesses.
+/// The call returns `InvalidInput` and names the missing piece.
+/// The call never guesses.
 ///
 /// # Errors
 ///
-/// Returns an error when configuration is missing or the operator refuses
-/// it. Building touches no network: the connection stays lazy until the
-/// first operation.
+/// The call fails when configuration is missing.
+/// The call fails when the operator refuses the configuration.
+/// Building touches no network.
+/// The connection stays lazy until the first operation.
 pub fn connect(url: &RemoteUrl) -> io::Result<Operator> {
     opendal::init_default_registry();
-    #[cfg(feature = "remote-tls")]
     super::tls::install()?;
-    #[cfg(not(feature = "remote-tls"))]
-    opendal_http_transport_reqwest::install_default();
 
     let (scheme, config) = config_for(url)?;
     let operator =
@@ -114,12 +127,10 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// S3 configuration: bucket from the address, endpoint and identity from the
-/// environment.
+/// Build S3 configuration from the address and the environment.
 ///
-/// Refuses `https://` endpoints without `--features remote-tls`: without a
-/// TLS transport they would fail mid-run. Refused here, they fail with the
-/// reason instead.
+/// The bucket comes from the address.
+/// The endpoint and the identity come from the environment.
 fn s3_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
     let endpoint = env("BLU_S3_ENDPOINT").ok_or_else(|| {
         io::Error::new(
@@ -132,20 +143,12 @@ fn s3_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
     s3_config_for(url, &endpoint)
 }
 
-/// S3 configuration for an explicit endpoint.
+/// Build S3 configuration for an explicit endpoint.
 ///
-/// Split from [`s3_config`] so tests cover the shape without touching the
-/// process environment, which Rust forbids outside `unsafe`.
+/// The splitter keeps this pure for tests.
+/// Tests cover the shape without touching the process environment.
+/// Rust forbids environment mutation outside `unsafe`.
 fn s3_config_for(url: &RemoteUrl, endpoint: &str) -> io::Result<Vec<(String, String)>> {
-    if endpoint.starts_with("https://") && !tls_supported() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "an https:// S3 endpoint needs --features remote-tls: this build links no \
-             TLS transport, so it would fail mid-run. Rebuild with the feature, or use \
-             an http:// endpoint on the same trust boundary",
-        ));
-    }
-
     let mut config = vec![
         ("bucket".to_string(), url.location().to_string()),
         ("endpoint".to_string(), endpoint.to_string()),
@@ -168,8 +171,7 @@ fn s3_config_for(url: &RemoteUrl, endpoint: &str) -> io::Result<Vec<(String, Str
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY travel together: one \
-                 without the other is refused",
+                "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY travel together. One without the other fails",
             ));
         }
     }
@@ -177,8 +179,11 @@ fn s3_config_for(url: &RemoteUrl, endpoint: &str) -> io::Result<Vec<(String, Str
     Ok(config)
 }
 
-/// FTP configuration: host from the address, identity from the address or
-/// the environment, defaulting to anonymous.
+/// Build FTP configuration.
+///
+/// The host comes from the address.
+/// The identity comes from the address or the environment.
+/// The user defaults to anonymous.
 fn ftp_config(url: &RemoteUrl) -> Vec<(String, String)> {
     let (user, host) = split_user(url.location());
 
@@ -196,8 +201,11 @@ fn ftp_config(url: &RemoteUrl) -> Vec<(String, String)> {
     ]
 }
 
-/// SFTP configuration: host from the address, identity required, key auth
-/// only.
+/// Build SFTP configuration.
+///
+/// The host comes from the address.
+/// The identity is required.
+/// This backend speaks key auth only.
 fn sftp_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
     let (user, host) = split_user(url.location());
 
@@ -207,15 +215,13 @@ fn sftp_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "sftp:// names no user: put one in the address (sftp://user@host) or \
-                 in BLU_SFTP_USER",
+                "sftp:// names no user. Put one in the address (sftp://user@host) or in BLU_SFTP_USER",
             )
         })?;
     let key = env("BLU_SFTP_KEY").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "BLU_SFTP_KEY names the key file and is required: this backend speaks \
-             key auth only",
+            "BLU_SFTP_KEY names the key file and is required. This backend speaks key auth only",
         )
     })?;
 
@@ -227,19 +233,12 @@ fn sftp_config(url: &RemoteUrl) -> io::Result<Vec<(String, String)>> {
     ])
 }
 
-/// Whether this build links a TLS transport.
-///
-/// One predicate for the `https://` gate:
-///
-/// without `remote-tls` it fails closed, with it it never fires.
-fn tls_supported() -> bool {
-    cfg!(feature = "remote-tls")
-}
-
 /// Split `[user@]authority` at the last `@`.
 ///
-/// Usernames carry no raw `@`: one in the address is percent-encoded, so the
-/// last `@` is the separator. Returns no user when none is there.
+/// Usernames carry no raw `@`.
+/// One `@` in the address is percent-encoded.
+/// The last `@` is the separator.
+/// The call returns no user when none is there.
 fn split_user(authority: &str) -> (Option<&str>, &str) {
     match authority.rsplit_once('@') {
         Some((user, host)) => (Some(user), host),
@@ -249,22 +248,24 @@ fn split_user(authority: &str) -> (Option<&str>, &str) {
 
 /// Refuse keys that are not bare file names.
 ///
-/// The mirror only passes grammar-checked names. A slash here would walk out
-/// of the root on a backend that joins paths naively.
+/// The mirror passes grammar-checked names only.
+/// A slash would leave the root on a naive backend.
 fn check_key(key: &str) -> io::Result<()> {
     if key.is_empty() || key == "." || key == ".." || key.contains('/') || key.contains('\\') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{key:?} is not an object key: a key is a file name, never a path"),
+            format!("{key:?} is not an object key. A key is a file name"),
         ));
     }
     Ok(())
 }
 
-/// An `io::Error` for an operator failure doing `doing`.
+/// Build an `io::Error` for an operator failure.
 ///
-/// Keeps the names the mirror matches on: missing stays missing, refused
-/// auth stays denied, bad configuration stays invalid input.
+/// The mapper keeps the names the mirror matches.
+/// Missing stays missing.
+/// Refused auth stays denied.
+/// Bad configuration stays invalid input.
 fn map_err(doing: &str, error: &opendal::Error) -> io::Error {
     let kind = match error.kind() {
         opendal::ErrorKind::NotFound => io::ErrorKind::NotFound,
@@ -448,10 +449,12 @@ impl AsyncObjectStore for Operator {
     }
 }
 
-/// In-memory operator, for tests.
+/// Build a memory operator for tests.
 ///
-/// No network, no credentials, no filesystem. Mirror round-trips run against
-/// it exactly as they run against a service.
+/// No network.
+/// No credentials.
+/// No filesystem.
+/// Mirror round-trips run against it as against a service.
 #[cfg(test)]
 fn memory() -> io::Result<Operator> {
     Operator::via_iter(services::MEMORY_SCHEME, Vec::new())
@@ -463,10 +466,11 @@ mod tests {
     use super::{connect, memory, s3_config_for};
     use crate::storage::{MirrorStats, RemoteUrl, pull_from_remote_async, push_to_remote_async};
 
-    /// Unique scratch base for one test, under the system temp dir.
+    /// Build a scratch base for one test.
     ///
-    /// Holds a staging set, never a real one. Each test removes its own
-    /// directory on the way out.
+    /// The base lives under the system temp dir.
+    /// It holds a staging set, never a real one.
+    /// Each test removes its own directory on exit.
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "blu-operator-{name}-{}-{:?}",
@@ -475,11 +479,10 @@ mod tests {
         ))
     }
 
-    /// One current-thread runtime for driving async backends in tests.
+    /// Build a current-thread runtime for async backends.
     ///
-    /// No worker threads: the memory operator needs none, and a test that
-    /// spawns threads to move bytes it already holds is measuring the
-    /// scheduler rather than the backend.
+    /// The runtime uses no worker threads.
+    /// The memory operator needs none.
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -487,9 +490,12 @@ mod tests {
             .expect("a current-thread runtime")
     }
 
-    /// Write a tiny staging set: two segment files and one index file, all a
-    /// few bytes. The bytes are arbitrary. The mirror copies files, never
-    /// records.
+    /// Write a tiny staging set.
+    ///
+    /// The set holds two segment files and one index file.
+    /// All files hold a few bytes.
+    /// The bytes are arbitrary.
+    /// The mirror copies files, never records.
     fn stage(base: &std::path::Path) {
         use crate::layout::IndexSet;
 
@@ -500,10 +506,14 @@ mod tests {
         std::fs::write(set.index_path(1), b"index-one").unwrap();
     }
 
-    /// Push uploads into the operator and pull fills a fresh directory from
-    /// it, through the real async mirror path. Small bytes, no network.
+    /// Push then pull through the operator.
+    ///
+    /// Push uploads into the operator.
+    /// Pull fills a fresh directory from it.
+    /// The test uses the real async mirror path.
+    /// It moves small bytes and no network.
     #[test]
-    fn push_then_pull_round_trips_through_the_operator() {
+    fn push_then_pull_through_operator() {
         use crate::layout::IndexSet;
 
         runtime().block_on(async {
@@ -535,11 +545,13 @@ mod tests {
         });
     }
 
-    /// Configuration gaps fail before the first byte moves. No network: the
-    /// refusal happens in the builder, which never dials. Reads the
-    /// environment but never writes it.
+    /// Refuse missing configuration before transfer.
+    ///
+    /// No network runs here.
+    /// The builder refuses and never dials.
+    /// The test reads the environment and never writes it.
     #[test]
-    fn missing_configuration_is_refused() {
+    fn refuse_missing_configuration() {
         for (address, fragment) in [
             ("s3://bucket/a", "BLU_S3_ENDPOINT"),
             ("sftp://host/a", "user"),
@@ -555,19 +567,22 @@ mod tests {
         }
     }
 
-    /// `https://` endpoints fail closed without
-    /// `--features remote-tls`: this build links no TLS transport. No network
-    /// and no environment writes: the S3 shape is covered through its pure
-    /// half.
-    #[cfg(not(feature = "remote-tls"))]
+    /// Accept HTTP and HTTPS endpoints.
+    ///
+    /// Both schemes configure.
+    /// HTTPS verifies against the system roots.
+    /// Building never dials.
+    /// No network runs here.
     #[test]
-    fn tls_endpoints_are_refused_without_a_tls_transport() {
+    fn accept_http_and_https_endpoints() {
         let url = RemoteUrl::parse("s3://bucket/a").unwrap();
-        let refused = s3_config_for(&url, "https://s3.amazonaws.com").unwrap_err();
-        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+
+        let secure = s3_config_for(&url, "https://s3.amazonaws.com").unwrap();
         assert!(
-            refused.to_string().contains("TLS"),
-            "an https endpoint must name the missing transport: {refused}"
+            secure
+                .iter()
+                .any(|(k, v)| k == "endpoint" && v == "https://s3.amazonaws.com"),
+            "an https endpoint configures: {secure:?}"
         );
 
         let plain = s3_config_for(&url, "http://127.0.0.1:9000").unwrap();
@@ -579,25 +594,12 @@ mod tests {
         );
     }
 
-    /// `https://` endpoints build with `--features
-    /// remote-tls`: the transport verifies. No network: building never dials.
-    #[cfg(feature = "remote-tls")]
+    /// Refuse file addresses in the operator.
+    ///
+    /// `file://` names a local directory.
+    /// Connecting it here would build a backend for a path.
     #[test]
-    fn tls_endpoints_build_with_a_tls_transport() {
-        let url = RemoteUrl::parse("s3://bucket/a").unwrap();
-        let configured = s3_config_for(&url, "https://s3.amazonaws.com").unwrap();
-        assert!(
-            configured
-                .iter()
-                .any(|(k, v)| k == "endpoint" && v == "https://s3.amazonaws.com"),
-            "an https endpoint configures under remote-tls: {configured:?}"
-        );
-    }
-
-    /// `file://` never reaches the operator: it is a local directory, and
-    /// connecting it here would be a backend for a path.
-    #[test]
-    fn file_addresses_do_not_reach_the_operator() {
+    fn refuse_file_address_in_operator() {
         let url = RemoteUrl::parse("file:///dir/backups").unwrap();
         assert!(connect(&url).is_err());
     }

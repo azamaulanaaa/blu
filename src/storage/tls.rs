@@ -1,18 +1,28 @@
 // Copyright (C) 2025-2026 Aza Maulana
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! TLS transport for the operator, behind `--features remote-tls`.
+//! TLS transport for the operator.
 //!
-//! rustls with ring and the operating system's roots: no compiled-in Mozilla
-//! bundle (CDLA, refused), no system OpenSSL (absent toolchain), no cmake
-//! (aws-lc). One transport speaks both schemes: plain HTTP passes through,
-//! HTTPS verifies. Installs process-wide once; the first install wins.
+//! The transport uses rustls with ring.
+//! It verifies against the system roots.
+//! It pulls no Mozilla bundle.
+//! It pulls no system OpenSSL.
+//! It pulls no cmake.
+//! One transport speaks both schemes.
+//! Plain HTTP continues unchanged.
+//! HTTPS verifies.
+//! The installer runs process-wide once.
+//! The first install wins.
 //!
-//! Redirects are followed in place, eight hops at most. 307 and 308 replay
-//! the request. 301, 302, and 303 convert GET and HEAD only; anything else
-//! comes back as-is for the backend to read. Credentials never cross hosts:
-//! a hop to another authority drops authorization, proxy, and cookie headers.
+//! The transport follows redirects in place.
+//! It follows eight hops at most.
+//! 307 and 308 replay the request.
+//! 301, 302 and 303 convert GET and HEAD only.
+//! Other cases return the response for the backend.
+//! Credentials never cross hosts.
+//! A hop to another authority drops auth headers.
 //!
-//! No proxy support: the client dials endpoint addresses directly.
+//! The client dials endpoint addresses directly.
+//! It uses no proxy.
 
 use std::io;
 
@@ -26,13 +36,14 @@ use hyper_util::{
 };
 use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Result};
 
-/// Redirect hops followed per operation.
+/// Count redirect hops per operation.
 ///
-/// Enough for endpoint canonicalization and region hops. A loop lands here
-/// as the backend reading the last 3xx, never as requests forever.
+/// Eight hops cover endpoint moves and region moves.
+/// A loop returns the last 3xx for the backend.
+/// The transport never requests forever.
 const MAX_REDIRECTS: u8 = 8;
 
-/// HTTPS-capable transport over hyper, rustls/ring, and system roots.
+/// HTTPS transport over hyper, rustls, ring and system roots.
 #[derive(Debug, Clone)]
 struct TlsTransport {
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
@@ -40,12 +51,15 @@ struct TlsTransport {
 
 /// Install the TLS transport process-wide.
 ///
-/// Idempotent: the first install wins and later calls do nothing. Reads the
-/// system roots, so a machine without any fails here rather than mid-run.
+/// The installer is idempotent.
+/// The first install wins.
+/// Later calls change nothing.
+/// The installer reads the system roots.
+/// A machine without roots fails here, not mid-run.
 ///
 /// # Errors
 ///
-/// Returns an error when no system roots load.
+/// The call fails when no system roots load.
 pub(crate) fn install() -> io::Result<()> {
     let mut roots = rustls::RootCertStore::empty();
     let result = rustls_native_certs::load_native_certs();
@@ -76,22 +90,24 @@ pub(crate) fn install() -> io::Result<()> {
     Ok(())
 }
 
-/// What a redirect status does to a request of `method`.
+/// Select what a redirect status does to a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Follow {
     /// Replay method and body at the new address.
     Replay,
     /// Retry as GET without a body.
     AsGet,
-    /// Leave the response for the backend.
+    /// Return the response for the backend.
     Return,
 }
 
-/// Follow decision for `status` answering a request of `method`.
+/// Decide how `status` moves a request with `method`.
 ///
-/// 307 and 308 keep everything by definition. 301, 302, and 303 keep GET
-/// and HEAD, and 303 converts anything else to GET. Anything else comes
-/// back as-is: only the backend knows what a 300 or 305 means for it.
+/// 307 and 308 keep everything.
+/// 301, 302 and 303 keep GET and HEAD.
+/// 303 converts other methods to GET.
+/// Other cases return.
+/// Only the backend knows what 300 or 305 means.
 fn follow(status: StatusCode, method: &Method) -> Follow {
     if status == StatusCode::TEMPORARY_REDIRECT || status == StatusCode::PERMANENT_REDIRECT {
         return Follow::Replay;
@@ -109,12 +125,13 @@ fn follow(status: StatusCode, method: &Method) -> Follow {
     Follow::Return
 }
 
-/// Absolute address for a redirect `location` against `base`.
+/// Build an absolute address for a redirect.
 ///
-/// Absolute addresses pass through. Absolute paths inherit the base scheme
-/// and authority. Anything else resolves against the base path's directory:
-/// a bare `Location` never parses as an address on its own, so it is merged
-/// as text and the whole is parsed once.
+/// Absolute addresses pass through.
+/// Absolute paths take the base scheme and authority.
+/// Other values resolve against the base directory.
+/// A bare `Location` never parses alone.
+/// The resolver merges it as text and parses the whole once.
 fn resolve_redirect(base: &Uri, location: &str) -> Result<Uri> {
     let failed = || {
         Error::new(
@@ -168,26 +185,26 @@ fn resolve_redirect(base: &Uri, location: &str) -> Result<Uri> {
         .map_err(|_| failed())
 }
 
-/// Whether `next` shares scheme and authority with `base`.
+/// Check whether `next` shares scheme and authority with `base`.
 ///
-/// Credentials move only within one origin. A scheme upgrade counts as a
-/// move: sending secrets to a new scheme on the same host is still sending
-/// them somewhere new.
+/// Credentials move inside one origin only.
+/// A scheme change counts as a move.
+/// Sending secrets to a new scheme sends them somewhere new.
 fn same_origin(base: &Uri, next: &Uri) -> bool {
     base.scheme() == next.scheme() && base.authority() == next.authority()
 }
 
 /// Drop credential headers before a cross-origin hop.
 ///
-/// Authorization, proxy, and cookies name one origin. A redirect target that
-/// is not that origin must not receive them.
+/// Authorization, proxy and cookies name one origin.
+/// A target outside that origin must not receive them.
 fn strip_credentials(headers: &mut HeaderMap) {
     headers.remove(http::header::AUTHORIZATION);
     headers.remove(http::header::PROXY_AUTHORIZATION);
     headers.remove(http::header::COOKIE);
 }
 
-/// An operator error for a transport failure doing `doing`.
+/// Build an operator error for a transport failure.
 fn net_err(doing: &str, error: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Unexpected, format!("could not {doing}: {error}"))
 }
@@ -261,10 +278,14 @@ mod tests {
     use super::{Follow, follow, resolve_redirect, same_origin};
     use http::{Method, StatusCode, Uri};
 
-    /// Redirect rules: replay keeps, GET converts nothing, others return.
-    /// Pure status and method matching, no network.
+    /// Check redirect rules.
+    ///
+    /// Replay keeps the request.
+    /// GET keeps its form.
+    /// Other cases return.
+    /// No network runs here.
     #[test]
-    fn redirect_rules_keep_replayable_requests() {
+    fn check_redirect_rules() {
         use StatusCode as S;
 
         assert_eq!(follow(S::TEMPORARY_REDIRECT, &Method::PUT), Follow::Replay);
@@ -281,10 +302,13 @@ mod tests {
         assert_eq!(follow(S::NOT_FOUND, &Method::GET), Follow::Return);
     }
 
-    /// Locations resolve against the base four ways, and garbage fails.
-    /// Pure string handling, no network.
+    /// Check redirect locations.
+    ///
+    /// Locations resolve four ways.
+    /// Bad values fail.
+    /// No network runs here.
     #[test]
-    fn redirect_locations_resolve_four_ways() {
+    fn check_redirect_locations() {
         let base: Uri = "http://host:8080/a/b".parse().unwrap();
 
         let absolute = resolve_redirect(&base, "https://other/x").unwrap();
@@ -302,10 +326,13 @@ mod tests {
         assert!(resolve_redirect(&base, "http://[::1").is_err());
     }
 
-    /// Origins compare scheme and authority. Upgrades count as moves.
-    /// Pure comparison, no network.
+    /// Check origin equality.
+    ///
+    /// The check compares scheme and authority.
+    /// A scheme change counts as a move.
+    /// No network runs here.
     #[test]
-    fn origins_compare_scheme_and_authority() {
+    fn check_origin_equality() {
         let base: Uri = "http://host/a".parse().unwrap();
         let same: Uri = "http://host/b".parse().unwrap();
         let upgrade: Uri = "https://host/a".parse().unwrap();
@@ -316,10 +343,14 @@ mod tests {
         assert!(!same_origin(&base, &other));
     }
 
-    /// Installing twice is idempotent: the first install wins. Needs system
-    /// roots, which every machine that verifies HTTPS holds.
+    /// Check install idempotence.
+    ///
+    /// The first install wins.
+    /// A second install changes nothing.
+    /// The test needs system roots.
+    /// Every machine that verifies HTTPS holds them.
     #[test]
-    fn installing_twice_is_idempotent() {
+    fn check_install_idempotence() {
         super::install().unwrap();
         super::install().unwrap();
     }
