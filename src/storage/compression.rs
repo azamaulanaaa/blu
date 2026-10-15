@@ -31,7 +31,7 @@ use super::record::Codec;
 /// and the one this crate ships. A caller with its own policy implements this trait
 /// instead. That policy may set a size threshold, a level of its own, or a rule
 /// about which payloads are worth a frame. The caller hands it to
-/// [`StoreBuilder::open_writer`]. The store stays unchanged.
+/// [`crate::storage::StoreBuilder::open_writer`]. The store stays unchanged.
 ///
 /// What a caller cannot do through this trait is add a codec. [`Codec`] has two
 /// arms and the store decodes one of them. A policy is therefore a choice about

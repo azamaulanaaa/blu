@@ -9,9 +9,6 @@
 //! Cuts differ from the `fastcdc` cuts of older releases. The table and the
 //! scan changed. Old chunks still restore. New backups share less data with
 //! old ones. Back up again to converge.
-//!
-//! DEPRECATED: the scalar `fastcdc` chunker is gone. `SimdStream` replaces
-//! it. The store keeps chunk contents. It never kept cut positions.
 
 use std::{
     fmt::Debug,

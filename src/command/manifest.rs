@@ -71,7 +71,7 @@ use crate::{fsattr, metadata::Snapshot, storage::BlobId};
 /// Suffix of the file recording what an apply put into a directory.
 ///
 /// Beside the destination rather than inside it, on the same terms as
-/// [`super::restore`]'s lock and scratch directories.
+/// [`super::DestinationLock`]'s lock and scratch directories.
 /// It must not appear in the tree it describes.
 /// Otherwise it would be backed up as part of that tree.
 pub const MANIFEST_SUFFIX: &str = "blu-state";
@@ -224,7 +224,7 @@ impl Manifest {
 
     /// Whether every file in `snapshot` is where this manifest left it.
     ///
-    /// The cheap question, and the only one [`super::apply`] asks on its ordinary
+    /// The cheap question, and the only one [`super::ApplyBuilder`] asks on its ordinary
     /// path. False means *some* file moved, not that nothing is known.
     #[must_use]
     pub fn trusts(&self, root: &Path, snapshot: &Snapshot) -> bool {

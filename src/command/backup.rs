@@ -32,7 +32,7 @@ const DEFAULT_CONCURRENCY: usize = 8;
 /// Hard ceiling on [`Options::concurrency`], whatever the caller asks for.
 const MAX_CONCURRENCY: usize = 32;
 
-/// Knobs for a single [`backup`] run.
+/// Knobs for a single [`BackupBuilder`] run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Paths to leave out of the backup, compared after normalisation. The

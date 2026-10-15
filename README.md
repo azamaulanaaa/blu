@@ -149,26 +149,27 @@ The crate also works as a library, published to crates.io as `blulib` (`cargo ad
 ```rust
 # async fn example() -> std::io::Result<()> {
 use blulib::{
-    command::{Options, backup, lock_destination, restore},
-    storage::{BlobStore, Compression, SegmentLimit},
+    command::{BackupBuilder, RestoreBuilder, lock_destination},
+    storage::BlobStore,
 };
 
 let _claim = lock_destination(std::path::Path::new("docs-restored"))?;
 
-let store = BlobStore::open_for_writing(
-    "docs",
-    SegmentLimit::default(),
-    Compression::default(),
-).await?;
-let first = backup("~/Documents", Options::default(), store, None).await?;
+let store = BlobStore::builder("docs").open_writer().await?;
+let first = BackupBuilder::new("~/Documents", store)
+    .latest(None)
+    .run()
+    .await?;
 
-let store = BlobStore::open_for_reading("docs").await?;
-restore("~/Documents-restored", first.snapshot, store).await?;
+let store = BlobStore::builder("docs").open_reader().await?;
+RestoreBuilder::new("~/Documents-restored", first.snapshot, store)
+    .run()
+    .await?;
 # Ok(())
 # }
 ```
 
-`backup` returns the version number and the snapshot hash. `store.versions()` and `store.snapshot(n)` address versions directly. See `docs.rs` output for `pack`, `apply`, and `merge`.
+`BackupBuilder::run` returns the version number and the snapshot hash. `store.versions()` and `store.snapshot(n)` address versions directly. See `docs.rs` output for `PackBuilder`, `ApplyBuilder`, and `MergeBuilder`.
 
 ## Formats
 

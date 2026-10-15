@@ -85,7 +85,7 @@ fn apply_concurrency() -> usize {
     super::concurrency(APPLY_CONCURRENCY)
 }
 
-/// Knobs for a single [`apply`] run.
+/// Knobs for a single [`ApplyBuilder`] run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
     /// Remove entries the version does not record.
@@ -139,7 +139,7 @@ pub struct Options {
     pub files: Vec<PathBuf>,
 }
 
-/// What an [`apply`] run changed.
+/// What an [`ApplyBuilder`] run changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Applied {
     /// Chunks the destination already held correctly, and did not have to be sent.

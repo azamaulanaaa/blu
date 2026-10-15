@@ -95,7 +95,7 @@ fn probe_concurrency() -> usize {
 
 /// Why the target does not hold the bytes a version records.
 ///
-/// Not named `Reason`, which [`super::verify`] already uses for why a chunk could
+/// Not named `Reason`, which [`super::Reason`] already uses for why a chunk could
 /// not be checked out. The two have the same shape and answer different questions.
 /// A caller holding a failure from either should be able to tell which one it has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

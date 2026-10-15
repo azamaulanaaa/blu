@@ -223,7 +223,7 @@ use crate::{
 /// rather than allocation.
 const SCRATCH: usize = 64 * 1024;
 
-/// What a [`merge`] run did.
+/// What a [`MergeBuilder`] run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Merged {
     /// The run published a new version.
@@ -248,7 +248,7 @@ pub enum Merged {
     },
 }
 
-/// What a [`merge_plan`] run found.
+/// What a [`MergePlanBuilder`] run found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Planned {
     /// A real merge would have committed this.
@@ -824,7 +824,7 @@ pub fn establish_base<W: storage::WriteMode, C: storage::Compressor>(
 /// It therefore decides whether the warning about a pack from behind is about
 /// anything.
 /// Nothing else decides either question.
-/// Doing it here and in [`merge`] is deliberate.
+/// Doing it here and in [`MergeBuilder`] is deliberate.
 /// The run under the lock is the one that counts, and this is the one that lets
 /// the CLI report without taking one.
 ///

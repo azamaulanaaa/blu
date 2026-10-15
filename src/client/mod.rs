@@ -71,7 +71,7 @@
 //! `blu serve` itself checks nothing.
 //! Put the server behind a proxy when it needs auth.
 //!
-//! [`blu merge`]: crate::command::merge
+//! [`blu merge`]: crate::command::MergeBuilder
 
 mod error;
 mod history;

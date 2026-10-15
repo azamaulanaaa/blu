@@ -313,21 +313,6 @@ opendal = { version = "0.59", default-features = false, features = ["services-sf
 [features]
 # Windows file identity, needed to detect hard links there.
 experimental = []
-# DEPRECATED: network stores are always built now.
-# This feature remains so old `--features remote` commands still resolve.
-# It selects nothing.
-# Use no feature flag for `sftp://`, `ftp://`, and `s3://`.
-remote = []
-# DEPRECATED: TLS for keyed stores is always built now.
-# This feature remains so old `--features remote-tls` commands still resolve.
-# It selects nothing.
-# Every build speaks `http://` and verified `https://`.
-remote-tls = []
-# DEPRECATED: TLS for telemetry is always built now.
-# This feature remains so old `--features telemetry-tls` commands still resolve.
-# It selects nothing.
-# Every build speaks `http://` and verified `https://`.
-telemetry-tls = []
 
 [dev-dependencies]
 # `default-features = false` drops criterion's `plotters`, `rayon` and

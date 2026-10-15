@@ -2072,7 +2072,7 @@ fn report_backup_plan(set: &IndexSet, plan: &BackupPlan, fresh: bool) -> std::io
 /// **The local path's work, unchanged, behind a download.** A local restore
 /// reads a version out of a set and writes every chunk of it. This one asks the
 /// server to pack the version, fetches the ranges it does not already have into
-/// a sparse file, and hands that file to [`apply`] — which is the same call
+/// a sparse file, and hands that file to [`blulib::command::ApplyBuilder`] — which is the same call
 /// `blu apply` makes, with the same options, and reports through the same
 /// [`report_applied`]. There is no second applier here and no second report.
 ///

@@ -97,7 +97,7 @@ pub enum Reason {
     /// Not damage: every other variant is a statement about the store, and this
     /// one is a statement about the verifier. It is a separate variant rather
     /// than folded into "could not be read" so that it cannot be mistaken for a
-    /// bad backup. It is also why [`verify`] documents what it does with a task
+    /// bad backup. It is also why [`VerifyBuilder`] documents what it does with a task
     /// that vanishes.
     Unchecked,
 }
