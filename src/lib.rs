@@ -70,6 +70,7 @@ pub mod serve;
 pub mod simd_cdc;
 pub mod slice;
 pub mod storage;
+pub mod target;
 pub mod telemetry;
 pub mod varint;
 

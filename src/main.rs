@@ -15,6 +15,7 @@ use blulib::{
     metadata::Timestamp,
     pack::Pack,
     reader, storage,
+    target::{StoreTarget, Target},
 };
 use clap::{Parser, Subcommand};
 use tracing::level_filters::LevelFilter;
@@ -3008,119 +3009,33 @@ fn report_pack(
     }
 }
 
-/// The set a command works on, and where it lives.
-///
-/// One `TARGET` names a local path (`photos`), a serve set
-/// (`http://127.0.0.1:8480/docs` or `https://example.test/docs`), or a keyed store
-/// (`file:///mnt/drive/docs` for local. `sftp://`, `ftp://` and `s3://` for network. `s3` accepts `http://` and `https://`. HTTPS verifies against system roots). Anything holding `://` is a remote address.
-/// Anything else is a path on this machine.
-/// Remote targets hold no local copy.
-/// A store target works in staging.
-/// An `http://` or `https://` target works on the server.
-#[derive(Debug)]
-enum Target {
-    /// A path on this machine.
-    Local(std::path::PathBuf),
-    /// A set on a `blu serve`.
-    Serve {
-        /// The server's address, without the set.
-        address: String,
-        /// The set's name there.
-        set: String,
-        /// The bearer token a proxy guards with, if any.
-        token: Option<String>,
-    },
-    /// A set in a keyed store, with its staging copy.
-    Store(StoreTarget),
-}
-
 /// Resolve one `TARGET` into where the set lives.
 ///
-/// `http://` and `https://` targets split into server and set.
-/// Every other `://` target splits into store and set.
-/// `--staging` selects the staging directory for a store target.
-/// It fails otherwise.
-/// Without a store there is no copy to stage.
-/// An `http://` or `https://` backup stages in a temp directory.
-/// The runner removes the temp directory afterwards.
-/// The token travels beside the address, never inside it.
+/// Thin wrapper over [`blulib::target`]. The binary keeps its call sites.
+/// The library owns the parsing.
 fn resolve_target(
     command: &str,
     raw: &str,
     staging: Option<&std::path::Path>,
     token: Option<&str>,
 ) -> std::io::Result<Target> {
-    if raw.contains("://") {
-        if raw.trim().to_ascii_lowercase().starts_with("http") {
-            if staging.is_some() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "`blu {command} --staging` needs a store target. An `http://` or `https://` target works on the server and stages nothing here"
-                    ),
-                ));
-            }
-            let (address, set) = blulib::client::split_serve_target(raw)?;
-            return Ok(Target::Serve {
-                address,
-                set,
-                token: token.map(str::to_string),
-            });
-        }
-        let (url, set) = storage::RemoteUrl::split_set(raw)?;
-        let root = match staging {
-            Some(dir) => dir.to_path_buf(),
-            None => storage::default_cache_root().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "no cache directory holds a staging copy on this machine: pass `--staging DIR`",
-                )
-            })?,
-        };
-        let staging = storage::staging_set_path(&root, &url, &set)?;
-        return Ok(Target::Store(StoreTarget { url, set, staging }));
-    }
-    if staging.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("`blu {command} --staging` needs a store target. A local path stages nothing"),
-        ));
-    }
-    Ok(Target::Local(std::path::PathBuf::from(raw)))
+    let parsing = Target::parse(raw).command(command);
+    let parsing = match staging {
+        Some(dir) => parsing.staging(dir),
+        None => parsing,
+    };
+    let parsing = match token {
+        Some(value) => parsing.token(value),
+        None => parsing,
+    };
+    parsing.resolve()
 }
 
 /// Build a serve client for `address`, with a bearer token when one is set.
 ///
-/// The token travels as `Authorization: Bearer <token>`.
-/// The client never checks it.
-/// A proxy before the server checks it.
-///
-/// # Errors
-///
-/// The call fails when `address` is not a server address.
-/// The call fails when the token is empty or holds whitespace.
+/// Thin wrapper over [`blulib::target::remote_for`].
 fn remote_for(address: &str, token: Option<&str>) -> std::io::Result<blulib::client::Remote> {
-    match token {
-        Some(value) => blulib::client::Remote::with_token(address, value),
-        None => blulib::client::Remote::new(address),
-    }
-}
-
-/// A set held by a keyed store, and the staging copy.
-///
-/// Resolution only.
-/// Staged runners pull into staging.
-/// They run the local command there.
-/// They push back after a write.
-/// Nothing else reads these fields.
-#[derive(Debug)]
-struct StoreTarget {
-    /// The store holding the set, without the set.
-    url: storage::RemoteUrl,
-    /// The set name on that store.
-    set: String,
-    /// Staging base path on this machine.
-    staging: std::path::PathBuf,
+    blulib::target::remote_for(address, token)
 }
 
 /// A connected keyed store.
