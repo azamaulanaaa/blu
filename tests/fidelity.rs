@@ -543,3 +543,119 @@ fn an_owners_target_is_not_followed_for_a_symbolic_link() {
         "and the link is still a link"
     );
 }
+
+/// Set a `user` attribute, or say why the test cannot run here.
+///
+/// Returns whether the attribute took. A filesystem without attribute
+/// support refuses the call. The test skips rather than fails there.
+/// A green run on such a filesystem says nothing about attributes.
+#[cfg(unix)]
+fn set_user_xattr(path: &std::path::Path, name: &str, value: &[u8]) -> bool {
+    match xattr::set(path, name, value) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("skipped: this filesystem rejects xattrs: {e}");
+            false
+        }
+    }
+}
+
+/// A file keeps its `user` extended attributes through a round trip.
+///
+/// Unix only. The backup records the allowlisted names. The restore writes
+/// them after the mode. Both the valued and the empty attribute must come
+/// back byte for byte.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_keeps_its_user_xattrs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let file = source.join("noted");
+    fs::write(&file, b"data").unwrap();
+    if !set_user_xattr(&file, "user.blu-test", b"kept") {
+        return;
+    }
+    if !set_user_xattr(&file, "user.blu-empty", b"") {
+        return;
+    }
+
+    let blob = dir.path().join("store.bin");
+    let committed = common::run_backup(&source, &blob).await;
+    let destination = dir.path().join("restored");
+    common::run_restore(&blob, committed.snapshot, &destination).await;
+
+    let restored = destination.join("noted");
+    assert_eq!(
+        xattr::get(&restored, "user.blu-test").unwrap(),
+        Some(b"kept".to_vec()),
+        "the restored file should carry the recorded attribute"
+    );
+    assert_eq!(
+        xattr::get(&restored, "user.blu-empty").unwrap(),
+        Some(Vec::new()),
+        "and an empty value should survive as empty rather than absent"
+    );
+}
+
+/// A directory keeps its `user` extended attributes through a round trip.
+///
+/// Unix only. Directories record attributes like files do. The attribute
+/// stage sets directory times last. Setting attributes must not disturb
+/// that order.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dir_keeps_its_user_xattr() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let sub = source.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("f.bin"), b"data").unwrap();
+    if !set_user_xattr(&sub, "user.blu-test", b"kept") {
+        return;
+    }
+
+    let blob = dir.path().join("store.bin");
+    let committed = common::run_backup(&source, &blob).await;
+    let destination = dir.path().join("restored");
+    common::run_restore(&blob, committed.snapshot, &destination).await;
+
+    assert_eq!(
+        xattr::get(destination.join("sub"), "user.blu-test").unwrap(),
+        Some(b"kept".to_vec()),
+        "the restored directory should carry the recorded attribute"
+    );
+}
+
+/// A restore of recorded attributes reports no misses on a filesystem that
+/// supports them.
+///
+/// Unix only. The count is the point here rather than the bytes. A restore
+/// that sets every attribute reports zero unattributed entries.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_restore_of_recorded_xattrs_reports_no_misses() {
+    use blulib::{command::RestoreBuilder, storage::BlobStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    let file = source.join("noted");
+    fs::write(&file, b"data").unwrap();
+    if !set_user_xattr(&file, "user.blu-test", b"kept") {
+        return;
+    }
+
+    let blob = dir.path().join("store.bin");
+    let committed = common::run_backup(&source, &blob).await;
+
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    let destination = dir.path().join("restored");
+    let restored = RestoreBuilder::new(&destination, committed.snapshot, store)
+        .run()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        restored.unattributed, 0,
+        "every recorded attribute took, so none should be reported missing"
+    );
+}

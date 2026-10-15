@@ -348,6 +348,14 @@ experimental = []
 criterion = { version = "0.7", default-features = false }
 tempfile = "3.27.0"
 
+[target.'cfg(unix)'.dev-dependencies]
+# Extended attributes in fidelity tests (`tests/fidelity.rs`).
+#
+# MIT OR Apache-2.0, both allowed by `deny.toml`.
+# Unix-only like the `cfg(unix)` dependency above. Tests set `user`
+# attributes through these calls and read them back after a round trip.
+xattr = "1.6.1"
+
 # Criterion is not a libtest harness, so each bench target opts out of it.
 [[bench]]
 name = "hotpath"
