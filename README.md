@@ -128,9 +128,11 @@ Use `reindex` to rebuild the per-version index files from the store's commit rec
 
 ## What is preserved
 
-blu preserves regular files, directories, symbolic links, hard links, owner ids, permission bits, and modification times. Empty files and empty directories survive. blu stores paths without valid UTF-8 as raw bytes.
+blu preserves regular files, directories, symbolic links, hard links, owner ids, permission bits, modification times, extended attributes, and access lists. Empty files and empty directories survive. blu stores paths without valid UTF-8 as raw bytes.
 
-blu does not preserve ACLs, extended attributes, or hard links outside the tree. It skips device nodes, named pipes, and sockets, and it reports each skip. Opening a FIFO for reading waits for a writer, so reading one would stall the run.
+On Linux blu keeps `user` extended attributes and POSIX access lists. It skips `security` and `trusted` names. Those need privilege to read and to write. On Windows blu keeps explicit allow and deny entries. Inherited entries stay with the parent. A restored file blocks inheritance from its parent. Symbolic links carry no extended attributes. Their target carries its own entry.
+
+blu does not preserve hard links outside the tree. It skips device nodes, named pipes, and sockets, and it reports each skip. Opening a FIFO for reading waits for a writer, so reading one would stall the run.
 
 An unprivileged restore cannot set owners it does not hold. It reports those entries, writes everything else, and still succeeds. Re-run as root to set them.
 
@@ -175,7 +177,7 @@ RestoreBuilder::new("~/Documents-restored", first.snapshot, store)
 
 | What | Version |
 |---|---|
-| Snapshot | 5 |
+| Snapshot | 6 |
 | Record | 2 |
 | Pack | 7 |
 

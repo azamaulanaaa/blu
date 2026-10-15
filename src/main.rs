@@ -2722,6 +2722,18 @@ fn report_restore_plan(
         );
     }
 
+    if plan.unattributed > 0 {
+        // The figure is a bound for the same reason as `unowned` above. Only
+        // trying to set extended attributes says whether this filesystem
+        // accepts them.
+        eprintln!(
+            "note: {} entr{} in this version record extended attributes. A restore \
+             may not be able to set them on this filesystem",
+            plan.unattributed,
+            if plan.unattributed == 1 { "y" } else { "ies" },
+        );
+    }
+
     Ok(())
 }
 
@@ -2738,6 +2750,10 @@ fn report_restored(restored: &blulib::command::Restored) {
     if restored.unowned > 0 {
         report_unowned(restored.unowned, "restore");
     }
+
+    if restored.unattributed > 0 {
+        report_unattributed(restored.unattributed, "restore");
+    }
 }
 
 /// Say that some entries could not be given the owner the version records.
@@ -2753,6 +2769,20 @@ fn report_unowned(count: u64, what: &str) {
         "note: {count} entr{} in this {what} recorded an owner this process could not set. \
          Setting an owner takes privilege. Their contents, permissions and times are correct. \
          Run as root to set them",
+        if count == 1 { "y" } else { "ies" },
+    );
+}
+
+/// Say that some entries missed the extended attributes the version records.
+///
+/// On stderr, and unconditionally, for the same reason as [`report_unowned`].
+/// A filesystem without attribute support meets this on every entry that
+/// records any. The wording says what is true. The files are right, and the
+/// extended attributes are not. The run still succeeded.
+fn report_unattributed(count: u64, what: &str) {
+    eprintln!(
+        "note: {count} entr{} in this {what} recorded extended attributes this filesystem \
+         could not set. Their contents, permissions and times are correct",
         if count == 1 { "y" } else { "ies" },
     );
 }
@@ -4203,6 +4233,24 @@ fn report_applied(
             );
         } else {
             report_unowned(applied.unowned, "apply");
+        }
+    }
+
+    if applied.unattributed > 0 {
+        if dry_run {
+            // The figure is a bound for the same reason as `unowned` above.
+            eprintln!(
+                "note: {} entr{} in this version record extended attributes. An apply \
+                 may not be able to set them on this filesystem",
+                applied.unattributed,
+                if applied.unattributed == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+            );
+        } else {
+            report_unattributed(applied.unattributed, "apply");
         }
     }
 
