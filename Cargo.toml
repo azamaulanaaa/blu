@@ -148,6 +148,13 @@ serde_json = "1.0"
 # in the address are this crate's rules, not the parser's.
 url = "2.5"
 fastcdc = "5.0.0"
+# SIMD Gear hash for content-defined chunking (`src/simd_cdc.rs`).
+#
+# MIT OR Apache-2.0, both allowed by `deny.toml`.
+# Zero runtime dependencies, so the graph grows by one crate.
+# `SSE4.2`/`AVX2` on `x86_64` and `NEON` on `aarch64` dispatch at runtime,
+# with a scalar fallback, so no `-C target-cpu` flag and no `dist` change.
+gearhash = "0.1"
 filetime = "0.2.29"
 # Time text for version stamps (`src/metadata.rs`).
 #
