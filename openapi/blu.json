@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "blu",
-    "version": "0.10.1",
+    "version": "0.11.0",
     "description": "Serve a backup set over HTTP.\n\nThe server moves packs and nothing else. It accepts no path on its own disk. No endpoint snapshots a tree on the server. No endpoint restores into one.\n\nTo push, the client runs `blu backup` and `blu pack`. The client uploads the pack. The server merges it. To restore, the server packs a version. The client fetches the chunks it lacks. The client merges or applies them locally.\n\nThere is no authentication. Anyone who reaches the port can read every set the server keeps and append versions to them. This is deliberate. The bind address defaults to 127.0.0.1.\n\n`GET /v1/packs/{id}` serves the pack bytes unchanged as `application/x-blu-pack`. A client passes those bytes to `Pack::open` and then runs `blu merge` or `blu apply`.",
     "license": {
       "name": "GPL-2.0-or-later",
@@ -1162,7 +1162,7 @@
           "version": {
             "type": "string",
             "description": "This build's version.",
-            "example": "0.10.1"
+            "example": "0.11.0"
           },
           "snapshot_format": {
             "type": "integer",
