@@ -26,7 +26,7 @@ use std::{
 
 use blulib::{
     metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
-    pack::{Pack, Range, StorageStored, hash_file},
+    pack::{Pack, PackReader, Range, StorageStored, hash_file},
     storage::{BlobStore, Codec, Plan, StorageGet},
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -4072,4 +4072,57 @@ async fn stop_the_window_at_the_first_error() {
         error.to_string().contains(&first.to_string()),
         "the error should name the failing chunk, got: {error}"
     );
+}
+/// Reused reader returns stored bytes.
+///
+/// Open one reader. Read each chunk with it. Compare each result with reading once per chunk. Expect identical bytes and codes.
+#[tokio::test]
+async fn reused_reader_returns_stored_bytes() {
+    let built = build(5, 180_000).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+    let mut reader = PackReader::open(&pack).await.unwrap();
+    for chunk in pack.chunks() {
+        let reused = reader.read_stored(&chunk.id).await.unwrap();
+        let single = pack.stored(&chunk.id).await.unwrap();
+        assert_eq!(reused.bytes, single.bytes);
+        assert_eq!(reused.codec, single.codec);
+        assert_eq!(reused.raw_len, single.raw_len);
+    }
+}
+
+/// Reused reader returns content bytes.
+///
+/// Open one reader. Read each chunk with it. Compare each result with reading once per chunk. Expect identical content.
+#[tokio::test]
+async fn reused_reader_returns_content_bytes() {
+    let built = build(5, 180_000).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+    let mut reader = PackReader::open(&pack).await.unwrap();
+    for chunk in pack.chunks() {
+        let reused = reader.read_content(&chunk.id).await.unwrap();
+        let mut single = Vec::new();
+        pack.get(&chunk.id)
+            .await
+            .unwrap()
+            .read_to_end(&mut single)
+            .await
+            .unwrap();
+        assert_eq!(reused, single);
+    }
+}
+
+/// Cached store returns same bytes.
+///
+/// Read each chunk twice. Compare the two payloads. Expect identical bytes and codes.
+#[tokio::test]
+async fn cached_store_returns_same_bytes() {
+    let built = build(4, 150_000).await;
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
+    for chunk in built.plan.chunks() {
+        let first = store.stored(&chunk.id).await.unwrap();
+        let second = store.stored(&chunk.id).await.unwrap();
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.codec, second.codec);
+        assert_eq!(first.raw_len, second.raw_len);
+    }
 }

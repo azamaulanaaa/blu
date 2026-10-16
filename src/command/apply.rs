@@ -71,7 +71,7 @@ use tracing::instrument;
 
 use crate::{
     metadata,
-    pack::Pack,
+    pack::{Pack, PackReader},
     progress::{Counter, Phase, Progress},
     storage::{BlobId, StorageGet},
 };
@@ -774,14 +774,16 @@ fn establish_base<'a>(
 /// A slice can be part of a chunk, and the hash the chunk is addressed by covers
 /// all of it.
 /// A chunk the pack has damaged at one end is not trustworthy at either.
+///
+/// This pass reads the pack through one open file. The pass opens the pack
+/// once for the whole pass, not once for every chunk. It is the only pass of
+/// an apply that does so: the write loop opens the pack for each chunk it
+/// writes.
 async fn verify_delta(probed: &Probed, pack: &Pack) -> io::Result<()> {
     let needed: HashSet<BlobId> = probed.mismatched.iter().map(|m| m.expected).collect();
-
+    let mut reader = PackReader::open(pack).await?;
     for id in &needed {
-        let mut reader = pack.get(id).await?;
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await?;
-
+        let buffer = reader.read_content(id).await?;
         if blake3::hash(&buffer) != *id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

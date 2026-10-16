@@ -75,7 +75,11 @@ use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
+    time::SystemTime,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 
 use tokio::{
     fs,
@@ -97,6 +101,16 @@ use crate::{
 /// Copy buffer for a payload: where it is hashed on its way through, and what
 /// coalesces the short reads a streaming backend hands out.
 const COPY_BUFFER: usize = 256 * 1024;
+
+/// How many open segment files the store keeps at once.
+///
+/// The cache of open files exists so that reading many chunks does not open
+/// the same segment again for each of them. A store has as many segments as
+/// its size asks for. An unbounded cache then holds one descriptor per
+/// segment, and a store that is merely large runs out of descriptors. The cap
+/// keeps the number of descriptors the store holds fixed, whatever the store
+/// holds.
+const OPEN_FILE_LIMIT: usize = 64;
 
 /// What a scan found, and what this handle may add to.
 #[derive(Debug, Default)]
@@ -120,6 +134,151 @@ impl Contents {
     /// files.
     fn lock(contents: &Mutex<Contents>) -> std::sync::MutexGuard<'_, Contents> {
         contents.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The open segment files a store keeps between reads.
+///
+/// The cache saves an open for every chunk a segment holds. The cache is
+/// bounded. A store has as many segments as its size asks for, and one
+/// descriptor per segment runs a large store out of descriptors.
+///
+/// Each entry remembers the identity of the file it was opened from. A segment
+/// can be replaced while the store holds it open: a restore from a copy, a
+/// move, another tool. The handle then reads a file that is no longer the
+/// segment, so the identity is compared before a handle is reused.
+#[derive(Debug, Default)]
+struct OpenFiles {
+    /// The open files, by segment number.
+    files: HashMap<u32, OpenFile>,
+    /// The number the entries were opened in.
+    ///
+    /// A counter rather than a place in a list. A file opened again after its
+    /// segment was replaced is a new file, and it counts as a new one.
+    opened: u64,
+}
+
+/// An open segment file, and the identity it was opened from.
+#[derive(Debug)]
+struct OpenFile {
+    /// The open file.
+    file: fs::File,
+    /// The identity of the file when it was opened.
+    identity: FileIdentity,
+    /// When it was opened, as a counter.
+    ///
+    /// The oldest file is the one dropped when the cache is full.
+    opened: u64,
+}
+
+/// The identity of a segment file.
+///
+/// These are the fields that say whether the file at a path is still the file a
+/// handle was opened from. A replaced segment has another inode on the systems
+/// that have one, and another length or modification time anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    /// The length of the file.
+    len: u64,
+    /// When the file was last modified.
+    modified: Option<SystemTime>,
+    /// The device the file lives on, on the systems that have one.
+    #[cfg(unix)]
+    device: u64,
+    /// The inode of the file, on the systems that have one.
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileIdentity {
+    /// The identity of the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be examined.
+    async fn at(path: &Path) -> io::Result<Self> {
+        let meta = crate::storage::at_async(path, "examine", fs::metadata(path)).await?;
+
+        Ok(Self::of(&meta))
+    }
+
+    /// The identity that a metadata describes.
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            device: meta.dev(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+        }
+    }
+}
+
+impl OpenFiles {
+    /// The open file for `segment`, opening `path` when the cache has none.
+    ///
+    /// A cached handle is reused only when the file at `path` is still the file
+    /// the handle was opened from. A segment that was replaced since is opened
+    /// again, so a read never comes from a file that is no longer the segment.
+    ///
+    /// The cache is bounded. When it is full the oldest file is dropped, so the
+    /// store holds a fixed number of descriptors whatever its size.
+    ///
+    /// The length of the file comes back with the handle. It is the length of
+    /// the file at the path, which is the file the handle was opened from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be examined or opened.
+    async fn file(&mut self, segment: u32, path: &Path) -> io::Result<(&mut fs::File, u64)> {
+        let identity = FileIdentity::at(path).await?;
+        let current = self
+            .files
+            .get(&segment)
+            .is_some_and(|open| open.identity == identity);
+        if !current {
+            // The cache has no file for this segment, or the one it has was
+            // opened from a file that the path does not name any more. Either
+            // way the handle that is cached cannot answer for the segment.
+            self.files.remove(&segment);
+
+            let opened = crate::storage::at_async(path, "open", fs::File::open(path)).await?;
+            let opened_at = self.opened;
+            self.opened += 1;
+            self.files.insert(
+                segment,
+                OpenFile {
+                    file: opened,
+                    identity,
+                    opened: opened_at,
+                },
+            );
+            self.evict();
+        }
+
+        let open = self
+            .files
+            .get_mut(&segment)
+            .ok_or_else(|| io::Error::other("the open file cache misses its own entry"))?;
+
+        Ok((&mut open.file, identity.len))
+    }
+
+    /// Drop the oldest files until the cache is back within its cap.
+    fn evict(&mut self) {
+        while self.files.len() > OPEN_FILE_LIMIT {
+            let Some(oldest) = self
+                .files
+                .iter()
+                .min_by_key(|(_, open)| open.opened)
+                .map(|(segment, _)| *segment)
+            else {
+                break;
+            };
+
+            self.files.remove(&oldest);
+        }
     }
 }
 
@@ -225,6 +384,12 @@ pub struct BlobStore<W: WriteMode, C: Compressor = Compression> {
     /// Not persisted: a run that wrote nothing has nothing to sync, and one that
     /// did has synced by the time it commits.
     dirty: Mutex<Vec<u32>>,
+    /// Reuse open segment files when reading stored payloads.
+    ///
+    /// Hold one file for each segment touched so far, up to a fixed cap.
+    /// Avoid opening the same file for each chunk. Keep the number of
+    /// descriptors the store holds independent of how many segments it has.
+    open_files: tokio::sync::Mutex<OpenFiles>,
     /// The mode, which selects the methods and so appears in no field.
     ///
     /// A `const WRITE: bool` parameter needs no such field. That is the one thing
@@ -328,6 +493,51 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
                     format!("this store does not hold a blob hashing to {id}"),
                 )
             })
+    }
+
+    /// Read the stored payload of a blob.
+    ///
+    /// Reuse one open file per segment, up to a fixed number of them. Check
+    /// that the handle and the path name the same file. Open the path again
+    /// when it is not. Check the range against the file length. Return the
+    /// payload bytes with the codec and the content length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store misses the blob. Returns an error if the
+    /// segment cannot be examined or opened. Returns an error if the range
+    /// overflows. Returns an error if the segment ends before the range.
+    /// Returns an error if reading the payload fails.
+    pub(crate) async fn read_stored_bytes(&self, id: &BlobId) -> io::Result<(Vec<u8>, Codec, u64)> {
+        let placement = self.locate(id)?;
+        let path = self.segment_path(placement.segment);
+        let mut files = self.open_files.lock().await;
+        let (file, len) = files.file(placement.segment, &path).await?;
+        let end = placement
+            .offset
+            .checked_add(placement.stored_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "a blob's range overflows")
+            })?;
+        if end > len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "blob at {} in segment {} needs bytes {}..{end} but that segment is \
+                     only {len} bytes long",
+                    path.display(),
+                    placement.segment,
+                    placement.offset
+                ),
+            ));
+        }
+        file.seek(SeekFrom::Start(placement.offset)).await?;
+        let mut bytes = crate::storage::zeroed(
+            placement.stored_len,
+            &format!("chunk {id} as {} stores it", path.display()),
+        )?;
+        file.read_exact(&mut bytes).await?;
+        Ok((bytes, placement.codec, placement.raw_len))
     }
 
     /// The snapshot a version names, taken from the per-version index file when
@@ -632,6 +842,7 @@ impl<C: Compressor> StoreBuilder<C> {
             limit: self.limit,
             compression: self.compression,
             dirty: Mutex::new(Vec::new()),
+            open_files: tokio::sync::Mutex::new(OpenFiles::default()),
             mode: PhantomData,
         })
     }
@@ -677,6 +888,7 @@ impl<C: Compressor> StoreBuilder<C> {
             limit: SegmentLimit::default(),
             compression: Compression::default(),
             dirty: Mutex::new(Vec::new()),
+            open_files: tokio::sync::Mutex::new(OpenFiles::default()),
             mode: PhantomData,
         })
     }
@@ -1677,4 +1889,133 @@ fn sync_parent(path: &Path) -> io::Result<()> {
     };
 
     std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    use crate::storage::{SegmentLimit, StoragePut};
+
+    /// A limit small enough that a few blobs roll over.
+    fn tiny() -> SegmentLimit {
+        SegmentLimit::new(4096)
+    }
+
+    /// Content that is neither a repeating pattern nor compressible.
+    ///
+    /// A payload that compressed would make a set hold fewer bytes than the
+    /// test expects. The arithmetic of a boundary would not mean what it says.
+    fn payload(seed: u8, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut key = [0u8; 32];
+        key[0] = seed;
+        for counter in 0..u64::try_from(len.div_ceil(64)).unwrap_or(0) {
+            let mut input = [0u8; 72];
+            input[..32].copy_from_slice(&key);
+            input[32..40].copy_from_slice(&counter.to_le_bytes());
+            out.extend_from_slice(blake3::hash(&input).as_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// Store `payloads` one at a time, returning the ids in the order stored.
+    async fn put_all(blob: &Path, limit: SegmentLimit, payloads: &[Vec<u8>]) -> Vec<BlobId> {
+        let store = BlobStore::builder(blob)
+            .segment_limit(limit)
+            .open_writer()
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for payload in payloads {
+            let id = blake3::hash(payload);
+            store
+                .put(
+                    &id,
+                    Box::new(Cursor::new(payload.clone())),
+                    u64::try_from(payload.len()).unwrap(),
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        store.sync_data().await.unwrap();
+
+        ids
+    }
+
+    /// The store keeps a bounded number of open segment files.
+    ///
+    /// The cache of open files saves an open for every chunk a segment holds.
+    /// Without a cap it holds one file per segment, and a store with more
+    /// segments than the process has descriptors fails with `EMFILE`. The test
+    /// reads from more segments than the cap allows, and then asks the cache
+    /// what it holds.
+    #[tokio::test]
+    async fn the_open_file_cache_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("store");
+
+        let payloads: Vec<Vec<u8>> = (0..=255).map(|i| payload(i, 2000)).collect();
+        let ids = put_all(&blob, tiny(), &payloads).await;
+
+        let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+        assert!(
+            store.segment_count() > OPEN_FILE_LIMIT,
+            "the set should have more segments than the cache holds, and it has {}",
+            store.segment_count()
+        );
+
+        for id in &ids {
+            store.read_stored_bytes(id).await.unwrap();
+        }
+
+        let open = store.open_files.lock().await;
+        assert!(
+            open.files.len() <= OPEN_FILE_LIMIT,
+            "the cache holds {} files, and it should hold no more than {OPEN_FILE_LIMIT}",
+            open.files.len()
+        );
+    }
+
+    /// A replaced segment is not read through the handle of the file it was.
+    ///
+    /// A segment can be replaced while the store holds it open: a restore from
+    /// a copy, a move, another tool. The handle then points at a file that is
+    /// no longer the segment. A read through it answers with bytes the
+    /// segment does not hold. The store compares the identity of the file at
+    /// the path with the identity of the file the handle opened. The store
+    /// opens the path again when the two differ.
+    #[tokio::test]
+    async fn a_replaced_segment_is_not_read_through_the_old_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("store");
+
+        let payloads: Vec<Vec<u8>> = vec![payload(1, 900)];
+        let ids = put_all(&blob, tiny(), &payloads).await;
+
+        let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+        let first = store.read_stored_bytes(&ids[0]).await.unwrap().0;
+
+        // The segment is replaced by a longer file with other bytes in it. The
+        // store still holds the old file open, and the file at the path is
+        // another one.
+        let segment = store.segment_path(0);
+        let len = std::fs::metadata(&segment).unwrap().len();
+        std::fs::write(&segment, vec![0xAA; usize::try_from(len + 100).unwrap()]).unwrap();
+
+        let second = store.read_stored_bytes(&ids[0]).await.unwrap().0;
+        assert_ne!(
+            first, second,
+            "the read came from the file the store opened before the segment was replaced"
+        );
+        assert!(
+            second.iter().all(|byte| *byte == 0xAA),
+            "the read should have come from the file at the path"
+        );
+    }
 }

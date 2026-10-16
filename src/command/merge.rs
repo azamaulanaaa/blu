@@ -214,15 +214,10 @@ use tracing::instrument;
 
 use crate::{
     metadata::{Snapshot, Timestamp},
-    pack::{Pack, StorageStored},
+    pack::{Pack, PackReader},
     progress::{Counter, Phase, Progress},
     storage::{self, BlobId, Codec, Placement, StorageGet, StoragePut},
 };
-
-/// Scratch size for hashing a chunk out of a pack.
-/// A plan never holds a whole chunk, and an unexpectedly large blob costs reads
-/// rather than allocation.
-const SCRATCH: usize = 64 * 1024;
 
 /// What a [`MergeBuilder`] run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +535,7 @@ async fn merge<C: storage::Compressor>(
     );
     progress.report();
 
+    let mut reader = PackReader::open(pack).await?;
     for chunk in &plan {
         merged.chunks = merged.chunks.saturating_add(1);
 
@@ -585,7 +581,7 @@ async fn merge<C: storage::Compressor>(
             // The store still decodes it. See [`StoragePut::put_stored`].
             // This saves the encode and nothing else.
             Compression::Keep => {
-                let stored = pack.stored(&chunk.id).await?;
+                let stored = reader.read_stored(&chunk.id).await?;
                 let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
 
                 store
@@ -606,10 +602,17 @@ async fn merge<C: storage::Compressor>(
             // compressed, a frame.
             // `get` decodes, so what comes back is content and content is what
             // `put` hashes.
-            Compression::Reencode => store
-                .put(&chunk.id, pack.get(&chunk.id).await?, located.content_len)
-                .await
-                .map_err(refused)?,
+            Compression::Reencode => {
+                let content = reader.read_content(&chunk.id).await?;
+                store
+                    .put(
+                        &chunk.id,
+                        Box::new(Cursor::new(content)),
+                        located.content_len,
+                    )
+                    .await
+                    .map_err(refused)?;
+            }
         }
 
         merged.fresh = merged.fresh.saturating_add(1);
@@ -717,6 +720,7 @@ async fn merge_plan<C: storage::Compressor>(
         bytes: 0,
     };
 
+    let mut reader = PackReader::open(pack).await?;
     for chunk in &plan {
         merged.chunks = merged.chunks.saturating_add(1);
 
@@ -734,7 +738,7 @@ async fn merge_plan<C: storage::Compressor>(
 
         // The check `put` would make, made here instead: this run is not writing,
         // so this is the only thing that can refuse a damaged pack.
-        check_chunk(pack, &chunk.id, located.content_len).await?;
+        check_chunk_with(&mut reader, pack, &chunk.id, located.content_len).await?;
 
         merged.fresh = merged.fresh.saturating_add(1);
         merged.bytes = merged.bytes.saturating_add(located.content_len);
@@ -983,43 +987,32 @@ fn in_pack(pack: &Pack, id: &BlobId) -> Option<Placement> {
     })
 }
 
-/// Hash `len` bytes of the chunk `id` out of the pack and refuse a mismatch.
+/// Hash the chunk `id` out of the pack.
 ///
-/// What [`StoragePut::put`] does with every record on a real merge, done here
-/// for a run that stores nothing. Streamed rather than buffered, so a plan over
-/// a large pack does not hold a chunk.
+/// Refuse a mismatch. Run the check that `put` runs on a real merge. Read the content with the reused reader. Hash the bytes. Refuse a hash that differs from `id`.
 ///
 /// # Errors
 ///
-/// Returns an error if the chunk cannot be read, is short of `len` bytes, or
-/// does not hash to `id`.
-async fn check_chunk(pack: &Pack, id: &BlobId, len: u64) -> io::Result<()> {
-    use tokio::io::AsyncReadExt as _;
-
-    let mut reader = pack.get(id).await?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; SCRATCH];
-
-    let mut left = len;
-    while left > 0 {
-        let want = usize::try_from(left.min(u64::try_from(SCRATCH).unwrap_or(u64::MAX)))
-            .unwrap_or(SCRATCH);
-        let read = reader.read(&mut buffer[..want]).await?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "refusing to merge: {} ends {left} bytes early in chunk {id}",
-                    pack.path().display()
-                ),
-            ));
-        }
-
-        hasher.update(&buffer[..read]);
-        left -= u64::try_from(read).unwrap_or(u64::MAX);
+/// Returns an error if the pack misses the chunk. Returns an error if the content ends before `len` bytes. Returns an error if the bytes do not hash to `id`.
+async fn check_chunk_with(
+    reader: &mut PackReader<'_>,
+    pack: &Pack,
+    id: &BlobId,
+    len: u64,
+) -> io::Result<()> {
+    let bytes = reader.read_content(id).await?;
+    let have = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if have < len {
+        let left = len.saturating_sub(have);
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "refusing to merge: {} ends {left} bytes early in chunk {id}",
+                pack.path().display()
+            ),
+        ));
     }
-
-    if hasher.finalize() != *id {
+    if blake3::hash(&bytes) != *id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -1028,6 +1021,5 @@ async fn check_chunk(pack: &Pack, id: &BlobId, len: u64) -> io::Result<()> {
             ),
         ));
     }
-
     Ok(())
 }
