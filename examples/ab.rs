@@ -429,12 +429,8 @@ fn cpu_seconds() -> f64 {
 /// Building before a runtime exists is also simply the honest order: fixture
 /// first, then measure.
 fn main() {
-    let tmp = std::env::temp_dir().join("blu-ab");
-    let stores = std::env::temp_dir().join("blu-ab-stores");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _ = std::fs::remove_dir_all(&stores);
-    std::fs::create_dir_all(&tmp).expect("mkdir");
-    std::fs::create_dir_all(&stores).expect("mkdir");
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let stores = tempfile::TempDir::new().expect("tempdir");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().cloned().unwrap_or_default();
@@ -445,24 +441,28 @@ fn main() {
     // doing.
     match command.as_str() {
         "compare" => {
-            build(&tmp, 0);
-            build(&tmp, FILE_BYTES / 2);
+            build(tmp.path(), 0);
+            build(tmp.path(), FILE_BYTES / 2);
         }
         "report" => {
-            build(&tmp, 0);
+            build(tmp.path(), 0);
         }
         "gen" => {
             // Build the trees and leave them, so the in-process harness can be
             // cross-checked against the real binary on the same bytes.
             // Worth having: the two disagreeing is how the broken generator was
             // found, and neither one alone would have shown it.
-            let out = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| tmp.to_string_lossy().into_owned());
-            let out = std::path::PathBuf::from(out);
-            let _ = std::fs::remove_dir_all(&out);
-            std::fs::create_dir_all(&out).expect("mkdir");
+            if let Some(out_arg) = args.get(1) {
+                let out = std::path::PathBuf::from(out_arg);
+                let _ = std::fs::remove_dir_all(&out);
+                std::fs::create_dir_all(&out).expect("mkdir");
+                let unique = build(&out, 0);
+                let shared = build(&out, FILE_BYTES / 2);
+                println!("{}", unique.display());
+                println!("{}", shared.display());
+                return;
+            }
+            let out = tmp.keep();
             let unique = build(&out, 0);
             let shared = build(&out, FILE_BYTES / 2);
             println!("{}", unique.display());
@@ -482,7 +482,7 @@ fn main() {
 
     runtime.block_on(async {
         if command == "compare" {
-            compare(&tmp, &stores).await;
+            compare(tmp.path(), stores.path()).await;
         } else {
             let label = args.get(1).cloned().unwrap_or_else(|| "run".to_owned());
             let rounds = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(ROUNDS);
@@ -490,10 +490,13 @@ fn main() {
             // tree that shares nothing.
             // `report` exists to compare two builds, so it should compare them
             // where the difference shows.
-            report(&stores, &tmp.join("src-unique"), &label, rounds).await;
+            report(
+                stores.path(),
+                &tmp.path().join("src-unique"),
+                &label,
+                rounds,
+            )
+            .await;
         }
     });
-
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _ = std::fs::remove_dir_all(&stores);
 }

@@ -2260,16 +2260,13 @@ async fn run_restore_remote(
         "packing a version to restore from"
     );
 
-    let pack_path = std::env::temp_dir().join(format!(
-        "blu-pull-{}-{}.pack",
-        std::process::id(),
-        &summary.snapshot.to_hex().to_string()[..16]
-    ));
+    let work = tempfile::TempDir::new()?;
+    let pack_path = work.path().join("pull.pack");
 
     // Everything from here on owns that file. Whether the run succeeded or
     // failed, it goes: a pack nobody named is not something to leave in a user's
     // directory, and a run that failed half-way has already said so.
-    let restored = pull_and_apply(
+    pull_and_apply(
         &remote,
         set,
         destination,
@@ -2280,17 +2277,7 @@ async fn run_restore_remote(
         dry_run,
         files,
     )
-    .await;
-
-    if let Err(e) = std::fs::remove_file(&pack_path) {
-        tracing::debug!(
-            pack = %pack_path.display(),
-            error = %e,
-            "could not remove the pack this pull assembled"
-        );
-    }
-
-    restored
+    .await
 }
 
 /// Fetch the pack a remote restore needs, apply it, and report.
@@ -3326,15 +3313,6 @@ async fn run_backup_stored(
     Ok(())
 }
 
-/// Counter keeping temporary work directories apart within one process.
-static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A scratch directory for one pure-remote run, removed afterwards.
-fn temp_work_dir(prefix: &str) -> std::path::PathBuf {
-    let n = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("blu-{prefix}-{}-{n}", std::process::id()))
-}
-
 /// Back up into a `blu serve` set, holding no local copy.
 ///
 /// Backs the tree up into temporary staging with exactly the code a local
@@ -3356,12 +3334,11 @@ async fn run_backup_serve(
     token: Option<&str>,
 ) -> std::io::Result<()> {
     let push = Push::open(address, set, token)?;
-    let work = temp_work_dir("backup");
-    std::fs::create_dir_all(&work)?;
-    let staging = work.join(set);
-    let pack_path = work.join("push.pack");
+    let work = tempfile::TempDir::new()?;
+    let staging = work.path().join(set);
+    let pack_path = work.path().join("push.pack");
 
-    let result = async {
+    async {
         let outcome = run_backup(
             source,
             &staging,
@@ -3405,11 +3382,7 @@ async fn run_backup_serve(
         .await?;
         push.pack(&pack_path, KeepOrLevel::Keep).await
     }
-    .await;
-
-    let _ = std::fs::remove_dir_all(&work);
-
-    result
+    .await
 }
 
 /// Restore from a keyed store through staging.

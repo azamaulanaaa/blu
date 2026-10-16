@@ -300,6 +300,11 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-native-certs = { version = "0.8" }
+# Temporary files and directories (`src/pack.rs`, `src/storage`, `src/main.rs`).
+#
+# `TempDir` holds staging and pull work. `NamedTempFile` holds atomic writes.
+# MIT OR Apache-2.0, both allowed by `deny.toml`.
+tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
 # SFTP backend for unix builds only.
@@ -346,7 +351,6 @@ experimental = []
 # it in parallel would only measure the sampler. Add the features back if the
 # plots are ever wanted.
 criterion = { version = "0.7", default-features = false }
-tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 # Extended attributes in fidelity tests (`tests/fidelity.rs`).

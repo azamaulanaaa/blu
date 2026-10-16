@@ -13,7 +13,6 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
@@ -537,24 +536,43 @@ fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         super::at(parent, "create", fs::create_dir_all(parent))?;
     }
-
-    let mut sibling = path
-        .file_name()
-        .map_or_else(OsString::new, OsStr::to_os_string);
-    sibling.push(".tmp");
-    let temporary = path.with_file_name(sibling);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not create temporary in {}: {e}", dir.display()),
+        )
+    })?;
 
     {
-        let mut file = super::at(&temporary, "create", fs::File::create(&temporary))?;
-        super::at(
-            &temporary,
-            "write",
-            std::io::Write::write_all(&mut file, data),
-        )?;
-        super::at(&temporary, "sync", file.sync_all())?;
+        use std::io::Write as _;
+        tmp.write_all(data).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not write {}: {e}", tmp.path().display()),
+            )
+        })?;
+        tmp.as_file().sync_all().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not sync {}: {e}", tmp.path().display()),
+            )
+        })?;
     }
 
-    super::at(path, "rename into place", fs::rename(&temporary, path))?;
+    tmp.persist(path).map_err(|e| {
+        io::Error::new(
+            e.error.kind(),
+            format!(
+                "could not rename temporary into {}: {}",
+                path.display(),
+                e.error
+            ),
+        )
+    })?;
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let dir = super::at(parent, "open to sync it", fs::File::open(parent))?;
@@ -572,18 +590,22 @@ fn copy_file(from: &Path, to: &Path) -> io::Result<u64> {
     if let Some(parent) = to.parent().filter(|p| !p.as_os_str().is_empty()) {
         super::at(parent, "create", fs::create_dir_all(parent))?;
     }
-
-    let mut sibling = to
-        .file_name()
-        .map_or_else(OsString::new, OsStr::to_os_string);
-    sibling.push(".tmp");
-    let temporary = to.with_file_name(sibling);
+    let dir = to
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not create temporary in {}: {e}", dir.display()),
+        )
+    })?;
+    let tmp_path = tmp.path().to_path_buf();
 
     let count = {
         let source = super::at(from, "open", fs::File::open(from))?;
         let mut source = std::io::BufReader::with_capacity(COPY_BUFFER, source);
-        let dest = super::at(&temporary, "create", fs::File::create(&temporary))?;
-        let mut dest = std::io::BufWriter::with_capacity(COPY_BUFFER, dest);
+        let mut dest = std::io::BufWriter::with_capacity(COPY_BUFFER, &mut tmp);
         let count = super::at(
             from,
             "copy",
@@ -593,34 +615,36 @@ fn copy_file(from: &Path, to: &Path) -> io::Result<u64> {
                     format!(
                         "could not copy {} to {}: {e}",
                         from.display(),
-                        temporary.display()
+                        tmp_path.display()
                     ),
                 )
             }),
         )?;
         super::at(
-            &temporary,
+            &tmp_path,
             "flush",
             std::io::Write::flush(&mut dest).map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!("could not flush {}: {e}", temporary.display()),
+                    format!("could not flush {}: {e}", tmp_path.display()),
                 )
             }),
         )?;
-        super::at(
-            &temporary,
-            "sync",
-            dest.into_inner()
-                .map_err(|e| {
-                    io::Error::other(format!("could not flush {}: {e}", temporary.display()))
-                })?
-                .sync_all(),
-        )?;
+        drop(dest);
+        super::at(&tmp_path, "sync", tmp.as_file().sync_all())?;
         count
     };
 
-    super::at(to, "rename into place", fs::rename(&temporary, to))?;
+    tmp.persist(to).map_err(|e| {
+        io::Error::new(
+            e.error.kind(),
+            format!(
+                "could not rename temporary into {}: {}",
+                to.display(),
+                e.error
+            ),
+        )
+    })?;
 
     if let Some(parent) = to.parent().filter(|p| !p.as_os_str().is_empty()) {
         let dir = super::at(parent, "open to sync it", fs::File::open(parent))?;
@@ -635,25 +659,23 @@ mod tests {
     use super::{LocalDirStore, MemoryStore, ObjectStore};
     use std::io::ErrorKind;
 
-    /// Unique scratch directory for one test, under the system temp dir.
+    /// Build a scratch directory for one test.
     ///
-    /// Small fixtures only. Each test removes its own directory on the way
-    /// out, so a failed run leaves nothing behind.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "blu-object-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ))
+    /// The system temp dir holds it.
+    /// The test removes it on exit.
+    /// Small fixtures only.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     /// Both backends answer listing, measuring, and bounded reads the same
     /// way. A few hundred bytes move. Nothing touches a real set.
     #[test]
     fn backends_agree_on_small_objects() {
+        let tmp = scratch();
         for backend in [
             Box::new(MemoryStore::new()) as Box<dyn ObjectStore>,
-            Box::new(LocalDirStore::new(scratch("agree"))) as Box<dyn ObjectStore>,
+            Box::new(LocalDirStore::new(tmp.path())) as Box<dyn ObjectStore>,
         ] {
             assert_eq!(backend.keys().unwrap(), Vec::<String>::new());
             assert_eq!(backend.stat("a.bin").unwrap(), None);
@@ -673,15 +695,14 @@ mod tests {
             backend.write_bytes("a.bin", b"longer bytes").unwrap();
             assert_eq!(backend.stat("a.bin").unwrap(), Some(12));
         }
-
-        std::fs::remove_dir_all(scratch("agree")).ok();
     }
 
     /// A key is a file name, never a path. Both backends refuse the same
     /// escapes. No filesystem assertions beyond the refusal.
     #[test]
     fn keys_cannot_escape_the_store() {
-        let local = LocalDirStore::new(scratch("escape"));
+        let tmp = scratch();
+        let local = LocalDirStore::new(tmp.path());
         for key in ["", ".", "..", "a/b", "a\\b", "../x"] {
             assert!(local.stat(key).is_err(), "{key:?} must be refused");
             assert!(
@@ -689,15 +710,14 @@ mod tests {
                 "{key:?} must be refused"
             );
         }
-
-        std::fs::remove_dir_all(scratch("escape")).ok();
     }
 
     /// Large files stream both ways without holding the whole object. The
     /// fixture is one megabyte, the largest thing this file moves.
     #[test]
     fn files_stream_in_and_out() {
-        let dir = scratch("stream");
+        let tmp = scratch();
+        let dir = tmp.path();
         let source = dir.join("source.bin");
         let dest = dir.join("nested").join("dest.bin");
         let bytes = vec![0xabu8; 1024 * 1024];
@@ -719,7 +739,5 @@ mod tests {
         let read = local.export_file("seg.bin", &second).unwrap();
         assert_eq!(read, bytes.len() as u64);
         assert_eq!(std::fs::read(&second).unwrap(), bytes);
-
-        std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -418,17 +418,19 @@ impl AsyncObjectStore for Operator {
                 )
             })?;
         }
-        let mut sibling = path
-            .file_name()
-            .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string);
-        sibling.push(".tmp");
-        let temporary = path.with_file_name(sibling);
-        let mut dest = tokio::fs::File::create(&temporary).await.map_err(|e| {
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("could not create {}: {e}", temporary.display()),
+                format!("could not create temporary in {}: {e}", dir.display()),
             )
         })?;
+        let tmp_path = tmp.path().to_path_buf();
+        let (file, temp_path) = tmp.into_parts();
+        let mut dest = tokio::fs::File::from_std(file);
 
         let mut written = 0u64;
         let mut offset = 0u64;
@@ -445,7 +447,7 @@ impl AsyncObjectStore for Operator {
             dest.write_all(&chunk).await.map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!("could not write {}: {e}", temporary.display()),
+                    format!("could not write {}: {e}", tmp_path.display()),
                 )
             })?;
             offset = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
@@ -454,14 +456,18 @@ impl AsyncObjectStore for Operator {
         dest.sync_all().await.map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("could not sync {}: {e}", temporary.display()),
+                format!("could not sync {}: {e}", tmp_path.display()),
             )
         })?;
         drop(dest);
-        tokio::fs::rename(&temporary, path).await.map_err(|e| {
+        temp_path.persist(path).map_err(|e| {
             io::Error::new(
-                e.kind(),
-                format!("could not rename {} into place: {e}", temporary.display()),
+                e.error.kind(),
+                format!(
+                    "could not rename temporary into {}: {}",
+                    path.display(),
+                    e.error
+                ),
             )
         })?;
         Ok(written)
@@ -485,17 +491,14 @@ mod tests {
     use super::{connect, memory, s3_config_for};
     use crate::storage::{MirrorStats, RemoteUrl, pull_from_remote_async, push_to_remote_async};
 
-    /// Build a scratch base for one test.
+    /// Build a scratch directory for one test.
     ///
-    /// The base lives under the system temp dir.
-    /// It holds a staging set, never a real one.
-    /// Each test removes its own directory on exit.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "blu-operator-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ))
+    /// The system temp dir holds it.
+    /// The test removes it on exit.
+    /// It holds a staging set.
+    /// It never holds a real one.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     /// Build a current-thread runtime for async backends.
@@ -536,8 +539,9 @@ mod tests {
         use crate::layout::IndexSet;
 
         runtime().block_on(async {
-            let dir = scratch("round-trip");
-            stage(&dir);
+            let tmp = scratch();
+            let dir = tmp.path();
+            stage(dir);
             let set = IndexSet::new(dir.join("photos"));
             let remote = memory().unwrap();
 
@@ -559,8 +563,6 @@ mod tests {
                 std::fs::read(fresh.segment_path(0)).unwrap(),
                 b"segment-zero"
             );
-
-            std::fs::remove_dir_all(dir).ok();
         });
     }
 

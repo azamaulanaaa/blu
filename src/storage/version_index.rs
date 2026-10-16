@@ -28,11 +28,7 @@
 //! the wrong segment gets a snapshot whose bytes do not hash to what the index
 //! claimed. The resolve says so instead of returning it.
 
-use std::{
-    fs,
-    io::{self, Write},
-    path::Path,
-};
+use std::{fs, io, path::Path};
 
 use crate::{metadata::Timestamp, storage::BlobId};
 
@@ -164,15 +160,43 @@ impl VersionIndex {
     /// Returns an error if the file cannot be written, renamed, or the directory
     /// synced.
     pub fn write_atomic(&self, path: &Path) -> io::Result<()> {
-        let temporary = temporary_for(path);
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not create temporary in {}: {e}", dir.display()),
+            )
+        })?;
 
         {
-            let mut file = super::at(&temporary, "create", fs::File::create(&temporary))?;
-            file.write_all(&self.to_bytes())?;
-            file.sync_all()?;
+            use std::io::Write as _;
+            tmp.write_all(&self.to_bytes()).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("could not write {}: {e}", tmp.path().display()),
+                )
+            })?;
+            tmp.as_file().sync_all().map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("could not sync {}: {e}", tmp.path().display()),
+                )
+            })?;
         }
 
-        super::at(path, "rename into place", fs::rename(&temporary, path))?;
+        tmp.persist(path).map_err(|e| {
+            io::Error::new(
+                e.error.kind(),
+                format!(
+                    "could not rename temporary into {}: {}",
+                    path.display(),
+                    e.error
+                ),
+            )
+        })?;
 
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             super::at(parent, "open to sync it", fs::File::open(parent))?.sync_all()?;
@@ -232,22 +256,6 @@ impl TryFrom<&[u8]> for VersionIndex {
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
         Self::parse(bytes)
     }
-}
-
-/// A sibling path to write an index to first, before renaming it.
-///
-/// In the same directory, because `rename` is only atomic within one filesystem.
-#[must_use]
-fn temporary_for(path: &Path) -> std::path::PathBuf {
-    let mut name = path
-        .file_name()
-        .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string);
-
-    // A fixed suffix rather than a pid or a counter: two runs cannot be writing
-    // the same set at once, because the lock says so.
-    name.push(".tmp");
-
-    path.with_file_name(name)
 }
 
 #[cfg(test)]

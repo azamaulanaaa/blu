@@ -574,11 +574,10 @@ impl Pack {
         })?;
         let snapshot_id = blake3::hash(&snapshot_bytes);
 
-        let temporary = temporary_for(path);
-        // Removed however this function leaves. A temporary beside a
+        // Removed on drop unless persisted below. A temporary beside a
         // finished pack is a file with no meaning, and one beside a failed run is
         // the same file.
-        let mut unfinished = Temporary(Some(temporary.clone()));
+        let (mut file, temp_path, tmp_path) = temp_file_in(path)?;
 
         let planned_count = u64::try_from(plan.len()).unwrap_or(0);
         let planned_bytes = planned_payload_len(plan);
@@ -599,9 +598,12 @@ impl Pack {
         });
         let payload_start = u64::try_from(header.len()).unwrap_or(u64::MAX);
 
-        let mut file =
-            crate::storage::at_async(&temporary, "create", tfs::File::create(&temporary)).await?;
-        file.write_all(&header).await?;
+        file.write_all(&header).await.map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not write {}: {e}", tmp_path.display()),
+            )
+        })?;
 
         let planned_chunks = plan.chunks();
         let mut start = 0usize;
@@ -644,16 +646,34 @@ impl Pack {
             u64::try_from(snapshot_bytes.len()).unwrap_or(0),
         ))
         .await?;
-        file.write_all(&MAGIC).await?;
-        file.sync_all().await?;
+        file.write_all(&MAGIC).await.map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not write {}: {e}", tmp_path.display()),
+            )
+        })?;
+        file.sync_all().await.map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not sync {}: {e}", tmp_path.display()),
+            )
+        })?;
         drop(file);
 
         // Into place only once it is whole, so a run that fails part-way
         // leaves the pack that was already at this path alone. It does not replace
         // that pack with a file that cannot be opened. `blu pack` overwrites,
         // so the path is usually one a previous run wrote and somebody wants back.
-        crate::storage::at_async(path, "rename into place", tfs::rename(&temporary, path)).await?;
-        unfinished.disarm();
+        temp_path.persist(path).map_err(|e| {
+            io::Error::new(
+                e.error.kind(),
+                format!(
+                    "could not rename temporary into {}: {}",
+                    path.display(),
+                    e.error
+                ),
+            )
+        })?;
 
         // Sorted by hash for everything that is not the file. The index on
         // disk keeps payload order, because that is the order the records were
@@ -1375,40 +1395,26 @@ async fn write_fetched(
     ))
 }
 
-/// A sibling path to write a pack to first, before renaming it.
+/// Build a temporary pack file beside `path`.
 ///
-/// In the same directory, because `rename` is only atomic within one filesystem.
-///
-/// A fixed suffix rather than a pid or a counter.
-fn temporary_for(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map_or_else(std::ffi::OsString::new, std::ffi::OsStr::to_os_string);
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
-/// The temporary a pack is written to, removed unless it was renamed into place.
-///
-/// The lock file makes the same trade for the same reason. However the run ends,
-/// the temporary does not outlive it. This is a `Drop` rather than a cleanup at
-/// each exit. The exits are one rename that may fail and a dozen errors. Those
-/// errors may come from anywhere in between.
-struct Temporary(Option<PathBuf>);
-
-impl Temporary {
-    /// The run has renamed this into place, so there is nothing left to remove.
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for Temporary {
-    fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
+/// Use the same directory, because `rename` stays atomic in one filesystem.
+/// The file disappears on drop unless the call persists it.
+/// A temporary beside a finished pack has no meaning.
+/// A temporary beside a failed run is the same file.
+fn temp_file_in(path: &Path) -> io::Result<(tfs::File, tempfile::TempPath, PathBuf)> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("could not create temporary in {}: {e}", dir.display()),
+        )
+    })?;
+    let tmp_path = tmp.path().to_path_buf();
+    let (file, temp_path) = tmp.into_parts();
+    Ok((tfs::File::from_std(file), temp_path, tmp_path))
 }
 
 /// How a codec is named in a message about two of them disagreeing.
