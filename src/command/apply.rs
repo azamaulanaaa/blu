@@ -71,7 +71,7 @@ use tracing::instrument;
 
 use crate::{
     metadata,
-    pack::Pack,
+    pack::{Pack, PackReader},
     progress::{Counter, Phase, Progress},
     storage::{BlobId, StorageGet},
 };
@@ -776,12 +776,9 @@ fn establish_base<'a>(
 /// A chunk the pack has damaged at one end is not trustworthy at either.
 async fn verify_delta(probed: &Probed, pack: &Pack) -> io::Result<()> {
     let needed: HashSet<BlobId> = probed.mismatched.iter().map(|m| m.expected).collect();
-
+    let mut reader = PackReader::open(pack).await?;
     for id in &needed {
-        let mut reader = pack.get(id).await?;
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await?;
-
+        let buffer = reader.read_content(id).await?;
         if blake3::hash(&buffer) != *id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

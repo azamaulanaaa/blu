@@ -225,6 +225,10 @@ pub struct BlobStore<W: WriteMode, C: Compressor = Compression> {
     /// Not persisted: a run that wrote nothing has nothing to sync, and one that
     /// did has synced by the time it commits.
     dirty: Mutex<Vec<u32>>,
+    /// Reuse open segment files when reading stored payloads.
+    ///
+    /// Hold one file for each segment touched so far. Avoid opening the same file for each chunk.
+    open_files: tokio::sync::Mutex<HashMap<u32, fs::File>>,
     /// The mode, which selects the methods and so appears in no field.
     ///
     /// A `const WRITE: bool` parameter needs no such field. That is the one thing
@@ -328,6 +332,54 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
                     format!("this store does not hold a blob hashing to {id}"),
                 )
             })
+    }
+
+    /// Read the stored payload of a blob.
+    ///
+    /// Reuse one open file per segment. Check the range against the file length. Return the payload bytes with the codec and the content length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store misses the blob. Returns an error if the range overflows. Returns an error if the segment ends before the range. Returns an error if reading the payload fails.
+    pub(crate) async fn read_stored_bytes(&self, id: &BlobId) -> io::Result<(Vec<u8>, Codec, u64)> {
+        let placement = self.locate(id)?;
+        let path = self.segment_path(placement.segment);
+        let mut files = self.open_files.lock().await;
+        let file = if let Some(file) = files.get_mut(&placement.segment) {
+            file
+        } else {
+            let opened = crate::storage::at_async(&path, "open", fs::File::open(&path)).await?;
+            files.insert(placement.segment, opened);
+            files
+                .get_mut(&placement.segment)
+                .ok_or_else(|| io::Error::other("the open file cache misses its own entry"))?
+        };
+        let len = file.metadata().await?.len();
+        let end = placement
+            .offset
+            .checked_add(placement.stored_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "a blob's range overflows")
+            })?;
+        if end > len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "blob at {} in segment {} needs bytes {}..{end} but that segment is \
+                     only {len} bytes long",
+                    path.display(),
+                    placement.segment,
+                    placement.offset
+                ),
+            ));
+        }
+        file.seek(SeekFrom::Start(placement.offset)).await?;
+        let mut bytes = crate::storage::zeroed(
+            placement.stored_len,
+            &format!("chunk {id} as {} stores it", path.display()),
+        )?;
+        file.read_exact(&mut bytes).await?;
+        Ok((bytes, placement.codec, placement.raw_len))
     }
 
     /// The snapshot a version names, taken from the per-version index file when
@@ -632,6 +684,7 @@ impl<C: Compressor> StoreBuilder<C> {
             limit: self.limit,
             compression: self.compression,
             dirty: Mutex::new(Vec::new()),
+            open_files: tokio::sync::Mutex::new(HashMap::new()),
             mode: PhantomData,
         })
     }
@@ -677,6 +730,7 @@ impl<C: Compressor> StoreBuilder<C> {
             limit: SegmentLimit::default(),
             compression: Compression::default(),
             dirty: Mutex::new(Vec::new()),
+            open_files: tokio::sync::Mutex::new(HashMap::new()),
             mode: PhantomData,
         })
     }

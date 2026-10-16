@@ -1296,16 +1296,29 @@ fn whole_pack_refusal(length: u64) -> Option<ApiError> {
 /// allocator, so the one allocation this endpoint can make is one whose size an
 /// operator chose. See [`whole_pack_refusal`].
 fn read_range(resolved: &Resolved, range: crate::pack::Range) -> std::io::Result<Vec<u8>> {
+    use std::collections::HashMap;
+
     let sources = resolved.source(range)?;
 
     let total = range.len();
     let mut out = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
+    let mut files: HashMap<std::path::PathBuf, std::fs::File> = HashMap::new();
 
     for source in sources {
         match source {
             crate::pack::Source::Bytes(bytes) => out.extend_from_slice(&bytes),
             crate::pack::Source::Segment { path, offset, len } => {
-                let mut file = std::fs::File::open(&path)?;
+                // Reuse one open file per segment path for the life of this range.
+                // A range that spans many records in one segment opens that file once.
+                let file = if let Some(file) = files.get_mut(path.as_path()) {
+                    file
+                } else {
+                    let opened = std::fs::File::open(&path)?;
+                    files.insert(path.clone(), opened);
+                    files.get_mut(path.as_path()).ok_or_else(|| {
+                        std::io::Error::other("the open file cache misses its own entry")
+                    })?
+                };
                 file.seek(SeekFrom::Start(offset))?;
 
                 let start = out.len();

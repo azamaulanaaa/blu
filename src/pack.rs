@@ -323,42 +323,11 @@ where
     /// a blob handed out now has to be the blob that was indexed.
     #[instrument(skip_all, err)]
     async fn stored(&self, id: &BlobId) -> io::Result<Stored> {
-        let placement = self.locate(id)?;
-        let path = self.segment_path(placement.segment);
-
-        let mut file = crate::storage::at_async(&path, "open", tfs::File::open(&path)).await?;
-        let len = file.metadata().await?.len();
-        let end = placement
-            .offset
-            .checked_add(placement.stored_len)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "a blob's range overflows")
-            })?;
-
-        if end > len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "blob at {} in segment {} needs bytes {}..{end} but that segment is \
-                     only {len} bytes long",
-                    path.display(),
-                    placement.segment,
-                    placement.offset
-                ),
-            ));
-        }
-
-        file.seek(io::SeekFrom::Start(placement.offset)).await?;
-        let mut bytes = crate::storage::zeroed(
-            placement.stored_len,
-            &format!("chunk {id} as {} stores it", path.display()),
-        )?;
-        file.read_exact(&mut bytes).await?;
-
+        let (bytes, codec, raw_len) = self.read_stored_bytes(id).await?;
         Ok(Stored {
             bytes,
-            codec: placement.codec,
-            raw_len: placement.raw_len,
+            codec,
+            raw_len,
         })
     }
 }
@@ -1807,6 +1776,160 @@ struct Opened {
     start: u64,
 }
 
+/// Read many pack records with one open file.
+///
+/// Open the pack once. Reuse the file for each read. Use this for a sequential pass over many chunks. Prefer this to opening the file for each chunk.
+#[derive(Debug)]
+pub struct PackReader<'a> {
+    pack: &'a Pack,
+    file: tfs::File,
+}
+
+impl<'a> PackReader<'a> {
+    /// Return a reader that reuses one file handle.
+    ///
+    /// Keep one file handle for the life of the reader. Reuse that file for each read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if opening the file fails.
+    pub async fn open(pack: &'a Pack) -> io::Result<Self> {
+        let file =
+            crate::storage::at_async(pack.path(), "open", tfs::File::open(pack.path())).await?;
+        Ok(Self { pack, file })
+    }
+
+    /// Read the stored form of a chunk.
+    ///
+    /// Reuse the open file. Check the header against the index. Return the payload as the store holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pack misses the chunk. Returns an error if the header fails to decode. Returns an error if the header disagrees with the index. Returns an error if reading the payload fails.
+    pub async fn read_stored(&mut self, id: &BlobId) -> io::Result<Stored> {
+        let (located, span, start) = self.pack.record_bounds(id)?;
+        let header =
+            read_header_at(&mut self.file, self.pack.path(), id, located, span, start).await?;
+        self.file
+            .seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
+            .await?;
+        let mut bytes = crate::storage::zeroed(
+            header.stored_len,
+            &format!("chunk {id} as {} stores it", self.pack.path().display()),
+        )?;
+        self.file.read_exact(&mut bytes).await?;
+        Ok(Stored {
+            bytes,
+            codec: header.codec,
+            raw_len: header.raw_len,
+        })
+    }
+
+    /// Read the content of a chunk.
+    ///
+    /// Reuse the open file. Check the header against the index. Decode the frame where the record holds one. Return the content bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pack misses the chunk. Returns an error if the header fails to decode. Returns an error if the header disagrees with the index. Returns an error if the frame fails to decode. Returns an error if reading the payload fails.
+    pub async fn read_content(&mut self, id: &BlobId) -> io::Result<Vec<u8>> {
+        let (located, span, start) = self.pack.record_bounds(id)?;
+        let header =
+            read_header_at(&mut self.file, self.pack.path(), id, located, span, start).await?;
+        self.file
+            .seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
+            .await?;
+        match header.codec {
+            Codec::Raw => {
+                let mut bytes =
+                    crate::storage::zeroed(header.raw_len, &format!("the content of chunk {id}"))?;
+                self.file.read_exact(&mut bytes).await?;
+                Ok(bytes)
+            }
+            Codec::Zstd => {
+                let mut frame = crate::storage::zeroed(
+                    header.stored_len,
+                    &format!("the compressed frame of chunk {id}"),
+                )?;
+                self.file.read_exact(&mut frame).await?;
+                Decompressor::decompress(&Zstd, frame, header.raw_len).await
+            }
+        }
+    }
+}
+
+/// Return the checked header of the record at `start`.
+///
+/// Seek to the record. Read the header bytes. Decode the header. Check the header against the index. Return the header.
+async fn read_header_at(
+    file: &mut tfs::File,
+    path: &Path,
+    id: &BlobId,
+    located: &Located,
+    span: u64,
+    start: u64,
+) -> io::Result<crate::storage::RecordHeader> {
+    file.seek(io::SeekFrom::Start(start)).await?;
+    let head_len = span.min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
+    let mut head = crate::storage::zeroed(
+        head_len,
+        &format!("the record header of chunk {id} in {}", path.display()),
+    )?;
+    file.read_exact(&mut head).await?;
+    let Some(header) = crate::storage::decode_header(&head, 0) else {
+        return Err(not_a_pack(
+            path,
+            &format!(
+                "the record it holds for chunk {id} does not begin with a record header: \
+                 the {head_len} bytes the index leaves for it hold no header — its magic, \
+                 kind and codec are not there, or its own check does not verify",
+            ),
+        ));
+    };
+    check_record(path, id, &header, located, span)?;
+    Ok(header)
+}
+
+/// Check a decoded header against the index entry.
+///
+/// Compare the record length against the room. Compare the content length against the index. Bound the content claim. Return the header when all checks pass.
+fn check_record(
+    path: &Path,
+    id: &BlobId,
+    header: &crate::storage::RecordHeader,
+    located: &Located,
+    span: u64,
+) -> io::Result<()> {
+    let total = header.total_len.saturating_add(header.stored_len);
+    if header.kind != RecordKind::Blob
+        || BlobId::from_bytes(header.hash) != *id
+        || total > span
+        || header.raw_len != located.content_len
+        || (header.codec == Codec::Raw && header.stored_len != header.raw_len)
+    {
+        return Err(not_a_pack(
+            path,
+            &format!(
+                "the record it holds for chunk {id} is not the one its index names: it \
+                 claims {total} bytes where the index gives it {span}, and {} bytes of \
+                 content where the index says {}, stored as {:?}",
+                header.raw_len, located.content_len, header.codec,
+            ),
+        ));
+    }
+    if header.raw_len > MAX_CHUNK {
+        return Err(not_a_pack(
+            path,
+            &format!(
+                "chunk {id} claims {} bytes of content, which is more than the largest \
+                 chunk this crate's chunker produces ({MAX_CHUNK})",
+                header.raw_len
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// A pack read as the store a merge writes from, so both halves read the same way.
 ///
 /// [`StorageGet`] is [`StorageStored`] plus the decode. One record is opened and
@@ -1887,6 +2010,23 @@ impl Pack {
     /// does not agree with the index. It returns an error if the file
     /// cannot be opened, seeked or read.
     async fn open_record(&self, id: &BlobId) -> io::Result<Opened> {
+        let (located, span, start) = self.record_bounds(id)?;
+        let mut file =
+            crate::storage::at_async(self.path(), "open", tfs::File::open(self.path())).await?;
+        let header = read_header_at(&mut file, self.path(), id, located, span, start).await?;
+        Ok(Opened {
+            file,
+            header,
+            start,
+        })
+    }
+
+    /// Return the bounds of the record for `id`.
+    ///
+    /// Returns the index entry and the room the index gives the record and the
+    /// file offset where the record starts. Refuses a chunk the pack does not
+    /// hold.
+    fn record_bounds(&self, id: &BlobId) -> io::Result<(&Located, u64, u64)> {
         let at = self.position(id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1895,80 +2035,8 @@ impl Pack {
         })?;
         let located = &self.chunks[at];
         let span = self.record_span(located.offset);
-
-        let mut file =
-            crate::storage::at_async(self.path(), "open", tfs::File::open(self.path())).await?;
-
-        // Saturating for the same reason `needed` saturates. These are two numbers
-        // out of an index, and `open` checked they add up, but the sum is still
-        // arithmetic on a claim.
         let start = self.payload_start.saturating_add(located.offset);
-        file.seek(io::SeekFrom::Start(start)).await?;
-
-        // The header is variable width, so it is read rather than stepped over, and
-        // bounded by the record's own span. A header that did not fit inside the
-        // span the index gives the record is not this record's header, and reading
-        // on would pull in the next chunk's bytes.
-        let head_len = span.min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
-        let mut head = crate::storage::zeroed(
-            head_len,
-            &format!(
-                "the record header of chunk {id} in {}",
-                self.path().display()
-            ),
-        )?;
-        file.read_exact(&mut head).await?;
-
-        let Some(header) = crate::storage::decode_header(&head, 0) else {
-            return Err(not_a_pack(
-                self.path(),
-                &format!(
-                    "the record it holds for chunk {id} does not begin with a record header: \
-                     the {head_len} bytes the index leaves for it hold no header — its magic, \
-                     kind and codec are not there, or its own check does not verify",
-                ),
-            ));
-        };
-
-        let total = header.total_len.saturating_add(header.stored_len);
-        if header.kind != RecordKind::Blob
-            || BlobId::from_bytes(header.hash) != *id
-            || total > span
-            || header.raw_len != located.content_len
-            || (header.codec == Codec::Raw && header.stored_len != header.raw_len)
-        {
-            return Err(not_a_pack(
-                self.path(),
-                &format!(
-                    "the record it holds for chunk {id} is not the one its index names: it \
-                     claims {total} bytes where the index gives it {span}, and {} bytes of \
-                     content where the index says {}, stored as {:?}",
-                    header.raw_len, located.content_len, header.codec,
-                ),
-            ));
-        }
-
-        // The content claim is bounded before it is believed, and before anything
-        // reserves it. A frame declaring more content than the chunker can ever
-        // produce would have the decode allocate that much before finding out.
-        // The index bounds the claim only as far as the index is honest, and the
-        // index is as downloaded as the header is.
-        if header.raw_len > MAX_CHUNK {
-            return Err(not_a_pack(
-                self.path(),
-                &format!(
-                    "chunk {id} claims {} bytes of content, which is more than the largest \
-                     chunk this crate's chunker produces ({MAX_CHUNK})",
-                    header.raw_len
-                ),
-            ));
-        }
-
-        Ok(Opened {
-            file,
-            header,
-            start,
-        })
+        Ok((located, span, start))
     }
 }
 
