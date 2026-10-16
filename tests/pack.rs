@@ -3846,3 +3846,38 @@ async fn a_pack_with_the_same_tree_as_the_tip_merges_nothing() {
         "a same-tree merge wrote to the set"
     );
 }
+
+/// Blocking hash matches sync hash.
+///
+/// It writes random bytes to a temp file. It hashes the file twice. It compares both digests. Both digests match.
+#[tokio::test]
+async fn blocking_hash_matches_sync_hash_for_large_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("large.bin");
+    let bytes = common::noisy(4 * 1024 * 1024);
+    fs::write(&path, &bytes).unwrap();
+
+    let via_task = hash_file(&path).await.unwrap();
+
+    assert_eq!(via_task, blake3::hash(&bytes));
+}
+
+/// Missing pack reports open path.
+///
+/// It hashes a missing file. It expects an open error. The error names the path.
+#[tokio::test]
+async fn missing_pack_reports_open_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing.pack");
+
+    let err = hash_file(&path).await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("could not open"),
+        "the error should name the open, got {err}"
+    );
+    assert!(
+        err.to_string().contains(&path.display().to_string()),
+        "the error should name the path, got {err}"
+    );
+}
