@@ -2122,30 +2122,42 @@ fn check_index_geometry(path: &Path, chunks: &[Located], payload_len: u64) -> io
     Ok(order)
 }
 
-/// The hash of a pack's contents, for naming it.
+/// Hash a pack file to name it.
 ///
-/// The whole file, which is the header, payloads, index and trailer. The name
-/// therefore covers the format too, and a pack written by a future format version
-/// is a different name rather than a collision. Streamed once in constant memory.
-/// Call it after writing.
+/// The function runs on the blocking pool. The file read and the hash both
+/// happen on that thread.
+///
+/// The function reads the file in blocks of 256 kibibytes. Each block goes
+/// straight from the read into the BLAKE3 hasher, so the bytes are not copied
+/// into a second buffer first. The file is never held whole in memory.
+///
+/// The hash covers the whole file. That is the header, the payload, the index
+/// and the trailer. Call it after the write completes.
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be opened or read.
+/// Returns an error if it cannot open the pack file.
+/// Returns an error if it cannot read the pack file.
+/// Returns an error if the hashing task panics.
 pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
-    let mut file = crate::storage::at_async(path, "open", tfs::File::open(path)).await?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; 256 * 1024];
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = crate::storage::at(&owned, "open", fs::File::open(&owned))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 256 * 1024];
 
-    loop {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            break;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
         }
-        hasher.update(&buffer[..read]);
-    }
 
-    Ok(hasher.finalize())
+        Ok(hasher.finalize())
+    })
+    .await
+    .map_err(|join| io::Error::other(format!("hashing panicked: {join}")))?
 }
 
 /// A pack that is never written: the same bytes, computed where they are asked
