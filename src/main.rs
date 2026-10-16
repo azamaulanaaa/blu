@@ -946,6 +946,35 @@ async fn dispatch(
     outcome
 }
 
+/// How one `backup` run excludes paths.
+///
+/// One struct because the four flags travel together from the command line to
+/// the walk. Clap fills it where the command lands and `run_backup` reads it.
+#[derive(Debug, Clone, clap::Args)]
+struct IgnoreArgs {
+    /// Exclude paths matching PATTERN, in gitignore line syntax. Repeatable.
+    ///
+    /// A line without a slash matches the name at any depth. A leading slash
+    /// anchors it to the backup root. A trailing slash matches directories
+    /// only. A leading `!` re-includes. Later lines win, and CLI lines win
+    /// over `.bluignore` and `.gitignore` files.
+    #[arg(long, value_name = "PATTERN")]
+    exclude: Vec<String>,
+    /// Read exclusion lines from FILE, one gitignore line per entry.
+    /// Repeatable.
+    ///
+    /// Blank lines change nothing and `#` starts a comment. A missing file
+    /// fails the run. Lines read as if from the backup root.
+    #[arg(long, value_name = "FILE")]
+    exclude_file: Vec<std::path::PathBuf>,
+    /// Skip `.bluignore` files while walking.
+    #[arg(long)]
+    no_bluignore: bool,
+    /// Skip `.gitignore` files while walking.
+    #[arg(long)]
+    no_gitignore: bool,
+}
+
 /// One `backup` run: the tree, the set spellings, and the policies.
 ///
 /// One struct because `dispatch_inner` routes commands, and a ten-flag
@@ -1014,6 +1043,9 @@ struct BackupArgs {
     /// backup stages in a temporary directory that is removed afterwards.
     #[arg(long, value_name = "DIR")]
     staging: Option<std::path::PathBuf>,
+    /// How this run excludes paths.
+    #[command(flatten)]
+    ignore: IgnoreArgs,
 }
 
 impl BackupArgs {
@@ -1034,6 +1066,7 @@ impl BackupArgs {
                 self.segment_size,
                 compression,
                 profile,
+                &self.ignore,
                 self.dry_run,
             )
             .await
@@ -1045,6 +1078,7 @@ impl BackupArgs {
                     self.segment_size,
                     compression,
                     profile,
+                    &self.ignore,
                     self.dry_run,
                 )
                 .await
@@ -1069,6 +1103,7 @@ impl BackupArgs {
                     self.segment_size,
                     compression,
                     profile,
+                    &self.ignore,
                     token.as_deref(),
                 )
                 .await
@@ -1932,12 +1967,17 @@ async fn backup_previous(
     }))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a backup's own arguments, threaded from the command line"
+)]
 async fn run_backup(
     source: &std::path::Path,
     name: &std::path::Path,
     segment_size: Option<u64>,
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
+    ignore: &IgnoreArgs,
     dry_run: bool,
 ) -> std::io::Result<Option<BackedUp>> {
     let set = IndexSet::new(name);
@@ -1999,6 +2039,10 @@ async fn run_backup(
 
         let plan = BackupPlanBuilder::new(source)
             .exclude(exclude)
+            .exclude_patterns(ignore.exclude.iter().cloned())
+            .exclude_files(ignore.exclude_file.iter().cloned())
+            .read_bluignore(!ignore.no_bluignore)
+            .read_gitignore(!ignore.no_gitignore)
             .chunker(chunker)
             .store(existing)
             .run()
@@ -2037,6 +2081,10 @@ async fn run_backup(
 
     let outcome = BackupBuilder::new(source, store)
         .exclude(exclude)
+        .exclude_patterns(ignore.exclude.iter().cloned())
+        .exclude_files(ignore.exclude_file.iter().cloned())
+        .read_bluignore(!ignore.no_bluignore)
+        .read_gitignore(!ignore.no_gitignore)
         .chunker(chunker)
         .latest(latest)
         .previous(previous)
@@ -3215,12 +3263,17 @@ fn require_staged_set(staging: &IndexSet, target: &StoreTarget) -> std::io::Resu
 /// Pulls the set into staging, backs the tree up there with exactly the code
 /// a local run uses, and pushes the result back. A dry run pulls and plans
 /// with that same code and pushes nothing back.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a backup's own arguments, threaded from the command line"
+)]
 async fn run_backup_stored(
     source: &std::path::Path,
     target: &StoreTarget,
     segment_size: Option<u64>,
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
+    ignore: &IgnoreArgs,
     dry_run: bool,
 ) -> std::io::Result<()> {
     let backend = connect_store(&target.url)?;
@@ -3233,6 +3286,7 @@ async fn run_backup_stored(
         segment_size,
         compression,
         profile,
+        ignore,
         dry_run,
     )
     .await?;
@@ -3298,6 +3352,7 @@ async fn run_backup_serve(
     segment_size: Option<u64>,
     compression: storage::Compression,
     profile: reader::ChunkerProfile,
+    ignore: &IgnoreArgs,
     token: Option<&str>,
 ) -> std::io::Result<()> {
     let push = Push::open(address, set, token)?;
@@ -3307,8 +3362,16 @@ async fn run_backup_serve(
     let pack_path = work.join("push.pack");
 
     let result = async {
-        let outcome =
-            run_backup(source, &staging, segment_size, compression, profile, false).await?;
+        let outcome = run_backup(
+            source,
+            &staging,
+            segment_size,
+            compression,
+            profile,
+            ignore,
+            false,
+        )
+        .await?;
         let Some(outcome) = outcome else {
             return Err(std::io::Error::other(
                 "a backup that stored nothing published no version",
