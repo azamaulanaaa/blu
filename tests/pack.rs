@@ -1981,6 +1981,145 @@ async fn a_partial_range_records_nothing() {
     assert_eq!(pack.chunks_covering(&[whole]).len(), 1);
 }
 
+/// Record spans of a pack in payload order, in file coordinates.
+///
+/// Sort by offset to get payload order. Each record ends where the next
+/// record starts. The last record ends at the payload end.
+fn spans_of(pack: &Pack) -> Vec<(blulib::storage::BlobId, u64, u64)> {
+    let mut located = pack.chunks().to_vec();
+    located.sort_by_key(|chunk| chunk.offset);
+    located
+        .iter()
+        .enumerate()
+        .map(|(at, chunk)| {
+            let start = pack.payload_start().saturating_add(chunk.offset);
+            let end = located.get(at + 1).map_or_else(
+                || pack.payload_start().saturating_add(pack.payload_len()),
+                |next| pack.payload_start().saturating_add(next.offset),
+            );
+            (chunk.id, start, end)
+        })
+        .collect()
+}
+
+/// The call reports nothing for a record that spans two ranges.
+///
+/// Each range holds part of the record. Neither range holds all of it.
+#[tokio::test]
+async fn a_record_spanning_two_ranges_reports_nothing() {
+    let built = build(4, 100_000).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+    let spans = spans_of(&pack);
+    assert!(
+        spans.len() >= 2,
+        "the fixture should hold at least two records"
+    );
+    let (_, start, end) = spans[0];
+    assert!(
+        end.saturating_sub(start) > 2,
+        "the first record should span three points"
+    );
+
+    // Each range holds one end of the record. Neither holds both.
+    let left = Range {
+        start,
+        end: start.saturating_add(1),
+    };
+    let right = Range {
+        start: start.saturating_add(1),
+        end,
+    };
+    assert!(
+        pack.chunks_covering(&[left, right]).is_empty(),
+        "two touching ranges should not cover the record they meet in"
+    );
+
+    // Overlapping rather than touching. Same answer.
+    let wide_left = Range {
+        start,
+        end: start.saturating_add(2),
+    };
+    assert!(
+        pack.chunks_covering(&[wide_left, right]).is_empty(),
+        "two overlapping ranges should not cover the record they share"
+    );
+}
+
+/// Empty and inverted ranges cover nothing.
+///
+/// An empty range holds no byte. An inverted range is malformed.
+/// Neither covers a whole record.
+#[tokio::test]
+async fn empty_and_inverted_ranges_cover_nothing() {
+    let built = build(4, 100_000).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+    let spans = spans_of(&pack);
+    let (id, start, end) = spans[0];
+
+    let empty = Range { start, end: start };
+    let inverted = Range {
+        start: end,
+        end: start,
+    };
+    assert!(
+        pack.chunks_covering(&[empty, inverted]).is_empty(),
+        "an empty and an inverted range should cover nothing"
+    );
+
+    // Beside a range that does cover. The bad ranges add nothing.
+    let whole = Range { start, end };
+    assert_eq!(
+        pack.chunks_covering(&[empty, inverted, whole]),
+        HashSet::from([id]),
+        "bad ranges beside a good one should add nothing"
+    );
+}
+
+/// Duplicate ranges in any order cover every chunk.
+///
+/// Each range holds one whole record. The list repeats each range twice
+/// in reverse order. The call still reports every chunk once.
+#[tokio::test]
+async fn duplicate_ranges_in_any_order_cover_every_chunk() {
+    let built = build(6, 200_000).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+    let spans = spans_of(&pack);
+    assert!(
+        spans.len() >= 2,
+        "the fixture should hold at least two records"
+    );
+
+    let mut ranges: Vec<Range> = spans
+        .iter()
+        .map(|(_, start, end)| Range {
+            start: *start,
+            end: *end,
+        })
+        .collect();
+    ranges.reverse();
+    let mut doubled = ranges.clone();
+    doubled.extend(ranges);
+
+    // Partial ranges and empty ranges join the list. They cover nothing alone.
+    for (_, start, _) in &spans {
+        doubled.push(Range {
+            start: *start,
+            end: start.saturating_add(1),
+        });
+        doubled.push(Range {
+            start: *start,
+            end: *start,
+        });
+    }
+
+    let want: HashSet<_> = spans.iter().map(|(id, _, _)| *id).collect();
+    assert_eq!(
+        pack.chunks_covering(&doubled),
+        want,
+        "doubled and shuffled ranges should still report every chunk"
+    );
+}
+
 /// A placement for a chunk a plan does not have to locate.
 ///
 /// These two tests are about set arithmetic on the chunk table, so where the chunks
