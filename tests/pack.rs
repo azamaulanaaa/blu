@@ -3881,3 +3881,132 @@ async fn missing_pack_reports_open_path() {
         "the error should name the path, got {err}"
     );
 }
+
+/// A store that delays each named chunk by its mapped wait.
+struct Skewed<'a, S: ?Sized> {
+    store: &'a S,
+    delays: HashMap<blulib::storage::BlobId, std::time::Duration>,
+}
+
+impl<S: StorageStored + ?Sized> StorageStored for Skewed<'_, S> {
+    async fn stored(&self, id: &blulib::storage::BlobId) -> std::io::Result<blulib::pack::Stored> {
+        if let Some(wait) = self.delays.get(id) {
+            tokio::time::sleep(*wait).await;
+        }
+        self.store.stored(id).await
+    }
+}
+
+/// A store that fails two named chunks with staged errors.
+struct FailsTwo<'a, S: ?Sized> {
+    store: &'a S,
+    first: blulib::storage::BlobId,
+    second: blulib::storage::BlobId,
+}
+
+impl<S: StorageStored + ?Sized> StorageStored for FailsTwo<'_, S> {
+    async fn stored(&self, id: &blulib::storage::BlobId) -> std::io::Result<blulib::pack::Stored> {
+        if id == &self.first || id == &self.second {
+            return Err(std::io::Error::other(format!("staged failure for {id}")));
+        }
+        self.store.stored(id).await
+    }
+}
+
+/// Write prefetched chunks in plan order.
+///
+/// Delay early chunks more than late chunks.
+/// Assert both packs hold equal bytes.
+#[tokio::test]
+async fn write_prefetched_chunks_in_plan_order() {
+    let built = build(6, 200_000).await;
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
+    let snapshot = snapshot_of(&built.blob).await;
+
+    let count = built.plan.len();
+    assert!(
+        count >= 6,
+        "the fixture should hold six chunks, got {count}"
+    );
+    let mut delays = HashMap::new();
+    for (at, planned) in built.plan.iter().enumerate() {
+        let wait_ms = u64::try_from(count - at).unwrap_or(0).saturating_mul(2);
+        delays.insert(planned.id, std::time::Duration::from_millis(wait_ms));
+    }
+    let skewed = Skewed {
+        store: &store,
+        delays,
+    };
+
+    let skewed_at = built.dir.path().join("skewed.pack");
+    let skewed_pack = Pack::write(&skewed, &built.plan, &snapshot, 1, &skewed_at)
+        .await
+        .unwrap();
+    let plain_at = built.dir.path().join("plain.pack");
+    let plain_pack = Pack::write(&store, &built.plan, &snapshot, 1, &plain_at)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fs::read(&skewed_at).unwrap(),
+        fs::read(&plain_at).unwrap(),
+        "skewed fetch timing changed the pack bytes"
+    );
+    assert_eq!(skewed_pack.chunks(), plain_pack.chunks());
+
+    let mut offsets: Vec<u64> = built
+        .plan
+        .iter()
+        .map(|planned| skewed_pack.locate(&planned.id).unwrap().offset)
+        .collect();
+    let sorted = {
+        let mut rank = offsets.clone();
+        rank.sort_unstable();
+        rank
+    };
+    assert_eq!(
+        offsets, sorted,
+        "records left the file in plan order: {offsets:?}"
+    );
+    offsets.dedup();
+    assert_eq!(offsets.len(), count, "two records share one offset");
+}
+
+/// Report the first error in plan order.
+///
+/// Fail two chunks.
+/// Assert the error names the first chunk.
+#[tokio::test]
+async fn report_first_error_in_plan_order() {
+    let built = build(6, 200_000).await;
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
+    let snapshot = snapshot_of(&built.blob).await;
+
+    assert!(built.plan.len() >= 6, "the fixture should hold six chunks");
+    let first = built.plan.chunks()[1].id;
+    let second = built.plan.chunks()[4].id;
+    let failing = FailsTwo {
+        store: &store,
+        first,
+        second,
+    };
+
+    let error = Pack::write(
+        &failing,
+        &built.plan,
+        &snapshot,
+        1,
+        &built.dir.path().join("failed.pack"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains(&first.to_string()),
+        "the error should name the first failing chunk, got: {error}"
+    );
+    assert!(
+        !error.to_string().contains(&second.to_string()),
+        "the error should not name the later chunk, got: {error}"
+    );
+}

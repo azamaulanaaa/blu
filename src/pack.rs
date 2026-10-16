@@ -173,6 +173,12 @@ pub(crate) const MAX_CHUNK: u64 = crate::simd_cdc::MAXIMUM_MAX as u64;
 /// number is stated here because the refusal that enforces it must name it.
 const MAX_PACK_CHUNKS: u32 = u32::MAX;
 
+/// The writer fetches this many chunks concurrently.
+///
+/// The writer writes records in plan order.
+/// It limits held bytes to this window.
+const PREFETCH_WINDOW: usize = 16;
+
 /// Magic at the start of a pack, and again at the very end.
 const MAGIC: [u8; 4] = *b"LPK1";
 
@@ -614,15 +620,25 @@ impl Pack {
             crate::storage::at_async(&temporary, "create", tfs::File::create(&temporary)).await?;
         file.write_all(&header).await?;
 
-        for planned in plan.chunks() {
-            let (mut located, record_len) = write_record(&mut file, store, planned).await?;
-            located.offset = offset;
+        for window in plan.chunks().chunks(PREFETCH_WINDOW) {
+            // Fetch one window concurrently, then write it in plan order.
+            // The fetch runs ahead while the writes stay ordered.
+            // The first error in plan order wins.
+            let fetched = futures_util::future::join_all(
+                window.iter().map(|planned| store.stored(&planned.id)),
+            )
+            .await;
+            for (planned, result) in window.iter().zip(fetched) {
+                let stored = result?;
+                let (mut located, record_len) = write_fetched(&mut file, planned, &stored).await?;
+                located.offset = offset;
 
-            // Saturating, to match the count the header carries. The
-            // header reports one total and the index is built on the other. A plain
-            // `+=` would panic where both would have clamped.
-            offset = offset.saturating_add(record_len);
-            chunks.push(located);
+                // Saturating, to match the count the header carries. The
+                // header reports one total and the index is built on the other. A plain
+                // `+=` would panic where both would have clamped.
+                offset = offset.saturating_add(record_len);
+                chunks.push(located);
+            }
         }
 
         // Between the payloads and the index, so `index length` alone
@@ -1211,29 +1227,21 @@ pub(crate) fn planned_payload_len(plan: &Plan) -> u64 {
     })
 }
 
-/// Write one chunk's record and say where it landed, and how long it is.
+/// Write one fetched chunk.
 ///
-/// The caller fills in the offset later. The offset is the sum of every record
-/// before this one. This function does not know them. The length
-/// comes back rather than staying in the returned [`Located`], because the index
-/// does not carry it. It is in the record's header, which was just written. A
-/// second copy in the index would be a second claim about the same bytes.
+/// Compare the bytes with the plan.
+/// Encode the header.
+/// Append the record.
 ///
 /// # Errors
 ///
-/// Returns an error if the store cannot yield the chunk. It returns an error if
-/// what the store yields is not the stored form the plan resolved. The plan saw
-/// a set that changed while the pack was being written. It returns an error if the
-/// file cannot be written.
-async fn write_record<S>(
+/// Return an error if the bytes differ from the plan.
+/// Return an error if the file write fails.
+async fn write_fetched(
     file: &mut tfs::File,
-    store: &S,
     planned: &PlannedChunk,
-) -> io::Result<(Located, u64)>
-where
-    S: StorageStored + ?Sized,
-{
-    let stored = store.stored(&planned.id).await?;
+    stored: &Stored,
+) -> io::Result<(Located, u64)> {
     let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
 
     // Checked rather than assumed, because the header's payload length
