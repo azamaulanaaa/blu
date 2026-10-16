@@ -10,6 +10,7 @@ mod apply;
 mod backup;
 mod filter;
 mod history;
+mod ignore;
 mod manifest;
 mod merge;
 mod pack;
@@ -24,6 +25,7 @@ pub use backup::{
 };
 pub use filter::Filter;
 pub use history::{Detail, Event, HistoryBuilder, Status};
+pub use ignore::{IgnoreMatcher, IgnoreOptions};
 pub use manifest::{MANIFEST_SUFFIX, Manifest};
 pub use merge::{
     Compression as MergeCompression, MergeBuilder, MergePlan, MergePlanBuilder, Merged, Planned,
