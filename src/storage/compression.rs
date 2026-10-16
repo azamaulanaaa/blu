@@ -18,7 +18,11 @@
 //! `tests/compression.rs` holds the store's other properties true across a codec
 //! byte.
 
-use std::{borrow::Cow, io};
+use std::{
+    borrow::Cow,
+    io,
+    sync::{Arc, OnceLock},
+};
 
 use super::record::Codec;
 
@@ -148,6 +152,25 @@ pub trait Decompressor: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Zstd;
 
+/// Return the maximum concurrent decodes.
+///
+/// Clamp CPU count between one and thirty-two.
+fn decompress_limit() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZero::get)
+        .clamp(1, 32)
+}
+
+/// Return the shared decode semaphore.
+///
+/// Hold one permit during each decode.
+fn decompress_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(decompress_limit())))
+        .clone()
+}
+
 /// The body of [`Zstd::decompress`], split out so the trait method above can keep
 /// its return-position `impl Future`. The `manual_async_fn` lint points at a
 /// signature that names the future rather than an `async fn`. Here the naming is
@@ -190,6 +213,11 @@ impl Zstd {
         }
 
         // Frame and header agree, so the decode can come up neither short nor long.
+        // Hold one permit through the decode. Concurrent gets share the limit.
+        let _permit = decompress_semaphore()
+            .acquire_owned()
+            .await
+            .map_err(|e| io::Error::other(format!("a decompression permit failed: {e}")))?;
         let bytes = tokio::task::spawn_blocking(move || zstd::bulk::decompress(&stored, expected))
             .await
             .map_err(|join| io::Error::other(format!("decompression panicked: {join}")))??;
@@ -522,6 +550,40 @@ mod compression_tests {
             "a frame with no declared size should be refused in those words, and says {:?}",
             err.to_string()
         );
+    }
+
+    /// Check that the decode limit matches CPU count.
+    #[tokio::test]
+    async fn decode_limit_matches_cpu_count() {
+        let limit = super::decompress_limit();
+        assert!(
+            (1..=32).contains(&limit),
+            "the limit stays within bounds, got {limit}"
+        );
+        let cpus = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZero::get)
+            .clamp(1, 32);
+        assert_eq!(limit, cpus, "the limit follows CPU count");
+    }
+
+    /// Run many decodes concurrently. Check all results.
+    #[tokio::test]
+    async fn concurrent_decodes_respect_limit() {
+        let raw = vec![b'a'; 64 * 1024];
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let len = u64::try_from(raw.len()).unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let frame = frame.clone();
+            tasks.spawn(async move { Zstd.decompress(frame, len).await });
+        }
+        let mut done = 0;
+        while let Some(outcome) = tasks.join_next().await {
+            let bytes = outcome.unwrap().unwrap();
+            assert_eq!(bytes, raw, "each decode returns the payload");
+            done += 1;
+        }
+        assert_eq!(done, 32, "all decodes complete");
     }
 
     /// Bytes zstd cannot compress, without needing a fixture on disk.
