@@ -375,6 +375,245 @@ fn the_backup_set_is_excluded_from_its_own_backup() {
 }
 
 #[test]
+fn a_child_bluignore_overrides_a_parent_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("sub")).unwrap();
+    fs::write(source.join("top.log"), b"top\n").unwrap();
+    fs::write(source.join("sub").join("inner.log"), b"inner\n").unwrap();
+    fs::write(source.join("sub").join("kept.txt"), b"kept\n").unwrap();
+    // The parent file excludes every log. The child file re-includes the ones
+    // below it. Deeper files win over parent files.
+    fs::write(source.join(".gitignore"), b"*.log\n").unwrap();
+    fs::write(source.join("sub").join(".bluignore"), b"!*.log\n").unwrap();
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    let out = dir.path().join("out");
+    assert!(
+        !out.join("top.log").exists(),
+        "the parent gitignore still excludes the top log"
+    );
+    assert!(
+        out.join("sub/inner.log").is_file(),
+        "the child bluignore re-includes the nested log"
+    );
+    assert!(out.join("sub/kept.txt").is_file());
+    assert!(out.join(".gitignore").is_file());
+    assert!(out.join("sub/.bluignore").is_file());
+}
+
+#[test]
+fn a_cli_exclude_beats_an_ignore_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("keep.log"), b"keep\n").unwrap();
+    fs::write(source.join("drop.log"), b"drop\n").unwrap();
+    fs::write(source.join("main.txt"), b"main\n").unwrap();
+    // The file re-includes keep.log. The CLI line below re-excludes it and
+    // wins because CLI lines come last.
+    fs::write(source.join(".bluignore"), b"*.log\n!keep.log\n").unwrap();
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+    assert!(
+        dir.path().join("out/keep.log").is_file(),
+        "the file negation re-includes the log without CLI lines"
+    );
+
+    ok(
+        dir.path(),
+        &["backup", "src", "snap", "--exclude", "keep.log"],
+    );
+    ok(dir.path(), &["restore", "out2", "snap"]);
+    assert!(
+        !dir.path().join("out2/keep.log").exists(),
+        "the CLI line wins over the file negation"
+    );
+    assert!(!dir.path().join("out2/drop.log").exists());
+    assert!(dir.path().join("out2/main.txt").is_file());
+}
+
+#[test]
+fn an_excluded_subtree_never_reaches_the_chunker() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("skip")).unwrap();
+    fs::write(source.join("keep.txt"), b"keep\n").unwrap();
+    fs::write(source.join("skip").join("big.bin"), noisy(200_000)).unwrap();
+    // The ignore file itself stays in the backup. Only the named subtree
+    // leaves, with every byte under it.
+    let ignore = "*.bin\nskip/\n";
+    fs::write(source.join(".bluignore"), ignore).unwrap();
+
+    let report = ok(dir.path(), &["backup", "src", "snap", "--dry-run"]);
+    let figures = backup_figures(&report);
+    assert_eq!(figures[0], 2, "a dry run counts only kept files: {report}");
+    // The byte total names every kept byte. The 200_000 bytes under `skip`
+    // would dwarf it had the pruned subtree reached the chunker.
+    assert_eq!(
+        figures[6],
+        u64::try_from(b"keep\n".len() + ignore.len()).unwrap(),
+        "a dry run stores only kept bytes: {report}"
+    );
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+    assert!(dir.path().join("out/keep.txt").is_file());
+    assert!(
+        !dir.path().join("out/skip").exists(),
+        "the pruned subtree restores nothing"
+    );
+}
+
+#[test]
+fn an_ignore_file_restores_with_the_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("real.txt"), b"real\n").unwrap();
+    fs::write(source.join("junk.tmp"), b"junk\n").unwrap();
+    fs::write(source.join("old.bak"), b"old\n").unwrap();
+    fs::write(source.join(".bluignore"), b"*.tmp\n").unwrap();
+    fs::write(source.join(".gitignore"), b"*.bak\n").unwrap();
+
+    ok(dir.path(), &["backup", "src", "snap"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    let out = dir.path().join("out");
+    assert!(out.join(".bluignore").is_file());
+    assert!(out.join(".gitignore").is_file());
+    assert!(out.join("real.txt").is_file());
+    assert!(!out.join("junk.tmp").exists());
+    assert!(!out.join("old.bak").exists());
+}
+
+#[test]
+fn an_excluded_dotfile_stays_out_of_the_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("real.txt"), b"real\n").unwrap();
+    fs::write(source.join("junk.tmp"), b"junk\n").unwrap();
+    fs::write(source.join(".bluignore"), b"*.tmp\n").unwrap();
+
+    ok(
+        dir.path(),
+        &["backup", "src", "snap", "--exclude", ".bluignore"],
+    );
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    let out = dir.path().join("out");
+    assert!(!out.join(".bluignore").exists());
+    assert!(out.join("real.txt").is_file());
+    assert!(!out.join("junk.tmp").exists());
+}
+
+#[test]
+fn an_exclude_file_excludes_listed_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(source.join("build")).unwrap();
+    fs::write(source.join("main.txt"), b"main\n").unwrap();
+    fs::write(source.join("notes.tmp"), b"notes\n").unwrap();
+    fs::write(source.join("build").join("out.o"), b"obj\n").unwrap();
+    // Comments and blank lines change nothing. The two rules exclude the
+    // scratch file and the build tree.
+    fs::write(dir.path().join("excludes"), b"# scratch\n\n*.tmp\nbuild/\n").unwrap();
+
+    ok(
+        dir.path(),
+        &["backup", "src", "snap", "--exclude-file", "excludes"],
+    );
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    let out = dir.path().join("out");
+    assert!(out.join("main.txt").is_file());
+    assert!(!out.join("notes.tmp").exists());
+    assert!(!out.join("build").exists());
+}
+
+#[test]
+fn a_missing_exclude_file_fails_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+
+    let error = fails(
+        dir.path(),
+        &[
+            "backup",
+            "src",
+            "snap",
+            "--exclude-file",
+            "no-such-excludes",
+        ],
+    );
+    assert!(
+        error.contains("no-such-excludes"),
+        "the error names the missing file: {error}"
+    );
+    assert!(
+        error.contains("cannot read exclude file"),
+        "the error says what failed: {error}"
+    );
+}
+
+#[test]
+fn a_no_gitignore_opt_out_restores_ignored_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("scratch.tmp"), b"scratch\n").unwrap();
+    fs::write(source.join(".gitignore"), b"*.tmp\n").unwrap();
+
+    ok(dir.path(), &["backup", "src", "snap", "--no-gitignore"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    assert!(dir.path().join("out/scratch.tmp").is_file());
+    assert!(dir.path().join("out/.gitignore").is_file());
+}
+
+#[test]
+fn a_no_bluignore_opt_out_restores_ignored_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("src");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("scratch.tmp"), b"scratch\n").unwrap();
+    fs::write(source.join(".bluignore"), b"*.tmp\n").unwrap();
+
+    ok(dir.path(), &["backup", "src", "snap", "--no-bluignore"]);
+    ok(dir.path(), &["restore", "out", "snap"]);
+
+    assert!(dir.path().join("out/scratch.tmp").is_file());
+    assert!(dir.path().join("out/.bluignore").is_file());
+}
+
+#[test]
+fn a_negation_keeps_the_set_out_of_its_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("inner");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("data.bin"), noisy(80_000)).unwrap();
+    // Re-include every path. The set under backup stays out anyway because
+    // internal excludes never reach the matcher.
+    fs::write(source.join(".bluignore"), b"*\n!*\n").unwrap();
+
+    ok(&source, &["backup", ".", "self"]);
+    ok(dir.path(), &["restore", "out", "inner/self"]);
+
+    assert_eq!(
+        fs::read(dir.path().join("out/data.bin")).unwrap(),
+        noisy(80_000)
+    );
+    assert!(
+        !dir.path().join("out/self.0000.bin").exists(),
+        "the set must not back up into itself whatever the ignore lines say"
+    );
+}
+
+#[test]
 fn verify_reports_a_clean_store() {
     let dir = tempfile::tempdir().unwrap();
     build_tree(dir.path());

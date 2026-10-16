@@ -83,6 +83,22 @@ $ blu apply game.pack /tmp/docs-restored --files 'src/*.rs'
 
 `restore --clean` is refused with `--files`: a clean restore promises exactly the snapshot. `apply --prune` scopes to the selection, removing only the unrecorded entries the filter keeps. A remote restore fetches only the chunks the selection needs.
 
+## Exclude paths from a backup
+
+`backup` reads `.bluignore` and `.gitignore` files in every directory it walks, plus repeatable `--exclude PATTERN` lines and `--exclude-file FILE` lists. Both file kinds share one gitignore dialect: blank lines change nothing, `#` starts a comment, `!` re-includes, a trailing `/` matches directories only, `*` `?` and `[...]` match inside one path level, and `**` spans nested levels. Use `--no-bluignore` or `--no-gitignore` to skip one kind.
+
+```console
+$ blu backup ~/Documents docs --exclude '*.log' --exclude-file excludes
+```
+
+Merge order, later wins:
+
+1. parent `.gitignore`, then parent `.bluignore`
+2. child `.gitignore`, then child `.bluignore`, at each deeper level
+3. `--exclude-file` files, then `--exclude` lines
+
+Excluded directories are pruned before chunking, so `backup --dry-run` reports the filtered figures. Ignore files themselves back up with the tree unless a rule excludes them. The set under backup stays excluded whatever `!` lines say.
+
 ## Remote sets and serve
 
 Every build speaks `file://`, `ftp://` and `s3://`; unix builds also speak `sftp://` (`openssh` is unix-only). `s3` speaks plain HTTP and verified HTTPS. HTTPS verifies against the system roots. Remote targets hold no local copy. A `file://` command pulls the set into staging, runs locally, and pushes back its writes. Use `--staging DIR` for the staging copy. Without it, the system cache holds the copy.
