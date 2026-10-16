@@ -19,6 +19,7 @@ use std::{
 use tracing::instrument;
 use walkdir::WalkDir;
 
+use super::ignore::{IgnoreMatcher, IgnoreOptions};
 use crate::metadata::Timestamp;
 use crate::{command::pipeline, metadata, reader, storage};
 
@@ -39,6 +40,12 @@ pub struct Options {
     /// caller should exclude its own output artifacts: backing up a store that
     /// is being appended to while it is read corrupts the run.
     pub exclude: Vec<PathBuf>,
+    /// Ignore files and CLI lines to exclude.
+    ///
+    /// The walk reads `.bluignore` and `.gitignore` in every visited directory
+    /// unless cleared. Parent files come first and deeper files win. CLI lines
+    /// come last and win over every file.
+    pub ignore: IgnoreOptions,
     /// Content-defined chunking parameters.
     pub chunker: reader::ChunkerConfig,
     /// How many chunks to upload at once.
@@ -68,6 +75,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             exclude: Vec::new(),
+            ignore: IgnoreOptions::new(),
             chunker: reader::ChunkerConfig::default(),
             concurrency: default_concurrency(),
         }
@@ -367,6 +375,7 @@ pub struct BackupBuilder<S> {
     root: PathBuf,
     store: S,
     exclude: Vec<PathBuf>,
+    ignore: IgnoreOptions,
     chunker: reader::ChunkerConfig,
     concurrency: usize,
     latest: Option<Timestamp>,
@@ -382,6 +391,7 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
             root: root.into(),
             store,
             exclude: Vec::new(),
+            ignore: IgnoreOptions::new(),
             chunker: reader::ChunkerConfig::default(),
             concurrency: default_concurrency(),
             latest: None,
@@ -400,6 +410,54 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
         P: Into<PathBuf>,
     {
         self.exclude.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Exclude paths matching these gitignore lines.
+    ///
+    /// Lines read as if from the backup root. Later lines win over earlier
+    /// lines and over ignore files.
+    #[must_use]
+    pub fn exclude_patterns<I, T>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.ignore
+            .patterns
+            .extend(patterns.into_iter().map(Into::into));
+        self
+    }
+
+    /// Exclude paths matching the lines in these files.
+    ///
+    /// Each file holds one gitignore line per entry. A missing file fails the
+    /// run. Lines read as if from the backup root and win over ignore files.
+    #[must_use]
+    pub fn exclude_files<I, P>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.ignore.files.extend(files.into_iter().map(Into::into));
+        self
+    }
+
+    /// Read `.bluignore` files while walking.
+    ///
+    /// Pass false to ignore them. Reads happen by default.
+    #[must_use]
+    pub fn read_bluignore(mut self, read: bool) -> Self {
+        self.ignore.read_bluignore = read;
+        self
+    }
+
+    /// Read `.gitignore` files while walking.
+    ///
+    /// Pass false to ignore them. Reads happen by default.
+    #[must_use]
+    pub fn read_gitignore(mut self, read: bool) -> Self {
+        self.ignore.read_gitignore = read;
         self
     }
 
@@ -456,6 +514,7 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
     #[must_use]
     pub fn options(mut self, options: Options) -> Self {
         self.exclude = options.exclude;
+        self.ignore = options.ignore;
         self.chunker = options.chunker;
         self.concurrency = options.concurrency;
         self
@@ -478,6 +537,7 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
     pub async fn run(self) -> io::Result<BackedUp> {
         let options = Options {
             exclude: self.exclude,
+            ignore: self.ignore,
             chunker: self.chunker,
             concurrency: self.concurrency,
         };
@@ -506,6 +566,7 @@ impl<S: storage::StoragePut + 'static> BackupBuilder<S> {
 pub struct BackupPlanBuilder {
     root: PathBuf,
     exclude: Vec<PathBuf>,
+    ignore: IgnoreOptions,
     chunker: reader::ChunkerConfig,
     concurrency: usize,
     store: Option<storage::BlobStore<storage::Read>>,
@@ -520,6 +581,7 @@ impl BackupPlanBuilder {
         Self {
             root: root.into(),
             exclude: Vec::new(),
+            ignore: IgnoreOptions::new(),
             chunker: reader::ChunkerConfig::default(),
             concurrency: default_concurrency(),
             store: None,
@@ -536,6 +598,54 @@ impl BackupPlanBuilder {
         P: Into<PathBuf>,
     {
         self.exclude.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Exclude paths matching these gitignore lines.
+    ///
+    /// Lines read as if from the backup root. Later lines win over earlier
+    /// lines and over ignore files.
+    #[must_use]
+    pub fn exclude_patterns<I, T>(mut self, patterns: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.ignore
+            .patterns
+            .extend(patterns.into_iter().map(Into::into));
+        self
+    }
+
+    /// Exclude paths matching the lines in these files.
+    ///
+    /// Each file holds one gitignore line per entry. A missing file fails the
+    /// run. Lines read as if from the backup root and win over ignore files.
+    #[must_use]
+    pub fn exclude_files<I, P>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.ignore.files.extend(files.into_iter().map(Into::into));
+        self
+    }
+
+    /// Read `.bluignore` files while walking.
+    ///
+    /// Pass false to ignore them. Reads happen by default.
+    #[must_use]
+    pub fn read_bluignore(mut self, read: bool) -> Self {
+        self.ignore.read_bluignore = read;
+        self
+    }
+
+    /// Read `.gitignore` files while walking.
+    ///
+    /// Pass false to ignore them. Reads happen by default.
+    #[must_use]
+    pub fn read_gitignore(mut self, read: bool) -> Self {
+        self.ignore.read_gitignore = read;
         self
     }
 
@@ -582,6 +692,7 @@ impl BackupPlanBuilder {
     #[must_use]
     pub fn options(mut self, options: Options) -> Self {
         self.exclude = options.exclude;
+        self.ignore = options.ignore;
         self.chunker = options.chunker;
         self.concurrency = options.concurrency;
         self
@@ -620,6 +731,7 @@ impl BackupPlanBuilder {
 
         let options = Options {
             exclude: self.exclude,
+            ignore: self.ignore,
             chunker: self.chunker,
             concurrency: self.concurrency,
         };
@@ -688,6 +800,7 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 ) -> io::Result<(Entries, BackedUp)> {
     let Options {
         exclude,
+        ignore,
         chunker: config,
         concurrency,
     } = options;
@@ -706,7 +819,7 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
         mut snapshot,
         file_index,
         paths,
-    } = tokio::task::spawn_blocking(move || walk(&walk_root, &excluded))
+    } = tokio::task::spawn_blocking(move || walk(&walk_root, &excluded, &ignore))
         .await
         .map_err(|join| io::Error::other(format!("the walk thread failed: {join}")))??;
 
@@ -791,7 +904,12 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
 }
 
 /// Walk the tree, recording everything that is not file content.
-fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
+///
+/// Prune excluded subtrees while walking so their files never reach the
+/// chunker. Read `.gitignore` and `.bluignore` in each visited directory
+/// unless [`IgnoreOptions`] clears them. Ignore files stay ordinary files and
+/// back up with the tree unless a rule excludes them.
+fn walk(root: &Path, excluded: &[PathBuf], ignore: &IgnoreOptions) -> io::Result<Walked> {
     // The walk records each entry relative to the root, so the root itself comes
     // back with an empty relative path and is skipped below.
     // That skip has to be unconditional.
@@ -818,6 +936,10 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
         ));
     }
 
+    // CLI lines apply at the root and win over every ignore file, so they live
+    // in their own matcher. Consult it last whatever the walk finds later.
+    let mut filter = WalkFilter::new(excluded, ignore)?;
+
     let mut snapshot = metadata::Snapshot::new(metadata::Timestamp::now());
     let mut inode_map: HashMap<FileId, PathBuf> = HashMap::new();
 
@@ -827,13 +949,16 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
     let entries = WalkDir::new(root)
         .sort_by_file_name()
         .into_iter()
+        .filter_entry(|entry| filter.keep(root, entry.path(), entry.file_type().is_dir()))
         .map(|entry| entry.map(walkdir::DirEntry::into_path).map_err(WalkFailure))
         .collect::<Result<Vec<_>, WalkFailure>>()
-        .map_err(io::Error::from)?
-        .into_iter();
+        .map_err(io::Error::from)?;
+    if let Some(error) = filter.refused() {
+        return Err(error);
+    }
+    let entries = entries.into_iter();
 
     let paths = entries
-        .filter(|path| !excluded.contains(&normalise(path)))
         .map(|path| {
             let meta = fs::symlink_metadata(&path)?;
 
@@ -931,6 +1056,137 @@ fn walk(root: &Path, excluded: &[PathBuf]) -> io::Result<Walked> {
         file_index,
         paths,
     })
+}
+
+/// The exclusion state a walk consults while descending.
+///
+/// Holds CLI lines apart from stacked ignore file rules so CLI lines win
+/// whatever the walk finds later. `refused` carries the first failed ignore
+/// read out of `filter_entry`, which answers keep or prune without failing.
+#[derive(Debug)]
+struct WalkFilter<'a> {
+    /// Store paths under backup, compared after normalisation.
+    excluded: &'a [PathBuf],
+    /// Which ignore files the walk reads.
+    ignore: &'a IgnoreOptions,
+    /// CLI lines applied at the root.
+    cli: IgnoreMatcher,
+    /// Ignore file rules in discovery order. Deeper directories come later.
+    stacked: IgnoreMatcher,
+    /// The first failed ignore read, reported after the walk ends.
+    refused: Option<io::Error>,
+}
+
+impl<'a> WalkFilter<'a> {
+    /// Build the filter for a walk with `excluded` and `ignore`.
+    ///
+    /// Read CLI exclude files now so a missing file fails before the walk
+    /// starts. Ignore files in the tree load while the walk descends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a CLI exclude file cannot be read.
+    fn new(excluded: &'a [PathBuf], ignore: &'a IgnoreOptions) -> io::Result<Self> {
+        let mut cli = IgnoreMatcher::new();
+        for file in &ignore.files {
+            let content = fs::read_to_string(file).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot read exclude file {}: {e}", file.display()),
+                )
+            })?;
+            cli.push_str(Path::new(""), &content);
+        }
+        for pattern in &ignore.patterns {
+            cli.push_line(Path::new(""), pattern);
+        }
+        Ok(Self {
+            excluded,
+            ignore,
+            cli,
+            stacked: IgnoreMatcher::new(),
+            refused: None,
+        })
+    }
+
+    /// Answer whether the walk enters `path`.
+    ///
+    /// Load ignore files for directories before answering. Prune excluded
+    /// subtrees so their files never reach the chunker. Keep the root and
+    /// every path no rule excludes.
+    fn keep(&mut self, root: &Path, path: &Path, is_dir: bool) -> bool {
+        if self.refused.is_some() {
+            return true;
+        }
+        if is_dir {
+            let base: PathBuf = path
+                .strip_prefix(root)
+                .map_or_else(|_| PathBuf::new(), Path::to_path_buf);
+            if self.ignore.read_gitignore
+                && let Err(e) = read_ignore_file(path, &base, ".gitignore", &mut self.stacked)
+            {
+                self.refused = Some(e);
+                return true;
+            }
+            if self.ignore.read_bluignore
+                && let Err(e) = read_ignore_file(path, &base, ".bluignore", &mut self.stacked)
+            {
+                self.refused = Some(e);
+                return true;
+            }
+        }
+        // Internal excludes name exact store paths under backup. They win over
+        // any `!` line because they never reach the matcher.
+        if self.excluded.contains(&normalise(path)) {
+            return false;
+        }
+        let relative: PathBuf = path
+            .strip_prefix(root)
+            .map_or_else(|_| PathBuf::new(), Path::to_path_buf);
+        if relative.as_os_str().is_empty() {
+            return true;
+        }
+        !is_ignored(&self.stacked, &self.cli, &relative, is_dir)
+    }
+
+    /// Take the first failed ignore read, if any.
+    fn refused(&mut self) -> Option<io::Error> {
+        self.refused.take()
+    }
+}
+
+/// Answer whether ignore rules exclude a backup relative path.
+///
+/// Consult CLI lines first so they win over ignore files. Internal excludes
+/// stay outside this answer and always win over any `!` line.
+fn is_ignored(stacked: &IgnoreMatcher, cli: &IgnoreMatcher, path: &Path, is_dir: bool) -> bool {
+    match cli.decide(path, is_dir) {
+        Some(hit) => hit,
+        None => stacked.decide(path, is_dir).unwrap_or(false),
+    }
+}
+
+/// Read one ignore file in `dir` and push its lines under `base`.
+///
+/// Pass silently where the file is absent. Report any other read failure with
+/// the file name so the run says what it could not read.
+fn read_ignore_file(
+    dir: &Path,
+    base: &Path,
+    name: &str,
+    stacked: &mut IgnoreMatcher,
+) -> io::Result<()> {
+    match fs::read_to_string(dir.join(name)) {
+        Ok(content) => {
+            stacked.push_str(base, &content);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("cannot read {}: {e}", dir.join(name).display()),
+        )),
+    }
 }
 
 /// Best-effort normalisation used only for comparing excluded paths.
