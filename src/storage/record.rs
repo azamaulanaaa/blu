@@ -109,6 +109,14 @@ pub(crate) const MAX_HEADER: usize = PREFIX + 2 * crate::varint::MAX + HASH + CH
 /// leaves [`MAX_HEADER`] bytes available to decode one.
 const SCAN_BUFFER: usize = 1024 * 1024;
 
+/// Most blob entries a scan reserves before it reads a record.
+///
+/// The scan bounds the entry count by the file length. That bound overcounts
+/// segments of large records. The clamp caps the overcount. It covers a full
+/// 4 GiB segment of 16 KiB chunks, which is 262,144 entries. A segment of
+/// smaller chunks regrows from there, once or twice rather than from empty.
+const MAX_BLOB_RESERVE: usize = 256 * 1024;
+
 /// What a record holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -237,6 +245,12 @@ pub(super) struct Scan {
     ///
     /// From record headers only. The scan never reads a payload, so a blob with
     /// a damaged payload is still listed here. That blob fails when it is read.
+    ///
+    /// Each entry costs one insert while the scan runs. Each entry costs memory
+    /// for as long as the store stays open. The scan sizes the table from the
+    /// file length, so the inserts do not regrow it. A caller that wants only
+    /// versions still walks every header. That caller passes [`Blobs::Discard`]
+    /// and skips the inserts entirely.
     pub blobs: HashMap<BlobId, Placement>,
     /// The snapshot hash of each committed version, oldest first.
     ///
@@ -554,6 +568,9 @@ pub(super) fn scan_commits_with_buffer(
 pub(super) enum Blobs {
     /// Index every blob record, for a caller that is about to read from the store
     /// and needs to know where each chunk is.
+    ///
+    /// The scan reserves room for the entries up front. The reservation is an
+    /// upper bound from the file length, clamped by [`MAX_BLOB_RESERVE`].
     Index,
     /// Skip them, for a caller that wants only the commit records.
     ///
@@ -642,6 +659,18 @@ pub(super) fn scan_with_buffer(
     // bytes. Both cases take this path.
     let file_len = file.seek(SeekFrom::End(0))?;
     let mut scan = Scan::default();
+
+    // Size the blob index from the file length before the first insert.
+    // Without this the map regrew as the scan inserted. Each regrow rehashed
+    // the entries it already held. A record needs at least MIN_HEADER bytes,
+    // so the length divided by that floor caps the entry count. The clamp
+    // caps the overcount on segments of large records. The hasher is
+    // unchanged, so crafted segments still cannot force collisions.
+    if blobs.indexes() {
+        let upper = file_len.saturating_sub(STORE_HEADER as u64) / MIN_HEADER as u64;
+        let upper = usize::try_from(upper).unwrap_or(usize::MAX);
+        scan.blobs.reserve(upper.min(MAX_BLOB_RESERVE));
+    }
 
     // The allocation and how much of it is valid are separate, deliberately.
     //
