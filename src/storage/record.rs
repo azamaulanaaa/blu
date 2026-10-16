@@ -102,11 +102,22 @@ pub(crate) const MAX_HEADER: usize = PREFIX + 2 * crate::varint::MAX + HASH + CH
 
 /// Bytes read at a time while scanning.
 ///
-/// A record is skipped with a seek rather than read. The scan is therefore
-/// proportional to the number of records and not to the size of the store. This
-/// constant sets what it is proportional to in *reads*. The buffer is refilled only
-/// when the next header would not fit in what is left. A refill therefore always
-/// leaves [`MAX_HEADER`] bytes available to decode one.
+/// One MiB holds about a thousand 1 KiB records per refill. Each refill costs
+/// one seek and one read. A larger buffer therefore issues fewer syscalls per
+/// record. A smaller buffer issues more.
+///
+/// Throughput plateaus from 16 KiB to 1 MiB. A 4 KiB buffer scans about 1.5x
+/// slower than the plateau on 20,000 1 KiB records. A 4 MiB buffer scans
+/// slower than 1 MiB and holds 4x the memory. 1 MiB sits at the top of the
+/// plateau with headroom for stores of smaller records. It issues fewer
+/// refills there. The ignored sweep below varies the size and checks it.
+///
+/// The buffer lives only for the scan. It drops on return. Its peak is one
+/// buffer against the blob index beside it. That index holds one entry per
+/// record. It dwarfs the buffer on large sets.
+///
+/// Tune through [`scan_with_buffer`]. That function is the internal tuning
+/// point. It stays `pub(super)`. Production code calls [`scan`].
 const SCAN_BUFFER: usize = 1024 * 1024;
 
 /// Most blob entries a scan reserves before it reads a record.
@@ -468,10 +479,7 @@ pub(super) fn commits_in(file: &mut (impl Read + Seek), segment: u32) -> io::Res
 /// The call takes any `Read + Seek` source.
 /// It seeks for itself.
 /// It never builds a blob map.
-pub(super) fn scan_commits(
-    file: &mut (impl Read + Seek),
-    segment: u32,
-) -> io::Result<CommitScan> {
+pub(super) fn scan_commits(file: &mut (impl Read + Seek), segment: u32) -> io::Result<CommitScan> {
     scan_commits_with_buffer(file, segment, SCAN_BUFFER)
 }
 
@@ -623,11 +631,11 @@ pub(super) fn scan(file: &mut (impl Read + Seek), segment: u32, blobs: Blobs) ->
 
 /// [`scan`], with the read size chosen rather than fixed.
 ///
-/// `scan_buffer` is a parameter so that `benches/throughput.rs` can measure it.
-/// The value was a `const`. That is the right thing for a value nobody has ever
-/// varied. A constant that has never been measured is a constant nobody can say is
-/// right. This is the one constant that decides how many `read` syscalls a
-/// whole-set scan makes and how large a buffer it holds while doing it.
+/// `scan_buffer` is a parameter so that a sweep can vary it. This function is
+/// the internal tuning point for scan read size. It stays `pub(super)` on
+/// purpose. No public caller passes a size. Production code calls [`scan`].
+/// The ignored sweep below calls this function at every size and asserts
+/// an identical [`Scan`].
 ///
 /// A record is skipped with a seek rather than read. The scan is therefore
 /// proportional to the *record count*, not to the size of the store. This is
@@ -1327,6 +1335,8 @@ mod golden {
 /// everything in this module is `pub(super)`. Exposing a knob to measure it would
 /// put an internal tuning parameter in the public API. The measurement therefore
 /// lives here, where the function is.
+///
+/// This test stays the one place that calls it at every size.
 ///
 /// Ignored by default because it writes a temporary file and takes a second or
 /// two. Run it with:
