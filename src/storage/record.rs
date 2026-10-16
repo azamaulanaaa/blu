@@ -423,6 +423,19 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
     crate::varint::read(bytes, 0).ok()
 }
 
+/// What a commit-only scan of one segment found.
+///
+/// The scan reads record headers and keeps commit hashes.
+/// It keeps no blob map.
+/// A caller that lists versions thus avoids the map cost.
+#[derive(Debug, Default)]
+pub(super) struct CommitScan {
+    /// The snapshot hash of each committed version, oldest first.
+    pub commits: Vec<BlobId>,
+    /// First byte past the last valid record.
+    pub end: u64,
+}
+
 /// Read one segment's records, and keep only the commit records among them.
 ///
 /// One segment's worth of headers and no payloads: what a lookup that would
@@ -436,6 +449,106 @@ pub(super) fn commits_in(file: &mut (impl Read + Seek), segment: u32) -> io::Res
     Ok(scan(file, segment, Blobs::Discard)?.commits)
 }
 
+/// Read one segment and keep only its commit records.
+///
+/// The call takes any `Read + Seek` source.
+/// It seeks for itself.
+/// It never builds a blob map.
+pub(super) fn scan_commits(
+    file: &mut (impl Read + Seek),
+    segment: u32,
+) -> io::Result<CommitScan> {
+    scan_commits_with_buffer(file, segment, SCAN_BUFFER)
+}
+
+/// Read commits, with the read size chosen rather than fixed.
+///
+/// The caller picks the buffer size.
+/// A small size slows the scan.
+/// It never changes the result.
+pub(super) fn scan_commits_with_buffer(
+    file: &mut (impl Read + Seek),
+    _segment: u32,
+    scan_buffer: usize,
+) -> io::Result<CommitScan> {
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let mut scan = CommitScan::default();
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut filled = 0usize;
+    let mut base = STORE_HEADER as u64;
+    let mut position = base;
+
+    while position < file_len {
+        if position - base + MAX_HEADER as u64 > filled as u64 {
+            file.seek(SeekFrom::Start(position))?;
+            let want = usize::try_from((file_len - position).min(scan_buffer as u64))
+                .unwrap_or(scan_buffer);
+            if buffer.len() < want {
+                buffer.resize(want, 0);
+            }
+            filled = 0;
+            while filled < want {
+                let read = file.read(&mut buffer[filled..])?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            base = position;
+
+            if filled < MIN_HEADER {
+                break;
+            }
+        }
+
+        let at = usize::try_from(position - base).ok();
+        let Some(at) = at.filter(|a| *a < filled) else {
+            break;
+        };
+
+        let Some(header) = decode_header(&buffer[at..filled], position) else {
+            break;
+        };
+
+        let end = position
+            .checked_add(header.total_len)
+            .and_then(|e| e.checked_add(header.stored_len))
+            .filter(|e| *e <= file_len);
+
+        let Some(end) = end else { break };
+
+        if header.kind == Kind::Commit
+            && header.raw_len == HASH as u64
+            && header.codec == Codec::Raw
+        {
+            let start = usize::try_from(header.payload_offset - base).ok();
+            let start = start.filter(|s| *s + HASH <= filled);
+
+            if let Some(snapshot) = start.map(|s| {
+                let mut hash = [0u8; HASH];
+                hash.copy_from_slice(&buffer[s..s + HASH]);
+                BlobId::from_bytes(hash)
+            }) {
+                scan.commits.push(snapshot);
+            } else {
+                let mut hash = [0u8; HASH];
+                file.seek(SeekFrom::Start(header.payload_offset))?;
+                if read_exact_or_eof(file, &mut hash)? {
+                    scan.commits.push(BlobId::from_bytes(hash));
+                } else {
+                    break;
+                }
+            }
+        }
+
+        position = end;
+    }
+
+    scan.end = position;
+    Ok(scan)
+}
+
 /// What a scan is being asked to collect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Blobs {
@@ -444,12 +557,15 @@ pub(super) enum Blobs {
     Index,
     /// Skip them, for a caller that wants only the commit records.
     ///
-    /// This is not a micro-optimisation. A scan that indexes builds a
-    /// `HashMap` entry per blob record. At the default 4 GiB segment size and
-    /// 16 KiB average chunks that is 262,144 entries, about 42 MB. The scan
-    /// allocates, grows and frees that map. The one caller that wants only commits
-    /// asks once per version listed. A set of a thousand versions that share a
-    /// segment therefore paid for the map a thousand times over to print a list.
+    /// The commit-only walk does not build the index. It reads every header
+    /// and keeps the commit records. A scan that indexes builds a `HashMap`
+    /// entry per blob record. At the default 4 GiB segment size and 16 KiB
+    /// average chunks that is 262,144 entries, about 42 MB.
+    ///
+    /// This is not a micro-optimisation. The caller that wants only commits
+    /// asks once per version listed. A set of a thousand versions that share
+    /// a segment therefore walks that segment a thousand times over to print a
+    /// list.
     Discard,
 }
 
@@ -480,6 +596,14 @@ impl Blobs {
 /// because only that module can tell a truncated tail from a file that was never
 /// a store.
 pub(super) fn scan(file: &mut (impl Read + Seek), segment: u32, blobs: Blobs) -> io::Result<Scan> {
+    if blobs == Blobs::Discard {
+        let commits = scan_commits(file, segment)?;
+        return Ok(Scan {
+            blobs: HashMap::new(),
+            commits: commits.commits,
+            end: commits.end,
+        });
+    }
     scan_with_buffer(file, segment, blobs, SCAN_BUFFER)
 }
 
@@ -507,6 +631,14 @@ pub(super) fn scan_with_buffer(
     blobs: Blobs,
     scan_buffer: usize,
 ) -> io::Result<Scan> {
+    if blobs == Blobs::Discard {
+        let commits = scan_commits_with_buffer(file, segment, scan_buffer)?;
+        return Ok(Scan {
+            blobs: HashMap::new(),
+            commits: commits.commits,
+            end: commits.end,
+        });
+    }
     // This code finds the length by seeking. It does not read file metadata.
     // The source can be any seekable bytes. A remote backend reports the
     // object length separately. It provides a seekable view of the fetched
@@ -592,14 +724,10 @@ pub(super) fn scan_with_buffer(
 
         match header.kind {
             Kind::Blob => {
-                if !blobs.indexes() {
-                    // The header has already been decoded and bounds-checked, so
-                    // the record is known good. The only thing being skipped is the
-                    // index entry that nobody asked for.
-                    position = end;
-                    continue;
-                }
-
+                // Discard returns through `scan_commits` above.
+                // This loop thus always indexes.
+                // No branch remains here.
+                debug_assert!(blobs.indexes());
                 scan.blobs.insert(
                     BlobId::from_bytes(header.hash),
                     Placement {
@@ -835,6 +963,72 @@ mod tests {
         assert_eq!(skipped.commits, commits);
         assert_eq!(
             skipped.end, indexed.end,
+            "both modes must agree on where the segment's records end"
+        );
+    }
+
+    /// Commit-only scans skip the blob map when they list versions.
+    ///
+    /// The test shows that path matches the full scan on mixed records.
+    #[test]
+    fn a_commit_scan_matches_the_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("scan.bin");
+
+        // Four blobs and two commits, so the commits are not simply "everything
+        // at the start". One of them follows a skipped blob record.
+        let mut bytes = encode_store_header(0).to_vec();
+        let mut commits = Vec::new();
+        for n in 0u8..6 {
+            if n % 3 == 2 {
+                let mut hash = [0u8; HASH];
+                hash[0] = 0xff;
+                hash[1] = n;
+                // A commit's payload is the snapshot hash, which is 32 bytes. Both
+                // of its lengths say so. Without the payload the record is
+                // malformed. The scan would then read the next record's header as
+                // this one's content.
+                let payload = HASH as u64;
+                let mut header = Vec::new();
+                encode_header(
+                    &mut header,
+                    Kind::Commit,
+                    Codec::Raw,
+                    &hash,
+                    payload,
+                    payload,
+                );
+                bytes.extend_from_slice(&header);
+                bytes.extend_from_slice(&hash);
+                commits.push(BlobId::from_bytes(hash));
+            } else {
+                let mut hash = [0u8; HASH];
+                hash[0] = n;
+                let payload = 100;
+                let mut header = Vec::new();
+                encode_header(&mut header, Kind::Blob, Codec::Raw, &hash, payload, payload);
+                bytes.extend_from_slice(&header);
+                bytes.extend(std::iter::repeat_n(0u8, usize::try_from(payload).unwrap()));
+            }
+        }
+        std::fs::write(&file, &bytes).unwrap();
+
+        let indexed = {
+            let mut handle = std::fs::File::open(&file).unwrap();
+            scan(&mut handle, 0, Blobs::Index).unwrap()
+        };
+        let commit_only = {
+            let mut handle = std::fs::File::open(&file).unwrap();
+            scan_commits(&mut handle, 0).unwrap()
+        };
+
+        assert_eq!(
+            commit_only.commits, indexed.commits,
+            "a skipped blob record must not hide the commit after it"
+        );
+        assert_eq!(commit_only.commits, commits);
+        assert_eq!(
+            commit_only.end, indexed.end,
             "both modes must agree on where the segment's records end"
         );
     }
