@@ -429,16 +429,14 @@ mod tests {
         storage::{MemoryStore, RemoteUrl},
     };
 
-    /// Unique scratch base for one test, under the system temp dir.
+    /// Build a scratch directory for one test.
     ///
-    /// Holds a staging set, never a real one. Each test removes its own
-    /// directory on the way out.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "blu-mirror-{name}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ))
+    /// The system temp dir holds it.
+    /// The test removes it on exit.
+    /// It holds a staging set.
+    /// It never holds a real one.
+    fn scratch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     /// Write a tiny staging set: two segment files and one index file, all a
@@ -543,8 +541,9 @@ mod tests {
     /// the backend. A second push is a no-op. Small bytes only.
     #[test]
     fn push_then_pull_round_trips_finished_files() {
-        let dir = scratch("round-trip");
-        stage(&dir);
+        let tmp = scratch();
+        let dir = tmp.path();
+        stage(dir);
         let set = IndexSet::new(dir.join("photos"));
         let remote = MemoryStore::new();
 
@@ -563,16 +562,15 @@ mod tests {
 
         let again = push_to_remote(&set, &remote).unwrap();
         assert_eq!(again.pushed_files, 0);
-
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// A longer file on either side fails the run. The mirror never merges
     /// and never repairs. Both directions report the same divergence.
     #[test]
     fn longer_files_on_either_side_fail() {
-        let dir = scratch("divergence");
-        stage(&dir);
+        let tmp = scratch();
+        let dir = tmp.path();
+        stage(dir);
         let set = IndexSet::new(dir.join("photos"));
         let remote = MemoryStore::new();
         push_to_remote(&set, &remote).unwrap();
@@ -583,8 +581,6 @@ mod tests {
         pull_from_remote(&remote, &longer_local).unwrap();
         std::fs::write(longer_local.segment_path(0), b"segment-zero plus more").unwrap();
         assert!(pull_from_remote(&remote, &longer_local).is_err());
-
-        std::fs::remove_dir_all(dir).ok();
     }
 
     /// Keys outside the set grammar travel with nothing. A stray file beside
@@ -593,8 +589,9 @@ mod tests {
     fn stray_keys_are_left_alone() {
         use crate::storage::ObjectStore;
 
-        let dir = scratch("stray");
-        stage(&dir);
+        let tmp = scratch();
+        let dir = tmp.path();
+        stage(dir);
         let set = IndexSet::new(dir.join("photos"));
         std::fs::write(dir.join("photos.notes.txt"), b"not ours").unwrap();
         let remote = MemoryStore::new();
@@ -613,7 +610,5 @@ mod tests {
                 .unwrap_or("")
                 .ends_with("notes.txt")
         );
-
-        std::fs::remove_dir_all(dir).ok();
     }
 }

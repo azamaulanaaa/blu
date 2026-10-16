@@ -731,12 +731,8 @@ mod tests {
     fn a_header_in_the_last_bytes_of_the_scan_buffer_is_not_damage() {
         const RECORD: u64 = 524_263;
 
-        let file = std::env::temp_dir().join(format!(
-            "blu-scan-{}-{:?}.bin",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_file(&file).ok();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("scan.bin");
 
         let mut bytes = encode_store_header(0).to_vec();
         for n in 0u8..4 {
@@ -759,7 +755,6 @@ mod tests {
         let mut handle = std::fs::File::open(&file).unwrap();
         let scan = scan(&mut handle, 0, Blobs::Index).unwrap();
         drop(handle);
-        std::fs::remove_file(&file).ok();
 
         assert_eq!(
             scan.end,
@@ -778,11 +773,8 @@ mod tests {
     /// return a version list missing whatever came after it.
     #[test]
     fn a_scan_that_skips_the_index_finds_the_same_records() {
-        let file = std::env::temp_dir().join(format!(
-            "blu-discard-{}-{:?}.bin",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("scan.bin");
 
         // Four blobs and two commits, so the commits are not simply "everything
         // at the start". One of them follows a discarded blob record.
@@ -830,7 +822,6 @@ mod tests {
             let mut handle = std::fs::File::open(&file).unwrap();
             scan(&mut handle, 0, Blobs::Discard).unwrap()
         };
-        std::fs::remove_file(&file).ok();
 
         assert_eq!(indexed.blobs.len(), 4);
         assert!(
@@ -1138,12 +1129,8 @@ fn a_scan_read_size_measurement_reports_the_same_records() {
     const RECORDS: usize = 20_000;
     const PAYLOAD: usize = 1024;
 
-    let file = std::env::temp_dir().join(format!(
-        "blu-bench-{}-{:?}.bin",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::remove_file(&file).ok();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("scan.bin");
 
     let mut bytes = encode_store_header(0).to_vec();
     for n in 0..RECORDS {
@@ -1194,8 +1181,6 @@ fn a_scan_read_size_measurement_reports_the_same_records() {
             slowest.as_secs_f64() * 1000.0
         );
     }
-
-    std::fs::remove_file(&file).ok();
 }
 
 /// A length written in more bytes than it needs is not a header.
@@ -1295,14 +1280,10 @@ fn a_torn_tail_is_never_taken_for_a_record() {
         ("a whole header", &header[..header.len()]),
     ];
 
-    for (what, tail) in tails {
-        let file = std::env::temp_dir().join(format!(
-            "blu-tail-{}-{:?}.bin",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_file(&file).ok();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tail.bin");
 
+    for (what, tail) in tails {
         let mut bytes = encode_store_header(0).to_vec();
         for n in 0..RECORDS {
             let mut hash = [0u8; HASH];
@@ -1317,7 +1298,6 @@ fn a_torn_tail_is_never_taken_for_a_record() {
         let mut handle = std::fs::File::open(&file).unwrap();
         let scan = scan_with_buffer(&mut handle, 0, Blobs::Index, SCAN_BUFFER).unwrap();
         drop(handle);
-        std::fs::remove_file(&file).ok();
 
         assert_eq!(
             scan.blobs.len(),
