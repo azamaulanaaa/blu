@@ -132,8 +132,9 @@
 //! nothing reads a pack to answer that.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, hash_map::RandomState},
     fs,
+    hash::{BuildHasher, Hasher},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
@@ -1469,6 +1470,68 @@ fn encode_index(chunks: &[Located]) -> Vec<u8> {
     out
 }
 
+/// Seed for the fold behind the duplicate scan.
+///
+/// Standard sets pair random keys with a `SipHash` fold. The random keys block
+/// crafted input from forcing collisions. The `SipHash` fold costs more per
+/// hash than the scan around it. This keeps the random keys and replaces the
+/// fold with a cheaper one.
+///
+/// Each table takes one seed when the scan builds it. A later open never
+/// reuses that seed.
+struct IndexSeed(u64);
+
+impl IndexSeed {
+    /// Generate one fresh seed for one duplicate scan.
+    ///
+    /// A throwaway standard builder supplies the seed.
+    fn fresh() -> Self {
+        Self(RandomState::new().build_hasher().finish())
+    }
+}
+
+impl BuildHasher for IndexSeed {
+    type Hasher = IndexFold;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        IndexFold(self.0)
+    }
+}
+
+/// Fold for [`IndexSeed`].
+///
+/// The fold mixes each 8-byte lane once with a rotate, a xor and a multiply.
+/// Short input spreads across buckets without further passes.
+struct IndexFold(u64);
+
+impl IndexFold {
+    /// Mix one lane into the running state.
+    ///
+    /// A rotate spreads nearby bits. A xor merges the lane with the state. A
+    /// multiply spreads the result across the state.
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for IndexFold {
+    fn write(&mut self, bytes: &[u8]) {
+        let (lanes, rest) = bytes.as_chunks::<8>();
+        for lane in lanes {
+            self.mix(u64::from_le_bytes(*lane));
+        }
+        if !rest.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(tail));
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// The index read back.
 ///
 /// # Errors
@@ -1477,9 +1540,30 @@ fn encode_index(chunks: &[Located]) -> Vec<u8> {
 /// an error if either of the two varints runs past the end of `bytes`. It
 /// returns an error if a number is overlong or overflows. It returns an error
 /// if a hash is repeated. A repeated hash would mean two chunks at one offset.
+///
+/// **The scan reserves the table up front.** The index length gives an upper
+/// bound on the number of entries. The table never regrows while the scan runs.
+///
+/// **Each open seeds the fold.** The scan generates a fresh seed. A crafted
+/// pack cannot compute where a hash lands, so it cannot fill one bucket on
+/// purpose.
+///
+/// **The duplicate check does not change.** The table compares the hashes
+/// themselves, so a repeated hash is still reported at the same place with the
+/// same message. The fold only picks the bucket.
 fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
+    // An upper bound on the entry count. Each entry holds 32 bytes of hash
+    // and two varints of at least one byte each, so this never undercounts.
+    // The table below then never regrows while the scan runs.
+    //
+    // The bound can overcount, because an entry with a long payload holds more
+    // than 34 bytes. The table then holds more buckets than it needs. The
+    // memory it takes is a few percent of the index.
+    //
+    // A collision costs a probe, not a mistake. The table compares the hashes
+    // themselves, so a repeated hash is still a repeated hash.
+    let mut seen = HashSet::with_capacity_and_hasher(bytes.len() / 34, IndexSeed::fresh());
     let mut at = 0usize;
 
     while at < bytes.len() {
