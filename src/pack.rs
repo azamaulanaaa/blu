@@ -139,6 +139,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use futures_util::StreamExt as _;
 use tokio::{
     fs as tfs,
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -172,6 +173,23 @@ pub(crate) const MAX_CHUNK: u64 = crate::simd_cdc::MAXIMUM_MAX as u64;
 /// gigabytes of payload, and the file would have to be read to be opened. The
 /// number is stated here because the refusal that enforces it must name it.
 const MAX_PACK_CHUNKS: u32 = u32::MAX;
+
+/// The writer fetches this many chunks at once.
+///
+/// The writer writes the records in plan order.
+/// A window holds at most this many chunks.
+const PREFETCH_WINDOW: usize = 16;
+
+/// The writer holds at most this many bytes of fetched chunks at once.
+///
+/// The plan gives the size of every chunk, so the writer knows the size of a
+/// chunk before it reads the chunk. A window stops before it would hold more
+/// than this. The window fetches a chunk that is larger than this on its own.
+///
+/// The value is the size of the largest chunk the chunker can produce. A pack of
+/// large chunks therefore holds one chunk at a time. A pack of small chunks
+/// holds [`PREFETCH_WINDOW`] of them, because they fit in the budget.
+const PREFETCH_BYTES: u64 = MAX_CHUNK;
 
 /// Magic at the start of a pack, and again at the very end.
 const MAGIC: [u8; 4] = *b"LPK1";
@@ -467,8 +485,10 @@ impl Pack {
     /// opened. A pack is derived output, so a partial one is a file to write
     /// again rather than a thing to recover. The pack a *previous* run wrote is
     /// not this run's to lose, and the pack's own path usually names one.
-    /// One chunk is buffered at a time, never a whole version. The index and the
-    /// snapshot both grow with what is being packed.
+    /// The writer holds one window of chunks at a time, never a whole version.
+    /// A window holds at most sixteen chunks and at most sixteen mebibytes of
+    /// fetched chunk data. The index and the snapshot both grow with what is
+    /// being packed.
     ///
     /// `version` is the number the version has *in the set this is being packed
     /// from*. It goes in the header so a receiver can see where the pack came from.
@@ -614,15 +634,28 @@ impl Pack {
             crate::storage::at_async(&temporary, "create", tfs::File::create(&temporary)).await?;
         file.write_all(&header).await?;
 
-        for planned in plan.chunks() {
-            let (mut located, record_len) = write_record(&mut file, store, planned).await?;
-            located.offset = offset;
+        let planned_chunks = plan.chunks();
+        let mut start = 0usize;
+        while start < planned_chunks.len() {
+            let end = start + window_end(&planned_chunks[start..]);
+            let window = &planned_chunks[start..end];
 
-            // Saturating, to match the count the header carries. The
-            // header reports one total and the index is built on the other. A plain
-            // `+=` would panic where both would have clamped.
-            offset = offset.saturating_add(record_len);
-            chunks.push(located);
+            // Fetch the window at the same time.
+            // The writes follow in plan order once the window is in hand.
+            // The first error in plan order wins.
+            let fetched = fetch_window(store, window).await?;
+            for (planned, stored) in window.iter().zip(fetched) {
+                let (mut located, record_len) = write_fetched(&mut file, planned, &stored).await?;
+                located.offset = offset;
+
+                // Saturating, to match the count the header carries. The
+                // header reports one total and the index is built on the other. A plain
+                // `+=` would panic where both would have clamped.
+                offset = offset.saturating_add(record_len);
+                chunks.push(located);
+            }
+
+            start = end;
         }
 
         // Between the payloads and the index, so `index length` alone
@@ -1215,29 +1248,103 @@ pub(crate) fn planned_payload_len(plan: &Plan) -> u64 {
     })
 }
 
-/// Write one chunk's record and say where it landed, and how long it is.
+/// Where a window of fetched chunks ends.
 ///
-/// The caller fills in the offset later. The offset is the sum of every record
-/// before this one. This function does not know them. The length
-/// comes back rather than staying in the returned [`Located`], because the index
-/// does not carry it. It is in the record's header, which was just written. A
-/// second copy in the index would be a second claim about the same bytes.
+/// The window holds at most [`PREFETCH_WINDOW`] chunks.
+/// The window holds at most [`PREFETCH_BYTES`] bytes of chunk data.
+/// The window fetches a chunk that is larger than the budget on its own.
+///
+/// The size of a chunk comes from the plan, so the writer knows it before it
+/// reads the chunk.
+fn window_end(window: &[PlannedChunk]) -> usize {
+    let mut bytes = 0u64;
+    for (at, planned) in window.iter().enumerate() {
+        if at == PREFETCH_WINDOW {
+            return at;
+        }
+        let len = planned.placement.stored_len;
+        if at > 0 && bytes.saturating_add(len) > PREFETCH_BYTES {
+            return at;
+        }
+        bytes = bytes.saturating_add(len);
+    }
+    window.len()
+}
+
+/// Fetch the chunks of one window at the same time.
+///
+/// The window holds every chunk it fetched, in plan order.
+/// The window reports the first error in plan order.
+/// The window stops waiting for the other fetches once it knows that error.
+/// The window drops the other fetches, so their results are not used.
 ///
 /// # Errors
 ///
-/// Returns an error if the store cannot yield the chunk. It returns an error if
-/// what the store yields is not the stored form the plan resolved. The plan saw
-/// a set that changed while the pack was being written. It returns an error if the
-/// file cannot be written.
-async fn write_record<S>(
-    file: &mut tfs::File,
-    store: &S,
-    planned: &PlannedChunk,
-) -> io::Result<(Located, u64)>
+/// Returns an error if a fetch fails.
+/// The error is the first one in plan order.
+async fn fetch_window<S>(store: &S, window: &[PlannedChunk]) -> io::Result<Vec<Stored>>
 where
     S: StorageStored + ?Sized,
 {
-    let stored = store.stored(&planned.id).await?;
+    let mut pending = futures_util::stream::FuturesUnordered::new();
+    for (at, planned) in window.iter().enumerate() {
+        pending.push(async move { (at, store.stored(&planned.id).await) });
+    }
+
+    // The chunk of every fetch, in plan order.
+    // A slot stays empty until its fetch finishes.
+    let mut fetched: Vec<Option<Stored>> = vec![None; window.len()];
+    // The first failure in plan order, and the place it sits.
+    let mut first_failure: Option<(usize, io::Error)> = None;
+
+    while let Some((at, result)) = pending.next().await {
+        match result {
+            Ok(stored) => fetched[at] = Some(stored),
+            Err(error) => {
+                if first_failure
+                    .as_ref()
+                    .is_none_or(|(earlier, _)| at < *earlier)
+                {
+                    first_failure = Some((at, error));
+                }
+            }
+        }
+
+        let Some((earlier, _)) = first_failure.as_ref() else {
+            continue;
+        };
+        // A fetch before the first failure may fail earlier in plan order, so
+        // the window waits for those fetches. A fetch after it cannot be the
+        // first failure, so the window stops as soon as the earlier fetches
+        // have finished. The window drops the fetches it does not wait for.
+        if fetched[..*earlier].iter().all(Option::is_some) {
+            break;
+        }
+    }
+
+    if let Some((_, error)) = first_failure {
+        return Err(error);
+    }
+
+    // Every fetch of the window finished, so every slot holds its chunk.
+    Ok(fetched.into_iter().flatten().collect())
+}
+
+/// Write one fetched chunk.
+///
+/// Compare the bytes with the plan.
+/// Encode the header.
+/// Append the record.
+///
+/// # Errors
+///
+/// Return an error if the bytes differ from the plan.
+/// Return an error if the file write fails.
+async fn write_fetched(
+    file: &mut tfs::File,
+    planned: &PlannedChunk,
+    stored: &Stored,
+) -> io::Result<(Located, u64)> {
     let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
 
     // Checked rather than assumed, because the header's payload length
