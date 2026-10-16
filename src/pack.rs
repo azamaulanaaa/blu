@@ -630,7 +630,11 @@ impl Pack {
         let snapshot_start = payload_start.saturating_add(offset);
         file.write_all(&snapshot_bytes).await?;
 
-        let index = encode_index(&chunks);
+        let index = encode_index(
+            chunks
+                .iter()
+                .map(|chunk| (chunk.id, chunk.offset, chunk.content_len)),
+        );
 
         file.write_all(&index).await?;
         file.write_all(&encode_trailer(
@@ -1459,12 +1463,17 @@ struct Header {
 /// record's own length is *not* here. It is in the record's header, which is the
 /// first thing the record holds. The index says where the records begin rather than
 /// how long each one is.
-fn encode_index(chunks: &[Located]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * (32 + 16));
-    for chunk in chunks {
-        out.extend_from_slice(chunk.id.as_bytes());
-        write_varint(&mut out, chunk.offset);
-        write_varint(&mut out, chunk.content_len);
+///
+/// Each entry is a chunk hash, an offset and a content length.
+/// One encoder serves the writer and the virtual pack.
+/// Two encoders would drift apart, and the pack bytes would depend on which one
+/// ran.
+fn encode_index(entries: impl Iterator<Item = (BlobId, u64, u64)>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(entries.size_hint().0.saturating_mul(32 + 16));
+    for (id, offset, content_len) in entries {
+        out.extend_from_slice(id.as_bytes());
+        write_varint(&mut out, offset);
+        write_varint(&mut out, content_len);
     }
 
     out
@@ -2202,6 +2211,12 @@ pub async fn hash_file(path: &Path) -> io::Result<BlobId> {
 /// **Not** the payload, and not a chunk. The index is proportional to
 /// the chunk count and nothing else, which is the same cost [`Pack::open`] pays
 /// and is what makes a pack's index-at-the-end layout worth its trailer.
+/// The constructor caches each record header in one byte store.
+/// The pack reuses those bytes for each range.
+/// The constructor builds the header store before the pack answers a range.
+/// A pack that answers one range pays the build for one answer.
+/// The saving grows with the number of ranges the pack answers.
+/// `blu serve` builds a pack per request, so a request pays the build once.
 #[derive(Debug, Clone)]
 pub struct VirtualPack {
     /// The header, the whole of it, at offset zero.
@@ -2209,6 +2224,8 @@ pub struct VirtualPack {
     /// One entry per record, in payload order. The same order [`Pack::write`]
     /// writes them in, which is the order a range walk needs.
     records: Vec<VirtualRecord>,
+    /// The header store holds all record headers in payload order.
+    header_store: Vec<u8>,
     /// Bytes the payload region occupies.
     payload_len: u64,
     /// The snapshot section, verbatim, as [`Pack::write`] writes it.
@@ -2229,8 +2246,8 @@ pub struct VirtualPack {
 /// makes the difference hard to forget. `start` is where the *record* is in the
 /// pack, which is what a range request covers. `segment` and `payload_offset`
 /// are where the *payload* is in the segment file, which is what a read is made
-/// from. A record's header is in neither: it is computed and written to the pack,
-/// never copied out of the store.
+/// from. The header store holds each record header. The constructor writes each
+/// one once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VirtualRecord {
     /// The chunk's content hash, and the identity it is addressed by.
@@ -2246,6 +2263,10 @@ struct VirtualRecord {
     raw_len: u64,
     /// How the payload is stored.
     codec: crate::storage::Codec,
+    /// The offset locates the header bytes in the header store.
+    header_start: usize,
+    /// The length measures the header bytes in the header store.
+    header_len: usize,
     /// The file the payload is in.
     ///
     /// Resolved once, at construction, rather than by a second mechanism at serve
@@ -2293,6 +2314,13 @@ impl VirtualPack {
     /// that is damaged fails when its bytes are served, by the same check a real
     /// read makes.
     ///
+    /// The constructor encodes each record header once.
+    /// The pack reuses those bytes for each range.
+    /// The constructor builds the header store before the pack answers a range.
+    /// The build costs one encode per record.
+    /// A pack that answers one range pays the build for one answer.
+    /// `blu serve` builds a pack per request, so a request pays the build once.
+    ///
     /// # Errors
     ///
     /// Returns an error if `snapshot` cannot be encoded on this platform, which
@@ -2331,12 +2359,25 @@ impl VirtualPack {
         // The same walk `write_from` does, over the same plan and the same
         // placements, accumulating the same offsets. This is the half of the
         // byte-identity guarantee that `tests/pack_geometry.rs` checks.
+        // Each header is encoded once here and cached in the header store,
+        // so serving a range slices bytes instead of encoding them again.
         let mut records = Vec::with_capacity(plan.len());
+        let mut header_store = Vec::with_capacity(plan.len().saturating_mul(64));
         let mut offset = 0u64;
 
         for planned in plan.chunks() {
             let stored_len = planned.placement.stored_len;
-            let len = crate::storage::header_len(stored_len, planned.placement.raw_len)
+            let header_start = header_store.len();
+            append_record_header(
+                &mut header_store,
+                &planned.id,
+                planned.placement.codec,
+                stored_len,
+                planned.placement.raw_len,
+            );
+            let header_len = header_store.len().saturating_sub(header_start);
+            let len = u64::try_from(header_len)
+                .unwrap_or(u64::MAX)
                 .saturating_add(stored_len);
 
             records.push(VirtualRecord {
@@ -2346,6 +2387,8 @@ impl VirtualPack {
                 stored_len,
                 raw_len: planned.placement.raw_len,
                 codec: planned.placement.codec,
+                header_start,
+                header_len,
                 path: resolve(planned.placement.segment),
                 payload_offset: planned.placement.offset,
             });
@@ -2354,7 +2397,11 @@ impl VirtualPack {
         }
 
         let payload_len = offset;
-        let index = encode_index_of(&records);
+        let index = encode_index(
+            records
+                .iter()
+                .map(|record| (record.id, record.start, record.raw_len)),
+        );
         let trailer_len = u64::try_from(TRAILER).unwrap_or(0);
         let mut trailer = encode_trailer(
             u64::try_from(index.len()).unwrap_or(0),
@@ -2377,6 +2424,7 @@ impl VirtualPack {
         Ok(Self {
             header,
             records,
+            header_store,
             payload_len,
             snapshot: snapshot_bytes,
             index,
@@ -2539,6 +2587,9 @@ impl VirtualPack {
     /// was computed fails at the read, which is the same place a real transfer
     /// would fail and with the same error.
     ///
+    /// The call slices cached header bytes.
+    /// The call names segment reads.
+    ///
     /// # Errors
     ///
     /// Returns an error if `range` is inverted or reaches past the end of the
@@ -2603,14 +2654,17 @@ impl VirtualPack {
 
             // A record is its header followed by its payload. A range can land in
             // either, in both, or across the join.
-            let header_bytes = record.len.saturating_sub(record.stored_len);
+            let header_bytes = u64::try_from(record.header_len).unwrap_or(u64::MAX);
             let payload_from = from.saturating_sub(record_range.start);
             let payload_to = to.saturating_sub(record_range.start);
+            let cached = self
+                .header_store
+                .get(record.header_start..record.header_start.saturating_add(record.header_len))
+                .unwrap_or(&[]);
 
             if payload_from < header_bytes && payload_to <= header_bytes {
-                // Entirely in the header, which is computed rather than read.
-                let header = record_header(record);
-                push(&mut out, &header, payload_from, payload_to);
+                // Entirely in the header, which is cached rather than read.
+                push(&mut out, cached, payload_from, payload_to);
             } else if payload_from >= header_bytes {
                 // Entirely in the payload, which is read out of the segment.
                 out.push(Source::Segment {
@@ -2622,8 +2676,7 @@ impl VirtualPack {
                 });
             } else {
                 // The join. The header's tail, then the payload's head.
-                let header = record_header(record);
-                push(&mut out, &header, payload_from, header_bytes);
+                push(&mut out, cached, payload_from, header_bytes);
                 out.push(Source::Segment {
                     path: record.path.clone(),
                     offset: record.payload_offset,
@@ -2671,39 +2724,23 @@ impl VirtualPack {
     }
 }
 
-/// Build the index over a set of records.
+/// Append one header to the header store.
 ///
-/// The same encoder [`Pack::write`] uses, over the same entries in the same
-/// order. A function rather than a method because the writer needs it too, and a
-/// second encoder that agreed with the first until the first moved is the exact
-/// failure this module's docs warn about.
-fn encode_index_of(records: &[VirtualRecord]) -> Vec<u8> {
-    let entries: Vec<Located> = records
-        .iter()
-        .map(|record| Located {
-            id: record.id,
-            offset: record.start,
-            content_len: record.raw_len,
-        })
-        .collect();
-
-    encode_index(&entries)
-}
-
-/// One record's header bytes, computed the way `write_record` writes them.
-///
-/// The store's own encoder, over the lengths the plan resolved. That is the
-/// whole point: these have to be the bytes `write_record` wrote, and the only way
-/// to be sure of that is to be the same call.
-fn record_header(record: &VirtualRecord) -> Vec<u8> {
-    let mut header = Vec::new();
+/// Use the store encoder for the given lengths.
+/// Keep the bytes equal to the bytes [`Pack::write`] writes.
+fn append_record_header(
+    out: &mut Vec<u8>,
+    id: &BlobId,
+    codec: Codec,
+    stored_len: u64,
+    raw_len: u64,
+) {
     crate::storage::encode_header(
-        &mut header,
+        out,
         crate::storage::RecordKind::Blob,
-        record.codec,
-        record.id.as_bytes(),
-        record.stored_len,
-        record.raw_len,
+        codec,
+        id.as_bytes(),
+        stored_len,
+        raw_len,
     );
-    header
 }

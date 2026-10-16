@@ -83,8 +83,12 @@ pub struct Requested {
 ///
 /// A [`VirtualPack`] is cheap to hold — the index and the snapshot, not the
 /// payload — and answering a range from it is a walk plus a read per segment the
-/// range touches. So the same value serves every range request, and a client
-/// making ten requests pays for ten walks rather than ten packs.
+/// range touches. One value serves every range of one request.
+///
+/// **The server builds a pack per request.** The server stores nothing for a
+/// pack id, so every request computes the pack again. A client that makes ten
+/// requests pays for ten packs. Each pack builds its header store once, and the
+/// ranges of that request share it.
 #[derive(Debug)]
 pub struct Resolved {
     /// The geometry, and the files each of its records is in.

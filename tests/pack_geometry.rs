@@ -645,3 +645,130 @@ async fn any_range_out_of_a_virtual_pack_reassembles_to_the_written_bytes() {
         "only {checked} ranges were checked, which is too few to mean anything"
     );
 }
+
+#[tokio::test]
+async fn cached_headers_match_written_bytes() {
+    // Each header slice from the pack matches the file.
+    // The test fetches each header alone.
+    // The test also fetches each header join.
+    let dir = tempfile::tempdir().unwrap();
+    let (_, blob) = built(dir.path(), 4, 20_000).await;
+
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    let plan = plan_of(&store).await;
+    let snapshot = snapshot_of(&store).await;
+
+    let written_at = dir.path().join("written.pack");
+    Pack::write(&store, &plan, &snapshot, 1, &written_at)
+        .await
+        .unwrap();
+    let written = fs::read(&written_at).unwrap();
+
+    let segments = segments(&blob);
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
+
+    let opened = Pack::open(&written_at).unwrap();
+    let payload_start = opened.payload_start();
+    let payload_end = virtual_pack.payload_range().end;
+
+    for chunk in opened.chunks() {
+        let base = payload_start.saturating_add(chunk.offset);
+        let mut ranges = vec![
+            Range {
+                start: base,
+                end: base.saturating_add(4),
+            },
+            Range {
+                start: base.saturating_add(1),
+                end: base.saturating_add(5),
+            },
+        ];
+        let join_end = base.saturating_add(70).min(payload_end);
+        if join_end > base {
+            ranges.push(Range {
+                start: base,
+                end: join_end,
+            });
+        }
+
+        for range in ranges {
+            let sources = virtual_pack.source(range).unwrap();
+            let mut assembled = Vec::new();
+            for source in sources {
+                match source {
+                    Source::Bytes(bytes) => assembled.extend_from_slice(&bytes),
+                    Source::Segment { path, offset, len } => {
+                        let mut handle = tokio::fs::File::open(&path).await.unwrap();
+                        handle.seek(std::io::SeekFrom::Start(offset)).await.unwrap();
+                        let mut buffer = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                        tokio::io::AsyncReadExt::read_exact(&mut handle, &mut buffer)
+                            .await
+                            .unwrap();
+                        assembled.extend_from_slice(&buffer);
+                    }
+                }
+            }
+
+            let from = usize::try_from(range.start).unwrap_or(0);
+            let to = usize::try_from(range.end).unwrap_or(0);
+            assert_eq!(
+                assembled,
+                &written[from..to],
+                "{range:?}: cached header bytes differ from the written pack"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn direct_index_matches_written_index() {
+    // The index from the pack matches the file.
+    // The test fetches the index range.
+    let dir = tempfile::tempdir().unwrap();
+    let (_, blob) = built(dir.path(), 4, 20_000).await;
+
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    let plan = plan_of(&store).await;
+    let snapshot = snapshot_of(&store).await;
+
+    let written_at = dir.path().join("written.pack");
+    Pack::write(&store, &plan, &snapshot, 1, &written_at)
+        .await
+        .unwrap();
+    let written = fs::read(&written_at).unwrap();
+
+    let segments = segments(&blob);
+    let virtual_pack = VirtualPack::new(&plan, &snapshot, 1, None, |segment| {
+        segments[segment as usize].clone()
+    })
+    .unwrap();
+
+    let range = virtual_pack.index_range();
+    let sources = virtual_pack.source(range).unwrap();
+    let mut assembled = Vec::new();
+    for source in sources {
+        match source {
+            Source::Bytes(bytes) => assembled.extend_from_slice(&bytes),
+            Source::Segment { path, offset, len } => {
+                let mut handle = tokio::fs::File::open(&path).await.unwrap();
+                handle.seek(std::io::SeekFrom::Start(offset)).await.unwrap();
+                let mut buffer = vec![0u8; usize::try_from(len).unwrap_or(0)];
+                tokio::io::AsyncReadExt::read_exact(&mut handle, &mut buffer)
+                    .await
+                    .unwrap();
+                assembled.extend_from_slice(&buffer);
+            }
+        }
+    }
+
+    let from = usize::try_from(range.start).unwrap_or(0);
+    let to = usize::try_from(range.end).unwrap_or(0);
+    assert_eq!(
+        assembled,
+        &written[from..to],
+        "cached index bytes differ from the written pack"
+    );
+}
