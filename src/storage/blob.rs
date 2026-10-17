@@ -210,6 +210,17 @@ pub struct BlobStore<W: WriteMode, C: Compressor = Compression> {
     /// that range. Reclaiming it here would mean truncating past a writer that
     /// already promised the space.
     reserved: Mutex<Reservation>,
+    /// Serialise rollovers so one thread wins each new segment.
+    ///
+    /// Hold this lock across file creation and publish.
+    /// Never hold `reserved` across file creation.
+    ///
+    /// Lock order:
+    ///
+    /// - Lock `rollover` first.
+    /// - Lock `reserved` next.
+    /// - Lock `dirty` last.
+    rollover: Mutex<()>,
     /// How large a segment may get. This is a write policy, not a format property.
     /// That is why it is not in the header. No record depends on where a boundary
     /// fell.
@@ -681,6 +692,7 @@ impl<C: Compressor> StoreBuilder<C> {
                 commits_per_segment: scanned.commits_per_segment,
             }),
             reserved: Mutex::new(reserved),
+            rollover: Mutex::new(()),
             limit: self.limit,
             compression: self.compression,
             dirty: Mutex::new(Vec::new()),
@@ -721,6 +733,7 @@ impl<C: Compressor> StoreBuilder<C> {
                 segment: u32::MAX,
                 offset: 0,
             })),
+            rollover: Mutex::new(()),
             // Both fields are shared with the writing open, and only that
             // one consults them. Neither field has a value worth recording on a
             // read. A read never rolls over, and never compresses anything. The
@@ -1227,124 +1240,167 @@ fn write_index(set: &IndexSet, index: VersionIndex) -> io::Result<()> {
 }
 
 impl<C: Compressor> BlobStore<Write, C> {
-    /// Claim `total` bytes for a record, rolling into a new segment if it will not
-    /// fit in the last one.
+    /// Claim `total` bytes for one record.
     ///
-    /// The lock is held only for the decision. The copy that follows happens outside
-    /// it. A record is never split across a boundary, so this either returns a
-    /// range inside the current segment or starts the next one.
+    /// Return a range in the current segment when it fits.
+    /// Start the next segment when it does not fit.
+    /// Reject a record larger than the whole limit.
     ///
-    /// A record larger than the whole limit is an error. It is not a segment that
-    /// quietly grows past the cap. The error names the cap so the caller can raise
-    /// it deliberately.
+    /// Fast path:
     ///
-    /// # Why the `fsync` in here stays on the runtime thread
+    /// - Lock `reserved`.
+    /// - Claim the range.
+    /// - Release `reserved`.
+    /// - Mark the segment dirty.
     ///
-    /// `create_segment` opens a file, writes six bytes to it and `fsync`s. All
-    /// three are blocking. The audit flagged that for `spawn_blocking`, and the
-    /// flag is the right instinct. `open` and `open_reader` both send their
-    /// *scan* to a blocking thread. The scan is what this module is careful about.
+    /// Slow path:
     ///
-    /// The scan cannot be done here without giving up the property that makes this
-    /// function correct. The lock is held across `create_segment` on purpose. The
-    /// file has to exist before `reserved.segment` names it. Otherwise a rollover
-    /// hands out an offset in a file that does not exist yet. Awaiting needs the
-    /// guard dropped. A `std::sync::MutexGuard` that is held across an await is not
-    /// `Send`, so the compiler rejects it. Dropping the guard means two threads
-    /// can both decide to roll to segment *n*. Both then pick `offset = header`,
-    /// and both write there. Tolerating `AlreadyExists` on the create does not fix
-    /// that, because by then both have already chosen the same offset.
+    /// - Release `reserved`.
+    /// - Lock `rollover`.
+    /// - Recheck `reserved`.
+    /// - Create the file outside `reserved`.
+    /// - Publish the new segment under `reserved`.
     ///
-    /// What is left is to weigh the cost, and the weighing is arithmetic rather than
-    /// a guess. This runs **once per segment rollover**. A run against the default
-    /// 4 GiB limit therefore does it once per 4 GiB stored. A 150 MB backup does it
-    /// zero times. An `fsync` on a freshly created six-byte header is not free, but
-    /// it is not on any hot path either. The alternative is losing the guarantee
-    /// that `tests/segments.rs::concurrent_writes_across_a_rollover_do_not_overlap`
-    /// exists to pin.
+    /// Lock order:
     ///
-    /// A blocking pool and an async lock would make this both safe and off-thread.
-    /// Both cost more than the problem does.
+    /// - Lock `rollover` before `reserved`.
+    /// - Release `reserved` before `dirty`.
+    /// - Never hold `reserved` across file creation.
+    ///
+    /// Correctness notes:
+    ///
+    /// - Hold `rollover` across creation and publish.
+    /// - Recheck `reserved` after acquiring `rollover`.
+    /// - Publish the file before any writer uses it.
+    /// - Cover this rule with `concurrent_writes_across_a_rollover_do_not_overlap`.
+    ///
+    /// Performance notes:
+    ///
+    /// - Keep the fast path short.
+    /// - Run file creation outside `reserved`.
+    /// - Let small writes proceed during a rollover.
+    /// - Pay one file sync per rollover only.
     fn reserve(&self, total: u64) -> io::Result<Reservation> {
-        let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
-
-        let limit = self.limit.bytes();
-        let header = u64::try_from(STORE_HEADER).unwrap_or(u64::MAX);
-
-        // `offset` starts past the store header, so it already counts those bytes
-        // against the file's size. Adding them again here would roll over early.
-        let end = reserved.offset.saturating_add(total);
-
-        if end <= limit {
-            let reservation = Reservation {
-                segment: reserved.segment,
-                offset: reserved.offset,
+        loop {
+            let full = {
+                let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+                let limit = self.limit.bytes();
+                let header = u64::try_from(STORE_HEADER).unwrap_or(u64::MAX);
+                // `offset` starts past the store header.
+                // It already counts those bytes against the file size.
+                let end = reserved.offset.saturating_add(total);
+                if end <= limit {
+                    let reservation = Reservation {
+                        segment: reserved.segment,
+                        offset: reserved.offset,
+                    };
+                    reserved.offset = end;
+                    drop(reserved);
+                    self.note_segment(reservation.segment);
+                    return Ok(reservation);
+                }
+                // Roll only a non-empty segment.
+                // Report an oversized record instead of retrying forever.
+                if reserved.offset <= header {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "a record of {total} bytes does not fit in a segment of {limit}, which is \
+                             the limit this store was opened with; raise it to store this blob"
+                        ),
+                    ));
+                }
+                // Reject a record that cannot fit in a fresh segment.
+                // Check here to avoid creating an empty file and then failing.
+                if header.saturating_add(total) > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "a record of {total} bytes does not fit in a segment of {limit}, which is \
+                             the limit this store was opened with; raise it to store this blob"
+                        ),
+                    ));
+                }
+                reserved.segment
             };
 
-            reserved.offset = end;
-            self.note_segment(reservation.segment);
+            // Serialize rollovers.
+            // Fast path writers continue to use the old segment meanwhile.
+            let rollover = self.rollover.lock().unwrap_or_else(PoisonError::into_inner);
 
+            let next = {
+                let reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+                let limit = self.limit.bytes();
+                let header = u64::try_from(STORE_HEADER).unwrap_or(u64::MAX);
+                let end = reserved.offset.saturating_add(total);
+                if end <= limit || reserved.segment != full {
+                    // Another thread already rolled or freed space.
+                    // Retry through the fast path without holding `rollover`.
+                    drop(reserved);
+                    drop(rollover);
+                    continue;
+                }
+                if reserved.offset <= header || header.saturating_add(total) > limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "a record of {total} bytes does not fit in a segment of {limit}, which is \
+                             the limit this store was opened with; raise it to store this blob"
+                        ),
+                    ));
+                }
+                let next = reserved.segment.checked_add(1).ok_or_else(|| {
+                    io::Error::other("a store cannot hold more than u32::MAX segments")
+                })?;
+                // A segment number uses zero-padded `SEGMENT_DIGITS`.
+                // Padding never truncates.
+                // One past the width would name a file that the parser rejects.
+                if next > crate::layout::MAX_SEGMENT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "this set has reached {MAX_SEGMENT} segments, which is as many as the \
+                             naming scheme can name; a run that fills segment {MAX_SEGMENT} cannot be \
+                             completed, so nothing was written",
+                            MAX_SEGMENT = crate::layout::MAX_SEGMENT
+                        ),
+                    ));
+                }
+                // Drop `reserved` before file creation.
+                // Keep `rollover` to keep one winner.
+                drop(reserved);
+                next
+            };
+
+            // Create the file before any writer uses it.
+            // Hold `rollover` but not `reserved` here.
+            create_segment(&self.segment_path(next), next)?;
+
+            let header = u64::try_from(STORE_HEADER).unwrap_or(u64::MAX);
+            let reservation = Reservation {
+                segment: next,
+                offset: header,
+            };
+            {
+                let mut reserved = self.reserved.lock().unwrap_or_else(PoisonError::into_inner);
+                // Only this thread holds `rollover`.
+                // No other thread can publish a new segment now.
+                // Fast path writes may have advanced the old offset meanwhile.
+                // Discard that tail and seal the old segment.
+                reserved.segment = next;
+                reserved.offset = header.saturating_add(total);
+            }
+            drop(rollover);
+            self.note_segment(next);
             return Ok(reservation);
         }
-
-        // The code rolls only if something has been written to this segment. An
-        // empty segment that cannot hold the record holds a record bigger than the
-        // limit. The code reports that rather than retrying forever against a fresh
-        // segment.
-        if reserved.offset <= header {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "a record of {total} bytes does not fit in a segment of {limit}, which is \
-                     the limit this store was opened with; raise it to store this blob"
-                ),
-            ));
-        }
-
-        let next = reserved
-            .segment
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("a store cannot hold more than u32::MAX segments"))?;
-
-        // A segment's number is zero-padded to `SEGMENT_DIGITS`, which pads and
-        // never truncates. One past the width would be written as a five-digit name
-        // that `IndexSet::segment_number` rejects. The file would then exist while
-        // the set reported it missing. This run's commit record would go into a
-        // segment that no later run could read, taking a published version with it.
-        // The next `create_segment` would then fail `AlreadyExists` and wedge the
-        // set. The code refuses the number here, where the message can name the
-        // cause.
-        if next > crate::layout::MAX_SEGMENT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "this set has reached {MAX_SEGMENT} segments, which is as many as the \
-                     naming scheme can name; a run that fills segment {MAX_SEGMENT} cannot be \
-                     completed, so nothing was written",
-                    MAX_SEGMENT = crate::layout::MAX_SEGMENT
-                ),
-            ));
-        }
-
-        // The code creates the file here, before any writer is told that it may use
-        // it. A rollover therefore cannot hand out an offset in a file that does not
-        // exist yet.
-        create_segment(&self.segment_path(next), next)?;
-
-        let reservation = Reservation {
-            segment: next,
-            offset: header,
-        };
-
-        reserved.segment = next;
-        reserved.offset = header + total;
-        self.note_segment(next);
-
-        Ok(reservation)
     }
 
-    /// Record that `segment` was written to by this run, so `sync_data` knows
-    /// which files to sync.
+    /// Record that `segment` was written to by this run.
+    ///
+    /// Call without holding `reserved`.
+    /// Call without holding `rollover`.
+    /// Let `sync_data` find the segment later.
     fn note_segment(&self, segment: u32) {
         let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
 

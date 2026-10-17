@@ -477,6 +477,72 @@ async fn concurrent_writes_across_a_rollover_do_not_overlap() {
     }
 }
 
+/// Concurrent fast path writes claim unique ranges.
+///
+/// No rollover happens here.
+/// The test covers the shortened fast path.
+/// It checks that parallel claims never overlap.
+///
+/// Follow these steps:
+///
+/// - Store many blobs concurrently.
+/// - Read each blob back.
+/// - Compare bytes with the input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fast_path_writes_claim_unique_ranges() {
+    const BLOBS: usize = 32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("store");
+    let limit = SegmentLimit::new(16 * 1024 * 1024);
+
+    let payloads: Vec<Vec<u8>> = (0..BLOBS)
+        .map(|i| payload(u8::try_from(i).unwrap(), 900 + i * 7))
+        .collect();
+    let store = std::sync::Arc::new(
+        BlobStore::builder(&blob)
+            .segment_limit(limit)
+            .open_writer()
+            .await
+            .unwrap(),
+    );
+
+    let mut tasks = Vec::new();
+    for payload in payloads.iter().cloned() {
+        let store = std::sync::Arc::clone(&store);
+        let id = common::id_of(&payload);
+        let len = common::len_of(&payload);
+        tasks.push(tokio::spawn(async move {
+            store.put(&id, common::reader(payload), len).await?;
+            Ok::<_, std::io::Error>(id)
+        }));
+    }
+
+    let mut stored = Vec::new();
+    for task in tasks {
+        stored.push(task.await.unwrap().unwrap());
+    }
+
+    let reader_store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    assert_eq!(
+        reader_store.segment_count(),
+        1,
+        "the set should stay in one segment"
+    );
+
+    for (i, id) in stored.iter().enumerate() {
+        let mut reader = reader_store.get(id).await.unwrap();
+        let mut read = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut read)
+            .await
+            .unwrap();
+        assert_eq!(
+            &read, &payloads[i],
+            "blob {i} holds another blob range"
+        );
+    }
+}
+
 /// The limit is a write policy, not part of the format.
 ///
 /// A set written under one limit reads back under another, because no record
