@@ -84,6 +84,9 @@ const HASH: usize = 32;
 /// Length of the header's own checksum.
 const CHECK: usize = 8;
 
+/// Bytes of a record-header digest.
+const DIGEST: usize = 32;
+
 /// Bytes in the smallest possible header: two one-byte lengths of zero.
 ///
 /// The `2` counts those two lengths at their minimum. This is also the smallest
@@ -185,14 +188,14 @@ pub enum Codec {
 }
 
 impl Codec {
-    fn to_byte(self) -> u8 {
+    pub(super) fn to_byte(self) -> u8 {
         match self {
             Self::Raw => 0,
             Self::Zstd => 1,
         }
     }
 
-    fn from_byte(byte: u8) -> Option<Self> {
+    pub(super) fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Raw),
             1 => Some(Self::Zstd),
@@ -225,6 +228,52 @@ pub(crate) struct Header {
     pub payload_offset: u64,
     /// Bytes the record occupies, header included.
     pub total_len: u64,
+}
+
+/// A digest of the record headers of one segment, in file order.
+///
+/// The digest covers the header of every record the scan read.
+/// It does not cover the payload of any record.
+/// Two segments with the same digest hold the same headers in the same order.
+///
+/// A caller uses this to tell one segment from another.
+/// The caller keeps the digest of a segment from an earlier scan.
+/// The caller compares that digest with the digest of a later scan.
+/// A difference means the segment changed, so a cache of the first one is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HeaderDigest([u8; DIGEST]);
+
+impl Default for HeaderDigest {
+    /// The digest of a segment that holds no records.
+    fn default() -> Self {
+        Self(*blake3::hash(&[]).as_bytes())
+    }
+}
+
+impl HeaderDigest {
+    /// The bytes of this digest.
+    pub(super) fn as_bytes(&self) -> &[u8; DIGEST] {
+        &self.0
+    }
+
+    /// Read a digest from its bytes.
+    pub(super) fn from_bytes(bytes: [u8; DIGEST]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Add one record header to a running header digest.
+///
+/// Hash the canonical fields of the header.
+/// Leave the payload out of the digest.
+/// Keep the order of the records.
+fn digest_header(hasher: &mut blake3::Hasher, header: &Header) {
+    hasher.update(&[header.kind.to_byte(), header.codec.to_byte()]);
+    hasher.update(&header.hash);
+    hasher.update(&header.stored_len.to_le_bytes());
+    hasher.update(&header.raw_len.to_le_bytes());
+    hasher.update(&header.payload_offset.to_le_bytes());
+    hasher.update(&header.total_len.to_le_bytes());
 }
 
 /// Where a blob's payload sits in the store.
@@ -279,6 +328,11 @@ pub(super) struct Scan {
     pub commits: Vec<BlobId>,
     /// First byte past the last valid record, where the store should be truncated.
     pub end: u64,
+    /// Digest of the record headers of the segment, in file order.
+    ///
+    /// The digest covers the headers only. The payloads stay out of it.
+    /// A caller compares this with the digest it kept for an earlier scan.
+    pub digest: HeaderDigest,
 }
 
 /// Bytes a record header occupies, given the two lengths it carries.
@@ -468,6 +522,11 @@ pub(super) struct CommitScan {
     pub commits: Vec<BlobId>,
     /// First byte past the last valid record.
     pub end: u64,
+    /// Digest of the record headers of the segment, in file order.
+    ///
+    /// The digest covers the headers only. The payloads stay out of it.
+    /// A caller compares this with the digest it kept for an earlier scan.
+    pub digest: HeaderDigest,
 }
 
 /// Read one segment's records, and keep only the commit records among them.
@@ -504,6 +563,7 @@ pub(super) fn scan_commits_with_buffer(
 ) -> io::Result<CommitScan> {
     let file_len = file.seek(SeekFrom::End(0))?;
     let mut scan = CommitScan::default();
+    let mut digest = blake3::Hasher::new();
 
     let mut buffer: Vec<u8> = Vec::new();
     let mut filled = 0usize;
@@ -542,6 +602,10 @@ pub(super) fn scan_commits_with_buffer(
             break;
         };
 
+        // The digest takes every header the scan reads, in file order.
+        // The payload of a record stays out of the digest.
+        digest_header(&mut digest, &header);
+
         let end = position
             .checked_add(header.total_len)
             .and_then(|e| e.checked_add(header.stored_len))
@@ -577,6 +641,7 @@ pub(super) fn scan_commits_with_buffer(
     }
 
     scan.end = position;
+    scan.digest = HeaderDigest(*digest.finalize().as_bytes());
     Ok(scan)
 }
 
@@ -636,6 +701,7 @@ pub(super) fn scan(file: &mut (impl Read + Seek), segment: u32, blobs: Blobs) ->
             blobs: HashMap::new(),
             commits: commits.commits,
             end: commits.end,
+            digest: commits.digest,
         });
     }
     scan_with_buffer(file, segment, blobs, SCAN_BUFFER)
@@ -683,6 +749,7 @@ pub(super) fn scan_with_buffer(
             blobs: HashMap::new(),
             commits: commits.commits,
             end: commits.end,
+            digest: commits.digest,
         });
     }
     // This code finds the length by seeking. It does not read file metadata.
@@ -691,6 +758,7 @@ pub(super) fn scan_with_buffer(
     // bytes. Both cases take this path.
     let file_len = file.seek(SeekFrom::End(0))?;
     let mut scan = Scan::default();
+    let mut digest = blake3::Hasher::new();
 
     // Size the blob index before the first insert.
     // Without this the map regrew as the scan inserted. Each regrow rehashed
@@ -769,6 +837,10 @@ pub(super) fn scan_with_buffer(
             break;
         };
 
+        // The digest takes every header the scan reads, in file order.
+        // The payload of a record stays out of the digest.
+        digest_header(&mut digest, &header);
+
         // A record whose payload runs past the end of the file was torn by
         // something other than a clean append.
         let end = position
@@ -831,6 +903,7 @@ pub(super) fn scan_with_buffer(
     }
 
     scan.end = position;
+    scan.digest = HeaderDigest(*digest.finalize().as_bytes());
     Ok(scan)
 }
 
