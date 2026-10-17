@@ -536,10 +536,7 @@ async fn concurrent_fast_path_writes_claim_unique_ranges() {
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut read)
             .await
             .unwrap();
-        assert_eq!(
-            &read, &payloads[i],
-            "blob {i} holds another blob range"
-        );
+        assert_eq!(&read, &payloads[i], "blob {i} holds another blob range");
     }
 }
 

@@ -16,6 +16,7 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncSeek};
 
 use super::{BlobId, Codec};
+use crate::metadata::Timestamp;
 
 /// A stream that is both [`AsyncRead`] and [`AsyncSeek`].
 ///
@@ -179,4 +180,29 @@ pub trait StoragePut: Send + Sync {
     /// Returns an error if the commit record cannot be written or made durable,
     /// in which case the run is not published.
     fn commit(&self, snapshot: &BlobId) -> impl Future<Output = io::Result<u32>> + Send;
+
+    /// Publish `snapshot` as the next version with a known stamp.
+    ///
+    /// Take the stamp from the caller:
+    ///
+    /// * Skip the snapshot read.
+    /// * Write the index file from the given stamp.
+    ///
+    /// Keep [`StoragePut::commit`] for callers without the stamp.
+    /// Prefer this method when the caller holds the stamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit record cannot be written or made durable,
+    /// in which case the run is not published.
+    fn commit_with_time(
+        &self,
+        snapshot: &BlobId,
+        taken_at: Timestamp,
+    ) -> impl Future<Output = io::Result<u32>> + Send {
+        async move {
+            let _ = taken_at;
+            self.commit(snapshot).await
+        }
+    }
 }

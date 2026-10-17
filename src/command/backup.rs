@@ -299,6 +299,31 @@ impl storage::StoragePut for Planned {
     /// still worth handing back, and it is the one a real run would get: the set's
     /// own commit log, plus one.
     async fn commit(&self, _snapshot: &storage::BlobId) -> io::Result<u32> {
+        self.next_version()
+    }
+
+    /// The version this run *would* have committed with a known stamp.
+    ///
+    /// Take the stamp from the caller:
+    ///
+    /// * Ignore the stamp.
+    /// * Return the planned version.
+    async fn commit_with_time(
+        &self,
+        _snapshot: &storage::BlobId,
+        _taken_at: Timestamp,
+    ) -> io::Result<u32> {
+        self.next_version()
+    }
+}
+
+impl Planned {
+    /// The version a real run would get.
+    ///
+    /// Read the set commit log.
+    /// Add one to its length.
+    /// Return one where the set holds nothing.
+    fn next_version(&self) -> io::Result<u32> {
         let Some(store) = self.store.as_ref() else {
             return Ok(1);
         };
@@ -307,9 +332,7 @@ impl storage::StoragePut for Planned {
             .unwrap_or(u32::MAX)
             .saturating_add(1))
     }
-}
 
-impl Planned {
     /// Note what one blob would have been written as, and whether the set has it.
     ///
     /// The reader has already been dropped unread by the caller. Nothing
@@ -892,7 +915,10 @@ async fn run<P: AsRef<Path> + Debug, S: storage::StoragePut + 'static>(
     // `storage::blob` for why the commit is a second sync.
     pipeline.storage.sync_data().await?;
 
-    let version = pipeline.storage.commit(&id).await?;
+    let version = pipeline
+        .storage
+        .commit_with_time(&id, snapshot.taken_at)
+        .await?;
 
     Ok((
         entries,

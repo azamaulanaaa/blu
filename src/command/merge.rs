@@ -653,7 +653,9 @@ async fn merge<C: storage::Compressor>(
     // A version that exists before the data it names is durable is a version
     // nothing can be restored from.
     store.sync_data().await?;
-    let version = store.commit(&snapshot_id).await?;
+    let version = store
+        .commit_with_time(&snapshot_id, snapshot.taken_at)
+        .await?;
 
     Ok(Merged::Committed {
         version,
