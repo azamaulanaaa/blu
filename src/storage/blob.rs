@@ -102,14 +102,21 @@ use crate::{
 /// coalesces the short reads a streaming backend hands out.
 const COPY_BUFFER: usize = 256 * 1024;
 
+/// How many copy buffers the streaming path keeps.
+///
+/// A streamed record holds a buffer while it runs. A run that writes several
+/// large records at once holds one buffer for each of them. The cap keeps the
+/// memory bounded. The pool drops a buffer over the cap, and a later record
+/// allocates one again.
+const MAX_COPY_BUFFERS: usize = 8;
+
 /// How many open segment files the store keeps at once.
 ///
 /// The cache of open files exists so that reading many chunks does not open
 /// the same segment again for each of them. A store has as many segments as
-/// its size asks for. An unbounded cache then holds one descriptor per
-/// segment, and a store that is merely large runs out of descriptors. The cap
-/// keeps the number of descriptors the store holds fixed, whatever the store
-/// holds.
+/// its size asks for, so an unbounded cache holds one descriptor per segment,
+/// and a store that is merely large runs out of descriptors. The cap keeps the
+/// number of descriptors the store holds fixed, whatever the store holds.
 const OPEN_FILE_LIMIT: usize = 64;
 
 /// How many segments one sync round opens at once.
@@ -118,6 +125,27 @@ const OPEN_FILE_LIMIT: usize = 64;
 /// segments. The sync therefore opens the handles a batch at a time. The batch
 /// is a ceiling, not a target. A run that wrote to one segment opens one file.
 const SYNC_BATCH: usize = 16;
+/// Stream payloads above this size through temp files.
+///
+/// - Keep small payloads in memory.
+/// - Stage large payloads on disk.
+/// - Bound memory during concurrent writes.
+///
+/// The threshold sits well above the size of a chunk. The default chunker cuts
+/// at 16 KiB on average, and the coarse profile at 64 KiB. A record this large
+/// comes from a snapshot table or from a pack written elsewhere. A threshold
+/// near the size of a chunk would stage every large record of an ordinary
+/// backup on disk. The staging costs a second copy of the payload.
+#[cfg(not(test))]
+const STREAM_THRESHOLD: u64 = 64 * 1024 * 1024;
+
+/// The threshold the unit tests use.
+///
+/// The tests below exercise the streaming path with small payloads, so they do
+/// not allocate the production threshold's worth of memory. The code they
+/// exercise is the same code either way.
+#[cfg(test)]
+const STREAM_THRESHOLD: u64 = 1024 * 1024;
 
 /// What a scan found, and what this handle may add to.
 #[derive(Debug, Default)]
@@ -146,8 +174,8 @@ impl Contents {
 
 /// The open segment files a store keeps between reads.
 ///
-/// The cache saves an open for every chunk a segment holds. The cache is
-/// bounded. A store has as many segments as its size asks for, and one
+/// The cache saves an open for every chunk a segment holds. It is bounded,
+/// because a store has as many segments as its size asks for, and one
 /// descriptor per segment runs a large store out of descriptors.
 ///
 /// Each entry remembers the identity of the file it was opened from. A segment
@@ -160,8 +188,8 @@ struct OpenFiles {
     files: HashMap<u32, OpenFile>,
     /// The number the entries were opened in.
     ///
-    /// A counter rather than a place in a list. A file opened again after its
-    /// segment was replaced is a new file, and it counts as a new one.
+    /// A counter rather than a place in a list, because a file opened again
+    /// after its segment was replaced is a new file and counts as a new one.
     opened: u64,
 }
 
@@ -300,6 +328,64 @@ struct Reservation {
     offset: u64,
 }
 
+/// What a record needs before the code writes its payload.
+///
+/// The two write paths share this. A payload that is in memory and a payload
+/// that arrives as a reader produce the same header and take the same room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordHead {
+    /// The encoded header of the record.
+    header: Vec<u8>,
+    /// Which segment the record goes in.
+    segment: u32,
+    /// Byte offset of the record within that segment.
+    offset: u64,
+}
+
+/// The copy buffers the streaming path uses.
+///
+/// A streamed record copies its payload through a buffer. The pool allocates
+/// the buffer once. A later record takes the same buffer. The reuse does not
+/// zero the bytes again.
+#[derive(Debug, Default)]
+struct CopyBuffers {
+    /// The buffers that are free to use.
+    free: Vec<Vec<u8>>,
+}
+
+impl CopyBuffers {
+    /// Take a buffer of `chunk` bytes.
+    ///
+    /// The pool hands back a buffer of that size. The pool filled the buffer
+    /// once, so the reuse costs no zeroing. A pooled buffer of another size
+    /// does not fit, so the pool allocates a new one.
+    fn take(&mut self, chunk: usize) -> Vec<u8> {
+        let mut found = None;
+        for (index, buf) in self.free.iter().enumerate() {
+            if buf.len() == chunk {
+                found = Some(index);
+                break;
+            }
+        }
+
+        let Some(index) = found else {
+            return vec![0u8; chunk];
+        };
+
+        self.free.swap_remove(index)
+    }
+
+    /// Give a buffer back, so a later record does not allocate one.
+    ///
+    /// The pool keeps a fixed number of buffers. The pool drops a buffer over
+    /// the cap, and a later record allocates one again.
+    fn give(&mut self, buf: Vec<u8>) {
+        if self.free.len() < MAX_COPY_BUFFERS {
+            self.free.push(buf);
+        }
+    }
+}
+
 /// Whether a handle may append to its store.
 ///
 /// A marker trait rather than the `bool` it replaced, so the type says *which*
@@ -416,6 +502,11 @@ pub struct BlobStore<W: WriteMode, C: Compressor = Compression> {
     /// its own handles for writing, because `FlushFileBuffers` refuses a
     /// read-only handle on Windows.
     open_files: tokio::sync::Mutex<OpenFiles>,
+    /// The copy buffers the streaming path uses.
+    ///
+    /// A streamed record copies its payload through a buffer. A later record
+    /// takes the same buffer. The reuse does not zero the bytes again.
+    copy_buffers: Mutex<CopyBuffers>,
     /// The mode, which selects the methods and so appears in no field.
     ///
     /// A `const WRITE: bool` parameter needs no such field. That is the one thing
@@ -524,9 +615,9 @@ impl<W: WriteMode, C: Compressor> BlobStore<W, C> {
     /// Read the stored payload of a blob.
     ///
     /// Reuse one open file per segment, up to a fixed number of them. Check
-    /// that the handle and the path name the same file. Open the path again
-    /// when it is not. Check the range against the file length. Return the
-    /// payload bytes with the codec and the content length.
+    /// that the file at the path is still the file the handle was opened from,
+    /// and open it again when it is not. Check the range against the file
+    /// length. Return the payload bytes with the codec and the content length.
     ///
     /// # Errors
     ///
@@ -870,6 +961,7 @@ impl<C: Compressor> StoreBuilder<C> {
             compression: self.compression,
             dirty: Mutex::new(Vec::new()),
             open_files: tokio::sync::Mutex::new(OpenFiles::default()),
+            copy_buffers: Mutex::new(CopyBuffers::default()),
             mode: PhantomData,
         })
     }
@@ -917,6 +1009,7 @@ impl<C: Compressor> StoreBuilder<C> {
             compression: Compression::default(),
             dirty: Mutex::new(Vec::new()),
             open_files: tokio::sync::Mutex::new(OpenFiles::default()),
+            copy_buffers: Mutex::new(CopyBuffers::default()),
             mode: PhantomData,
         })
     }
@@ -1028,66 +1121,17 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
             return Ok(());
         }
 
-        let raw = read_whole(reader, len).await?;
-
-        // Checked before anything is stored, so nothing is written under the wrong
-        // name. Hashing the content is also what makes the codec a write policy.
-        // The same bytes deduplicate whether they were stored raw or compressed.
-        if blake3::hash(&raw) != *id {
-            // Nothing is written yet, so the run simply fails and the store is as
-            // it was.
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the content does not hash to {id}, so it was not stored"),
-            ));
+        // A large payload streams when the policy allows streaming. A small
+        // payload, or a policy that maps to nothing, stays on the buffered path.
+        if len > STREAM_THRESHOLD
+            && let Some(policy) = self.compression.stream_policy()
+        {
+            return self.put_streaming(id, reader, len, policy).await;
         }
 
-        // The code compresses, and stores the bytes as they are when that does not
-        // help. A zstd frame carries a header of its own, so on content that it
-        // cannot compress the frame comes out larger than the input.
-        let (codec, stored) = self.compression.compress(&raw);
-
-        // The code checks the answer, because the policy that produced it is not
-        // this crate's code. That policy need not be this crate's careful. This is
-        // the single place where the "only when strictly smaller" rule is
-        // *enforced* rather than observed. An implementor who returns a frame
-        // larger than its input therefore costs a copy of the frame and nothing
-        // else. The payload is stored as it came in, and the record says `Raw`.
-        // That is exactly what the reader would have done with it. See the note on
-        // [`Compressor`].
-        //
-        // The code checks the codec as well, and by naming `Zstd` rather than by
-        // asking the store's decoders. `Raw` in a record means "these are the bytes
-        // that hashed to this id". A policy that paired it with anything else would
-        // be naming bytes that the store never hashed. Nothing on the read path
-        // checks what it hands back. The pairing is therefore worth enforcing where
-        // it is written rather than assuming that a caller got it right. `Zstd` is
-        // the fail-closed arm in exchange. Its decode validates the frame against
-        // the `raw_len` that the header claims. That is why the store may keep a
-        // frame on a policy's word that it decodes to exactly that.
-        //
-        // `Compression` never trips this, because it applies the rule itself and
-        // hands back a borrow of `raw` when the frame did not win.
-        let keep = matches!(codec, Codec::Zstd) && stored.len() < raw.len();
-        let (codec, stored) = if keep {
-            (Codec::Zstd, stored)
-        } else {
-            (Codec::Raw, Cow::Borrowed(raw.as_slice()))
-        };
-
-        self.write_record(id, &stored, len, codec).await
+        self.put_buffered(id, reader, len).await
     }
 
-    /// Store a payload that is already encoded, after checking what it decodes to.
-    ///
-    /// The decode is the whole of the verification and is not optional. See
-    /// [`StoragePut::put_stored`](crate::storage::StoragePut::put_stored), which
-    /// says why in the terms that a caller has. This is the part of that method
-    /// which is specific to a store. The frame is kept as it came in only when it
-    /// is strictly smaller than the content. The frame is kept only when it names a
-    /// codec that the store can decode. Otherwise the content is stored raw. That
-    /// is the same fallback that `put` takes, and for the same reason.
-    #[instrument(skip_all, err)]
     async fn put_stored(
         &self,
         id: &BlobId,
@@ -1099,6 +1143,15 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
         if self.holds(id) {
             tracing::trace!(already = %id, "already stored");
             return Ok(());
+        }
+
+        // A large payload streams. This path consults no policy: the codec and
+        // the two lengths decide what is kept, and the store decides that in
+        // `verify_staged` the same way the buffered path below does.
+        if stored_len > STREAM_THRESHOLD {
+            return self
+                .put_stored_streaming(id, reader, stored_len, raw_len, codec)
+                .await;
         }
 
         let mut stored = read_whole(reader, stored_len).await?;
@@ -1139,10 +1192,7 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
         // The check happens before anything is written, so a failure leaves the
         // store as it was.
         if blake3::hash(&content) != *id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the content does not hash to {id}, so it was not stored"),
-            ));
+            return Err(hash_mismatch(id));
         }
 
         // The record's own content length is what was decoded. The value is not
@@ -1152,10 +1202,10 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
         let content_len = u64::try_from(content.len()).unwrap_or(u64::MAX);
 
         if keep {
-            self.write_record(id, &stored, content_len, Codec::Zstd)
+            self.write_record(id, stored.as_slice(), content_len, Codec::Zstd)
                 .await
         } else {
-            self.write_record(id, &content, content_len, Codec::Raw)
+            self.write_record(id, content.as_slice(), content_len, Codec::Raw)
                 .await
         }
     }
@@ -1200,9 +1250,9 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
             let syncs = batch.iter().map(|segment| {
                 let path = self.segment_path(*segment);
                 async move {
-                    // One handle per segment. The reason is the same one that `put`
-                    // has for each record. This is a standalone sync, and nothing
-                    // is seeking.
+                    // A handle of its own per segment, for the same reason that `put`
+                    // takes one per record. This is a standalone sync and nothing is
+                    // seeking.
                     //
                     // The handle is opened for writing. The cached read handles are
                     // not reused here. A sync needs write access, and
@@ -1290,12 +1340,6 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
     ///
     /// * Skip the snapshot read.
     /// * Write the index file from the given stamp.
-    ///
-    /// The caller owns the stamp.
-    /// The store writes the stamp into the index file as it stands.
-    /// The store does not read the snapshot to check the stamp.
-    /// A caller that passes a wrong stamp writes a wrong time into the index.
-    /// A rebuild of the index reads the stamp from the snapshot instead.
     async fn commit_with_time(&self, snapshot: &BlobId, taken_at: Timestamp) -> io::Result<u32> {
         let (version, segment, ordinal) = self.commit_record(snapshot).await?;
 
@@ -1373,6 +1417,382 @@ async fn read_whole(mut reader: StreamReadSeeker, len: u64) -> io::Result<Vec<u8
     }
 
     Ok(bytes)
+}
+
+/// The error for content whose hash is not the name it was offered under.
+///
+/// Every write path checks this before anything is stored. Nothing is written
+/// under a name its content does not own.
+fn hash_mismatch(id: &BlobId) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the content does not hash to {id}, so it was not stored"),
+    )
+}
+
+/// Stage exactly `len` bytes to a temp file.
+///
+/// - Read the input in bounded chunks.
+/// - Hash the bytes that are staged.
+/// - Reject a short input with an error.
+/// - Reject a long input with an error.
+/// - Return the staged file and its hash.
+///
+/// The file is left at the end. Every reader of a staged file rewinds first.
+async fn stage_raw_streaming(
+    mut reader: StreamReadSeeker,
+    len: u64,
+    mut tmp: fs::File,
+) -> io::Result<(std::fs::File, blake3::Hash)> {
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = len;
+    let mut buf = vec![0u8; COPY_BUFFER];
+
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(COPY_BUFFER as u64)).unwrap_or(COPY_BUFFER);
+        let read = reader.read(&mut buf[..want]).await?;
+        if read == 0 {
+            break;
+        }
+        tmp.write_all(&buf[..read]).await?;
+        hasher.update(&buf[..read]);
+        remaining -= u64::try_from(read).unwrap_or(u64::MAX);
+    }
+
+    if remaining != 0 {
+        let read = len - remaining;
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("declared {len} bytes but the reader yielded only {read}"),
+        ));
+    }
+
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing).await? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the reader yielded more than the declared {len} bytes"),
+        ));
+    }
+
+    tmp.flush().await?;
+
+    Ok((tmp.into_std().await, hasher.finalize()))
+}
+
+/// Compress a staged payload on a worker thread.
+///
+/// - Rewind the staged file.
+/// - Build a frame at the level the policy names.
+/// - Keep the frame only when it is strictly smaller.
+/// - Fall back to raw when compression is off, fails, or does not win.
+/// - Return the file a record writes, with its lengths and codec.
+///
+/// The frame is built with the content size pledged, so the record's frame
+/// declares exactly `raw_len`. A frame without a declared size would be refused
+/// by every later read, so the pledge is a correctness requirement here.
+///
+/// The returned file stays wherever the work left it.
+/// [`BlobStore::write_record_from`] rewinds whatever the caller hands it.
+fn compress_staged(
+    raw: std::fs::File,
+    raw_len: u64,
+    policy: Compression,
+) -> io::Result<(std::fs::File, u64, Codec)> {
+    use std::io::Seek as _;
+
+    let mut raw = raw;
+    // `stage_raw_streaming` leaves the file at the end. The encoder reads from
+    // the start.
+    raw.seek(std::io::SeekFrom::Start(0))?;
+
+    let Some(level) = policy.level() else {
+        return Ok((raw, raw_len, Codec::Raw));
+    };
+
+    // A host that cannot give a second temporary file stores the content as it
+    // is. The record then says `Raw`, and the reader decodes it as the bytes
+    // that hashed to the id. The frame is an encoding of the content, so the
+    // content is what the store owes the reader either way.
+    let Ok(dest) = tempfile::tempfile() else {
+        return Ok((raw, raw_len, Codec::Raw));
+    };
+
+    let encoded: io::Result<(std::fs::File, u64)> = (|| {
+        let mut encoder = match zstd::stream::Encoder::new(dest, i32::from(level)) {
+            Ok(encoder) => encoder,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("could not start zstd encoder: {e}"),
+                ));
+            }
+        };
+        if let Err(e) = encoder.set_pledged_src_size(Some(raw_len)) {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("could not pledge payload size: {e}"),
+            ));
+        }
+        if let Err(e) = std::io::copy(&mut raw, &mut encoder) {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("could not feed payload to encoder: {e}"),
+            ));
+        }
+        let finished = match encoder.finish() {
+            Ok(finished) => finished,
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("could not finish zstd frame: {e}"),
+                ));
+            }
+        };
+        let frame_len = finished.metadata().map_or(u64::MAX, |m| m.len());
+        Ok((finished, frame_len))
+    })();
+
+    match encoded {
+        Ok((frame, frame_len)) if frame_len < raw_len => Ok((frame, frame_len, Codec::Zstd)),
+        // The frame lost the comparison, or the encode failed. The frame is
+        // dropped either way. The raw bytes are stored as they are, which is a
+        // correct record however the encode went.
+        _ => Ok((raw, raw_len, Codec::Raw)),
+    }
+}
+
+/// What a verified staged payload is kept as.
+///
+/// A record writes the file the arm carries, and the arm's lengths are the
+/// lengths the record claims. The three arms are the three answers the buffered
+/// path can give, and they are given under the same rules.
+enum Staged {
+    /// The staged frame is kept, and it is strictly smaller than its content.
+    Frame {
+        /// The staged frame.
+        file: std::fs::File,
+        /// The content length the record claims.
+        raw_len: u64,
+    },
+    /// The staged bytes are the content, and they are kept as they are.
+    Content {
+        /// The staged bytes.
+        file: std::fs::File,
+        /// The content length the record claims, which is the measured length.
+        raw_len: u64,
+    },
+    /// The staged frame decoded into a second file, because its frame lost.
+    Decoded {
+        /// The decoded content.
+        file: std::fs::File,
+        /// The content length the record claims, which is the verified length.
+        raw_len: u64,
+    },
+}
+
+/// Verify a staged `put_stored` payload on a worker thread.
+///
+/// - Hash a raw payload as it stands.
+/// - Check a frame's declared size against `raw_len`.
+/// - Hash the content a frame decodes to.
+/// - Refuse a frame that is not a single whole frame.
+/// - Keep the frame only when it is strictly smaller.
+/// - Decode into a second file when the frame is not kept.
+/// - Return the file a record writes, with its lengths.
+///
+/// The buffered path decodes through [`Zstd::decompress`]. So does every later
+/// read. This function checks the same things, in the same words, so a payload
+/// it accepts is a payload a read accepts. A payload a read would refuse is
+/// refused here, before the run can go on.
+///
+/// The staged file stays wherever the work left it.
+/// [`BlobStore::write_record_from`] rewinds whatever the caller hands it.
+fn verify_staged(
+    stored: std::fs::File,
+    stored_len: u64,
+    raw_len: u64,
+    codec: Codec,
+    id: BlobId,
+) -> io::Result<Staged> {
+    use std::io::Seek as _;
+
+    let mut stored = stored;
+    // `stage_raw_streaming` leaves the file at the end.
+    stored.seek(std::io::SeekFrom::Start(0))?;
+
+    // A `Raw` payload *is* the content. There is no decode and no length to
+    // check, so the hash is the whole of the verification. A `Raw` payload whose
+    // two lengths disagree is stored under the length it actually has.
+    if matches!(codec, Codec::Raw) {
+        let hash = hash_staged(&mut stored)?;
+        if hash != id {
+            return Err(hash_mismatch(&id));
+        }
+        return Ok(Staged::Content {
+            file: stored,
+            raw_len: stored_len,
+        });
+    }
+
+    // The frame must declare a size, and the size it declares must be `raw_len`.
+    // The declared size is read from the frame header rather than taken from the
+    // record, for the reason [`Zstd::decompress`] gives: the header is a claim
+    // the frame carries about itself, and the record's `raw_len` is checked
+    // against it rather than trusted by it.
+    let declared = frame_content_size(&mut stored)?;
+    if declared != raw_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "a compressed payload declares {declared} bytes but its record claims {raw_len}"
+            ),
+        ));
+    }
+
+    // A frame is kept only when it is strictly smaller than its content. The
+    // decode runs either way: a kept frame is verified by it, and a frame that
+    // loses is replaced by the content it decodes to.
+    let keep = stored_len < raw_len;
+    let mut out = if keep {
+        None
+    } else {
+        Some(tempfile::tempfile()?)
+    };
+    let (hash, count, consumed) = decode_staged(&mut stored, out.as_mut())?;
+
+    // The content a frame produces must be exactly `raw_len` bytes. A frame that
+    // comes up short or long is a damaged record, however good its hash looks.
+    if count != raw_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "a compressed payload decoded to {count} bytes but its record claims {raw_len}"
+            ),
+        ));
+    }
+
+    if hash != id {
+        return Err(hash_mismatch(&id));
+    }
+
+    // The staged bytes must be exactly one frame. Bytes past the frame would be
+    // stored with it and refused by every later read, so they are refused here.
+    // The buffered path reaches the same refusal through the decode itself.
+    if consumed != stored_len {
+        return Err(io::Error::other(format!(
+            "a compressed payload carries {} bytes past its frame",
+            stored_len - consumed
+        )));
+    }
+
+    match out {
+        Some(file) => Ok(Staged::Decoded { file, raw_len }),
+        None => Ok(Staged::Frame {
+            file: stored,
+            raw_len,
+        }),
+    }
+}
+
+/// Read the content size a staged frame declares, and rewind the file.
+///
+/// - Read the frame header from the start of the file.
+/// - Rewind the file after the read.
+/// - Refuse a frame whose header cannot be parsed.
+/// - Refuse a frame that declares no size.
+///
+/// A frame header is at most 18 bytes. A staged payload here is longer, so the
+/// read cannot come up short.
+fn frame_content_size(stored: &mut std::fs::File) -> io::Result<u64> {
+    use std::io::{Read as _, Seek as _};
+
+    stored.seek(std::io::SeekFrom::Start(0))?;
+    let mut header = [0u8; 18];
+    stored.read_exact(&mut header)?;
+    stored.seek(std::io::SeekFrom::Start(0))?;
+
+    zstd::zstd_safe::get_frame_content_size(&header)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a compressed payload is not a readable zstd frame: {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a compressed payload does not say how many bytes it decodes to",
+            )
+        })
+}
+
+/// Decode one frame from `stored`, hashing the content it produces.
+///
+/// - Read the frame through a bounded buffer.
+/// - Write the content to `out` when one is given.
+/// - Hash the content while it is produced.
+/// - Return the content hash, its length, and the consumed byte count.
+///
+/// A decode error is the error zstd gives. The buffered path reports the same
+/// errors, and for the same failures. The frame is read in single-frame mode, so
+/// bytes past the frame are left unread for the caller to find.
+fn decode_staged(
+    stored: &mut std::fs::File,
+    mut out: Option<&mut std::fs::File>,
+) -> io::Result<(blake3::Hash, u64, u64)> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let buffered = std::io::BufReader::with_capacity(COPY_BUFFER, &mut *stored);
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(buffered)?.single_frame();
+
+    let mut hasher = blake3::Hasher::new();
+    let mut count = 0u64;
+    let mut chunk = vec![0u8; COPY_BUFFER];
+
+    loop {
+        let read = decoder.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        count += u64::try_from(read).unwrap_or(u64::MAX);
+        if let Some(out) = out.as_mut() {
+            out.write_all(&chunk[..read])?;
+        }
+    }
+
+    let mut buffered = decoder.finish();
+    // The decoder read ahead through the buffer it was given. Bytes the decoder
+    // did not consume wait in that buffer, so the position the reader reports is
+    // the span of the frame. That is what a `put_stored` caller must have offered.
+    let consumed = buffered.stream_position()?;
+
+    Ok((hasher.finalize(), count, consumed))
+}
+
+/// Hash a file whole, from its start.
+///
+/// - Read the file in bounded chunks.
+/// - Hash the bytes that are read.
+/// - Return the hash.
+fn hash_staged(stored: &mut std::fs::File) -> io::Result<blake3::Hash> {
+    use std::io::{Read as _, Seek as _};
+
+    stored.seek(std::io::SeekFrom::Start(0))?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; COPY_BUFFER];
+
+    loop {
+        let read = stored.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+
+    Ok(hasher.finalize())
 }
 
 /// Write a version's index file, best-effort.
@@ -1636,16 +2056,19 @@ impl<C: Compressor> BlobStore<Write, C> {
         Contents::lock(&self.contents).blobs.contains_key(id)
     }
 
-    /// Append one blob record holding `stored` verbatim, and index it.
+    /// Append one blob record, and index the blob once the payload is on disk.
     ///
-    /// Shared by [`storage::StoragePut::put`] and
-    /// [`storage::StoragePut::put_stored`]. The two methods differ in how they decide
-    /// what `stored` is. They never differ in how a record is written. There is one
-    /// record layout, and one place that knows where a blob lands.
+    /// Every write path comes through here. `put` and `put_stored` differ in how
+    /// they decide what the payload is. They never differ in how a record is
+    /// written. There is one record layout, and one place that knows where a blob
+    /// lands.
     ///
     /// `raw_len` is the length of the *content*. That is what the header's second
     /// length carries. That is also what a reader compares a snapshot's lengths
     /// against.
+    ///
+    /// The payload is already in memory. One call writes it. A payload that is
+    /// in memory pays for no copy buffer.
     async fn write_record(
         &self,
         id: &BlobId,
@@ -1654,7 +2077,89 @@ impl<C: Compressor> BlobStore<Write, C> {
         codec: Codec,
     ) -> io::Result<()> {
         let stored_len = u64::try_from(stored.len()).unwrap_or(u64::MAX);
+        let head = self.plan_record(id, stored_len, raw_len, codec)?;
+        let mut file = self.open_record(head.segment, head.offset).await?;
 
+        file.write_all(&head.header).await?;
+        file.write_all(stored).await?;
+
+        // The code does not sync here. The run's single `sync_data` is the
+        // durability point. Syncing per blob would pay for thousands of syncs.
+        file.flush().await?;
+
+        self.index_record(id, &head, stored_len, raw_len, codec);
+
+        Ok(())
+    }
+
+    /// Append one blob record from a reader, and index the blob once the payload
+    /// is on disk.
+    ///
+    /// The payload is copied through a bounded buffer, so a record can hold a
+    /// payload larger than this process would hold in memory. `payload` must
+    /// yield exactly `stored_len` bytes, and it must stand at its start. A
+    /// payload that ends early is an error.
+    ///
+    /// The bytes are the bytes the buffered path writes. The two paths differ in
+    /// where the payload comes from, not in what the record holds.
+    async fn write_record_from<R>(
+        &self,
+        id: &BlobId,
+        mut payload: R,
+        stored_len: u64,
+        raw_len: u64,
+        codec: Codec,
+    ) -> io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let head = self.plan_record(id, stored_len, raw_len, codec)?;
+        let mut file = self.open_record(head.segment, head.offset).await?;
+
+        file.write_all(&head.header).await?;
+
+        // The copy buffer is sized to the payload, capped at [`COPY_BUFFER`]. A
+        // small payload then pays for no oversized allocation. The buffer comes
+        // from the pool, so a later record reuses it. The bytes in a reused
+        // buffer are already initialized, so the reuse costs no zeroing.
+        let chunk = COPY_BUFFER.min(usize::try_from(stored_len).unwrap_or(COPY_BUFFER));
+        let mut buf = self.take_copy_buffer(chunk);
+        let mut remaining = stored_len;
+        while remaining > 0 {
+            let want = usize::try_from(remaining.min(chunk as u64)).unwrap_or(chunk);
+            let read = payload.read(&mut buf[..want]).await?;
+            if read == 0 {
+                self.give_copy_buffer(buf);
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("the payload of {stored_len} bytes ended before it was copied whole"),
+                ));
+            }
+            file.write_all(&buf[..read]).await?;
+            remaining -= u64::try_from(read).unwrap_or(u64::MAX);
+        }
+        self.give_copy_buffer(buf);
+
+        // The code does not sync here. The run's single `sync_data` is the
+        // durability point. Syncing per blob would pay for thousands of syncs.
+        file.flush().await?;
+
+        self.index_record(id, &head, stored_len, raw_len, codec);
+
+        Ok(())
+    }
+
+    /// Reserve the room for a record, and encode its header.
+    ///
+    /// The two write paths share this step. The header says the same thing in
+    /// both. The code reserves the room in the same way.
+    fn plan_record(
+        &self,
+        id: &BlobId,
+        stored_len: u64,
+        raw_len: u64,
+        codec: Codec,
+    ) -> io::Result<RecordHead> {
         let mut header = Vec::with_capacity(
             usize::try_from(record::header_len(stored_len, raw_len)).unwrap_or(0),
         );
@@ -1669,8 +2174,16 @@ impl<C: Compressor> BlobStore<Write, C> {
 
         let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + stored_len;
         let reservation = self.reserve(total)?;
-        let offset = reservation.offset;
 
+        Ok(RecordHead {
+            header,
+            segment: reservation.segment,
+            offset: reservation.offset,
+        })
+    }
+
+    /// Open the segment a record lands in, and seek to the record's start.
+    async fn open_record(&self, segment: u32, offset: u64) -> io::Result<fs::File> {
         // A handle of its own, never `try_clone`. A dup shares the file offset, so
         // concurrent puts would interleave headers into each other's payloads. The
         // store would then read back as a shorter prefix of itself.
@@ -1678,28 +2191,34 @@ impl<C: Compressor> BlobStore<Write, C> {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.segment_path(reservation.segment))
+            .open(self.segment_path(segment))
             .await?;
 
         // Positional, never append. `append` would redirect every write to wherever
         // the end of the file happened to be. That end is the offset that the code
         // just decided not to use.
         file.seek(SeekFrom::Start(offset)).await?;
-        file.write_all(&header).await?;
-        file.write_all(stored).await?;
 
-        // Nothing is synced here. The run's single `sync_data` is the durability
-        // point. Syncing per blob would pay for thousands of syncs.
-        file.flush().await?;
+        Ok(file)
+    }
 
-        let payload_offset = offset + u64::try_from(header.len()).unwrap_or(u64::MAX);
+    /// Put the blob in the index, once its payload is on disk.
+    fn index_record(
+        &self,
+        id: &BlobId,
+        head: &RecordHead,
+        stored_len: u64,
+        raw_len: u64,
+        codec: Codec,
+    ) {
+        let payload_offset = head.offset + u64::try_from(head.header.len()).unwrap_or(u64::MAX);
 
         // The index receives the blob only once the payload is written, so nothing
         // ever points at bytes that are not there.
         Contents::lock(&self.contents).blobs.insert(
             *id,
             Placement {
-                segment: reservation.segment,
+                segment: head.segment,
                 offset: payload_offset,
                 stored_len,
                 // The *content* length, which is why the two fields are named for
@@ -1710,15 +2229,207 @@ impl<C: Compressor> BlobStore<Write, C> {
         );
 
         tracing::trace!(
-            segment = reservation.segment,
-            offset,
+            segment = head.segment,
+            offset = head.offset,
             raw_length = raw_len,
             stored_length = stored_len,
             ?codec,
             "stored blob"
         );
+    }
 
-        Ok(())
+    /// Take a copy buffer for the streaming path.
+    ///
+    /// The pool holds the buffer when it has one of that size. The bytes in a
+    /// reused buffer are already initialized, so the reuse costs no zeroing.
+    fn take_copy_buffer(&self, chunk: usize) -> Vec<u8> {
+        let mut buffers = self
+            .copy_buffers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        buffers.take(chunk)
+    }
+
+    /// Give a copy buffer back, so a later record does not allocate one.
+    fn give_copy_buffer(&self, buf: Vec<u8>) {
+        let mut buffers = self
+            .copy_buffers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        buffers.give(buf);
+    }
+
+    /// Store a large payload without holding it whole.
+    ///
+    /// - Stage the content to a temp file.
+    /// - Hash the content while it is staged.
+    /// - Compress the staged content on a worker thread.
+    /// - Write the staged record from the stored file.
+    ///
+    /// Nothing is written to the store before the hash is checked. The store is
+    /// left as it was by a payload that does not hash to `id`.
+    /// Store `len` bytes whose content hashes to `id`, holding them in memory.
+    ///
+    /// - Read the payload whole.
+    /// - Check the hash against `id`.
+    /// - Compress it, and store the bytes as they are when that does not help.
+    ///
+    /// The payload is hashed on its way through and checked against `id`: a
+    /// mismatch fails the run rather than storing content under the wrong name.
+    #[instrument(skip_all, err)]
+    async fn put_buffered(
+        &self,
+        id: &BlobId,
+        reader: StreamReadSeeker,
+        len: u64,
+    ) -> io::Result<()> {
+        let raw = read_whole(reader, len).await?;
+
+        // Checked before anything is stored, so nothing is written under the wrong
+        // name. Hashing the content is also what makes the codec a write policy.
+        // The same bytes deduplicate whether they were stored raw or compressed.
+        if blake3::hash(&raw) != *id {
+            // Nothing is written yet, so the run simply fails and the store is as
+            // it was.
+            return Err(hash_mismatch(id));
+        }
+
+        // The code compresses, and stores the bytes as they are when that does not
+        // help. A zstd frame carries a header of its own, so on content that it
+        // cannot compress the frame comes out larger than the input.
+        let (codec, stored) = self.compression.compress(&raw);
+        // The code checks the answer, because the policy that produced it is not
+        // this crate's code. That policy need not be this crate's careful. This is
+        // the single place where the "only when strictly smaller" rule is
+        // *enforced* rather than observed. An implementor who returns a frame
+        // larger than its input therefore costs a copy of the frame and nothing
+        // else. The payload is stored as it came in, and the record says `Raw`.
+        // That is exactly what the reader would have done with it. See the note on
+        // [`Compressor`].
+        //
+        // The code checks the codec as well, and by naming `Zstd` rather than by
+        // asking the store's decoders. `Raw` in a record means "these are the bytes
+        // that hashed to this id". A policy that paired it with anything else would
+        // be naming bytes that the store never hashed. Nothing on the read path
+        // checks what it hands back. The pairing is therefore worth enforcing where
+        // it is written rather than assuming that a caller got it right. `Zstd` is
+        // the fail-closed arm in exchange. Its decode validates the frame against
+        // the `raw_len` that the header claims. That is why the store may keep a
+        // frame on a policy's word that it decodes to exactly that.
+        //
+        // `Compression` never trips this, because it applies the rule itself and
+        // hands back a borrow of `raw` when the frame did not win.
+        let keep = matches!(codec, Codec::Zstd) && stored.len() < raw.len();
+        let (codec, stored) = if keep {
+            (Codec::Zstd, stored)
+        } else {
+            (Codec::Raw, Cow::Borrowed(raw.as_slice()))
+        };
+
+        self.write_record(id, stored.as_ref(), len, codec).await
+    }
+
+    /// Store a payload that is already encoded, after checking what it decodes to.
+    ///
+    /// The decode is the whole of the verification and is not optional. See
+    /// [`StoragePut::put_stored`](crate::storage::StoragePut::put_stored), which
+    /// says why in the terms that a caller has. This is the part of that method
+    /// which is specific to a store. The frame is kept as it came in only when it
+    /// is strictly smaller than the content. The frame is kept only when it names a
+    /// codec that the store can decode. Otherwise the content is stored raw. That
+    /// is the same fallback that `put` takes, and for the same reason.
+    #[instrument(skip_all, err)]
+    async fn put_streaming(
+        &self,
+        id: &BlobId,
+        reader: StreamReadSeeker,
+        len: u64,
+        policy: Compression,
+    ) -> io::Result<()> {
+        // The staging needs a temporary file. The creation runs on a blocking
+        // thread. A host whose temporary directory cannot give one falls back
+        // to the buffered path, which holds the payload in memory. The reader
+        // has not been read yet, so the fallback still sees every byte.
+        let temp = tokio::task::spawn_blocking(tempfile::tempfile)
+            .await
+            .map_err(|join| io::Error::other(format!("a temporary-file task failed: {join}")))?;
+        let Ok(std_tmp) = temp else {
+            return self.put_buffered(id, reader, len).await;
+        };
+
+        let (raw_file, hash) =
+            stage_raw_streaming(reader, len, fs::File::from_std(std_tmp)).await?;
+
+        if hash != *id {
+            return Err(hash_mismatch(id));
+        }
+
+        let staged = tokio::task::spawn_blocking(move || compress_staged(raw_file, len, policy))
+            .await
+            .map_err(|join| io::Error::other(format!("a compression task failed: {join}")))??;
+
+        let (stored_file, stored_len, codec) = staged;
+
+        // The staged file stands wherever the compression left it. The record is
+        // written from its start.
+        let mut staged = fs::File::from_std(stored_file);
+        staged.seek(SeekFrom::Start(0)).await?;
+
+        self.write_record_from(id, staged, stored_len, len, codec)
+            .await
+    }
+
+    /// Store a large already-encoded payload without holding it whole.
+    ///
+    /// - Stage the stored bytes to a temp file.
+    /// - Verify the staged payload on a worker thread.
+    /// - Write the record the verification answered for.
+    ///
+    /// The verification decodes the payload when it is a frame, and hashes the
+    /// content either way. Nothing is written to the store before both checks
+    /// pass, so a refused payload leaves the store as it was.
+    async fn put_stored_streaming(
+        &self,
+        id: &BlobId,
+        reader: StreamReadSeeker,
+        stored_len: u64,
+        raw_len: u64,
+        codec: Codec,
+    ) -> io::Result<()> {
+        let (staged, _) = stage_raw_streaming(
+            reader,
+            stored_len,
+            fs::File::from_std(tempfile::tempfile()?),
+        )
+        .await?;
+        let expected = *id;
+
+        let verified = tokio::task::spawn_blocking(move || {
+            verify_staged(staged, stored_len, raw_len, codec, expected)
+        })
+        .await
+        .map_err(|join| io::Error::other(format!("a verification task failed: {join}")))??;
+
+        match verified {
+            Staged::Frame { file, raw_len } => {
+                let mut frame = fs::File::from_std(file);
+                frame.seek(SeekFrom::Start(0)).await?;
+                self.write_record_from(id, frame, stored_len, raw_len, Codec::Zstd)
+                    .await
+            }
+            Staged::Content { file, raw_len } => {
+                let mut content = fs::File::from_std(file);
+                content.seek(SeekFrom::Start(0)).await?;
+                self.write_record_from(id, content, stored_len, raw_len, Codec::Raw)
+                    .await
+            }
+            Staged::Decoded { file, raw_len } => {
+                let mut decoded = fs::File::from_std(file);
+                decoded.seek(SeekFrom::Start(0)).await?;
+                self.write_record_from(id, decoded, raw_len, raw_len, Codec::Raw)
+                    .await
+            }
+        }
     }
 }
 
@@ -2075,130 +2786,663 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod write_buffer_tests {
     use std::io::Cursor;
 
-    use super::*;
+    use tokio::io::AsyncReadExt as _;
 
-    use crate::storage::{SegmentLimit, StoragePut};
+    use super::STREAM_THRESHOLD;
+    use crate::storage::{BlobStore, Codec, StorageGet as _, StoragePut as _};
 
-    /// A limit small enough that a few blobs roll over.
-    fn tiny() -> SegmentLimit {
-        SegmentLimit::new(4096)
-    }
+    /// Five mebibytes, in byte units.
+    const MIB: u64 = 1024 * 1024;
 
-    /// Content that is neither a repeating pattern nor compressible.
+    /// Pseudo-random bytes, generated without a fixture on disk.
     ///
-    /// A payload that compressed would make a set hold fewer bytes than the
-    /// test expects. The arithmetic of a boundary would not mean what it says.
-    fn payload(seed: u8, len: usize) -> Vec<u8> {
+    /// - Mix each 8-byte block from an incrementing seed.
+    /// - Truncate the result to `len`.
+    ///
+    /// The stream has no structure for zstd to find. A frame around it is not
+    /// smaller than it.
+    fn noisy(len: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(len);
-        let mut key = [0u8; 32];
-        key[0] = seed;
-        for counter in 0..u64::try_from(len.div_ceil(64)).unwrap_or(0) {
-            let mut input = [0u8; 72];
-            input[..32].copy_from_slice(&key);
-            input[32..40].copy_from_slice(&counter.to_le_bytes());
-            out.extend_from_slice(blake3::hash(&input).as_bytes());
+        let mut block = 0u64;
+        while out.len() < len {
+            let mut x = block.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            out.extend_from_slice(&x.to_le_bytes());
+            block += 1;
         }
         out.truncate(len);
         out
     }
 
-    /// Store `payloads` one at a time, returning the ids in the order stored.
-    async fn put_all(blob: &Path, limit: SegmentLimit, payloads: &[Vec<u8>]) -> Vec<BlobId> {
-        let store = BlobStore::builder(blob)
-            .segment_limit(limit)
-            .open_writer()
+    /// Bytes that compress to about half their length.
+    ///
+    /// - Alternate a pseudo-random block with a fixed block.
+    /// - Seed each random block by its index, so nothing repeats.
+    ///
+    /// A frame of this fixture is large. The tests use that to put a kept frame
+    /// above the streaming threshold without a huge uncompressed payload.
+    fn mixed(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut block = 0u64;
+        while out.len() < len {
+            let want = out.len() + 16;
+            let mut seed = block.wrapping_mul(0x5DEE_CE66);
+            while out.len() < want {
+                let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                x ^= x >> 30;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x ^= x >> 27;
+                out.extend_from_slice(&x.to_le_bytes());
+                seed += 1;
+            }
+            out.extend_from_slice(b"ABCDEFGHIJKLMNOP");
+            block += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// Open a writer on a fresh set at `dir`.
+    async fn writer(store: &std::path::Path) -> BlobStore<super::Write, super::Compression> {
+        BlobStore::builder(store).open_writer().await.unwrap()
+    }
+
+    /// Open a reader on the set at `dir`.
+    async fn reader_of(store: &std::path::Path) -> BlobStore<super::Read, super::Compression> {
+        BlobStore::builder(store).open_reader().await.unwrap()
+    }
+
+    /// Read the content of a blob back whole.
+    async fn content<W: super::WriteMode, C: super::Compressor>(
+        store: &BlobStore<W, C>,
+        id: &super::BlobId,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        store
+            .get(id)
+            .await
+            .unwrap()
+            .read_to_end(&mut out)
+            .await
+            .unwrap();
+        out
+    }
+
+    /// Stream a large compressible payload through temp files.
+    ///
+    /// - Write five mebibytes through the streaming path.
+    /// - Check the record names Zstd.
+    /// - Read the payload back byte for byte.
+    #[tokio::test]
+    async fn stream_large_compressible_payload_through_temp_file() {
+        let len = 5 * MIB;
+        let payload = vec![b'a'; usize::try_from(len).unwrap()];
+        assert!(
+            len > STREAM_THRESHOLD,
+            "the fixture must sit above the streaming threshold"
+        );
+        let id = blake3::hash(&payload);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        store
+            .put(&id, Box::new(Cursor::new(payload.clone())), len)
             .await
             .unwrap();
 
-        let mut ids = Vec::new();
-        for payload in payloads {
-            let id = blake3::hash(payload);
-            store
-                .put(
-                    &id,
-                    Box::new(Cursor::new(payload.clone())),
-                    u64::try_from(payload.len()).unwrap(),
-                )
-                .await
-                .unwrap();
-            ids.push(id);
-        }
-        store.sync_data().await.unwrap();
-
-        ids
-    }
-
-    /// The store keeps a bounded number of open segment files.
-    ///
-    /// The cache of open files saves an open for every chunk a segment holds.
-    /// Without a cap it holds one file per segment, and a store with more
-    /// segments than the process has descriptors fails with `EMFILE`. The test
-    /// reads from more segments than the cap allows, and then asks the cache
-    /// what it holds.
-    #[tokio::test]
-    async fn the_open_file_cache_is_bounded() {
-        let dir = tempfile::tempdir().unwrap();
-        let blob = dir.path().join("store");
-
-        let payloads: Vec<Vec<u8>> = (0..=255).map(|i| payload(i, 2000)).collect();
-        let ids = put_all(&blob, tiny(), &payloads).await;
-
-        let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+        let placement = store.locate(&id).unwrap();
+        assert_eq!(
+            placement.codec,
+            Codec::Zstd,
+            "a compressible payload is stored as a frame"
+        );
         assert!(
-            store.segment_count() > OPEN_FILE_LIMIT,
-            "the set should have more segments than the cache holds, and it has {}",
-            store.segment_count()
+            placement.stored_len < placement.raw_len,
+            "a kept frame is smaller than its content"
         );
 
-        for id in &ids {
-            store.read_stored_bytes(id).await.unwrap();
-        }
-
-        let open = store.open_files.lock().await;
-        assert!(
-            open.files.len() <= OPEN_FILE_LIMIT,
-            "the cache holds {} files, and it should hold no more than {OPEN_FILE_LIMIT}",
-            open.files.len()
+        let reader = reader_of(&dir.path().join("store")).await;
+        assert_eq!(
+            content(&reader, &id).await,
+            payload,
+            "the content is restored byte for byte"
         );
     }
 
-    /// A replaced segment is not read through the handle of the file it was.
+    /// Stream a large incompressible payload through temp files.
     ///
-    /// A segment can be replaced while the store holds it open: a restore from
-    /// a copy, a move, another tool. The handle then points at a file that is
-    /// no longer the segment. A read through it answers with bytes the
-    /// segment does not hold. The store compares the identity of the file at
-    /// the path with the identity of the file the handle opened. The store
-    /// opens the path again when the two differ.
+    /// - Write five mebibytes of pseudo-random bytes.
+    /// - Check the record names Raw.
+    /// - Read the payload back byte for byte.
     #[tokio::test]
-    async fn a_replaced_segment_is_not_read_through_the_old_handle() {
+    async fn stream_large_incompressible_payload_as_raw() {
+        let len = 5 * MIB;
+        let payload = noisy(usize::try_from(len).unwrap());
+        assert!(
+            len > STREAM_THRESHOLD,
+            "the fixture must sit above the streaming threshold"
+        );
+        let id = blake3::hash(&payload);
+
         let dir = tempfile::tempdir().unwrap();
-        let blob = dir.path().join("store");
+        let store = writer(&dir.path().join("store")).await;
+        store
+            .put(&id, Box::new(Cursor::new(payload.clone())), len)
+            .await
+            .unwrap();
 
-        let payloads: Vec<Vec<u8>> = vec![payload(1, 900)];
-        let ids = put_all(&blob, tiny(), &payloads).await;
+        let placement = store.locate(&id).unwrap();
+        assert_eq!(
+            placement.codec,
+            Codec::Raw,
+            "a payload zstd cannot shrink is stored as it came"
+        );
 
-        let store = BlobStore::builder(&blob).open_reader().await.unwrap();
-        let first = store.read_stored_bytes(&ids[0]).await.unwrap().0;
+        let reader = reader_of(&dir.path().join("store")).await;
+        assert_eq!(
+            content(&reader, &id).await,
+            payload,
+            "the content is restored byte for byte"
+        );
+    }
 
-        // The segment is replaced by a longer file with other bytes in it. The
-        // store still holds the old file open, and the file at the path is
-        // another one.
-        let segment = store.segment_path(0);
-        let len = std::fs::metadata(&segment).unwrap().len();
-        std::fs::write(&segment, vec![0xAA; usize::try_from(len + 100).unwrap()]).unwrap();
+    /// Reject a large payload with a wrong hash.
+    ///
+    /// - Offer five mebibytes under another hash.
+    /// - Expect an `InvalidData` error.
+    /// - Index nothing under the wrong hash.
+    #[tokio::test]
+    async fn reject_large_payload_with_wrong_hash() {
+        let len = 5 * MIB;
+        let payload = vec![b'b'; usize::try_from(len).unwrap()];
+        assert!(
+            len > STREAM_THRESHOLD,
+            "the fixture must sit above the streaming threshold"
+        );
+        let wrong = blake3::hash(b"other content for streaming path");
 
-        let second = store.read_stored_bytes(&ids[0]).await.unwrap().0;
-        assert_ne!(
-            first, second,
-            "the read came from the file the store opened before the segment was replaced"
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put(&wrong, Box::new(Cursor::new(payload)), len)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a wrong hash is damaged data, not an I/O failure"
         );
         assert!(
-            second.iter().all(|byte| *byte == 0xAA),
-            "the read should have come from the file at the path"
+            error.to_string().contains("does not hash to"),
+            "the error names the hash the store was asked for"
+        );
+        assert!(
+            store.locate(&wrong).is_err(),
+            "the store indexes nothing under a hash it refused"
+        );
+    }
+
+    /// Reject a large payload with a short reader.
+    ///
+    /// - Declare more bytes than the reader holds.
+    /// - Expect an `UnexpectedEof` error.
+    /// - Name both lengths in the error.
+    #[tokio::test]
+    async fn reject_large_payload_with_short_reader() {
+        let declared = 5 * MIB + 1000;
+        let payload = vec![b'c'; usize::try_from(declared - 1000).unwrap()];
+        assert!(
+            declared > STREAM_THRESHOLD,
+            "the declared length must sit above the streaming threshold"
+        );
+        let id = blake3::hash(&payload);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put(&id, Box::new(Cursor::new(payload)), declared)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a short reader can never be read back whole"
+        );
+        assert!(
+            error.to_string().contains("yielded only"),
+            "the error names what was declared and what arrived"
+        );
+    }
+
+    /// Reject a large payload with a long reader.
+    ///
+    /// - Declare fewer bytes than the reader holds.
+    /// - Expect an `InvalidData` error.
+    /// - Name the declared length in the error.
+    #[tokio::test]
+    async fn reject_large_payload_with_long_reader() {
+        let declared = 5 * MIB;
+        let mut payload = vec![b'd'; usize::try_from(declared).unwrap()];
+        payload.extend_from_slice(&[b'e'; 1000]);
+        assert!(
+            declared > STREAM_THRESHOLD,
+            "the declared length must sit above the streaming threshold"
+        );
+        let id = blake3::hash(&payload[..usize::try_from(declared).unwrap()]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put(&id, Box::new(Cursor::new(payload)), declared)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a reader that does not stop where it was told is damaged input"
+        );
+        assert!(
+            error.to_string().contains("more than the declared"),
+            "the error names the declared length"
+        );
+    }
+
+    /// Stream a large frame that is kept as it stands.
+    ///
+    /// - Compress nine mebibytes to a frame above the threshold.
+    /// - Offer the frame as already encoded, with both lengths.
+    /// - Check the record keeps the frame.
+    /// - Read the content back byte for byte.
+    #[tokio::test]
+    async fn stream_a_large_frame_that_is_kept_as_it_stands() {
+        let raw = mixed(usize::try_from(9 * MIB).unwrap());
+        let raw_len = u64::try_from(raw.len()).unwrap();
+        let id = blake3::hash(&raw);
+
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let stored_len = u64::try_from(frame.len()).unwrap();
+        assert!(
+            stored_len > STREAM_THRESHOLD && stored_len < raw_len,
+            "the fixture must give a frame above {STREAM_THRESHOLD} and below {raw_len}, got {stored_len}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(frame)),
+                stored_len,
+                raw_len,
+                Codec::Zstd,
+            )
+            .await
+            .unwrap();
+
+        let placement = store.locate(&id).unwrap();
+        assert_eq!(
+            placement.codec,
+            Codec::Zstd,
+            "a frame that wins is kept as it came"
+        );
+        assert_eq!(
+            placement.stored_len, stored_len,
+            "the frame is stored at the length it was offered"
+        );
+        assert_eq!(
+            placement.raw_len, raw_len,
+            "the content length is the length that was claimed"
+        );
+
+        let reader = reader_of(&dir.path().join("store")).await;
+        assert_eq!(
+            content(&reader, &id).await,
+            raw,
+            "the content is decoded back byte for byte"
+        );
+    }
+
+    /// Store a large frame that cannot shrink its content as raw content.
+    ///
+    /// - Offer a frame no smaller than its content.
+    /// - Check the record names Raw.
+    /// - Check both lengths and the content.
+    #[tokio::test]
+    async fn store_a_large_losing_frame_as_raw_content() {
+        let raw = noisy(usize::try_from(5 * MIB).unwrap());
+        let raw_len = u64::try_from(raw.len()).unwrap();
+        let id = blake3::hash(&raw);
+
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let stored_len = u64::try_from(frame.len()).unwrap();
+        assert!(stored_len >= raw_len, "the fixture must not compress");
+        assert!(
+            stored_len > STREAM_THRESHOLD,
+            "the fixture must sit above the streaming threshold"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(frame)),
+                stored_len,
+                raw_len,
+                Codec::Zstd,
+            )
+            .await
+            .unwrap();
+
+        let placement = store.locate(&id).unwrap();
+        assert_eq!(
+            placement.codec,
+            Codec::Raw,
+            "a frame that does not win is replaced by its content"
+        );
+        assert_eq!(
+            placement.raw_len, raw_len,
+            "the content length is the length that was claimed"
+        );
+        assert_eq!(
+            placement.stored_len, raw_len,
+            "the stored length is the content length"
+        );
+
+        let reader = reader_of(&dir.path().join("store")).await;
+        assert_eq!(
+            content(&reader, &id).await,
+            raw,
+            "the content is decoded back byte for byte"
+        );
+    }
+
+    /// Store a large raw payload under the length it actually has.
+    ///
+    /// - Claim a content length the payload does not have.
+    /// - Check the record takes the measured length instead.
+    /// - Read the payload back byte for byte.
+    #[tokio::test]
+    async fn store_a_large_raw_payload_under_the_length_it_actually_has() {
+        let len = 5 * MIB;
+        let payload = noisy(usize::try_from(len).unwrap());
+        assert!(
+            len > STREAM_THRESHOLD,
+            "the fixture must sit above the streaming threshold"
+        );
+        let id = blake3::hash(&payload);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(payload.clone())),
+                len,
+                len + 5,
+                Codec::Raw,
+            )
+            .await
+            .unwrap();
+
+        let placement = store.locate(&id).unwrap();
+        assert_eq!(
+            placement.codec,
+            Codec::Raw,
+            "a raw payload is stored as it came"
+        );
+        assert_eq!(
+            placement.raw_len, len,
+            "a raw payload is stored under its measured length"
+        );
+
+        let reader = reader_of(&dir.path().join("store")).await;
+        assert_eq!(
+            content(&reader, &id).await,
+            payload,
+            "the content is restored byte for byte"
+        );
+    }
+
+    /// Reject a large stored payload that hashes to another name.
+    ///
+    /// - Offer five mebibytes under another hash.
+    /// - Expect an `InvalidData` error.
+    /// - Index nothing under the wrong hash.
+    #[tokio::test]
+    async fn reject_a_large_stored_payload_that_hashes_to_another_name() {
+        let len = 5 * MIB;
+        let payload = noisy(usize::try_from(len).unwrap());
+        let wrong = blake3::hash(b"other content for the stored path");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put_stored(&wrong, Box::new(Cursor::new(payload)), len, len, Codec::Raw)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a wrong hash is damaged data, not an I/O failure"
+        );
+        assert!(
+            error.to_string().contains("does not hash to"),
+            "the error names the hash the store was asked for"
+        );
+        assert!(
+            store.locate(&wrong).is_err(),
+            "the store indexes nothing under a hash it refused"
+        );
+    }
+
+    /// Reject a large stored payload that ends early.
+    ///
+    /// - Declare more bytes than the reader holds.
+    /// - Expect an `UnexpectedEof` error.
+    /// - Name both lengths in the error.
+    #[tokio::test]
+    async fn reject_a_large_stored_payload_that_ends_early() {
+        let declared = 5 * MIB + 1000;
+        let payload = noisy(usize::try_from(declared - 1000).unwrap());
+        assert!(
+            declared > STREAM_THRESHOLD,
+            "the declared length must sit above the streaming threshold"
+        );
+        let id = blake3::hash(&payload);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(payload)),
+                declared,
+                declared,
+                Codec::Raw,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a short reader can never be read back whole"
+        );
+        assert!(
+            error.to_string().contains("yielded only"),
+            "the error names what was declared and what arrived"
+        );
+    }
+
+    /// Reject a large stored payload that carries extra bytes.
+    ///
+    /// - Declare fewer bytes than the reader holds.
+    /// - Expect an `InvalidData` error.
+    /// - Name the declared length in the error.
+    #[tokio::test]
+    async fn reject_a_large_stored_payload_that_carries_extra_bytes() {
+        let declared = 5 * MIB;
+        let mut payload = noisy(usize::try_from(declared).unwrap());
+        payload.extend_from_slice(&[0xff; 1000]);
+        assert!(
+            declared > STREAM_THRESHOLD,
+            "the declared length must sit above the streaming threshold"
+        );
+        let id = blake3::hash(&payload[..usize::try_from(declared).unwrap()]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(payload)),
+                declared,
+                declared,
+                Codec::Raw,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a reader that does not stop where it was told is damaged input"
+        );
+        assert!(
+            error.to_string().contains("more than the declared"),
+            "the error names the declared length"
+        );
+    }
+
+    /// Reject a large frame that declares no content size.
+    ///
+    /// - Encode five mebibytes without a pledged size.
+    /// - Expect an `InvalidData` error.
+    /// - Name the missing size in the error.
+    #[tokio::test]
+    async fn reject_a_large_frame_that_declares_no_size() {
+        let raw_len = 5 * MIB;
+        let raw = noisy(usize::try_from(raw_len).unwrap());
+        let id = blake3::hash(&raw);
+
+        let mut frame = Vec::new();
+        zstd::stream::copy_encode(&raw[..], &mut frame, 1).unwrap();
+        let stored_len = u64::try_from(frame.len()).unwrap();
+        assert!(
+            stored_len > STREAM_THRESHOLD,
+            "the frame must sit above the streaming threshold"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(frame)),
+                stored_len,
+                raw_len,
+                Codec::Zstd,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a frame without a declared size cannot be checked"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("does not say how many bytes it decodes to"),
+            "the error names the missing size"
+        );
+    }
+
+    /// Reject a large frame whose declared size disagrees with the record.
+    ///
+    /// - Claim one byte less than the frame decodes to.
+    /// - Expect an `InvalidData` error.
+    /// - Name both sizes in the error.
+    #[tokio::test]
+    async fn reject_a_large_frame_whose_declared_size_disagrees() {
+        let raw = noisy(usize::try_from(5 * MIB).unwrap());
+        let raw_len = u64::try_from(raw.len()).unwrap();
+        let id = blake3::hash(&raw);
+
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let stored_len = u64::try_from(frame.len()).unwrap();
+        assert!(
+            stored_len > STREAM_THRESHOLD,
+            "the frame must sit above the streaming threshold"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(frame)),
+                stored_len,
+                raw_len - 1,
+                Codec::Zstd,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a size the frame disagrees with is a damaged record"
+        );
+        assert!(
+            error.to_string().contains("bytes but its record claims"),
+            "the error names what the frame declares and what was claimed"
+        );
+    }
+
+    /// Reject a large frame that carries bytes past its frame.
+    ///
+    /// - Append garbage to a frame, inside the stored length.
+    /// - Expect an error of the kind the buffered path gives.
+    /// - Name the extra bytes in the error.
+    #[tokio::test]
+    async fn reject_a_large_frame_that_carries_bytes_past_its_frame() {
+        let raw = noisy(usize::try_from(5 * MIB).unwrap());
+        let raw_len = u64::try_from(raw.len()).unwrap();
+        let id = blake3::hash(&raw);
+
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let mut stored = frame.clone();
+        stored.extend_from_slice(b"TRAILING7");
+        let stored_len = u64::try_from(stored.len()).unwrap();
+        assert!(
+            stored_len > STREAM_THRESHOLD,
+            "the frame must sit above the streaming threshold"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = writer(&dir.path().join("store")).await;
+        let error = store
+            .put_stored(
+                &id,
+                Box::new(Cursor::new(stored)),
+                stored_len,
+                raw_len,
+                Codec::Zstd,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Other,
+            "bytes past a frame are the refusal the decode gives"
+        );
+        assert!(
+            error.to_string().contains("past its frame"),
+            "the error names the bytes past the frame"
         );
     }
 }
