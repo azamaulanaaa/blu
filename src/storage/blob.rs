@@ -112,6 +112,13 @@ const COPY_BUFFER: usize = 256 * 1024;
 /// holds.
 const OPEN_FILE_LIMIT: usize = 64;
 
+/// How many segments one sync round opens at once.
+///
+/// A sync opens a handle for each dirty segment. A store can hold thousands of
+/// segments. The sync therefore opens the handles a batch at a time. The batch
+/// is a ceiling, not a target. A run that wrote to one segment opens one file.
+const SYNC_BATCH: usize = 16;
+
 /// What a scan found, and what this handle may add to.
 #[derive(Debug, Default)]
 struct Contents {
@@ -383,12 +390,20 @@ pub struct BlobStore<W: WriteMode, C: Compressor = Compression> {
     ///
     /// Not persisted: a run that wrote nothing has nothing to sync, and one that
     /// did has synced by the time it commits.
+    ///
+    /// The list is never cleared. A segment that a sync covered stays on the
+    /// list. A later sync therefore covers the bytes that were written after
+    /// that one.
     dirty: Mutex<Vec<u32>>,
     /// Reuse open segment files when reading stored payloads.
     ///
     /// Hold one file for each segment touched so far, up to a fixed cap.
     /// Avoid opening the same file for each chunk. Keep the number of
     /// descriptors the store holds independent of how many segments it has.
+    ///
+    /// The handles are read-only. The sync path does not use them. A sync opens
+    /// its own handles for writing, because `FlushFileBuffers` refuses a
+    /// read-only handle on Windows.
     open_files: tokio::sync::Mutex<OpenFiles>,
     /// The mode, which selects the methods and so appears in no field.
     ///
@@ -1134,21 +1149,74 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
 
     /// Make every record written so far durable.
     ///
-    /// Called once per run, after the last data record and before the commit
-    /// record (see the module docs).
+    /// Call this method once per run. Call it after the last data record. Call it before the commit record.
+    ///
+    /// The method syncs every dirty segment. It syncs the segments in bounded batches. It opens each segment for writing.
+    ///
+    /// The method follows these steps:
+    ///
+    /// - List dirty segments in order.
+    /// - Open each segment for writing.
+    /// - Sync the segments, a batch at a time.
+    ///
+    /// The dirty list keeps every segment. A later call therefore syncs the
+    /// bytes that were written after an earlier call. This covers a write that
+    /// overlapped a sync. The segment is still listed, so the next call syncs
+    /// it again. The cost is one extra sync of a segment that is already durable.
+    ///
+    /// A failed segment is synced again by a later call. The two-sync protocol stays unchanged.
     ///
     /// Every segment that this run wrote to is synced, not just the last. A run
     /// that crossed a boundary has records in two files. Syncing only the newer one
     /// would leave the older one's pages unordered against it.
+    ///
+    /// Batching helps only a store with several dirty segments. The default
+    /// segment size is 4 GiB, so a normal backup writes one segment and syncs one
+    /// segment. There is nothing to batch there.
     async fn sync_data(&self) -> io::Result<()> {
-        let dirty = self.dirty_segments()?;
+        let segments = self.dirty_segments();
+        if segments.is_empty() {
+            return Ok(());
+        }
 
-        for segment in dirty {
-            // A handle of its own per segment, for the same reason that `put` takes
-            // one per record. This is a standalone sync and nothing is seeking.
-            let file = fs::OpenOptions::new().write(true).open(segment).await?;
+        // The first failure in segment order is the one reported. Every segment is
+        // still synced, so a later call has less work to do.
+        let mut failure: Option<io::Error> = None;
 
-            file.sync_data().await?;
+        for batch in segments.chunks(SYNC_BATCH) {
+            let syncs = batch.iter().map(|segment| {
+                let path = self.segment_path(*segment);
+                async move {
+                    // One handle per segment. The reason is the same one that `put`
+                    // has for each record. This is a standalone sync, and nothing
+                    // is seeking.
+                    //
+                    // The handle is opened for writing. The cached read handles are
+                    // not reused here. A sync needs write access, and
+                    // `FlushFileBuffers` refuses a read-only handle on Windows.
+                    let file = crate::storage::at_async(
+                        &path,
+                        "open",
+                        fs::OpenOptions::new().write(true).open(&path),
+                    )
+                    .await?;
+                    crate::storage::at_async(&path, "sync", file.sync_data()).await?;
+                    Ok::<(), io::Error>(())
+                }
+            });
+            let results = futures_util::future::join_all(syncs).await;
+
+            for result in results {
+                if let Err(error) = result
+                    && failure.is_none()
+                {
+                    failure = Some(error);
+                }
+            }
+        }
+
+        if let Some(error) = failure {
+            return Err(error);
         }
 
         Ok(())
@@ -1614,11 +1682,14 @@ impl<C: Compressor> BlobStore<Write, C> {
         None
     }
 
-    /// The segments this run has written to, in order.
-    fn dirty_segments(&self) -> io::Result<Vec<PathBuf>> {
-        let dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
-
-        dirty.iter().map(|s| Ok(self.segment_path(*s))).collect()
+    /// List segments this run wrote to.
+    ///
+    /// Answer in segment order. Answer with numbers. Callers map numbers to paths.
+    fn dirty_segments(&self) -> Vec<u32> {
+        self.dirty
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
