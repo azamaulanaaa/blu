@@ -89,6 +89,23 @@ pub trait Compressor: Send + Sync + 'static {
     /// is one it can decode. `Cow` rather than `Vec` for the reason [`Compression`]
     /// gives. Most answers are the input, unchanged.
     fn compress<'a>(&self, raw: &'a [u8]) -> (Codec, Cow<'a, [u8]>);
+
+    /// Map a large payload to the policy that streams it.
+    ///
+    /// The store streams a payload above its own size threshold instead of
+    /// reading the whole payload into memory. It cannot stream through
+    /// `compress`, because that method receives the whole payload. It needs a
+    /// mapping from this policy to one it knows instead.
+    ///
+    /// - Return `None` when no built-in policy gives the same record.
+    /// - The store then buffers the whole payload, as before.
+    /// - Return `Some` with a built-in policy when streaming gives the same
+    ///   bytes.
+    /// - Name only built-in policies. The store can only encode, decode, and
+    ///   fall back under the rules those policies obey.
+    fn stream_policy(&self) -> Option<Compression> {
+        None
+    }
 }
 
 impl Compressor for Compression {
@@ -97,6 +114,14 @@ impl Compressor for Compression {
         // operation under two names. The inherent one is what the tests in this
         // module call, and it is not going away.
         Compression::compress(*self, raw)
+    }
+
+    /// The built-in policy is its own mapping.
+    ///
+    /// - Return the policy itself.
+    /// - The store streams a large payload under it.
+    fn stream_policy(&self) -> Option<Compression> {
+        Some(*self)
     }
 }
 
