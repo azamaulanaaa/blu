@@ -10,6 +10,7 @@ mod common;
 use blulib::{
     command::load_snapshot,
     layout::IndexSet,
+    metadata::Timestamp,
     pack::StorageStored,
     storage::{BlobId, BlobStore, Read, StorageGet, StoragePut},
 };
@@ -513,6 +514,80 @@ async fn content_the_store_does_not_hold_is_written_in_a_later_run() {
             .await
             .unwrap(),
         second
+    );
+}
+
+/// The caller stamp reaches the version index without a snapshot read.
+#[tokio::test]
+async fn commit_with_time_stores_the_caller_stamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("a.bin"), common::noisy(10_000)).unwrap();
+    let seed = dir.path().join("seed");
+    common::run_backup(&source, &seed).await;
+
+    let seed_store = BlobStore::builder(&seed).open_reader().await.unwrap();
+    let snapshot_id = seed_store.snapshot(1).unwrap();
+    let snapshot_bytes = read_all(&seed_store, &snapshot_id).await.unwrap();
+    let embedded = load_snapshot(&seed_store, snapshot_id)
+        .await
+        .unwrap()
+        .taken_at;
+    let caller = Timestamp {
+        secs: embedded.secs + 1,
+        nanos: embedded.nanos,
+    };
+
+    let blob = dir.path().join("store");
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
+    let len = u64::try_from(snapshot_bytes.len()).unwrap();
+    store
+        .put(&snapshot_id, common::reader(snapshot_bytes), len)
+        .await
+        .unwrap();
+    store.sync_data().await.unwrap();
+    let version = store.commit_with_time(&snapshot_id, caller).await.unwrap();
+
+    assert_eq!(version, 1, "the first commit publishes version one");
+    assert_eq!(
+        store.version_time(1).await.unwrap(),
+        caller,
+        "version_time returns the caller stamp"
+    );
+}
+
+/// The fallback commit still reads the stamp from the snapshot blob.
+#[tokio::test]
+async fn commit_reads_the_stamp_from_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("a.bin"), common::noisy(10_000)).unwrap();
+    let seed = dir.path().join("seed");
+    common::run_backup(&source, &seed).await;
+
+    let seed_store = BlobStore::builder(&seed).open_reader().await.unwrap();
+    let snapshot_id = seed_store.snapshot(1).unwrap();
+    let snapshot_bytes = read_all(&seed_store, &snapshot_id).await.unwrap();
+    let embedded = load_snapshot(&seed_store, snapshot_id)
+        .await
+        .unwrap()
+        .taken_at;
+
+    let blob = dir.path().join("store");
+    let store = BlobStore::builder(&blob).open_writer().await.unwrap();
+    let len = u64::try_from(snapshot_bytes.len()).unwrap();
+    store
+        .put(&snapshot_id, common::reader(snapshot_bytes), len)
+        .await
+        .unwrap();
+    store.sync_data().await.unwrap();
+    let version = store.commit(&snapshot_id).await.unwrap();
+
+    assert_eq!(version, 1, "the first commit publishes version one");
+    assert_eq!(
+        store.version_time(1).await.unwrap(),
+        embedded,
+        "version_time returns the embedded stamp"
     );
 }
 

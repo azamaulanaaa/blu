@@ -1237,71 +1237,11 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
 
     /// Publish `snapshot` as the next version, durably.
     ///
-    /// The caller must already have synced the run's data. This writes the one
-    /// record that makes the run visible and syncs it, and only then is the
-    /// version reported as taken.
+    /// Read the stamp back from the snapshot blob.
+    /// Prefer [`StoragePut::commit_with_time`](crate::storage::StoragePut::commit_with_time) when the caller holds the stamp.
+    /// Keep this path for callers without the stamp.
     async fn commit(&self, snapshot: &BlobId) -> io::Result<u32> {
-        // A commit's payload is the hash that it commits to. Its two lengths are
-        // that hash's width. The value is `HASH`, not `snapshot.len()`. A `BlobId`
-        // is a hash, and a hash is not an array. Asking it for a length is a
-        // question about the wrong thing. That question compiled, because the value
-        // used to be a `[u8; 32]`.
-        let hash = snapshot.as_bytes();
-        let hash_len = 32_u64;
-
-        // Always raw: the scan requires a commit to be exactly one uncompressed
-        // hash, so a compressed one would be invisible to the scan that finds it.
-        let mut header = Vec::new();
-        record::encode_header(
-            &mut header,
-            Kind::Commit,
-            storage::Codec::Raw,
-            hash,
-            hash_len,
-            hash_len,
-        );
-
-        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + hash_len;
-        let reservation = self.reserve(total)?;
-        let offset = reservation.offset;
-
-        // Its own handle, for the same reason that `put` takes one. A clone shares
-        // the offset that this write is aimed with.
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.segment_path(reservation.segment))
-            .await?;
-
-        file.seek(SeekFrom::Start(offset)).await?;
-        file.write_all(&header).await?;
-        file.write_all(snapshot.as_bytes()).await?;
-        file.flush().await?;
-
-        // The second sync, and the one that makes the run real.
-        file.sync_data().await?;
-
-        // The version, and which commit record within this segment it is. The
-        // ordinal is counted rather than read back, because the run knows it. The
-        // ordinal is what lets a reader confirm an index file from this segment
-        // alone.
-        let (version, ordinal) = {
-            let mut contents = Contents::lock(&self.contents);
-
-            let version = u32::try_from(contents.commits.len() + 1)
-                .map_err(|_| io::Error::other("a store cannot hold more than u32::MAX versions"))?;
-            contents.commits.push(*snapshot);
-
-            let count = contents
-                .commits_per_segment
-                .entry(reservation.segment)
-                .or_insert(0);
-            let ordinal = *count;
-            *count = count.saturating_add(1);
-
-            (version, ordinal)
-        };
+        let (version, segment, ordinal) = self.commit_record(snapshot).await?;
 
         // The code writes the file after the commit, and never lets its failure fail
         // the run. A version whose index write is lost still exists and still
@@ -1317,7 +1257,7 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
                     &self.set,
                     VersionIndex {
                         version,
-                        segment: reservation.segment,
+                        segment,
                         ordinal,
                         snapshot: *snapshot,
                         taken_at,
@@ -1339,6 +1279,50 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
                      find it instead"
                 );
             }
+        }
+
+        Ok(version)
+    }
+
+    /// Publish `snapshot` as the next version with a known stamp.
+    ///
+    /// Take the stamp from the caller:
+    ///
+    /// * Skip the snapshot read.
+    /// * Write the index file from the given stamp.
+    ///
+    /// The caller owns the stamp.
+    /// The store writes the stamp into the index file as it stands.
+    /// The store does not read the snapshot to check the stamp.
+    /// A caller that passes a wrong stamp writes a wrong time into the index.
+    /// A rebuild of the index reads the stamp from the snapshot instead.
+    async fn commit_with_time(&self, snapshot: &BlobId, taken_at: Timestamp) -> io::Result<u32> {
+        let (version, segment, ordinal) = self.commit_record(snapshot).await?;
+
+        // The code writes the file after the commit, and never lets its failure fail
+        // the run. A version whose index write is lost still exists and still
+        // restores. A run that reported failure here would have published a version
+        // and told the caller that it had not.
+        //
+        // The stamp travels with the index file, so listings read no blob.
+        // The caller passed the stamp, so no read happens here.
+        // A missed write skips the file rather than failing the run.
+        if let Err(e) = write_index(
+            &self.set,
+            VersionIndex {
+                version,
+                segment,
+                ordinal,
+                snapshot: *snapshot,
+                taken_at,
+            },
+        ) {
+            tracing::debug!(
+                version,
+                error = %e,
+                "published a version but could not write its index file; a scan will \
+                 find it instead"
+            );
         }
 
         Ok(version)
@@ -1401,6 +1385,78 @@ fn write_index(set: &IndexSet, index: VersionIndex) -> io::Result<()> {
 }
 
 impl<C: Compressor> BlobStore<Write, C> {
+    /// Write the commit record and register the version number.
+    ///
+    /// Follow these steps:
+    ///
+    /// * Encode the commit header.
+    /// * Append the record at the reserved offset.
+    /// * Sync the file.
+    /// * Register the version in memory.
+    ///
+    /// Return the version with its segment and ordinal.
+    async fn commit_record(&self, snapshot: &BlobId) -> io::Result<(u32, u32, u32)> {
+        // A commit's payload is the hash that it commits to. Its two lengths are
+        // that hash's width. The value is `HASH`, not `snapshot.len()`. A `BlobId`
+        // is a hash, and a hash is not an array. Asking it for a length is a
+        // question about the wrong thing. That question compiled, because the value
+        // used to be a `[u8; 32]`.
+        let hash = snapshot.as_bytes();
+        let hash_len = 32_u64;
+
+        // Always raw: the scan requires a commit to be exactly one uncompressed
+        // hash, so a compressed one would be invisible to the scan that finds it.
+        let mut header = Vec::new();
+        record::encode_header(
+            &mut header,
+            Kind::Commit,
+            storage::Codec::Raw,
+            hash,
+            hash_len,
+            hash_len,
+        );
+
+        let total = u64::try_from(header.len()).unwrap_or(u64::MAX) + hash_len;
+        let reservation = self.reserve(total)?;
+        let offset = reservation.offset;
+
+        // Its own handle, for the same reason that `put` takes one. A clone shares
+        // the offset that this write is aimed with.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.segment_path(reservation.segment))
+            .await?;
+
+        file.seek(SeekFrom::Start(offset)).await?;
+        file.write_all(&header).await?;
+        file.write_all(snapshot.as_bytes()).await?;
+        file.flush().await?;
+
+        // The second sync, and the one that makes the run real.
+        file.sync_data().await?;
+
+        // The version, and which commit record within this segment it is. The
+        // ordinal is counted rather than read back, because the run knows it. The
+        // ordinal is what lets a reader confirm an index file from this segment
+        // alone.
+        let mut contents = Contents::lock(&self.contents);
+
+        let version = u32::try_from(contents.commits.len() + 1)
+            .map_err(|_| io::Error::other("a store cannot hold more than u32::MAX versions"))?;
+        contents.commits.push(*snapshot);
+
+        let count = contents
+            .commits_per_segment
+            .entry(reservation.segment)
+            .or_insert(0);
+        let ordinal = *count;
+        *count = count.saturating_add(1);
+
+        Ok((version, reservation.segment, ordinal))
+    }
+
     /// Claim `total` bytes for one record.
     ///
     /// Return a range in the current segment when it fits.
