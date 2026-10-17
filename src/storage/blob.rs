@@ -976,21 +976,86 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
 
     /// Make every record written so far durable.
     ///
-    /// Called once per run, after the last data record and before the commit
-    /// record (see the module docs).
+    /// Call this method once per run. Call it after the last data record. Call it before the commit record.
+    ///
+    /// The method syncs every dirty segment. It syncs the segments concurrently. It reuses cached handles where possible.
+    ///
+    /// The method follows these steps:
+    ///
+    /// - List dirty segments in order.
+    /// - Reuse each cached handle.
+    /// - Open each missing segment.
+    /// - Sync all handles concurrently.
+    /// - Drop synced segments from the dirty list.
+    ///
+    /// A failed segment stays dirty. A later call retries it. The two-sync protocol stays unchanged.
     ///
     /// Every segment that this run wrote to is synced, not just the last. A run
     /// that crossed a boundary has records in two files. Syncing only the newer one
     /// would leave the older one's pages unordered against it.
     async fn sync_data(&self) -> io::Result<()> {
-        let dirty = self.dirty_segments()?;
+        let segments = self.dirty_segments();
+        if segments.is_empty() {
+            return Ok(());
+        }
 
-        for segment in dirty {
-            // A handle of its own per segment, for the same reason that `put` takes
-            // one per record. This is a standalone sync and nothing is seeking.
-            let file = fs::OpenOptions::new().write(true).open(segment).await?;
+        // Clone cached handles out from under the lock. A sync ignores
+        // the file offset. A clone therefore cannot interleave payloads
+        // the way a shared write handle could.
+        let mut reused: HashMap<u32, fs::File> = HashMap::new();
+        {
+            let files = self.open_files.lock().await;
+            for segment in &segments {
+                if let Some(file) = files.get(segment)
+                    && let Ok(clone) = file.try_clone().await
+                {
+                    reused.insert(*segment, clone);
+                }
+            }
+        }
 
-            file.sync_data().await?;
+        let syncs = segments.iter().map(|segment| {
+            let path = self.segment_path(*segment);
+            let cached = reused.remove(segment);
+            async move {
+                let file = match cached {
+                    Some(file) => file,
+                    None => {
+                        crate::storage::at_async(
+                            &path,
+                            "open",
+                            fs::OpenOptions::new().write(true).open(&path),
+                        )
+                        .await?
+                    }
+                };
+                crate::storage::at_async(&path, "sync", file.sync_data()).await?;
+                Ok::<u32, io::Error>(*segment)
+            }
+        });
+        let results = futures_util::future::join_all(syncs).await;
+
+        // Drop only the segments that synced. Keep failed segments dirty.
+        // Keep segments added while the sync ran. A later call retries them.
+        let mut synced: Vec<u32> = Vec::new();
+        let mut failure: Option<io::Error> = None;
+        for (segment, result) in segments.iter().zip(results) {
+            match result {
+                Ok(_) => synced.push(*segment),
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        {
+            let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+            dirty.retain(|segment| !synced.contains(segment));
+        }
+
+        if let Some(error) = failure {
+            return Err(error);
         }
 
         Ok(())
@@ -1456,11 +1521,14 @@ impl<C: Compressor> BlobStore<Write, C> {
         None
     }
 
-    /// The segments this run has written to, in order.
-    fn dirty_segments(&self) -> io::Result<Vec<PathBuf>> {
-        let dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
-
-        dirty.iter().map(|s| Ok(self.segment_path(*s))).collect()
+    /// List segments this run wrote to.
+    ///
+    /// Answer in segment order. Answer with numbers. Callers map numbers to paths.
+    fn dirty_segments(&self) -> Vec<u32> {
+        self.dirty
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
