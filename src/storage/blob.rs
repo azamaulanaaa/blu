@@ -45,6 +45,16 @@
 //! A store from another build is a backup that somebody cares about. A store that
 //! does not begin with the store magic is therefore refused rather than scanned.
 //!
+//! # Sealed segment caches
+//!
+//! A writer open may leave a `.sidx` file beside each sealed segment. The file
+//! holds that segment's blob placements and commit hashes. It is a cache, not a
+//! source, and nothing in it is believed before it is proven. A cached segment
+//! must carry the same length, the same store header, the same verified record
+//! headers, and the same commit hashes as a scan finds. Any disagreement drops
+//! the cache and falls back to a full scan. A reader open reads caches and
+//! rebuilds none.
+//!
 //! # Remote backends
 //!
 //! Remote backends use the same record format. The local durability mechanics
@@ -2164,6 +2174,20 @@ struct Scanned {
     append: Option<Reservation>,
 }
 
+impl Scanned {
+    /// Add one segment's scan to what the set scan holds.
+    ///
+    /// Extend the blob index with the segment's blobs.
+    /// Grow the commit log by the segment's commits.
+    /// Record the per-segment commit count.
+    fn absorb(&mut self, segment: u32, blobs: HashMap<BlobId, Placement>, commits: Vec<BlobId>) {
+        self.blobs.extend(blobs);
+        self.commits_per_segment
+            .insert(segment, u32::try_from(commits.len()).unwrap_or(u32::MAX));
+        self.commits.extend(commits);
+    }
+}
+
 /// What a scan is allowed to do to the set.
 ///
 /// The two halves of this were, for a long time, the same sixty lines written
@@ -2215,6 +2239,93 @@ fn read_only_scan(set: &IndexSet) -> io::Result<Scanned> {
     scan_set(set, Scan::Inspect)
 }
 
+/// Check that `path` holds this set's segment `segment`, and prove it.
+///
+/// Check the store header first.
+/// Compare the number the header claims with the slot the file fills.
+/// Refuse every other file as [`not_a_store`].
+fn check_segment_number(
+    file: &mut (impl io::Read + io::Seek),
+    path: &Path,
+    segment: u32,
+    mode: Scan,
+) -> io::Result<()> {
+    let claimed = check_store_header(file, path)?;
+    if claimed != segment {
+        return Err(not_a_store(
+            path,
+            &renamed_segment_message(claimed, segment, mode),
+        ));
+    }
+    Ok(())
+}
+
+/// Say why a segment file cannot fill its slot in this set.
+///
+/// A writer must recover the set and cannot recover a renamed segment. That
+/// writer names what the rename means. A reader refuses the same file in one
+/// short sentence. Keep both messages here, so the two cannot drift apart.
+fn renamed_segment_message(claimed: u32, segment: u32, mode: Scan) -> String {
+    if mode.repairs() {
+        format!(
+            "its header says it is segment {claimed}, but it is named as segment \
+             {segment}, so the set's segments have been moved around or renamed"
+        )
+    } else {
+        format!(
+            "its header says it is segment {claimed}, but it is named as segment \
+             {segment}"
+        )
+    }
+}
+
+/// Scan one sealed segment, believing a cache that verifies and only that one.
+///
+/// - Try the verified cache first.
+/// - Scan the whole segment on a miss.
+/// - Refuse a tail that does not verify.
+/// - Store the fresh scan when the open repairs.
+///
+/// The cache is a hint and carries no authority of its own. `load_checked`
+/// proves it against the segment's headers and commit records. This function
+/// therefore runs either a proven cache or a full scan, never both, and never
+/// a half of either.
+fn scan_sealed_segment(
+    set: &IndexSet,
+    segment: u32,
+    path: &Path,
+    mode: Scan,
+) -> io::Result<record::Scan> {
+    if let Some(cached) = super::segment_cache::load_checked(set, segment, path) {
+        tracing::debug!(segment, path = %path.display(), "sealed segment read from cache");
+        return Ok(record::Scan {
+            blobs: cached.blobs,
+            commits: cached.commits,
+            end: cached.segment_len,
+        });
+    }
+    let mut file = std::fs::File::open(path)?;
+    check_segment_number(&mut file, path, segment, mode)?;
+
+    let scan = record::scan(&mut file, segment, record::Blobs::Index)?;
+    let len = file.metadata()?.len();
+    if scan.end < len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is a sealed segment and has {} bytes that are not a valid record, so it \
+                 is damaged rather than unfinished and nothing was truncated",
+                path.display(),
+                len - scan.end
+            ),
+        ));
+    }
+    if mode.repairs() {
+        super::segment_cache::store(set, segment, len, &scan.commits, &scan.blobs);
+    }
+    Ok(scan)
+}
+
 /// Scan every segment of a set. See [`Scan`] for what the two callers differ in.
 fn scan_set(set: &IndexSet, mode: Scan) -> io::Result<Scanned> {
     let mut segments = set.segments()?;
@@ -2245,53 +2356,33 @@ fn scan_set(set: &IndexSet, mode: Scan) -> io::Result<Scanned> {
         let segment = u32::try_from(index).unwrap_or(u32::MAX);
         let is_last = index == last;
 
+        // Sealed segments read from a cache that verifies, else from a full
+        // scan of their own. The last segment always scans fully, because a
+        // cache would hide the tail that recovery is about to discard.
+        if !is_last {
+            let scan = scan_sealed_segment(set, segment, path, mode)?;
+            out.absorb(segment, scan.blobs, scan.commits);
+            continue;
+        }
+
+        // Only the last segment reaches here. Everything before it continued,
+        // so this open takes the segment for writing whatever the set holds.
         let mut file = if mode.repairs() {
             std::fs::OpenOptions::new()
                 .read(true)
-                .write(is_last)
+                .write(true)
                 .truncate(false)
                 .open(path)?
         } else {
             std::fs::File::open(path)?
         };
 
-        let claimed = check_store_header(&mut file, path)?;
-        if claimed != segment {
-            return Err(not_a_store(
-                path,
-                // The longer message is the writer's. A renamed or reordered set is
-                // a recoverable misconfiguration for a read. It is an unrecoverable
-                // one for a write. Only the write therefore explains it.
-                &if mode.repairs() {
-                    format!(
-                        "its header says it is segment {claimed}, but it is named as segment \
-                         {segment}, so the set's segments have been moved around or renamed"
-                    )
-                } else {
-                    format!(
-                        "its header says it is segment {claimed}, but it is named as segment \
-                         {segment}"
-                    )
-                },
-            ));
-        }
+        check_segment_number(&mut file, path, segment, mode)?;
 
         let scan = record::scan(&mut file, segment, record::Blobs::Index)?;
         let len = file.metadata()?.len();
 
         if scan.end < len {
-            if !is_last {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "{} is a sealed segment and has {} bytes that are not a valid record, so it \
-                         is damaged rather than unfinished; nothing here was truncated",
-                        path.display(),
-                        len - scan.end
-                    ),
-                ));
-            }
-
             if !mode.repairs() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2318,21 +2409,14 @@ fn scan_set(set: &IndexSet, mode: Scan) -> io::Result<Scanned> {
             );
         }
 
-        out.blobs.extend(scan.blobs);
-        out.commits_per_segment.insert(
-            segment,
-            u32::try_from(scan.commits.len()).unwrap_or(u32::MAX),
-        );
-        out.commits.extend(scan.commits);
+        out.absorb(segment, scan.blobs, scan.commits);
 
-        if is_last {
-            // Recording the last segment rather than how many are sealed is what
-            // makes a fresh set use the same arithmetic as a set of a thousand.
-            out.append = Some(Reservation {
-                segment,
-                offset: scan.end,
-            });
-        }
+        // Recording the last segment rather than how many are sealed is what
+        // makes a fresh set use the same arithmetic as a set of a thousand.
+        out.append = Some(Reservation {
+            segment,
+            offset: scan.end,
+        });
     }
 
     Ok(out)
@@ -2358,13 +2442,19 @@ fn create_segment(path: &Path, segment: u32) -> io::Result<()> {
 
 /// Check that `path` is a store segment, and return the number its header claims.
 ///
-/// This function never repairs and never truncates. A file that does not start with
-/// the store magic is somebody's data that this build does not understand.
+/// Check magic and version.
+/// Return the segment number on a match.
+/// Refuse every other file with an error.
+/// Never repair.
+/// Never truncate.
 ///
 /// This function takes any `Read + Seek` source. A remote backend can check
 /// header bytes it fetched. It needs no local file. The function finds the
 /// length by seeking to the end. It does not read file metadata.
-fn check_store_header(file: &mut (impl io::Read + io::Seek), path: &Path) -> io::Result<u32> {
+pub(super) fn check_store_header(
+    file: &mut (impl io::Read + io::Seek),
+    path: &Path,
+) -> io::Result<u32> {
     let len = io::Seek::seek(file, io::SeekFrom::End(0))?;
     if len < STORE_HEADER as u64 {
         return Err(not_a_store(path, "it is too short to hold a store header"));

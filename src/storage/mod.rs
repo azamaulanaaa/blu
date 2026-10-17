@@ -18,6 +18,9 @@
 //!   writing, so a restore cannot be handed something that appends.
 //! * `blob` is the store itself: segments, records, and deduplication.
 //! * `record` holds the framing of a record, and how a store is read back.
+//! * `segment_cache` caches a sealed segment's scan beside the segment.
+//!   It verifies a cache against that segment on every use.
+//!   It falls back to a full scan on any disagreement.
 //! * `hash` holds what a chunk is named by, and the truncated digest a header
 //!   checks itself with.
 //! * `compression` holds the seams for how a payload becomes stored bytes and
@@ -54,6 +57,7 @@ mod plan;
 mod record;
 mod remote;
 mod segment;
+mod segment_cache;
 mod version_index;
 
 mod operator;

@@ -177,14 +177,14 @@ pub enum Codec {
 }
 
 impl Codec {
-    fn to_byte(self) -> u8 {
+    pub(super) fn to_byte(self) -> u8 {
         match self {
             Self::Raw => 0,
             Self::Zstd => 1,
         }
     }
 
-    fn from_byte(byte: u8) -> Option<Self> {
+    pub(super) fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Raw),
             1 => Some(Self::Zstd),

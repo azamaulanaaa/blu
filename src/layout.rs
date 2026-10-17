@@ -77,6 +77,13 @@ use std::{
 pub const SEGMENT_EXTENSION: &str = "bin";
 /// Extension of a per-version index file.
 pub const INDEX_EXTENSION: &str = "idx";
+/// Extension of a sealed segment blob cache.
+///
+/// Name sealed segment caches with this extension.
+/// Keep caches beside segments.
+/// Rebuild caches from segments.
+/// Never trust caches alone.
+pub const SEGMENT_CACHE_EXTENSION: &str = "sidx";
 /// Extension of the write lock.
 pub const LOCK_EXTENSION: &str = "lock";
 
@@ -477,6 +484,19 @@ impl IndexSet {
     #[must_use]
     pub fn lock_path(&self) -> PathBuf {
         self.suffixed(LOCK_EXTENSION)
+    }
+
+    /// Path of the blob cache for `segment`.
+    ///
+    /// Name one cache per segment.
+    /// Store caches beside segments.
+    /// Ignore missing caches on open.
+    /// Rebuild stale caches from segments.
+    #[must_use]
+    pub fn segment_cache_path(&self, segment: u32) -> PathBuf {
+        self.suffixed(&format!(
+            "{segment:0SEGMENT_DIGITS$}.{SEGMENT_CACHE_EXTENSION}"
+        ))
     }
 
     /// The base path's file name, which every file of this set is named after.
