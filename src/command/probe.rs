@@ -545,6 +545,10 @@ fn bad_index(
 /// this chunk from a store or a pack anyway. A restore also buffers the same
 /// bytes.
 ///
+/// The slice buffer is reused across the placements. A chunk placed many times
+/// then reads every slice into one allocation instead of a fresh one per slice.
+/// The bytes of one slice are cleared out before the next is read into it.
+///
 /// **A chunk whose every placement is trusted is not read at all.** That is the
 /// whole point of the trusted set. The chunk's bytes are needed only to compare
 /// against a file, and a file nobody has touched does not need comparing. The
@@ -567,6 +571,11 @@ async fn check_chunk<S: StorageGet + ?Sized>(
     let mut chunk = Vec::new();
     reader.read_to_end(&mut chunk).await?;
 
+    // One buffer for every placement of this chunk. `read_slice` clears it and
+    // keeps its allocation, so a chunk placed many times allocates once here
+    // rather than once per placement.
+    let mut buffer = Vec::new();
+
     for slice in slices {
         // Trusted placements are neither read nor reported. See the type.
         if slice.trusted {
@@ -587,7 +596,14 @@ async fn check_chunk<S: StorageGet + ?Sized>(
             )
         })?;
 
-        let mut local = match read_slice(&slice.resolved, slice.file_offset, slice.length).await {
+        let local = match read_slice(
+            &slice.resolved,
+            slice.file_offset,
+            slice.length,
+            &mut buffer,
+        )
+        .await
+        {
             Ok(local) => local,
             Err(Unreadable::Absent) => {
                 findings.push(finding(&slice, Unheld::Absent));
@@ -599,11 +615,9 @@ async fn check_chunk<S: StorageGet + ?Sized>(
             }
         };
 
-        if local.as_slice() != expected {
+        if local != expected {
             findings.push(finding(&slice, Unheld::Content));
         }
-
-        local.clear();
     }
 
     Ok(findings)
@@ -620,6 +634,7 @@ fn finding(slice: &Placement, reason: Unheld) -> Mismatch {
 }
 
 /// Why a recorded slice could not be read at all.
+#[derive(Debug)]
 enum Unreadable {
     /// The file is not there.
     Absent,
@@ -627,13 +642,25 @@ enum Unreadable {
     Short,
 }
 
-/// Read exactly `length` bytes at `offset`, or say why they could not be.
+/// Read exactly `length` bytes at `offset` into `out`, or say why they could
+/// not be.
 ///
+/// The returned slice is the bytes that were read, and it borrows `out`.
+/// `out` is cleared first and its allocation is kept, so a caller that reads
+/// many slices allocates once rather than once per slice.
 /// A short read is reported rather than returned. The two are distinct because
 /// they are distinct problems. "This file is not here" and "this file ends early"
 /// send someone to two different places. A caller that got only one of the two
 /// would have to guess which one it was.
-async fn read_slice(path: &Path, offset: u64, length: u32) -> Result<Vec<u8>, Unreadable> {
+async fn read_slice<'a>(
+    path: &Path,
+    offset: u64,
+    length: u32,
+    out: &'a mut Vec<u8>,
+) -> Result<&'a [u8], Unreadable> {
+    // Cleared, so the bytes of an earlier slice cannot survive into this one.
+    // The capacity stays, so the allocation stays too.
+    out.clear();
     let wanted = u64::from(length);
 
     let mut file = match tfs::File::open(path).await {
@@ -651,8 +678,7 @@ async fn read_slice(path: &Path, offset: u64, length: u32) -> Result<Vec<u8>, Un
     // shows a short read. A short read is not the same as bytes that happen to be
     // different.
     let mut reader = crate::slice::SliceAsyncReader::new(file, wanted);
-    let mut out = Vec::new();
-    if reader.read_to_end(&mut out).await.is_err() {
+    if reader.read_to_end(out).await.is_err() {
         return Err(Unreadable::Short);
     }
 
@@ -660,7 +686,7 @@ async fn read_slice(path: &Path, offset: u64, length: u32) -> Result<Vec<u8>, Un
         return Err(Unreadable::Short);
     }
 
-    Ok(out)
+    Ok(out.as_slice())
 }
 
 /// Entries under `root` that `snapshot` does not record.
@@ -707,4 +733,47 @@ fn extra_entries(root: &Path, snapshot: &Snapshot) -> Vec<PathBuf> {
 
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_slice;
+
+    /// The slice buffer is the one the check loop reuses across the placements
+    /// of a chunk. A second read must keep the first read's allocation, and
+    /// must not leave the first read's bytes in the result.
+    #[tokio::test]
+    async fn read_slice_reuses_one_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slice.bin");
+        let bytes: Vec<u8> = b"0123456789abcdef".repeat(512);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut buffer = Vec::new();
+        let first = read_slice(&path, 0, 4096, &mut buffer).await.unwrap();
+        assert_eq!(first, &bytes[..4096]);
+
+        let capacity = buffer.capacity();
+        let allocation = buffer.as_ptr();
+
+        // A shorter slice from the middle. Short enough that the allocation the
+        // first read left is enough.
+        let second = read_slice(&path, 1024, 2048, &mut buffer).await.unwrap();
+
+        assert_eq!(
+            second,
+            &bytes[1024..1024 + 2048],
+            "the second read should answer with its own bytes and not the first's"
+        );
+        assert_eq!(
+            buffer.as_ptr(),
+            allocation,
+            "the second read should reuse the allocation the first one made"
+        );
+        assert_eq!(
+            buffer.capacity(),
+            capacity,
+            "the second read should fit in that allocation"
+        );
+    }
 }
