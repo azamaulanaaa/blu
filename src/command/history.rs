@@ -153,11 +153,16 @@ async fn load_snapshots<S: storage::StorageGet>(
 /// A file counts as changed when its bytes differ, not its chunks.
 /// Small files share chunks with neighbours. The report compares bytes
 /// where layout leaves doubt, and reads only reported files.
+///
+/// A whole-chunk cache serves the reads that compare slices.
+/// Set its budget with [`HistoryBuilder::cache_bytes`].
+/// The budget follows the bytes the snapshots reference.
 #[derive(Debug)]
 pub struct HistoryBuilder<'a, S> {
     store: &'a S,
     versions: Vec<(u32, storage::BlobId)>,
     files: Vec<PathBuf>,
+    cache_bytes: usize,
 }
 
 impl<'a, S: storage::StorageGet> HistoryBuilder<'a, S> {
@@ -170,6 +175,7 @@ impl<'a, S: storage::StorageGet> HistoryBuilder<'a, S> {
             store,
             versions: Vec::new(),
             files: Vec::new(),
+            cache_bytes: storage::DEFAULT_CACHE_BYTES,
         }
     }
 
@@ -197,6 +203,19 @@ impl<'a, S: storage::StorageGet> HistoryBuilder<'a, S> {
         self
     }
 
+    /// Set the bytes of whole chunks the report may keep in memory.
+    ///
+    /// Defaults to [`storage::DEFAULT_CACHE_BYTES`].
+    /// One store read then serves every slice that names a held chunk.
+    /// The report lowers the budget to the bytes its snapshots reference.
+    /// The budget never exceeds the cache default.
+    /// A budget of zero keeps nothing, and reads every slice from the store.
+    #[must_use]
+    pub fn cache_bytes(mut self, bytes: usize) -> Self {
+        self.cache_bytes = bytes;
+        self
+    }
+
     /// Load the snapshots and compare them.
     ///
     /// # Errors
@@ -206,7 +225,7 @@ impl<'a, S: storage::StorageGet> HistoryBuilder<'a, S> {
     /// Returns an error when a compared chunk cannot be read.
     #[instrument(level = "info", skip(self), err)]
     pub async fn run(self) -> io::Result<Vec<Event>> {
-        report(self.store, &self.versions, &self.files).await
+        report(self.store, &self.versions, &self.files, self.cache_bytes).await
     }
 }
 
@@ -215,6 +234,7 @@ async fn report<S: storage::StorageGet>(
     store: &S,
     versions: &[(u32, storage::BlobId)],
     raw: &[PathBuf],
+    cache_bytes: usize,
 ) -> io::Result<Vec<Event>> {
     let loaded = load_snapshots(store, versions).await?;
     let maps: Vec<HashMap<PathBuf, Entry>> = loaded
@@ -227,6 +247,16 @@ async fn report<S: storage::StorageGet>(
         dirs.extend(dirs_of(&item.snapshot_body));
     }
     let filter = Filter::new(raw, &dirs)?;
+
+    // One read of a chunk serves every slice that names it, over every file in
+    // this report. The snapshots stay outside the cache: the loader reads each
+    // one whole on purpose.
+    //
+    // The budget follows the work that is there. A report over a small tree
+    // keeps a small budget, and a report over a shared tree keeps the chunks
+    // it needs.
+    let budget = cache_budget(cache_bytes, referenced_bytes(&loaded));
+    let cache = storage::ChunkCache::with_bytes(store, budget);
 
     let mut out = Vec::new();
     let mut before: HashMap<PathBuf, Entry> = HashMap::new();
@@ -260,7 +290,7 @@ async fn report<S: storage::StorageGet>(
                     detail: None,
                 }),
                 (Some(previous), Some(next)) => {
-                    resolve(store, previous, next).await?.map(|detail| Event {
+                    resolve(&cache, previous, next).await?.map(|detail| Event {
                         version: item.version,
                         snapshot: item.snapshot,
                         taken_at: item.snapshot_body.taken_at,
@@ -278,6 +308,29 @@ async fn report<S: storage::StorageGet>(
     }
 
     Ok(out)
+}
+
+/// The bytes of whole chunks the report may keep in memory.
+///
+/// The budget follows the work that is there.
+/// The cache holds at most the bytes the snapshots reference.
+/// The budget never exceeds the cache default either.
+/// A budget of zero keeps nothing, and reads every slice from the store.
+fn cache_budget(requested: usize, referenced: u64) -> usize {
+    let referenced = usize::try_from(referenced).unwrap_or(usize::MAX);
+    requested.min(referenced).min(storage::DEFAULT_CACHE_BYTES)
+}
+
+/// The bytes the snapshots of a report reference.
+///
+/// Every slice counts once, because the report reads the range of each slice.
+fn referenced_bytes(loaded: &[Loaded]) -> u64 {
+    loaded
+        .iter()
+        .flat_map(|item| item.snapshot_body.file_chunks.iter())
+        .fold(0_u64, |total, slice| {
+            total.saturating_add(u64::from(slice.length))
+        })
 }
 
 /// Everything one comparison needs to know about one path.
@@ -515,8 +568,9 @@ async fn resolve<S: storage::StorageGet>(
 
 /// The BLAKE3 hash of a file's bytes, read slice by slice out of the store.
 ///
-/// Reads each named chunk whole and hashes the recorded range, so a chunk
-/// shared with other files is read once per file that names it.
+/// Seeks to each recorded range and hashes that range alone.
+/// A chunk that several slices name is read once per report when the caller
+/// wires a cache.
 ///
 /// # Errors
 ///
@@ -526,35 +580,62 @@ async fn content_hash<S: storage::StorageGet>(
     store: &S,
     slices: &[Slice],
 ) -> io::Result<blake3::Hash> {
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
     let mut hash = blake3::Hasher::new();
+    let mut range = Vec::new();
+
     for slice in slices {
         let mut reader = store.get(&slice.chunk).await?;
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await?;
-        let start = usize::try_from(slice.offset).unwrap_or(usize::MAX);
-        let len = usize::try_from(slice.length).unwrap_or(usize::MAX);
-        let end = start.saturating_add(len);
-        let Some(range) = bytes.get(start..end) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "chunk {} holds {} bytes and the snapshot reads past them",
-                    slice.chunk,
-                    bytes.len()
-                ),
-            ));
-        };
-        hash.update(range);
+        let held = reader.seek(io::SeekFrom::End(0)).await?;
+        let start = u64::from(slice.offset);
+        let length = u64::from(slice.length);
+
+        if start.saturating_add(length) > held {
+            return Err(truncated(slice, held));
+        }
+
+        reader.seek(io::SeekFrom::Start(start)).await?;
+        range.clear();
+        reader.take(length).read_to_end(&mut range).await?;
+
+        // A stream that ends inside the range cannot be hashed as the snapshot
+        // recorded it. A byte count that is short would compare as a different
+        // file rather than as a broken read.
+        if u64::try_from(range.len()).unwrap_or(u64::MAX) != length {
+            return Err(truncated(slice, held));
+        }
+        hash.update(&range);
     }
+
     Ok(hash.finalize())
+}
+
+/// The error for a slice that reaches past the end of its chunk.
+fn truncated(slice: &Slice, held: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "chunk {} holds {held} bytes and the snapshot reads past them",
+            slice.chunk
+        ),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Slice, Verdict, verdict_of};
-    use crate::{metadata::Attributes, storage::BlobId};
+    use std::{
+        collections::HashMap,
+        io::{self, Cursor},
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{Entry, Slice, Verdict, cache_budget, content_hash, report, verdict_of};
+    use crate::{
+        metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
+        storage::{BlobId, DEFAULT_CACHE_BYTES, StorageGet, StreamReadSeeker},
+    };
 
     /// One chunk slice covering whole test content.
     fn slice(hash: &str) -> Slice {
@@ -617,5 +698,162 @@ mod tests {
         };
 
         assert_eq!(verdict_of(&file(A), &dir), Verdict::Type);
+    }
+
+    /// A store of fixed blobs that counts every read.
+    struct Spy {
+        /// The blobs the store holds, by identity.
+        blobs: HashMap<BlobId, Vec<u8>>,
+        /// How many reads the store was asked for.
+        reads: AtomicUsize,
+    }
+
+    impl Spy {
+        /// A store holding these blobs.
+        fn new(blobs: Vec<(BlobId, Vec<u8>)>) -> Self {
+            Self {
+                blobs: blobs.into_iter().collect(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+
+        /// How many reads the store was asked for.
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StorageGet for Spy {
+        fn get(&self, id: &BlobId) -> impl Future<Output = io::Result<StreamReadSeeker>> + Send {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+
+            async move {
+                let bytes = self.blobs.get(id).cloned().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "the spy holds no such blob")
+                })?;
+
+                Ok(Box::new(Cursor::new(bytes)) as StreamReadSeeker)
+            }
+        }
+    }
+
+    /// A snapshot of two files that both name one chunk.
+    ///
+    /// `halves` records three slices of 2, 4 and 2 bytes.
+    /// Without it the same bytes come from two slices of 4.
+    fn two_files_over_one_chunk(chunk: BlobId, halves: bool, taken_at: Timestamp) -> Snapshot {
+        let mut snapshot = Snapshot::new(taken_at);
+        snapshot.chunks = vec![chunk];
+
+        for index in 0..2 {
+            let file_index = u32::try_from(index).unwrap();
+            snapshot.files.push(File {
+                path: PathBuf::from(format!("f{index}.bin")),
+                len: 8,
+                attrs: Attributes::default(),
+            });
+
+            let cuts: &[(u32, u64, u32)] = if halves {
+                &[(0, 0, 2), (2, 2, 4), (6, 6, 2)]
+            } else {
+                &[(0, 0, 4), (4, 4, 4)]
+            };
+            for &(chunk_offset, file_offset, length) in cuts {
+                snapshot.file_chunks.push(FileChunk {
+                    chunk_index: 0,
+                    file_index,
+                    chunk_offset,
+                    file_offset,
+                    length,
+                });
+            }
+        }
+
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn hashing_a_range_matches_hashing_the_whole_blob() {
+        let whole = b"01234567".to_vec();
+        let id = blake3::hash(&whole);
+        let spy = Spy::new(vec![(id, whole.clone())]);
+
+        let slices = [Slice {
+            chunk: id,
+            offset: 2,
+            length: 3,
+        }];
+        let hashed = content_hash(&spy, &slices).await.unwrap();
+
+        assert_eq!(hashed, blake3::hash(&whole[2..5]));
+        assert_eq!(spy.reads(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_range_past_the_chunk_end_is_refused() {
+        let whole = b"01234567".to_vec();
+        let id = blake3::hash(&whole);
+        let spy = Spy::new(vec![(id, whole)]);
+
+        let slices = [Slice {
+            chunk: id,
+            offset: 7,
+            length: 2,
+        }];
+        let error = content_hash(&spy, &slices).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_budget_follows_the_bytes_the_snapshots_reference() {
+        let budget = cache_budget(DEFAULT_CACHE_BYTES, 1024);
+
+        assert_eq!(budget, 1024);
+    }
+
+    #[test]
+    fn a_budget_never_exceeds_the_cache_default() {
+        let budget = cache_budget(usize::MAX, u64::MAX);
+
+        assert_eq!(budget, DEFAULT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn a_zero_budget_keeps_nothing() {
+        let budget = cache_budget(0, 1024);
+
+        assert_eq!(budget, 0);
+    }
+
+    #[tokio::test]
+    async fn one_read_serves_two_files_that_share_a_chunk() {
+        let bytes = b"01234567".to_vec();
+        let chunk = blake3::hash(&bytes);
+
+        let first = two_files_over_one_chunk(chunk, false, Timestamp { secs: 1, nanos: 0 });
+        let second = two_files_over_one_chunk(chunk, true, Timestamp { secs: 2, nanos: 0 });
+        let first_bytes = first.to_bytes().unwrap();
+        let second_bytes = second.to_bytes().unwrap();
+        let first_id = blake3::hash(&first_bytes);
+        let second_id = blake3::hash(&second_bytes);
+
+        let spy = Spy::new(vec![
+            (chunk, bytes),
+            (first_id, first_bytes),
+            (second_id, second_bytes),
+        ]);
+
+        let events = report(
+            &spy,
+            &[(1, first_id), (2, second_id)],
+            &[],
+            DEFAULT_CACHE_BYTES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 2, "the first version creates both files");
+        assert_eq!(spy.reads(), 3, "two snapshots and one shared chunk");
     }
 }
