@@ -17,6 +17,9 @@
 //! * `backend` says what a store can be asked to do. It splits into reading and
 //!   writing, so a restore cannot be handed something that appends.
 //! * `blob` is the store itself: segments, records, and deduplication.
+//! * `chunk_cache` holds whole chunks in memory in front of a store.
+//!   It holds them under a byte budget.
+//!   It makes one read serve requests that arrive together.
 //! * `record` holds the framing of a record, and how a store is read back.
 //! * `segment_cache` caches a sealed segment's scan beside the segment.
 //!   It verifies a cache against that segment on every use.
@@ -47,6 +50,7 @@
 
 mod backend;
 mod blob;
+mod chunk_cache;
 mod compression;
 mod error;
 mod hash;
@@ -65,6 +69,7 @@ mod tls;
 
 pub use backend::{AsyncReadSeek, StorageGet, StoragePut, StreamReadSeeker};
 pub use blob::{BlobStore, Read, StoreBuilder, Write, WriteMode};
+pub use chunk_cache::{ChunkCache, DEFAULT_CACHE_BYTES};
 pub use compression::{Compression, Compressor, Decompressor, MAX_COMPRESSION_LEVEL, Zstd};
 pub use error::{at, at_async};
 pub use hash::BlobId;

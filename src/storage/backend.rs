@@ -11,7 +11,7 @@
 //! caller of [`StorageGet::get`] receives a [`StreamReadSeeker`]. A blob is a
 //! region of a larger store rather than a file of its own.
 
-use std::io;
+use std::{io, sync::Arc};
 
 use tokio::io::{AsyncRead, AsyncSeek};
 
@@ -77,6 +77,20 @@ pub trait StorageGet: Send + Sync {
     /// Returns an error if the store does not hold that blob, or if it holds it
     /// but the bytes cannot be read.
     fn get(&self, id: &BlobId) -> impl Future<Output = io::Result<StreamReadSeeker>> + Send;
+}
+
+impl<S: StorageGet + ?Sized> StorageGet for &S {
+    /// Forward the read to the store this reference names.
+    fn get(&self, id: &BlobId) -> impl Future<Output = io::Result<StreamReadSeeker>> + Send {
+        S::get(*self, id)
+    }
+}
+
+impl<S: StorageGet + ?Sized> StorageGet for Arc<S> {
+    /// Forward the read to the store this handle names.
+    fn get(&self, id: &BlobId) -> impl Future<Output = io::Result<StreamReadSeeker>> + Send {
+        S::get(&**self, id)
+    }
 }
 
 /// Appending blobs to a store, and publishing what has been appended.
