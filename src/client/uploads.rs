@@ -120,16 +120,98 @@ impl std::fmt::Debug for Upload {
     }
 }
 
+/// A pack on disk, opened and measured.
+///
+/// **The caller opens the file before the upload begins.** That call refuses
+/// a path this machine cannot read, and a path that is not a regular file.
+/// The refusal comes before the server hears of the upload. The length is
+/// the open file's own, so the bytes a request promises are the bytes it
+/// sends. The number a caller logs is the number that crosses.
+///
+/// Built by [`PackFile::open`]. A caller that wants to push a pack opens it
+/// once and hands it to [`Remote::merge_pack_file`]. The caller measures the
+/// file once and streams it from the same handle.
+#[derive(Debug)]
+pub struct PackFile {
+    /// The open file the blocks come from.
+    file: tokio::fs::File,
+    /// Where the bytes come from, so an error names the file.
+    path: PathBuf,
+    /// The length the request promises.
+    len: u64,
+}
+
+impl PackFile {
+    /// Open `path` and take its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, if its length cannot be
+    /// read, or if it is not a regular file. All three arrive before the
+    /// upload is begun.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+
+        if !metadata.is_file() {
+            return Err(not_a_regular_file(path, &metadata));
+        }
+
+        Ok(Self {
+            file: tokio::fs::File::from_std(file),
+            path: path.to_path_buf(),
+            len: metadata.len(),
+        })
+    }
+
+    /// The number of bytes this file sends.
+    ///
+    /// **The length of the open file, not of the path.** It is what the
+    /// request promises, so it is what the server receives.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the file holds no bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The error for a path that is not a regular file.
+///
+/// **The kind is the one the read this replaced gave.** A directory failed in
+/// that read with the system's own "is a directory", and a caller that saw it
+/// then sees it now. A path that is no file at all has no such error, so it
+/// is refused as invalid input.
+fn not_a_regular_file(path: &Path, metadata: &std::fs::Metadata) -> io::Error {
+    if metadata.is_dir() {
+        return io::Error::new(
+            io::ErrorKind::IsADirectory,
+            format!(
+                "{} is a directory, not a regular file. A pack travels as a file with a length",
+                path.display()
+            ),
+        );
+    }
+
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} is not a regular file. A pack travels as a file with a length",
+            path.display()
+        ),
+    )
+}
+
 /// A pack on disk, as a request body.
 ///
 /// **The pack is read, not copied.** The sender asks for one block at a time,
 /// so this body holds one block rather than one pack, whatever the file's
 /// size. The length taken when the file was opened goes to the server as the
 /// body size before the first byte moves.
-///
-/// **A file that is not a regular file is refused.** A pipe or a device has no
-/// length to report, and a request whose body is shorter or longer than the
-/// length it promised is a protocol error rather than a backup.
 struct FileBody {
     /// The open file the blocks come from.
     file: tokio::fs::File,
@@ -147,36 +229,15 @@ struct FileBody {
 }
 
 impl FileBody {
-    /// Open `path` and take its length.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be opened, if its length cannot be
-    /// read, or if it is not a regular file. All three arrive before the
-    /// request is sent.
-    fn open(path: &Path) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let metadata = file.metadata()?;
-
-        if !metadata.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{} is not a regular file. A pack travels as a file with a length",
-                    path.display()
-                ),
-            ));
-        }
-
-        let len = metadata.len();
-
-        Ok(Self {
-            file: tokio::fs::File::from_std(file),
-            path: path.to_path_buf(),
-            len,
-            remaining: len,
+    /// Take an opened pack as a request body.
+    fn new(pack: PackFile) -> Self {
+        Self {
+            file: pack.file,
+            path: pack.path,
+            len: pack.len,
+            remaining: pack.len,
             block: vec![0; BLOCK].into_boxed_slice(),
-        })
+        }
     }
 }
 
@@ -305,9 +366,9 @@ impl Upload {
     /// **The pack stays on disk, and the client holds one block of it.** This
     /// is the entry point for a pack that may be larger than memory.
     /// [`Upload::send`] hands over a `Vec` the caller already has, and it
-    /// stays the right shape for a pack written in memory. This method opens
-    /// the file, reports its length to the server, and reads one 64 KiB block
-    /// for each block the request consumes.
+    /// stays the right shape for a pack written in memory. This method takes
+    /// the file the caller opened, and reads one 64 KiB block for each block
+    /// the request consumes.
     ///
     /// **The request carries its own ceiling, and every other request keeps
     /// the 30-second one.** A pack large enough to be worth streaming cannot
@@ -323,11 +384,11 @@ impl Upload {
     ///
     /// # Errors
     ///
-    /// Returns an error if `pack` cannot be opened or read, if the file is not
-    /// a regular file, if it ends before the length it reported, if the server
-    /// cannot be reached, or if the upload is not held — a `404` is
-    /// [`io::ErrorKind::NotFound`], carrying the server's sentence.
-    pub async fn send_file(&self, pack: &Path) -> io::Result<()> {
+    /// Returns an error if the file ends before the length it reported. It
+    /// also returns an error if the server cannot be reached. It also returns
+    /// an error if the upload is not held. A `404` is
+    /// [`io::ErrorKind::NotFound`], and it carries the server's sentence.
+    pub async fn send_file(&self, pack: PackFile) -> io::Result<()> {
         tokio::task::LocalSet::new()
             .run_until(self.send_file_inner(pack))
             .await
@@ -335,9 +396,9 @@ impl Upload {
 
     /// The request itself, for [`Upload::send_file`] to run on a
     /// [`tokio::task::LocalSet`].
-    pub(super) async fn send_file_inner(&self, pack: &Path) -> io::Result<()> {
+    pub(super) async fn send_file_inner(&self, pack: PackFile) -> io::Result<()> {
         let url = self.remote.url(&self.path())?;
-        let body = FileBody::open(pack)?;
+        let body = FileBody::new(pack);
 
         let mut response = self
             .remote
@@ -539,7 +600,7 @@ impl Remote {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileBody, PACK_MEDIA_TYPE, UploadCommit};
+    use super::{PACK_MEDIA_TYPE, PackFile, UploadCommit};
     use crate::{metadata::Timestamp, storage::BlobId};
 
     fn hash(byte: char) -> BlobId {
@@ -548,18 +609,44 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn a_file_body_refuses_a_directory() {
-        // A directory opens for reading on unix, and it has a length, so only
-        // the check inside `FileBody::open` stops a body that would promise
-        // the wrong size and then fail mid-transfer.
+    fn a_pack_file_refuses_a_directory() {
+        // A directory opens for reading on unix, and it has a length. Only
+        // the check inside `PackFile::open` stops a body that would promise
+        // the wrong size and then fail mid-transfer. The kind is the one the
+        // read this replaced gave. A caller sees the same failure it saw
+        // before the pack was streamed.
         let dir = tempfile::tempdir().unwrap();
 
-        let Err(error) = FileBody::open(dir.path()) else {
-            panic!("a directory is not a file body");
+        let Err(error) = PackFile::open(dir.path()) else {
+            panic!("a directory is not a pack file");
         };
 
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.kind(), std::io::ErrorKind::IsADirectory);
         assert!(error.to_string().contains("regular file"), "{error}");
+    }
+
+    #[test]
+    fn a_pack_file_measures_the_file_it_opened() {
+        // The length is the open file's own. The number a caller logs is the
+        // number the request promises and the number that crosses.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack.bin");
+        std::fs::write(&path, b"a pack").unwrap();
+
+        let pack = PackFile::open(&path).unwrap();
+
+        assert_eq!(pack.len(), 6);
+        assert!(!pack.is_empty());
+    }
+
+    #[test]
+    fn a_pack_file_that_is_not_there_is_not_found() {
+        // The kind is the one the read this replaced gave.
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = PackFile::open(&dir.path().join("gone.pack")).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

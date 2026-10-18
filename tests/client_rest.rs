@@ -47,7 +47,7 @@ use std::{
 };
 
 use blulib::{
-    client::{Kind, MergeCompression, Merged, Outcome, Remote, State},
+    client::{Kind, MergeCompression, Merged, Outcome, PackFile, Remote, State},
     pack::Pack,
     storage::{BlobId, BlobStore, Plan, StorageGet as _},
 };
@@ -242,7 +242,10 @@ async fn a_file_upload_stores_a_multi_megabyte_pack_byte_for_byte() {
     let remote = remote_of(&server);
 
     let upload = remote.begin_upload().await.unwrap();
-    upload.send_file(&pack_path).await.unwrap();
+    upload
+        .send_file(PackFile::open(&pack_path).unwrap())
+        .await
+        .unwrap();
     let commit = upload.commit().await.unwrap();
 
     assert_eq!(commit.length, u64::try_from(source.len()).unwrap());
@@ -271,7 +274,11 @@ async fn a_file_push_publishes_the_version_the_pack_holds() {
     let remote = remote_of(&server);
 
     let job = remote
-        .merge_pack_file("docs", &pack_path, MergeCompression::Keep)
+        .merge_pack_file(
+            "docs",
+            PackFile::open(&pack_path).unwrap(),
+            MergeCompression::Keep,
+        )
         .await
         .unwrap();
     let finished = remote.await_job(&job).await.unwrap();
@@ -299,22 +306,14 @@ async fn a_file_push_publishes_the_version_the_pack_holds() {
 
 #[tokio::test]
 async fn a_push_of_a_file_that_is_not_there_leaves_no_upload_on_the_server() {
-    // The cleanup covers the file as well as the transfer: the upload begins
-    // before the client learns the file cannot be read, and a failed push owes
-    // the server the same `DELETE` however it failed.
+    // The file is opened before the upload is begun, so a file this machine
+    // does not have fails there. The server is never told to expect an upload,
+    // so there is nothing for it to clean up afterwards.
     let dir = tempfile::tempdir().unwrap();
     let root = served_root(dir.path());
-    let server = Server::start(&root);
-    let remote = remote_of(&server);
+    let _server = Server::start(&root);
 
-    let error = remote
-        .merge_pack_file(
-            "docs",
-            &dir.path().join("gone.pack"),
-            MergeCompression::Keep,
-        )
-        .await
-        .unwrap_err();
+    let error = PackFile::open(&dir.path().join("gone.pack")).unwrap_err();
 
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     assert!(

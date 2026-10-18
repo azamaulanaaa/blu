@@ -89,7 +89,7 @@ pub use jobs::{
     State,
 };
 pub use pull::{Fetched, PackPlan, Pull};
-pub use uploads::{PACK_MEDIA_TYPE, Upload, UploadCommit};
+pub use uploads::{PACK_MEDIA_TYPE, PackFile, Upload, UploadCommit};
 pub use versions::Version;
 
 /// How long a request to a remote server may take before it is called a failure.

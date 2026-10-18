@@ -3714,35 +3714,41 @@ impl Push {
     /// Upload `pack`, ask the server to merge it, and report what it published.
     ///
     /// **The merge is the server's, not a local one followed by an upload.**
-    /// `merge_pack` is one request sequence: begin the upload, send the bytes,
-    /// commit, and start a merge into this set. The server opens the set, takes
-    /// its own write lock, and commits a version in its own numbering. So the
-    /// version this reports is the server's, and a pack pushed to a set that
+    /// `merge_pack_file` is one request sequence: begin the upload, stream the
+    /// file, commit, and start a merge into this set. The server opens the set,
+    /// takes its own write lock, and commits a version in its own numbering. So
+    /// the version this reports is the server's, and a pack pushed to a set that
     /// already holds it is answered with the version that holds it rather than
     /// an error.
+    ///
+    /// **The pack stays on disk, and this run never holds all of it.** The
+    /// client streams the file to the server's scratch space, so a pack larger
+    /// than memory pushes like any other. The file is opened before the first
+    /// request, so a path this machine cannot read fails before the server hears
+    /// about it.
     ///
     /// The job is awaited rather than handed back, so the exit code is about the
     /// merge: a job that failed or was cancelled is an error carrying the
     /// server's own sentence, and this prints nothing on stdout for it. There is
     /// no path here that reports a merge which did not happen.
     async fn pack(&self, pack: &std::path::Path, compression: KeepOrLevel) -> std::io::Result<()> {
-        // Read before the upload rather than after: the merge request names an
-        // upload, and an upload of bytes this machine does not have would fail at
-        // the server with a sentence about the network rather than about the
-        // file.
-        let bytes = std::fs::read(pack)?;
+        // The file is opened and measured before the first request: a path this
+        // machine does not have, or one it cannot read, fails here rather than
+        // after an upload was begun. The length is the open file's own, so the
+        // line below says how many bytes the upload will send.
+        let file = blulib::client::PackFile::open(pack)?;
 
         tracing::info!(
             server = %self.remote.address(),
             set = %self.set,
             pack = %pack.display(),
-            bytes = bytes.len(),
+            bytes = file.len(),
             "pushing pack"
         );
 
         let job = self
             .remote
-            .merge_pack(&self.set, bytes, Self::compression(compression))
+            .merge_pack_file(&self.set, file, Self::compression(compression))
             .await?;
 
         // Reported as it moves, on the same target and with the same counter

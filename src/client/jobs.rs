@@ -56,13 +56,13 @@
 //! whose `result` is a pack summary fails on the field the pack summary does not
 //! carry, rather than decoding into a merge that never happened.
 
-use std::{io, path::Path};
+use std::io;
 
 use super::{
     Remote,
     error::{Document, drift, read, refusal},
     segment, set_path,
-    uploads::Upload,
+    uploads::{PackFile, Upload},
 };
 use crate::{
     metadata::Timestamp,
@@ -545,20 +545,27 @@ impl Remote {
     /// asked for and its answer thrown away here for the same reason
     /// [`Remote::merge_pack`] gives.
     ///
+    /// **The caller opens the pack before this call, so the upload does not
+    /// begin for a file this machine cannot read.** The caller calls
+    /// [`PackFile::open`]. That call refuses a missing path, an unreadable
+    /// path and a path that is not a regular file. The length the request
+    /// promises is that open file's own, so the bytes a caller logs are the
+    /// bytes that cross.
+    ///
     /// **A failure after the upload is begun drops the upload**, as
-    /// [`Remote::merge_pack`] documents, and that covers a file this machine
-    /// cannot read as well as a server that refused the bytes.
+    /// [`Remote::merge_pack`] documents. That covers a file that ends early
+    /// and a server that refused the bytes.
     ///
     /// # Errors
     ///
-    /// Returns an error if `pack` cannot be read, if any of the four steps
-    /// fails — the server's own sentence, mapped to a kind as
-    /// `blulib::client`'s documentation says — or if `compression` names a
+    /// Returns an error if any of the four steps fails. The error carries the
+    /// server's own sentence, mapped to a kind as `blulib::client`'s
+    /// documentation says. It also returns an error if `compression` names a
     /// level this crate does not use.
     pub async fn merge_pack_file(
         &self,
         set: &str,
-        pack: &Path,
+        pack: PackFile,
         compression: MergeCompression,
     ) -> io::Result<String> {
         tokio::task::LocalSet::new()
@@ -571,9 +578,12 @@ impl Remote {
     async fn merge_pack_file_inner(
         &self,
         set: &str,
-        pack: &Path,
+        pack: PackFile,
         compression: MergeCompression,
     ) -> io::Result<String> {
+        // The caller opened the pack before this call. The caller knows the
+        // file reads and has a length. The upload begins here, and the server
+        // is told to expect one.
         let upload = self.begin_upload_inner().await?;
 
         let started = match self.pushed_file(set, &upload, pack, compression).await {
@@ -635,7 +645,7 @@ impl Remote {
         &self,
         set: &str,
         upload: &Upload,
-        pack: &Path,
+        pack: PackFile,
         compression: MergeCompression,
     ) -> io::Result<String> {
         upload.send_file_inner(pack).await?;
