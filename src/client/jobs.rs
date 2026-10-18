@@ -56,7 +56,7 @@
 //! whose `result` is a pack summary fails on the field the pack summary does not
 //! carry, rather than decoding into a merge that never happened.
 
-use std::io;
+use std::{io, path::Path};
 
 use super::{
     Remote,
@@ -527,24 +527,84 @@ impl Remote {
         let started = match self.pushed(set, &upload, pack, compression).await {
             Ok(started) => started,
             Err(failure) => {
-                // The failure that matters is the one that went wrong. A cleanup
-                // that could not run is a `debug!` rather than a second error,
-                // because naming the cleanup instead would send the reader after
-                // the wrong problem.
-                if let Err(cleanup) = upload.discard_inner().await {
-                    tracing::debug!(
-                        upload = upload.id(),
-                        server = self.address(),
-                        error = %cleanup,
-                        "could not drop an upload after a failed push"
-                    );
-                }
+                self.discard_after_failure(&upload).await;
 
                 return Err(failure);
             }
         };
 
         Ok(started)
+    }
+
+    /// Push the file `pack`, and ask a server to merge it.
+    ///
+    /// **The same four steps as [`Remote::merge_pack`], with the pack read
+    /// from disk.** The client streams the file to the server's scratch space
+    /// through [`Upload::send_file`] instead of holding it, so this is the
+    /// entry point for a pack that may be larger than memory. The commit is
+    /// asked for and its answer thrown away here for the same reason
+    /// [`Remote::merge_pack`] gives.
+    ///
+    /// **A failure after the upload is begun drops the upload**, as
+    /// [`Remote::merge_pack`] documents, and that covers a file this machine
+    /// cannot read as well as a server that refused the bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `pack` cannot be read, if any of the four steps
+    /// fails — the server's own sentence, mapped to a kind as
+    /// `blulib::client`'s documentation says — or if `compression` names a
+    /// level this crate does not use.
+    pub async fn merge_pack_file(
+        &self,
+        set: &str,
+        pack: &Path,
+        compression: MergeCompression,
+    ) -> io::Result<String> {
+        tokio::task::LocalSet::new()
+            .run_until(self.merge_pack_file_inner(set, pack, compression))
+            .await
+    }
+
+    /// The request itself, for [`Remote::merge_pack_file`] to run on a
+    /// [`tokio::task::LocalSet`].
+    async fn merge_pack_file_inner(
+        &self,
+        set: &str,
+        pack: &Path,
+        compression: MergeCompression,
+    ) -> io::Result<String> {
+        let upload = self.begin_upload_inner().await?;
+
+        let started = match self.pushed_file(set, &upload, pack, compression).await {
+            Ok(started) => started,
+            Err(failure) => {
+                self.discard_after_failure(&upload).await;
+
+                return Err(failure);
+            }
+        };
+
+        Ok(started)
+    }
+
+    /// Drop an upload after a failed step, and keep the failure that matters.
+    ///
+    /// **The cleanup the server's disk is owed.** A half-finished upload
+    /// leaves a scratch file on the server, so it is removed here. The failure
+    /// the caller hears is the one that went wrong rather than the cleanup's:
+    /// a refused cleanup is a `debug!` and nothing more, because reporting
+    /// "could not reach the server" in place of the real failure would send
+    /// the reader after the wrong problem.
+    async fn discard_after_failure(&self, upload: &Upload) {
+        if let Err(cleanup) = upload.discard_inner().await {
+            tracing::debug!(
+                upload = upload.id(),
+                server = self.address(),
+                error = %cleanup,
+                "could not drop an upload after a failed push"
+            );
+        }
     }
 
     /// Send, commit and merge, for [`Remote::merge_pack`].
@@ -561,6 +621,24 @@ impl Remote {
         compression: MergeCompression,
     ) -> io::Result<String> {
         upload.send_inner(pack).await?;
+        upload.commit_inner().await?;
+
+        self.start_merge_inner(set, upload.id(), compression).await
+    }
+
+    /// Send, commit and merge, for [`Remote::merge_pack_file`].
+    ///
+    /// The file variant of [`Remote::pushed`](Self::pushed): the same three
+    /// steps inside the one [`tokio::task::LocalSet`] the caller entered, with
+    /// the pack streamed from disk rather than held.
+    async fn pushed_file(
+        &self,
+        set: &str,
+        upload: &Upload,
+        pack: &Path,
+        compression: MergeCompression,
+    ) -> io::Result<String> {
+        upload.send_file_inner(pack).await?;
         upload.commit_inner().await?;
 
         self.start_merge_inner(set, upload.id(), compression).await

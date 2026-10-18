@@ -18,7 +18,8 @@
 //! 2. [`Upload::send`] — `PUT /v1/uploads/{id}`, and the `204` means the bytes
 //!    arrived **and are a pack**: the server runs `Pack::open` on every `PUT`,
 //!    so a client hears at this step that what it sent is not a pack rather than
-//!    one request later.
+//!    one request later. [`Upload::send_file`] is the same step for a pack on
+//!    disk, which the client streams instead of holding.
 //! 3. [`Upload::commit`] — `POST /v1/uploads/{id}/commit`, and the `200` is the
 //!    pack's own header: its length, its chunk count, the version it was packed
 //!    from and the snapshot hash that names it. Cheap, and it answers "is this
@@ -31,8 +32,9 @@
 //! **The scratch file is the client's mess and the server's disk.** An upload
 //! that was begun and never committed is a file on someone else's filesystem
 //! that nothing will ever clean up, so
-//! [`Remote::merge_pack`](super::Remote::merge_pack) drops the upload whenever a
-//! later step fails. The failure the caller hears is the one that went wrong
+//! [`Remote::merge_pack`](super::Remote::merge_pack) and
+//! [`Remote::merge_pack_file`](super::Remote::merge_pack_file) drop the upload
+//! whenever a later step fails. The failure the caller hears is the one that went wrong
 //! rather than the cleanup's: a refused cleanup is a `tracing::debug!` and
 //! nothing more, because reporting "could not reach the server" in place of "the
 //! pack is not a pack" would name the wrong failure.
@@ -50,7 +52,16 @@
 //! here as an [`io::ErrorKind::InvalidData`] carrying that sentence, rather than
 //! as "the upload failed". See [`super::error`].
 
-use std::io;
+use std::{
+    io,
+    path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use awc::body::{BodySize, MessageBody};
+use bytes::Bytes;
+use tokio::io::AsyncRead as _;
 
 use super::{
     Remote,
@@ -66,6 +77,22 @@ use crate::{metadata::Timestamp, storage::BlobId};
 /// and every client agree on what arrived without either of them sniffing a
 /// header.
 pub const PACK_MEDIA_TYPE: &str = "application/x-blu-pack";
+
+/// The block size a pack file streams in.
+///
+/// **A block is the unit of read, and one block is resident at a time.** 64
+/// KiB keeps the syscall count low without holding a real share of a pack: a
+/// 128 MiB pack crosses in 2048 blocks.
+const BLOCK: usize = 64 * 1024;
+
+/// How long a file upload may take.
+///
+/// **A pack is measured in minutes and a listing is measured in seconds.** The
+/// client-wide ceiling in [`Remote::new`] is 30 seconds and stays on every
+/// other request. A file upload names its own ceiling here: 30 minutes, long
+/// past any real pack over a real link, and short enough that a server which
+/// stopped reading is an error rather than a hang.
+const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(30);
 
 /// An upload this server is holding.
 ///
@@ -90,6 +117,118 @@ impl std::fmt::Debug for Upload {
             .field("id", &self.id)
             .field("remote", &self.remote.address())
             .finish()
+    }
+}
+
+/// A pack on disk, as a request body.
+///
+/// **The pack is read, not copied.** The sender asks for one block at a time,
+/// so this body holds one block rather than one pack, whatever the file's
+/// size. The length taken when the file was opened goes to the server as the
+/// body size before the first byte moves.
+///
+/// **A file that is not a regular file is refused.** A pipe or a device has no
+/// length to report, and a request whose body is shorter or longer than the
+/// length it promised is a protocol error rather than a backup.
+struct FileBody {
+    /// The open file the blocks come from.
+    file: tokio::fs::File,
+    /// Where the bytes come from, so an error names the file.
+    path: PathBuf,
+    /// The length the request promises.
+    ///
+    /// Taken from the open file when this body was built, and never changed,
+    /// so [`MessageBody::size`] answers the same figure on every call.
+    len: u64,
+    /// The bytes not yet read.
+    remaining: u64,
+    /// The block the next read fills.
+    block: Box<[u8]>,
+}
+
+impl FileBody {
+    /// Open `path` and take its length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, if its length cannot be
+    /// read, or if it is not a regular file. All three arrive before the
+    /// request is sent.
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} is not a regular file. A pack travels as a file with a length",
+                    path.display()
+                ),
+            ));
+        }
+
+        let len = metadata.len();
+
+        Ok(Self {
+            file: tokio::fs::File::from_std(file),
+            path: path.to_path_buf(),
+            len,
+            remaining: len,
+            block: vec![0; BLOCK].into_boxed_slice(),
+        })
+    }
+}
+
+impl MessageBody for FileBody {
+    type Error = io::Error;
+
+    fn size(&self) -> BodySize {
+        BodySize::Sized(self.len)
+    }
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+        let this = self.get_mut();
+
+        if this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        // The last block is whatever is left, and it may be shorter.
+        let want = this
+            .block
+            .len()
+            .min(usize::try_from(this.remaining).unwrap_or(usize::MAX));
+        let mut read = tokio::io::ReadBuf::new(&mut this.block[..want]);
+
+        match Pin::new(&mut this.file).poll_read(cx, &mut read) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(())) => {
+                let filled = read.filled().len();
+
+                if filled == 0 {
+                    return Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "{} ended after {} bytes of the {} the request promised",
+                            this.path.display(),
+                            this.len - this.remaining,
+                            this.len
+                        ),
+                    ))));
+                }
+
+                this.remaining = this
+                    .remaining
+                    .saturating_sub(u64::try_from(filled).unwrap_or(u64::MAX));
+
+                Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.block[..filled]))))
+            }
+        }
     }
 }
 
@@ -148,6 +287,68 @@ impl Upload {
                     .insert_header(("content-type", PACK_MEDIA_TYPE)),
             )
             .send_body(pack)
+            .await
+            .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
+
+        let status = response.status();
+        let body = read(&url, &mut response).await?;
+
+        if !status.is_success() {
+            return Err(refusal(status.as_u16(), &url, &body));
+        }
+
+        Ok(())
+    }
+
+    /// Send the file at `pack` as this upload's bytes.
+    ///
+    /// **The pack stays on disk, and the client holds one block of it.** This
+    /// is the entry point for a pack that may be larger than memory.
+    /// [`Upload::send`] hands over a `Vec` the caller already has, and it
+    /// stays the right shape for a pack written in memory. This method opens
+    /// the file, reports its length to the server, and reads one 64 KiB block
+    /// for each block the request consumes.
+    ///
+    /// **The request carries its own ceiling, and every other request keeps
+    /// the 30-second one.** A pack large enough to be worth streaming cannot
+    /// always cross a slow link in 30 seconds, and a request that fails at the
+    /// halfway mark leaves the caller unable to tell how much arrived. So this
+    /// request allows 30 minutes, long past any real pack and short enough
+    /// that a server which stopped reading is an error rather than a hang. The
+    /// choice is per request and changes nothing for [`Upload::send`].
+    ///
+    /// The `204` that answers means the pack arrived and `Pack::open` accepted
+    /// it. Bytes that are not a pack are refused here with a `422`, and the
+    /// error carries the server's own sentence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `pack` cannot be opened or read, if the file is not
+    /// a regular file, if it ends before the length it reported, if the server
+    /// cannot be reached, or if the upload is not held — a `404` is
+    /// [`io::ErrorKind::NotFound`], carrying the server's sentence.
+    pub async fn send_file(&self, pack: &Path) -> io::Result<()> {
+        tokio::task::LocalSet::new()
+            .run_until(self.send_file_inner(pack))
+            .await
+    }
+
+    /// The request itself, for [`Upload::send_file`] to run on a
+    /// [`tokio::task::LocalSet`].
+    pub(super) async fn send_file_inner(&self, pack: &Path) -> io::Result<()> {
+        let url = self.remote.url(&self.path())?;
+        let body = FileBody::open(pack)?;
+
+        let mut response = self
+            .remote
+            .authorize(
+                self.remote
+                    .client
+                    .put(&url)
+                    .insert_header(("content-type", PACK_MEDIA_TYPE))
+                    .timeout(UPLOAD_TIMEOUT),
+            )
+            .send_body(body)
             .await
             .map_err(|e| io::Error::other(format!("could not reach {url}: {e}")))?;
 
@@ -338,11 +539,27 @@ impl Remote {
 
 #[cfg(test)]
 mod tests {
-    use super::{PACK_MEDIA_TYPE, UploadCommit};
+    use super::{FileBody, PACK_MEDIA_TYPE, UploadCommit};
     use crate::{metadata::Timestamp, storage::BlobId};
 
     fn hash(byte: char) -> BlobId {
         BlobId::from_hex(byte.to_string().repeat(64)).unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_file_body_refuses_a_directory() {
+        // A directory opens for reading on unix, and it has a length, so only
+        // the check inside `FileBody::open` stops a body that would promise
+        // the wrong size and then fail mid-transfer.
+        let dir = tempfile::tempdir().unwrap();
+
+        let Err(error) = FileBody::open(dir.path()) else {
+            panic!("a directory is not a file body");
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"), "{error}");
     }
 
     #[test]

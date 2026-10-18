@@ -108,18 +108,15 @@ fn tree(dir: &Path) -> PathBuf {
     source
 }
 
-/// Pack `source` up locally, and hand back the pack's bytes, its snapshot and how
-/// many chunks it carries.
+/// Pack `source` into `dir` under `name`, and keep the pack file.
 ///
-/// **Packed rather than uploaded as a directory**, because the API this client
-/// speaks moves packs: a merge reads one twice, so it has to be a file on the
-/// server's disk before anything can merge it.
-async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
-    let source = tree(dir);
-
-    let blob = dir.join("local");
+/// The sequence [`packed`] runs, stopping at the file rather than reading it
+/// back into memory, so a test that sends the pack from disk has a path to
+/// send.
+async fn pack_at(dir: &Path, source: &Path, name: &str) -> (PathBuf, BlobId, u64) {
+    let blob = dir.join(name);
     let store = BlobStore::builder(&blob).open_writer().await.unwrap();
-    blulib::command::BackupBuilder::new(&source, store)
+    blulib::command::BackupBuilder::new(source, store)
         .latest(None)
         .run()
         .await
@@ -139,14 +136,53 @@ async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
     let snapshot = blulib::metadata::Snapshot::try_from(buffer.as_slice()).unwrap();
     let plan = Plan::from_snapshot(&snapshot, |id| Ok(reader.locate(id).unwrap())).unwrap();
 
-    let pack_path = dir.join("local.pack");
+    let pack_path = dir.join(format!("{name}.pack"));
     Pack::write(&reader, &plan, &snapshot, version, &pack_path)
         .await
         .unwrap();
 
-    let chunks = u64::try_from(plan.len()).unwrap();
+    (pack_path, snapshot_id, u64::try_from(plan.len()).unwrap())
+}
 
-    (fs::read(&pack_path).unwrap(), snapshot_id, chunks)
+/// Pack `source` up locally, and hand back the pack's bytes, its snapshot and how
+/// many chunks it carries.
+///
+/// **Packed rather than uploaded as a directory**, because the API this client
+/// speaks moves packs: a merge reads one twice, so it has to be a file on the
+/// server's disk before anything can merge it.
+async fn packed(dir: &Path) -> (Vec<u8>, BlobId, u64) {
+    let source = tree(dir);
+    let (pack_path, snapshot, chunks) = pack_at(dir, &source, "local").await;
+
+    (fs::read(&pack_path).unwrap(), snapshot, chunks)
+}
+
+/// Bytes in each file of the streaming tests' tree.
+///
+/// Two megabytes make a pack that crosses many 64 KiB blocks. Three files keep
+/// the pack multi-megabyte after the store compresses what it can.
+const BIG_FILE: usize = 2 * 1024 * 1024;
+
+/// A tree whose pack crosses many read blocks, kept as a file.
+///
+/// **Every file takes its bytes from its own window** of the `noisy` stream.
+/// That generator is a function of position alone, so three files that started
+/// at the same offset would deduplicate into one and the pack would not be
+/// large.
+async fn packed_big(dir: &Path) -> (PathBuf, BlobId, u64) {
+    let source = common::source(dir);
+    let stream = common::noisy(BIG_FILE * 4);
+
+    for (index, tag) in [1_u8, 2, 3].into_iter().enumerate() {
+        let start = index * BIG_FILE;
+        fs::write(
+            source.join(format!("big{tag}.bin")),
+            &stream[start..start + BIG_FILE],
+        )
+        .unwrap();
+    }
+
+    pack_at(dir, &source, "big").await
 }
 
 #[tokio::test]
@@ -184,6 +220,108 @@ async fn an_upload_round_trips_from_begin_through_send_to_commit() {
     // And the upload was there the whole time: the scratch file is the server's
     // side of that claim, and nothing has dropped it.
     assert_eq!(held_packs(dir.path().join("served").as_path()).len(), 1);
+}
+
+#[tokio::test]
+async fn a_file_upload_stores_a_multi_megabyte_pack_byte_for_byte() {
+    // **The file body's claim, checked at the server's own copy.** A client
+    // that streamed the wrong block, skipped one, or ended early hands over
+    // bytes that are not the file. `Pack::open` accepts a pack whose payload is
+    // damaged, so comparing the stored file is the only witness.
+    let dir = tempfile::tempdir().unwrap();
+    let (pack_path, snapshot, chunks) = packed_big(dir.path()).await;
+    let source = fs::read(&pack_path).unwrap();
+    assert!(
+        source.len() >= 4 * 1024 * 1024,
+        "the pack is multi-megabyte: {} bytes",
+        source.len()
+    );
+
+    let root = served_root(dir.path());
+    let server = Server::start(&root);
+    let remote = remote_of(&server);
+
+    let upload = remote.begin_upload().await.unwrap();
+    upload.send_file(&pack_path).await.unwrap();
+    let commit = upload.commit().await.unwrap();
+
+    assert_eq!(commit.length, u64::try_from(source.len()).unwrap());
+    assert_eq!(commit.chunks, chunks, "the pack's own chunk count");
+    assert_eq!(
+        commit.snapshot.to_hex().to_string(),
+        snapshot.to_hex().to_string(),
+        "the pack's snapshot is the version it was packed from"
+    );
+
+    // **The bytes that landed are the bytes on disk.** The scratch directory
+    // holds them before any merge runs, and nothing else has written there.
+    let held = held_packs(&root);
+    assert_eq!(held.len(), 1, "one upload is held: {held:?}");
+    let stored = fs::read(root.join(SCRATCH).join(&held[0])).unwrap();
+    assert_eq!(stored, source, "the stored pack is the file's bytes");
+}
+
+#[tokio::test]
+async fn a_file_push_publishes_the_version_the_pack_holds() {
+    // **The whole path `blu push` takes**: stream the file, commit it, ask the
+    // server to merge it, and make the set say it holds the version.
+    let dir = tempfile::tempdir().unwrap();
+    let (pack_path, snapshot, chunks) = packed_big(dir.path()).await;
+    let server = Server::start(&served_root(dir.path()));
+    let remote = remote_of(&server);
+
+    let job = remote
+        .merge_pack_file("docs", &pack_path, MergeCompression::Keep)
+        .await
+        .unwrap();
+    let finished = remote.await_job(&job).await.unwrap();
+
+    let Outcome::Merged(Merged::Committed(merged)) = finished.result.clone().unwrap() else {
+        panic!("a merge of a new pack commits a version: {finished:?}");
+    };
+    assert_eq!(merged.set, "docs");
+    assert_eq!(merged.version, 1);
+    assert_eq!(
+        merged.snapshot.to_hex().to_string(),
+        snapshot.to_hex().to_string(),
+        "the version holds the snapshot that was packed"
+    );
+    assert_eq!(merged.chunks, chunks, "the plan the merge committed");
+
+    // The push is only real if the server agrees it holds the version.
+    let listed = remote.versions("docs").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].snapshot.to_hex().to_string(),
+        snapshot.to_hex().to_string()
+    );
+}
+
+#[tokio::test]
+async fn a_push_of_a_file_that_is_not_there_leaves_no_upload_on_the_server() {
+    // The cleanup covers the file as well as the transfer: the upload begins
+    // before the client learns the file cannot be read, and a failed push owes
+    // the server the same `DELETE` however it failed.
+    let dir = tempfile::tempdir().unwrap();
+    let root = served_root(dir.path());
+    let server = Server::start(&root);
+    let remote = remote_of(&server);
+
+    let error = remote
+        .merge_pack_file(
+            "docs",
+            &dir.path().join("gone.pack"),
+            MergeCompression::Keep,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        held_packs(&root).is_empty(),
+        "a failed push must not leave an upload on the server: {:?}",
+        held_packs(&root)
+    );
 }
 
 #[tokio::test]
