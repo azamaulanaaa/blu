@@ -28,7 +28,7 @@ use std::{
 };
 
 use blulib::{
-    command::{Mislength, Unheld, probe},
+    command::{Mislength, Mismatch, Unheld, probe},
     metadata::Snapshot,
     pack::Pack,
     storage::{BlobId, BlobStore, Plan, StorageGet},
@@ -513,6 +513,94 @@ async fn a_chunk_in_two_places_is_held_only_if_it_is_right_in_both() {
             .iter()
             .any(|m| m.expected == shared && m.path == Path::new("a.bin")),
         "the broken slice should be reported against the file it is in"
+    );
+}
+
+/// A chunk placed many times is checked at every placement, from one buffer.
+///
+/// The check loop reads one chunk once, and then reads every slice that places
+/// it. The loop keeps one slice buffer for those reads. A version of this
+/// fixture places each of its chunks at many slices. Both the report of the
+/// correct tree and the report of a tree with one broken placement must then be
+/// exactly what the version says.
+#[tokio::test]
+async fn a_chunk_placed_many_times_is_reported_at_the_placement_that_broke() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+
+    // One block repeated. The chunker resynchronises on the repetition, so the
+    // version places each of its chunks at every repetition.
+    let block = common::untagged_stream(4, 128 * 1024);
+    let mut bytes = Vec::with_capacity(block.len() * 32);
+    for _ in 0..32 {
+        bytes.extend_from_slice(&block);
+    }
+    fs::write(source.join("repeated.bin"), &bytes).unwrap();
+
+    let built = built(dir, source).await;
+
+    // The fixture has to be what the test needs, or the test proves nothing.
+    let mut per_chunk: HashMap<u32, usize> = HashMap::new();
+    for slice in &built.snapshot.file_chunks {
+        *per_chunk.entry(slice.chunk_index).or_default() += 1;
+    }
+    let (chunk_index, placements) = per_chunk
+        .iter()
+        .max_by_key(|(_, count)| **count)
+        .map(|(chunk_index, count)| (*chunk_index, *count))
+        .expect("the fixture should place some chunk");
+    assert!(
+        placements >= 8,
+        "the fixture should place a chunk many times, chunk {chunk_index} is placed \
+         {placements} times"
+    );
+
+    // The tree as taken holds the version, so the report is every chunk held.
+    let probed = built.probe(&built.source).await;
+    assert!(
+        probed.is_current(),
+        "a repeated file is still the tree the version was taken from: {:?}",
+        probed.mismatched
+    );
+    assert_eq!(probed.held, built.all_chunks());
+
+    // Break one byte of the last placement of that chunk. Every other placement
+    // of it stays right, and no other chunk covers the byte.
+    let last = built
+        .snapshot
+        .file_chunks
+        .iter()
+        .rfind(|slice| slice.chunk_index == chunk_index)
+        .expect("a placement of the placed chunk");
+    let file = &built.snapshot.files[usize::try_from(last.file_index).unwrap()];
+    let at = usize::try_from(last.file_offset + u64::from(last.chunk_offset)).unwrap();
+    let path = built.source.join(&file.path);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[at] ^= 0xff;
+    fs::write(&path, &bytes).unwrap();
+
+    let probed = built.probe(&built.source).await;
+
+    let shared = built.snapshot.chunks[usize::try_from(chunk_index).unwrap()];
+    assert_eq!(
+        probed.mismatched,
+        vec![Mismatch {
+            path: file.path.clone(),
+            offset: last.file_offset,
+            length: u64::from(last.length),
+            expected: shared,
+            reason: Unheld::Content,
+        }],
+        "the broken placement should be the whole slice report"
+    );
+    assert!(
+        !probed.held.contains(&shared),
+        "a chunk wrong at one of its placements must not be held"
+    );
+    assert_eq!(
+        probed.held.len(),
+        built.all_chunks().len() - 1,
+        "every other chunk is placed elsewhere and stays held"
     );
 }
 
