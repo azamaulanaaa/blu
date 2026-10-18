@@ -95,7 +95,24 @@ impl Plan {
             *extent = (*extent).max(end);
         }
 
-        let mut chunks = Vec::with_capacity(snapshot.chunks.len());
+        // An output entry needs at least one slice, so the slice count bounds the
+        // output. The chunk table can be much longer. A sparse table must not
+        // reserve about 72 bytes for every listed-but-unread chunk.
+        //
+        // The `extent` array stays dense at 8 bytes per listed chunk. The writer
+        // and `Filter::select` prune chunk tables, and a decoded table is bounded
+        // by its own bytes. So a sparse extent array would not earn its cost here.
+        //
+        // The cap is a true upper bound. An output entry names a slice, so the
+        // output cannot be longer than the slice count. The vector therefore
+        // never has to grow, and the plan never reserves more than the slices.
+        //
+        // What this saves is the reservation, not resident memory. The space is
+        // never written, so it shows up as address space rather than as pages.
+        // It matters on a 32-bit host, under a limit on address space, and
+        // under an allocator that fills what it gets. It also matters for a
+        // snapshot that lists a million chunks and reads two.
+        let mut chunks = Vec::with_capacity(snapshot.chunks.len().min(snapshot.file_chunks.len()));
         for (index, id) in snapshot.chunks.iter().enumerate() {
             let length = extent[index];
             if length == 0 {
@@ -515,6 +532,49 @@ mod tests {
         assert!(
             error.to_string().contains("names chunk 9 of 2"),
             "the error should name what it could not resolve, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_sparse_table_reserves_only_for_its_slices() {
+        // A table that lists a thousand chunks and reads two of them.
+        // This is the shape of a snapshot before a filter has pruned it.
+        let mut s = Snapshot::new(stamped());
+        s.files.push(File {
+            path: "sparse.bin".into(),
+            len: 20,
+            attrs: Attributes {
+                owner: None,
+                mode: Some(0o644),
+                mtime: None,
+                xattrs: Vec::new(),
+                windows_acl: None,
+            },
+        });
+
+        for i in 0..1_000u32 {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            s.chunks.push(BlobId::from_bytes(id));
+        }
+
+        for i in 0..2u32 {
+            s.file_chunks.push(FileChunk {
+                chunk_index: i,
+                file_index: 0,
+                chunk_offset: 0,
+                file_offset: u64::from(i) * 10,
+                length: 10,
+            });
+        }
+
+        let plan = Plan::from_snapshot(&s, |_| Ok(at(0, 10))).unwrap();
+
+        assert_eq!(plan.chunks.len(), 2);
+        assert!(
+            plan.chunks.capacity() <= s.file_chunks.len(),
+            "the reservation should stay at the slice count, got capacity {}",
+            plan.chunks.capacity()
         );
     }
 
