@@ -101,3 +101,44 @@ async fn restore_builder_writes_the_selected_paths_only() {
         "the unselected file stays absent"
     );
 }
+
+/// The restore pass writes the same bytes with and without its chunk cache.
+///
+/// Every file names the same shared chunks, so both passes read those chunks.
+/// The cached pass reads each chunk once, and the direct pass reads each slice.
+/// The two trees must match the source and each other.
+#[tokio::test]
+async fn a_cached_restore_writes_the_same_bytes_as_a_direct_one() {
+    use blulib::{command::RestoreBuilder, storage::BlobStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+
+    let shared = noisy(200_000);
+    for index in 0..4 {
+        fs::write(source.join(format!("shared{index}.bin")), &shared).unwrap();
+    }
+    fs::write(source.join("own.bin"), noisy(100_000)).unwrap();
+
+    let blob = dir.path().join("store.bin");
+    let committed = common::run_backup(&source, &blob).await;
+
+    let direct = dir.path().join("direct");
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    RestoreBuilder::new(&direct, committed.snapshot(), store)
+        .cache_bytes(0)
+        .run()
+        .await
+        .unwrap();
+
+    let cached = dir.path().join("cached");
+    let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+    RestoreBuilder::new(&cached, committed.snapshot(), store)
+        .run()
+        .await
+        .unwrap();
+
+    common::assert_same_tree(&source, &direct);
+    common::assert_same_tree(&source, &cached);
+    common::assert_same_tree(&direct, &cached);
+}

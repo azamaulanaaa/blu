@@ -111,6 +111,7 @@ pub struct RestoreBuilder<S> {
     snapshot_id: storage::BlobId,
     store: S,
     files: Vec<PathBuf>,
+    cache_bytes: usize,
 }
 
 impl<S: storage::StorageGet + 'static> RestoreBuilder<S> {
@@ -124,6 +125,7 @@ impl<S: storage::StorageGet + 'static> RestoreBuilder<S> {
             snapshot_id,
             store,
             files: Vec::new(),
+            cache_bytes: storage::DEFAULT_CACHE_BYTES,
         }
     }
 
@@ -141,6 +143,19 @@ impl<S: storage::StorageGet + 'static> RestoreBuilder<S> {
         self
     }
 
+    /// Set the bytes of whole chunks the restore pass may keep in memory.
+    ///
+    /// Defaults to [`storage::DEFAULT_CACHE_BYTES`].
+    /// One store read then serves every slice that names a held chunk.
+    /// The restore lowers the budget to the bytes its snapshot references.
+    /// The budget never exceeds the cache default.
+    /// A budget of zero keeps nothing, and reads every slice from the store.
+    #[must_use]
+    pub fn cache_bytes(mut self, bytes: usize) -> Self {
+        self.cache_bytes = bytes;
+        self
+    }
+
     /// Reassemble the snapshot under the destination.
     ///
     /// Restoration runs in four phases. Directories land first so parents exist.
@@ -155,7 +170,14 @@ impl<S: storage::StorageGet + 'static> RestoreBuilder<S> {
     /// Returns an error when a `--files` value is empty, absolute, or holds `..`.
     #[instrument(level = "info", skip(self), err)]
     pub async fn run(self) -> io::Result<Restored> {
-        run_restore(self.root, self.snapshot_id, self.store, &self.files).await
+        run_restore(
+            self.root,
+            self.snapshot_id,
+            self.store,
+            &self.files,
+            self.cache_bytes,
+        )
+        .await
     }
 }
 
@@ -224,6 +246,7 @@ async fn run_restore<S: storage::StorageGet + 'static>(
     snapshot_id: storage::BlobId,
     storage: S,
     files: &[PathBuf],
+    cache_bytes: usize,
 ) -> io::Result<Restored> {
     // Shared, not copied: the write tasks need owned data, and a clone of the
     // chunk table would be one allocation per chunk in the store.
@@ -283,7 +306,28 @@ async fn run_restore<S: storage::StorageGet + 'static>(
         })?;
 
     restore_directories(root, &snapshot).await?;
-    let written = restore_files(root, Arc::clone(&snapshot), Arc::clone(&storage)).await?;
+
+    // The check above read every chunk whole through the store. The restore
+    // pass reads each chunk again for every slice that names it, so it runs
+    // behind a cache. The cache is built here and not earlier, so the check
+    // keeps its own reads.
+    //
+    // The budget follows the work that is there. A restore over a small tree
+    // keeps a small budget, and a restore over a shared tree keeps the chunks
+    // it needs.
+    //
+    // A budget of zero keeps nothing, and the pass reads every slice from the
+    // store. That path holds no cache and no lock.
+    let budget = cache_budget(cache_bytes, referenced_bytes(&snapshot));
+    let written = if budget == 0 {
+        restore_files(root, Arc::clone(&snapshot), Arc::clone(&storage)).await?
+    } else {
+        let cached = Arc::new(storage::ChunkCache::with_bytes(
+            Arc::clone(&storage),
+            budget,
+        ));
+        restore_files(root, Arc::clone(&snapshot), cached).await?
+    };
 
     // Off the runtime thread, and **in this order**. `restore_links` creates
     // symbolic links. Creating them changes the modification time of the directory
@@ -990,6 +1034,26 @@ pub(crate) fn restore_attributes(root: &Path, snapshot: &Snapshot) -> io::Result
     Ok(counts)
 }
 
+/// The bytes of whole chunks the restore pass may keep in memory.
+///
+/// The budget follows the work that is there.
+/// The cache holds at most the bytes the snapshot references.
+/// The budget never exceeds the cache default either.
+/// A budget of zero keeps nothing, and reads every slice from the store.
+fn cache_budget(requested: usize, referenced: u64) -> usize {
+    let referenced = usize::try_from(referenced).unwrap_or(usize::MAX);
+    requested.min(referenced).min(storage::DEFAULT_CACHE_BYTES)
+}
+
+/// The bytes a snapshot references.
+///
+/// Every slice counts once, because the restore writes the range of each slice.
+fn referenced_bytes(snapshot: &Snapshot) -> u64 {
+    snapshot.file_chunks.iter().fold(0_u64, |total, slice| {
+        total.saturating_add(u64::from(slice.length))
+    })
+}
+
 /// Remove whatever currently occupies `path`, if anything.
 ///
 /// Shared with [`super::apply`], which prunes the entries a version does not
@@ -1002,5 +1066,32 @@ pub(crate) fn remove_existing(path: &Path) -> io::Result<()> {
         Ok(_) => fs::remove_file(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cache_budget;
+    use crate::storage::DEFAULT_CACHE_BYTES;
+
+    #[test]
+    fn a_budget_follows_the_bytes_the_snapshot_references() {
+        let budget = cache_budget(DEFAULT_CACHE_BYTES, 1024);
+
+        assert_eq!(budget, 1024);
+    }
+
+    #[test]
+    fn a_budget_never_exceeds_the_cache_default() {
+        let budget = cache_budget(usize::MAX, u64::MAX);
+
+        assert_eq!(budget, DEFAULT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn a_zero_budget_keeps_nothing() {
+        let budget = cache_budget(0, 1024);
+
+        assert_eq!(budget, 0);
     }
 }
