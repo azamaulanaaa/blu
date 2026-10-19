@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Isolate `BlobStore::put` from everything else.
 //!
 //! The end-to-end numbers cannot separate "the store is slow" from "the machine

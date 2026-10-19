@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! A store of content-addressed blobs, in a sequence of append-only segments.
 //!
 //! Each segment is the journal for its own stretch of the log. A store header

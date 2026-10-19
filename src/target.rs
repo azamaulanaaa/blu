@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Where a backup set lives: a local path, a serve set, or a keyed store.
 //!
 //! One `TARGET` names all three. A local path (`photos`) names a set on this

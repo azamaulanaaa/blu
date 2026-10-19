@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Path handling, in particular paths that are not valid UTF-8.
 
 mod common;

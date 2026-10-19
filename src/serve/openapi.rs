@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The `OpenAPI` document this server serves, and the schema names it must define.
 //!
 //! **The document is the source of truth, and it is checked in.** It is written

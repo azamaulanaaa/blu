@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! A hand-rolled HTTP/1.1 client, for the server tests.
 //!
 //! ## Why not `awc`

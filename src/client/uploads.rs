@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! `POST /v1/uploads`, `PUT /v1/uploads/{id}`, its commit and its `DELETE`.
 //!
 //! ## Why an upload is four requests

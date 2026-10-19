@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Capture and restoration of platform-specific file attributes.
 //!
 //! Unix and Windows expose different attribute sets, so every attribute that

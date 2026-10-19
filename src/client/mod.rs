@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Talking to a `blu serve` that is somewhere else.
 //!
 //! ## What this is

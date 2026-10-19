@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Bounded async reads and writes.
 //!
 //! A blob store hands out a slice of a larger file. A restore copies a slice

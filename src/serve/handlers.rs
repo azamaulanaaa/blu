@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The routes.
 //!
 //! Every handler is a **private function**. Two of this crate's lint rules make

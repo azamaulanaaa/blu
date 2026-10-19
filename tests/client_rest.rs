@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The client's REST surface: a backup pushed to a server, end to end.
 //!
 //! Everything here goes through [`blulib::client::Remote`] — the same type

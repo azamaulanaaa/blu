@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! A probe: what a directory already holds of a version.
 //!
 //! The probe is the only thing standing between a client and a delta download,

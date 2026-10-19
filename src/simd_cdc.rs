@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Cut a byte stream into content-defined chunks with SIMD.
 //!
 //! The scan uses the Gear hash from the `gearhash` crate. It runs `SSE4.2`

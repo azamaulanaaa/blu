@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The JSON this service speaks. Responses are written by hand; requests are
 //! parsed by `serde_json`.
 //!

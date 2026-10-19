@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Integrity checking of a snapshot's stored chunks.
 //!
 //! Run over the whole snapshot before a restore writes anything. The verifier is

@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Segment rollover: a set under a size limit, and what the limit buys.
 //!
 //! The tests run against a limit far below the 4 GiB default.

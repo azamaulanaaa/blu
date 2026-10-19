@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Serving pack bytes without writing a pack.
 //!
 //! A pack is asked for as `(set, version, base, compression)` and **nothing is

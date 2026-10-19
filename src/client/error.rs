@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! What a `blu serve` said, and what it refused.
 //!
 //! ## Why the refusals live in one module

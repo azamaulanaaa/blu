@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! LEB128, the variable-width integer that all three of this crate's encodings use.
 //!
 //! There are three of them. They are the record format of the store, a pack index,

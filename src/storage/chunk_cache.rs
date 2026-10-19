@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! A byte-budgeted cache of whole chunks in front of a store.
 //!
 //! A store opens one chunk per [`StorageGet::get`] call.

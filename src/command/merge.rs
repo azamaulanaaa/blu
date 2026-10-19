@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Applying a pack *into* a backup set, as a new version of it.
 //!
 //! [`super::apply`] is the other half and works the other way round.

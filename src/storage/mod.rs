@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Where chunk and snapshot data is kept.
 //!
 //! Blobs are addressed by the BLAKE3 hash of their contents, and the backend is

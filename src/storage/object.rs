@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Objects behind a key, for backends a file path cannot name.
 //!
 //! A local directory is one backend. Memory is another, for tests. Remote

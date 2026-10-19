@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! On-disk description of a backup.
 //!
 //! A snapshot is serialised into a single blob in the storage backend. The store

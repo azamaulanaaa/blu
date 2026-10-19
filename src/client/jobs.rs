@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Starting work on a server, and waiting for it to finish.
 //!
 //! ## Why work is a job

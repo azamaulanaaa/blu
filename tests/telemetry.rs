@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Does a span actually leave the process?
 //!
 //! # Why a subprocess and a socket

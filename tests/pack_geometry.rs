@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The keystone: a [`VirtualPack`]'s bytes are the file [`Pack::write`] writes.
 //!
 //! `blu serve` answers a range request for a pack it has never written, by

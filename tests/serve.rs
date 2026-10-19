@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! `blu serve` over HTTP: the whole push and pull flows, end to end.
 //!
 //! The two directions a backup has over a network, driven through a real socket

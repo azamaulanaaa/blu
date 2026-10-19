@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Serving a backup set over HTTP.
 //!
 //! `blu serve` runs this. It exposes the two directions a backup has over a

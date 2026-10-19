@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The decompressing reader that a compressed blob is handed out through.
 //!
 //! It exists because [`blulib::storage::StorageGet`] returns something seekable,

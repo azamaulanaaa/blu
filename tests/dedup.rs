@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Deduplication: repeated content must be stored once, both within a single
 //! run and across runs against a store that already holds it.
 //!

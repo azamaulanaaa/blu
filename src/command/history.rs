@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! File history across versions: at which version a path appeared, changed, or left.
 //!
 //! [`report`] walks loaded snapshots oldest first and compares each one with

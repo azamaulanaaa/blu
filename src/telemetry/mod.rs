@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! OpenTelemetry spans, for an operator who asked for them.
 //!
 //! # Nothing leaves the machine unless the operator asked

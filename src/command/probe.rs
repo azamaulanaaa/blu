@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Asking what a directory already holds.
 //!
 //! A pack is a delta waiting for a client. To know which ranges of it to fetch,

@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Properties of the benchmark fixtures.
 //!
 //! These live in `tests/` rather than in either bench because a bench is its own

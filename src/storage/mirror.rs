@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Finished files between local staging and a keyed backend.
 //!
 //! The store scans local staging only. It never scans a backend. This module

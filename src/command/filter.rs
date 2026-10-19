@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Keeping only the snapshot paths a `--files` filter names.
 //!
 //! One dialect in one place, read three ways. [`Filter::matches`] answers one

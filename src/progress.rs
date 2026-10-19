@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Saying how a run is going while it is going.
 //!
 //! There is no percentage to report. Content-defined chunking finds each

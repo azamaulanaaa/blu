@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Recording what a directory tree contains, and handing the contents over to be
 //! stored.
 //! The run walks the tree, tells a file from a link from a directory, and writes

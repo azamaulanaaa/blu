@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! `GET /v1/sets/{set}/versions` — the versions a remote set holds.
 //!
 //! ## The answer is what a local listing gives

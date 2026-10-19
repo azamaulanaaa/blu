@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The manifest: a cache an apply writes so the next one need not read the tree.
 //!
 //! These tests are about one property above all: **a manifest can never make an

@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! Compression: what it does to a store, and what it must never do to one.
 //!
 //! The record format carries a codec byte and two lengths. The lengths are the

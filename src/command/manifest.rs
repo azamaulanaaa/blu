@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! What an apply put into a directory, recorded so the next one need not read it.
 //!
 //! A manifest is a **cache, never a source of truth.** That distinction is the

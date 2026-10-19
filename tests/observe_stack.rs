@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The layer stack `blu serve` installs, and a client's view of a job through it.
 //!
 //! # What this file is for

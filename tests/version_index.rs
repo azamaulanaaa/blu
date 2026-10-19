@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! The per-version index file, and the rule that governs it: it is a cache, so it
 //! is checked rather than believed.
 //!

@@ -1,5 +1,3 @@
-// Copyright (C) 2025-2026 Aza Maulana
-// SPDX-License-Identifier: GPL-2.0-or-later
 //! A restore must only ever write inside the directory it was given.
 //!
 //! A snapshot is a blob in a file that gets synced, shared and backed up like
