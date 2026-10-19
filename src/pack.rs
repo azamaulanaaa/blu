@@ -577,7 +577,7 @@ impl Pack {
         // Removed on drop unless persisted below. A temporary beside a
         // finished pack is a file with no meaning, and one beside a failed run is
         // the same file.
-        let (mut file, temp_path, tmp_path) = temp_file_in(path)?;
+        let (mut file, temp_path, tmp_path) = temp_file_in(path).await?;
 
         let planned_count = u64::try_from(plan.len()).unwrap_or(0);
         let planned_bytes = planned_payload_len(plan);
@@ -1395,26 +1395,34 @@ async fn write_fetched(
     ))
 }
 
-/// Build a temporary pack file beside `path`.
+/// Build a temporary pack file beside `path`, on a blocking thread.
 ///
 /// Use the same directory, because `rename` stays atomic in one filesystem.
 /// The file disappears on drop unless the call persists it.
 /// A temporary beside a finished pack has no meaning.
 /// A temporary beside a failed run is the same file.
-fn temp_file_in(path: &Path) -> io::Result<(tfs::File, tempfile::TempPath, PathBuf)> {
+///
+/// The call creates the file on a blocking thread.
+/// The unlink on drop stays synchronous, because a drop cannot await.
+async fn temp_file_in(path: &Path) -> io::Result<(tfs::File, tempfile::TempPath, PathBuf)> {
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("could not create temporary in {}: {e}", dir.display()),
-        )
-    })?;
-    let tmp_path = tmp.path().to_path_buf();
-    let (file, temp_path) = tmp.into_parts();
-    Ok((tfs::File::from_std(file), temp_path, tmp_path))
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::NamedTempFile::new_in(&dir).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("could not create temporary in {}: {e}", dir.display()),
+            )
+        })?;
+        let tmp_path = tmp.path().to_path_buf();
+        let (file, temp_path) = tmp.into_parts();
+        Ok((tfs::File::from_std(file), temp_path, tmp_path))
+    })
+    .await
+    .map_err(|join| io::Error::other(format!("a temporary-file task failed: {join}")))?
 }
 
 /// How a codec is named in a message about two of them disagreeing.
