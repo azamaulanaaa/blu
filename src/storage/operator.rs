@@ -421,13 +421,18 @@ impl AsyncObjectStore for Operator {
         let dir = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
-        let tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("could not create temporary in {}: {e}", dir.display()),
-            )
-        })?;
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        let tmp = tokio::task::spawn_blocking(move || {
+            tempfile::NamedTempFile::new_in(&dir).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("could not create temporary in {}: {e}", dir.display()),
+                )
+            })
+        })
+        .await
+        .map_err(|join| io::Error::other(format!("a temporary-file task failed: {join}")))??;
         let tmp_path = tmp.path().to_path_buf();
         let (file, temp_path) = tmp.into_parts();
         let mut dest = tokio::fs::File::from_std(file);

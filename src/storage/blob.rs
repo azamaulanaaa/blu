@@ -1322,7 +1322,9 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
                         snapshot: *snapshot,
                         taken_at,
                     },
-                ) {
+                )
+                .await
+                {
                     tracing::debug!(
                         version,
                         error = %e,
@@ -1370,7 +1372,9 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
                 snapshot: *snapshot,
                 taken_at,
             },
-        ) {
+        )
+        .await
+        {
             tracing::debug!(
                 version,
                 error = %e,
@@ -1810,8 +1814,31 @@ fn hash_staged(stored: &mut std::fs::File) -> io::Result<blake3::Hash> {
 /// This function is never called on a path where its failure matters. That is the
 /// point. The store's commit record is the version's existence. This file is a
 /// faster way to find it.
-fn write_index(set: &IndexSet, index: VersionIndex) -> io::Result<()> {
-    index.write_atomic(&set.index_path(index.version))
+///
+/// ## The write runs on the blocking pool
+///
+/// The write creates a file, syncs it, and renames it into place. None of that
+/// work belongs on a runtime worker. The pool runs the write, and this function
+/// waits for the result.
+///
+/// ## What a panic in the write does
+///
+/// The pool reports a panic as an error. This function returns that error
+/// rather than a panic of its own. The callers do not pass the error on. The
+/// commit paths log it, and a rebuild counts the file as not written. The
+/// commit record still holds the version, and a later scan finds it.
+///
+/// ## A caller that goes away
+///
+/// The pool keeps the write running when the caller drops this future. The
+/// write then finishes without a caller to read its result. The commit record
+/// is durable before the write starts. A lost index file costs a scan and not
+/// a version.
+async fn write_index(set: &IndexSet, index: VersionIndex) -> io::Result<()> {
+    let path = set.index_path(index.version);
+    tokio::task::spawn_blocking(move || index.write_atomic(&path))
+        .await
+        .map_err(|join| io::Error::other(format!("an index-write task failed: {join}")))?
 }
 
 impl<C: Compressor> BlobStore<Write, C> {
@@ -2483,6 +2510,7 @@ impl<C: Compressor> BlobStore<Write, C> {
                     taken_at,
                 },
             )
+            .await
             .is_ok()
             {
                 written += 1;
