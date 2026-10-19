@@ -36,10 +36,15 @@
 //! Only the bytes in flight differ, and only the ones that are deliberately being
 //! re-derived.
 //!
-//! The cost of the two non-default routes is a decode per chunk.
-//! Under a level it is an encode too, twice over.
-//! The first encode learns how long each record will be, and the second one writes
-//! it. See [`reencode_forms`].
+//! The two non-default routes pay a decode per chunk, and a level pays an
+//! encode too.
+//! A real run encodes each chunk **once**.
+//! The writer reserves the width of the payload total in the header, writes the
+//! records, and patches the total in afterwards.
+//! A dry run does the opposite.
+//! It measures each frame to report the figures of a file it does not write,
+//! and it discards that encode.
+//! See [`reencode_forms`].
 //! That is the price of a pack built for delivery rather than for a receiver who
 //! will keep the sender's frames.
 //! The price is paid only when asked for.
@@ -56,7 +61,7 @@ use tracing::instrument;
 use crate::{
     command::load_snapshot,
     metadata::Snapshot,
-    pack::{Pack, StorageStored, Stored},
+    pack::{Pack, Route, StorageStored, Stored},
     storage::{
         self, BlobId, BlobStore, Codec, Compressor as _, Placement, Plan, StorageGet, WriteMode,
     },
@@ -421,9 +426,19 @@ where
     // `Source` then answers the writer from the same policy.
     // The writer's own check that each record matches its placement holds the two
     // to the same answer.
-    let (plan, source) = match options.compression {
-        None => (plan, Source::Stored(store)),
-        Some(policy) => {
+    //
+    // **A dry run measures whether the policy is `Off` or a level.** Its figures
+    // have to describe the records the run *would* write.
+    // `Off` encodes nothing to measure: a raw record's stored length *is* its
+    // content length, so the plan already carries it, and `--compression 0`
+    // costs what `keep` costs.
+    // A real run under a level measures nothing either.
+    // Nothing can state a frame's width before zstd makes the frame, so that run
+    // encodes each record once as it writes it and patches the header's total in
+    // afterwards.
+    let (plan, source, route) = match options.compression {
+        None => (plan, Source::Stored(store), Route::Verbatim),
+        Some(policy) if policy.level().is_none() || options.dry_run => {
             let forms = reencode_forms(store, &plan, policy).await?;
             let whole = storage::Plan::from_snapshot(version_snapshot, |id| match forms.get(id) {
                 // Measured: this is what the record will be.
@@ -451,8 +466,12 @@ where
                 Some(base) => whole.since(version_snapshot, &base.snapshot),
             };
 
-            (plan, Source::Reencoded { store, policy })
+            (plan, Source::Reencoded { store, policy }, Route::Verbatim)
         }
+        // A real run under a level. The plan stays the source set's, because
+        // the record widths are not in it: the writer encodes each record once
+        // and checks its content length against this plan as it goes.
+        Some(policy) => (plan, Source::Reencoded { store, policy }, Route::Reencoded),
     };
 
     let table = u64::try_from(
@@ -477,8 +496,10 @@ where
         // `Plan::total_bytes`, which is content.
         // The two differ by every chunk's header and by every frame the set did not
         // have to make.
-        // The writer works this out too, and that figure rather than this one ends
-        // up in the file.
+        // Under `keep` and `0` this is the figure the file carries, and the
+        // written pack below reports the same one.
+        // A real run under a level replaces it, because its records are made
+        // while they are written.
         // See [`crate::pack::planned_payload_len`], which is one function rather
         // than the two this was.
         payload: crate::pack::planned_payload_len(&plan),
@@ -492,21 +513,32 @@ where
         return Ok(report);
     }
 
-    // `write_delta`, not `write` over a filtered plan, because the header has to
-    // say what the delta assumes.
+    // A base goes to the writer rather than into a filtered plan, because the
+    // header has to say what the delta assumes.
     // That is what lets an apply refuse rather than apply what it happens to hold.
-    let written = match base.as_ref() {
-        Some(base) => {
-            Pack::write_delta(&source, &plan, version_snapshot, base.id, *number, out).await?
-        }
-        None => Pack::write(&source, &plan, version_snapshot, *number, out).await?,
-    };
+    //
+    // One call either way. The route decided above is the writer's, so the two
+    // are chosen in one place rather than once per kind of pack.
+    let written = Pack::write_from(
+        &source,
+        &plan,
+        version_snapshot,
+        *number,
+        base.as_ref().map(|base| base.id),
+        route,
+        out,
+    )
+    .await?;
 
-    // Read back off the written pack rather than computed here, so the figures a
-    // pack reports are the ones its own index holds.
+    // The figures a pack reports come off the written pack rather than being
+    // computed here a second time.
     // A report assembled from the plan could disagree with the file by the header
     // and the index.
     // Those are precisely the bytes a client fetching it is counting.
+    // The payload is the writer's own total, which is the number its header
+    // carries. Under a level that total is a property of the frames the run
+    // made, so the plan could not have stated it.
+    report.payload = written.payload_len();
     report.bytes = Some(written.file_len()?);
     report.content = Some(crate::pack::hash_file(out).await?);
 
@@ -610,37 +642,28 @@ where
 
 /// The placement each record in `plan` will have under `policy`, by measuring.
 ///
-/// **Measured rather than predicted, which means encoding each chunk twice.**
-/// The writer's header carries the payload's total length and is written before
-/// any record.
-/// The length of every record therefore has to be known before the first byte of
-/// one is written.
-/// A zstd frame's length is a property of the bytes zstd produces.
+/// **Measured rather than predicted.** A zstd frame's length is a property of the
+/// bytes zstd produces.
 /// Nothing here can work out that length without producing the bytes.
+/// Predicting it from the content length is not a cheaper form of the work.
+/// There is no such function.
 ///
-/// The alternatives were considered and are both worse:
+/// **A dry run at any policy, and a real run that writes the content raw.**
+/// A dry run reports figures for a file it does not write. Those figures have to
+/// describe the records the run *would* write, so the run measures a level.
+/// `Off` encodes nothing, because a raw record's stored length *is* its content
+/// length.
+/// The plan already carries that answer, so `--compression 0` costs what `keep`
+/// costs.
 ///
-/// * *Predict it from the content length.* There is no such function.
-///   Compression is what it is because its output size depends on the input's
-///   structure.
-///   A header built from a guess would make every record after the first one land
-///   at the wrong offset.
-/// * *Keep the encoded chunks.* That holds a whole version's frames in memory to
-///   encode once.
-///   That is precisely the bound the writer holds itself to by buffering one
-///   record at a time.
-///   For a pack over a large version it is the difference between a pack that can
-///   be written and one that cannot.
-///
-/// So the encode runs twice under a level, and the second run's output is checked
-/// against the first by the writer's own per-record agreement check.
-/// If a frame comes out a different length, the run fails.
-/// Such a failure is better than writing a pack whose header contradicts its own
-/// payload.
-///
-/// With compression **off** nothing is encoded at all, and nothing is read.
-/// A raw record's stored length *is* its content length, so the plan already
-/// carries the answer and `--compression 0` costs what `keep` costs.
+/// **A real run under a level does not come here at all.** That run encodes each
+/// record once as it writes it, and the writer patches the header's payload
+/// total in afterwards.
+/// The encoded chunks are still discarded here rather than kept.
+/// Keeping them would hold a whole version's frames in memory instead of
+/// buffering one record at a time.
+/// For a pack over a large version that is the difference between a pack that
+/// can be written and one that cannot.
 ///
 /// # Errors
 ///

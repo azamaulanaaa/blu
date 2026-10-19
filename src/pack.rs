@@ -46,6 +46,13 @@
 //! index length (8) | snapshot length (8) | magic (4)
 //! ```
 //!
+//! The payload length is the one count a writer may not know when it starts the
+//! header. A pack that re-encodes under a level learns each frame's width as it
+//! makes the frame. Its header therefore reserves ten bytes for that length.
+//! The writer patches the real total in once the payload is on disk. A reader
+//! sees an ordinary number, because a padded LEB128 number ends within its ten
+//! bytes. [`Pack::open`] stops at the end as it does for any other.
+//!
 //! The header repeats the snapshot stamp, so a listing reads no snapshot
 //! section. The stamp matches the one inside the carried snapshot.
 //!
@@ -445,6 +452,29 @@ pub struct Pack {
     order: Vec<u32>,
 }
 
+/// How the writer learns a header's payload length.
+///
+/// A pack's header carries the payload's total length, and the writer writes the
+/// header before the payload. So the two routes decide whether the total is
+/// final when the header starts. It is the only decision they make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// The writer knows the total before the payload starts, so the header is
+    /// final.
+    ///
+    /// A record's width follows from two lengths. The plan already resolved both
+    /// lengths of every record. This is the route for a pack that copies the
+    /// set's own bytes, and for one that writes the content raw.
+    Verbatim,
+    /// The total is a property of frames the run has not made yet.
+    ///
+    /// The header reserves [`crate::varint::MAX`] bytes for the length. The
+    /// writer writes the payload and then seeks back and patches the real total
+    /// in. This is the route for a pack that re-encodes under a zstd level.
+    /// Nothing can state a frame's width before zstd makes the frame.
+    Reencoded,
+}
+
 impl Pack {
     /// Write a pack of `plan` to `path`, reading payloads from `store`.
     ///
@@ -513,7 +543,7 @@ impl Pack {
     where
         S: StorageStored + ?Sized,
     {
-        Self::write_from(store, plan, snapshot, version, None, path).await
+        Self::write_from(store, plan, snapshot, version, None, Route::Verbatim, path).await
     }
 
     /// Write a pack of `plan` that assumes its reader already holds `base`.
@@ -547,16 +577,42 @@ impl Pack {
     where
         S: StorageStored + ?Sized,
     {
-        Self::write_from(store, plan, snapshot, version, Some(base), path).await
+        Self::write_from(
+            store,
+            plan,
+            snapshot,
+            version,
+            Some(base),
+            Route::Verbatim,
+            path,
+        )
+        .await
     }
 
     /// [`Self::write`] or [`Self::write_delta`], by whether a base was given.
-    async fn write_from<S>(
+    ///
+    /// `route` decides how the header learns the payload's length. Under
+    /// [`Route::Verbatim`] the writer writes the plan's total and the header is
+    /// final. Under [`Route::Reencoded`] the run encodes the payload as it writes
+    /// it, so the total is unknown when the header starts. The header then
+    /// reserves [`crate::varint::MAX`] bytes for the length. The writer seeks back
+    /// and patches the total in once the payload is on disk. Either route puts
+    /// the payload region at the same place, so nothing after the header moves.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a pack's own facts, threaded from the two callers that name them"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one pack's whole write: header, payload, patch, index and trailer"
+    )]
+    pub(crate) async fn write_from<S>(
         store: &S,
         plan: &Plan,
         snapshot: &crate::metadata::Snapshot,
         version: u32,
         base: Option<BlobId>,
+        route: Route,
         path: &Path,
     ) -> io::Result<Self>
     where
@@ -585,20 +641,30 @@ impl Pack {
         let mut chunks = Vec::with_capacity(plan.len());
         let mut offset = 0u64;
 
-        // The header's length depends on the counts, since a varint runs
-        // until its high bit clears, so the header is built before the payload
-        // starts.
-        let header = encode_header(&Header {
+        // The header is built before the payload starts, because its own length
+        // decides where the payload starts.
+        let header = Header {
             snapshot: snapshot_id,
             taken_at: snapshot.taken_at,
             version,
             base,
             chunks: planned_count,
             payload_len: planned_bytes,
-        });
-        let payload_start = u64::try_from(header.len()).unwrap_or(u64::MAX);
+        };
 
-        file.write_all(&header).await.map_err(|e| {
+        // A re-encoded header reserves the widest a varint can be for the length
+        // and keeps the position of that field. The patch after the payload then
+        // does not restate the header's layout.
+        let (header_bytes, reserved_len_at) = match route {
+            Route::Verbatim => (encode_header(&header), None),
+            Route::Reencoded => {
+                let (bytes, at) = encode_header_padded(&header);
+                (bytes, Some(at))
+            }
+        };
+        let payload_start = u64::try_from(header_bytes.len()).unwrap_or(u64::MAX);
+
+        file.write_all(&header_bytes).await.map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!("could not write {}: {e}", tmp_path.display()),
@@ -616,7 +682,8 @@ impl Pack {
             // The first error in plan order wins.
             let fetched = fetch_window(store, window).await?;
             for (planned, stored) in window.iter().zip(fetched) {
-                let (mut located, record_len) = write_fetched(&mut file, planned, &stored).await?;
+                let (mut located, record_len) =
+                    write_fetched(&mut file, planned, &stored, route).await?;
                 located.offset = offset;
 
                 // Saturating, to match the count the header carries. The
@@ -632,6 +699,23 @@ impl Pack {
         // Between the payloads and the index, so `index length` alone
         // still locates the index. See the module docs.
         let snapshot_start = payload_start.saturating_add(offset);
+
+        // Put the payload's real length where a re-encoded header reserved it.
+        // The reserved width is the widest a varint can be, so the patch cannot
+        // move a byte of what follows it.
+        if let Some(at) = reserved_len_at {
+            let mut length = Vec::with_capacity(crate::varint::MAX);
+            crate::varint::write_padded(&mut length, offset);
+
+            file.seek(SeekFrom::Start(u64::try_from(at).unwrap_or(u64::MAX)))
+                .await?;
+            file.write_all(&length).await?;
+
+            // The cursor is inside the header now. The sections that follow
+            // start where the payload ends.
+            file.seek(SeekFrom::Start(snapshot_start)).await?;
+        }
+
         file.write_all(&snapshot_bytes).await?;
 
         let index = encode_index(
@@ -1220,9 +1304,14 @@ impl Pack {
 /// Every term comes from the plan's own placement, which the caller resolved
 /// against the store being packed. A record's width is decided by the two lengths
 /// it carries, and those are known from the store's index without reading a
-/// payload. That is what lets the header be written first and still carry the
-/// right total. It is also why the writer checks what it is given against the
-/// same numbers, rather than trusting that they still hold.
+/// payload. That is what lets a verbatim header come first and still carry the
+/// right total. It is also why the writer checks the bytes against the same
+/// numbers, rather than trusting that they still hold.
+///
+/// **A re-encoded pack's total is not this figure.** The run makes its records
+/// while it writes them, so the writer reserves the length's width and patches
+/// the real total in afterwards. See [`Route::Reencoded`]. This figure is still
+/// what a dry run reports and what a verbatim header carries from the start.
 ///
 /// Saturating throughout, because the header's count and the index built beside
 /// it are both sums of claims.
@@ -1325,6 +1414,13 @@ where
 /// Encode the header.
 /// Append the record.
 ///
+/// **What the comparison can see depends on the route.** Under
+/// [`Route::Verbatim`] the record is the form the plan resolved. The check then
+/// covers the codec, the stored length, and the content length. Under
+/// [`Route::Reencoded`] the form is this run's own output, and the plan says
+/// nothing about it. The check then covers the content length only. Both the
+/// store and the plan make that one claim about a chunk under either route.
+///
 /// # Errors
 ///
 /// Return an error if the bytes differ from the plan.
@@ -1333,6 +1429,7 @@ async fn write_fetched(
     file: &mut tfs::File,
     planned: &PlannedChunk,
     stored: &Stored,
+    route: Route,
 ) -> io::Result<(Located, u64)> {
     let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
 
@@ -1344,24 +1441,31 @@ async fn write_fetched(
     // refuses that pack, naming a count, long after the run that caused it had
     // exited successfully.
     let placement = planned.placement;
-    if stored.codec != placement.codec
-        || stored_len != placement.stored_len
-        || stored.raw_len != placement.raw_len
-    {
+    let disagrees = stored.raw_len != placement.raw_len
+        || (route == Route::Verbatim
+            && (stored.codec != placement.codec || stored_len != placement.stored_len));
+    if disagrees {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "chunk {} is stored as {} bytes of {} decoding to {} here, but the plan \
-             resolved it as {} bytes of {} decoding to {}; the set changed while this \
-             pack was being written",
-                planned.id,
-                stored_len,
-                name_of(stored.codec),
-                stored.raw_len,
-                placement.stored_len,
-                name_of(placement.codec),
-                placement.raw_len,
-            ),
+            match route {
+                Route::Verbatim => format!(
+                    "chunk {} is stored as {} bytes of {} decoding to {} here, but the plan \
+                 resolved it as {} bytes of {} decoding to {}; the set changed while this \
+                 pack was being written",
+                    planned.id,
+                    stored_len,
+                    name_of(stored.codec),
+                    stored.raw_len,
+                    placement.stored_len,
+                    name_of(placement.codec),
+                    placement.raw_len,
+                ),
+                Route::Reencoded => format!(
+                    "chunk {} holds {} bytes of content here, but the plan resolved it as \
+                 {}; the set changed while this pack was being written",
+                    planned.id, stored.raw_len, placement.raw_len,
+                ),
+            },
         ));
     }
 
@@ -1504,11 +1608,12 @@ fn header_taken_at(header: &[u8]) -> Timestamp {
     }
 }
 
-/// A header's fixed part. It holds the magic and the format version. It holds
-/// the version the pack was built from. It holds the snapshot hash. It holds
-/// the version time in UTC. It holds the base flag and hash if there is one.
-/// Then come the two counts as varints.
-fn encode_header(header: &Header) -> Vec<u8> {
+/// A header's fixed part, its flag byte, and its chunk count.
+///
+/// A header also holds the payload length. [`encode_header`] or
+/// [`encode_header_padded`] appends that field, and a header comes in those two
+/// shapes.
+fn encode_header_prefix(header: &Header) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + COUNTS_MAX);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -1528,16 +1633,50 @@ fn encode_header(header: &Header) -> Vec<u8> {
         None => out.push(0),
     }
     write_varint(&mut out, header.chunks);
+
+    out
+}
+
+/// A header whose payload length is the shortest varint that holds it.
+///
+/// This is the shape a reader finds in every pack on disk except one written by
+/// [`Route::Reencoded`]. The length is final when the writer starts the header,
+/// so there is nothing to patch afterwards.
+fn encode_header(header: &Header) -> Vec<u8> {
+    let mut out = encode_header_prefix(header);
     write_varint(&mut out, header.payload_len);
 
     out
 }
 
+/// A header that pads its payload length to [`crate::varint::MAX`] bytes, and
+/// the offset the length starts at.
+///
+/// The padded width is the widest a `u64` can occupy. The writer can then seek
+/// back and overwrite the field once the payload is on disk. The length does not
+/// then move a byte of what follows it. The offset travels with the bytes, so
+/// nothing else has to know where the field is.
+///
+/// A reader needs no change. A padded varint is an ordinary LEB128 number. It
+/// happens to end in its tenth byte, and [`read_varint`] stops there like it
+/// stops anywhere.
+fn encode_header_padded(header: &Header) -> (Vec<u8>, usize) {
+    let mut out = encode_header_prefix(header);
+    let at = out.len();
+    crate::varint::write_padded(&mut out, header.payload_len);
+
+    (out, at)
+}
+
 /// What a header records, and how much of it is fixed-length.
 ///
 /// The counts are varints and so are not fixed, but they come last. Everything a
-/// reader needs to find the payload is a fixed prefix, which is what lets [`open`]
+/// reader needs to find the payload is a fixed prefix. That is what lets [`open`]
 /// read the geometry without decoding the counts first.
+///
+/// A re-encoded header pads its payload length, so its counts region has a fixed
+/// width too. A reader stops at the end of each number rather than at a width, so
+/// both shapes of header read the same way.
 struct Header {
     snapshot: BlobId,
     taken_at: Timestamp,
@@ -2535,9 +2674,10 @@ impl VirtualPack {
         })?;
         let snapshot_id = blake3::hash(&snapshot_bytes);
 
-        // The same header `write_from` builds, over the same two counts. Built
-        // before the payload, because a varint's length depends on the numbers
-        // it carries, so the header's own length is only known once it is built.
+        // The header `write_from` builds on its verbatim route, over the same two
+        // counts. Built before the payload, because a varint's length depends on
+        // the numbers it carries, so the header's own length is only known once
+        // it is built.
         let header = encode_header(&Header {
             snapshot: snapshot_id,
             taken_at: snapshot.taken_at,

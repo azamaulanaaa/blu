@@ -27,7 +27,7 @@ use std::{
 use blulib::{
     metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
     pack::{Pack, PackReader, Range, StorageStored, hash_file},
-    storage::{BlobStore, Codec, Plan, StorageGet},
+    storage::{BlobStore, Codec, Plan, StorageGet, StoragePut},
 };
 use std::io::{Read, Seek, SeekFrom};
 use tokio::io::AsyncReadExt;
@@ -3606,6 +3606,353 @@ async fn a_dry_pack_under_a_level_reports_what_the_run_would_write() {
         by("zero"),
         by("keep")
     );
+}
+
+/// Only a pack written under a level pads its payload length.
+///
+/// A pack's header carries the payload's total length, and the writer writes the
+/// header before the payload. Under `keep` and `0` the plan states every record's
+/// length, so the header is final and the count is the shortest varint that holds
+/// it. Under a level the total belongs to frames the run has not made yet. The
+/// header reserves the widest a varint can be for the length. The writer patches
+/// the real total in once the payload is on disk.
+///
+/// **The width is the whole of what changed, so the width is what this test
+/// reads.** [`Pack::open`] already catches a patch that wrote a wrong total,
+/// because it checks the total against where the snapshot starts. A patch at a
+/// wrong offset has two shapes. It either moves the reserved field into a number
+/// a reader misreads, or leaves the header's own bytes where they were. Both make
+/// the file fail to open. This test pins the one thing left: the reserved width is
+/// exactly ten bytes, and those bytes hold the pack's own total.
+///
+/// What would falsify it:
+/// * a `keep` or `0` pack that pads its length. Such a pack spends nine bytes
+///   the plan did not have to spend.
+/// * a level pack whose length is not exactly the reserved width, or whose
+///   reserved number is not the pack's own total.
+#[tokio::test]
+async fn only_a_pack_written_under_a_level_pads_its_payload_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    mixed_set(dir.path(), &origin).await;
+
+    for (form, compression, padded) in [
+        ("keep", None, false),
+        ("zero", Some(blulib::storage::Compression::Off), false),
+        ("level", Some(blulib::storage::Compression::zstd(9)), true),
+    ] {
+        let at = dir.path().join(format!("v-{form}.pack"));
+        let pack = packed_with(&origin, &at, compression).await;
+        let bytes = fs::read(&at).unwrap();
+
+        assert!(!pack.is_empty(), "sanity: the fixture packs chunks");
+
+        // The counts start after the fixed header and its flag byte, and the
+        // payload starts after them. The fixed part is the bytes the format
+        // states: magic, format version, version, snapshot hash, stamp and flag.
+        let count_at = 4 + 4 + 4 + 32 + 12 + 1;
+        let len_at = count_at + varint_len(&bytes, count_at);
+        let len_len = varint_len(&bytes, len_at);
+
+        assert_eq!(
+            usize::try_from(pack.payload_start()).unwrap(),
+            len_at + len_len,
+            "sanity: the two counts are all that lie between the flag and the payload"
+        );
+        assert_eq!(
+            decode_varint(&bytes, len_at),
+            pack.payload_len(),
+            "a pack written as {form} must carry its own payload total in its header"
+        );
+        assert_eq!(
+            pack.payload_len(),
+            pack.snapshot_start() - pack.payload_start(),
+            "and that total must be the payload region's own width"
+        );
+
+        let width = if padded {
+            blulib::varint::MAX
+        } else {
+            blulib::varint::len(pack.payload_len())
+        };
+        assert_eq!(
+            len_len, width,
+            "a pack written as {form} has a payload length {len_len} bytes wide, and {form} \
+             must write one {width} bytes wide"
+        );
+
+        // Every record reads back as the chunk it is addressed by. That is what
+        // a padded header must not disturb: the payload starts at the same
+        // place, so every offset in the index still lands on its record.
+        for chunk in &pack {
+            let mut content = Vec::new();
+            pack.get(&chunk.id)
+                .await
+                .unwrap()
+                .read_to_end(&mut content)
+                .await
+                .unwrap();
+            assert_eq!(
+                blake3::hash(&content),
+                chunk.id,
+                "a pack written as {form} served content that is not the chunk's"
+            );
+        }
+    }
+}
+
+/// The varint reader as it was before a pack header could be padded.
+///
+/// This is the reader of the commit before this one, copied here unchanged.
+/// That commit let the writer reserve ten bytes for a pack's payload total.
+/// A reader of the old shape has to read a pack that the new writer wrote.
+///
+/// The copy is frozen on purpose. The claim is about the file and not about
+/// the crate that wrote it. The test needs a reader that cannot drift with
+/// the library.
+fn read_padded_legacy(bytes: &[u8], at: usize) -> Result<(u64, usize), blulib::varint::Error> {
+    let mut out: u64 = 0;
+    let mut shift: u32 = 0;
+
+    for index in 0..blulib::varint::MAX {
+        let byte = *bytes
+            .get(at + index)
+            .ok_or(blulib::varint::Error::Truncated)?;
+
+        if index == blulib::varint::MAX - 1 && byte > 1 {
+            return Err(blulib::varint::Error::Overlong);
+        }
+
+        out |= u64::from(byte & 0x7f) << shift;
+
+        if byte & 0x80 == 0 {
+            return Ok((out, index + 1));
+        }
+
+        shift += 7;
+    }
+
+    Err(blulib::varint::Error::Overlong)
+}
+
+/// An older reader reads a payload total that a new writer padded.
+///
+/// The writer reserves ten bytes for the payload total. It writes the payload
+/// and then seeks back to write the real total into the reserve. The commit
+/// that did this said that an older reader needs no change. This test reads
+/// the header with the reader from before that commit.
+///
+/// The test pins three things. The older reader reads the header. It reads
+/// the same total as the reader of this build. The number ends in the tenth
+/// byte, where the writer wrote it.
+///
+/// What would falsify it:
+/// * a padded total that the older reader cannot read.
+/// * a total that the two readers do not agree on.
+/// * a reader that ends the number before the tenth byte.
+#[tokio::test]
+async fn an_older_reader_reads_a_padded_payload_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    mixed_set(dir.path(), &origin).await;
+
+    let at = dir.path().join("level.pack");
+    let pack = packed_with(&origin, &at, Some(blulib::storage::Compression::zstd(9))).await;
+    let bytes = fs::read(&at).unwrap();
+
+    // The counts start after the fixed header and its flag byte. The fixed part
+    // is the bytes the format states: magic, format version, version, snapshot
+    // hash, stamp and flag.
+    let count_at = 4 + 4 + 4 + 32 + 12 + 1;
+    let (chunks, count_len) =
+        read_padded_legacy(&bytes, count_at).expect("the older reader reads the chunk count");
+    let len_at = count_at + count_len;
+    let (total, total_len) =
+        read_padded_legacy(&bytes, len_at).expect("the older reader reads the payload total");
+
+    assert_eq!(
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        7,
+        "the format version moved"
+    );
+    assert_eq!(
+        chunks,
+        u64::try_from(pack.chunks().len()).unwrap(),
+        "the older reader read a different chunk count"
+    );
+    assert_eq!(
+        total_len,
+        blulib::varint::MAX,
+        "the payload total is not the width that the writer reserved"
+    );
+    assert_eq!(
+        total,
+        pack.payload_len(),
+        "the older reader read a different payload total"
+    );
+    assert_eq!(
+        read_padded_legacy(&bytes, len_at),
+        blulib::varint::read(&bytes, len_at),
+        "the older reader and the reader of this build disagree"
+    );
+}
+
+/// A patched header and the pack's own index agree.
+///
+/// The writer seeks back to patch the total. That seek must not move a byte
+/// of the payload, the index, or the snapshot. This test walks the payload
+/// with the offsets that the index holds. Each record must start where the
+/// index says. The records must fill the region that the header names.
+///
+/// What would falsify it:
+/// * a patch that writes the total at the wrong offset.
+/// * a record that does not start where the index says.
+/// * a payload region that the records do not fill.
+#[tokio::test]
+async fn a_patched_header_leaves_the_index_consistent_with_the_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    mixed_set(dir.path(), &origin).await;
+
+    let at = dir.path().join("level.pack");
+    let pack = packed_with(&origin, &at, Some(blulib::storage::Compression::zstd(9))).await;
+    let bytes = fs::read(&at).unwrap();
+
+    // The header's total is the width of the payload region. The patch writes
+    // that number, so the two must be the same number.
+    let count_at = 4 + 4 + 4 + 32 + 12 + 1;
+    let len_at = count_at + varint_len(&bytes, count_at);
+    assert_eq!(
+        decode_varint(&bytes, len_at),
+        pack.payload_len(),
+        "the patched header does not carry the pack's own payload total"
+    );
+    assert_eq!(
+        pack.payload_len(),
+        pack.snapshot_start() - pack.payload_start(),
+        "the patched total is not the width of the payload region"
+    );
+
+    // The records tile the payload region, and the index says where each one
+    // starts. A patch that moved a byte would break one of the two.
+    let mut offsets: Vec<u64> = pack.chunks().iter().map(|chunk| chunk.offset).collect();
+    offsets.sort_unstable();
+    let mut at_record = pack.payload_start();
+    for offset in offsets {
+        assert_eq!(
+            at_record,
+            pack.payload_start() + offset,
+            "a record does not start where the index says"
+        );
+        at_record += record_len(&bytes, pack.payload_start(), offset);
+    }
+    assert_eq!(
+        at_record,
+        pack.snapshot_start(),
+        "the records do not fill the payload region"
+    );
+}
+
+/// A set whose pack does not depend on the clock or on the machine.
+///
+/// A pack carries the snapshot of the version it packs. The snapshot carries
+/// the time of the backup and the attributes of every file. Those two make
+/// two runs of the same tree differ, and a pack of that set differ too.
+///
+/// This helper publishes a second version. Its snapshot names a fixed time
+/// and no attributes at all. The store holds raw chunks, because a
+/// compressed frame's bytes depend on the build of zstd.
+///
+/// The result is a set with one answer. Every build packs the same bytes.
+async fn fixed_set(dir: &Path, at: &Path) {
+    let source = dir.join("source");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("a.bin"), common::noisy(20_000)).unwrap();
+    fs::write(source.join("b.bin"), common::untagged_stream(1, 12_000)).unwrap();
+
+    // A raw store, so that the pack holds no compressed frame.
+    common::run_backup_compressed(&source, at, blulib::storage::Compression::Off).await;
+
+    // A second version, with a snapshot that names a fixed time and no
+    // attributes.
+    let store = BlobStore::builder(at)
+        .compression(blulib::storage::Compression::Off)
+        .open_writer()
+        .await
+        .unwrap();
+    let (_, id) = store.latest().unwrap();
+    let mut reader = store.get(&id).await.unwrap();
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).await.unwrap();
+    let mut snapshot = Snapshot::try_from(buffer.as_slice()).unwrap();
+    snapshot.taken_at = Timestamp {
+        secs: 1_600_000_000,
+        nanos: 0,
+    };
+    let attrs = Attributes {
+        owner: None,
+        mode: None,
+        mtime: None,
+        xattrs: Vec::new(),
+        windows_acl: None,
+    };
+    for file in &mut snapshot.files {
+        file.attrs = attrs.clone();
+    }
+    for entry in &mut snapshot.dirs {
+        entry.attrs = attrs.clone();
+    }
+
+    let bytes = snapshot.to_bytes().unwrap();
+    let len = u64::try_from(bytes.len()).unwrap();
+    let new_id = common::id_of(&bytes);
+    store
+        .put(&new_id, common::reader(bytes), len)
+        .await
+        .unwrap();
+    store.sync_data().await.unwrap();
+    store.commit(&new_id).await.unwrap();
+}
+
+/// A verbatim pack writes the bytes the parent commit wrote.
+///
+/// The commit that padded the payload total changed the pack writer. It said
+/// that the two verbatim forms keep their bytes. This test pins that claim.
+///
+/// It packs a fixed set with `keep` and with `--compression 0`. The two packs
+/// must be the same bytes. The bytes must be the bytes that the parent
+/// commit's writer wrote for the same set.
+///
+/// The hash below is the hash of that pack. The parent commit's build packs
+/// the same fixture, and its writer gave the same hash.
+///
+/// What would falsify it:
+/// * a verbatim pack whose bytes changed.
+/// * a `keep` pack and a `0` pack that differ.
+#[tokio::test]
+async fn a_verbatim_pack_writes_the_bytes_the_parent_commit_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    fixed_set(dir.path(), &origin).await;
+
+    let kept_at = dir.path().join("keep.pack");
+    let zero_at = dir.path().join("zero.pack");
+    packed_with(&origin, &kept_at, None).await;
+    packed_with(&origin, &zero_at, Some(blulib::storage::Compression::Off)).await;
+
+    let kept = fs::read(&kept_at).unwrap();
+    let zero = fs::read(&zero_at).unwrap();
+
+    assert_eq!(kept, zero, "the two verbatim forms wrote different bytes");
+
+    // The hash of the pack that the parent commit's writer wrote.
+    for (form, bytes) in [("keep", &kept), ("zero", &zero)] {
+        assert_eq!(
+            blake3::hash(bytes).to_hex().to_string(),
+            "095205551ce2ab67c9f91e57dd0809155fb7459882913db1c4f9fda0a202ea15",
+            "a pack written as {form} no longer writes the bytes the parent commit wrote"
+        );
+    }
 }
 
 /// A record claiming more content than the chunker can ever produce is refused

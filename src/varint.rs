@@ -74,6 +74,26 @@ pub fn write(out: &mut Vec<u8>, value: u64) {
     }
 }
 
+/// Append `value` to `out` as LEB128, padded to exactly [`MAX`] bytes.
+///
+/// The padded form is still a valid LEB128 number. The first nine bytes hold
+/// seven bits each and ask for another. The tenth holds the last bit of the
+/// `u64` and ends the number. [`read`] stops at the tenth byte like it does at
+/// the last byte of any other encoding, so a reader needs no change.
+///
+/// The padding costs bytes a short number does not need. A caller pays that to
+/// reserve the width *before* it knows the value. The caller can then write the
+/// value into the reserved bytes afterwards without moving a byte that follows
+/// it.
+pub fn write_padded(out: &mut Vec<u8>, value: u64) {
+    // Nine groups of seven bits are sixty-three. The tenth byte therefore holds
+    // the last bit of the `u64` and nothing else.
+    for shift in 0..MAX - 1 {
+        out.push((((value >> (shift * 7)) & 0x7f) as u8) | 0x80);
+    }
+    out.push(((value >> 63) & 1) as u8);
+}
+
 /// The LEB128 number at `at`, and how many bytes it occupied.
 ///
 /// # Errors
@@ -137,7 +157,7 @@ pub fn len(value: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, MAX, len, read, write};
+    use super::{Error, MAX, len, read, write, write_padded};
 
     #[test]
     fn a_number_survives_a_round_trip_at_every_width() {
@@ -184,6 +204,18 @@ mod tests {
         // Ten, with the last still asking for more.
         let exactly_max = [0x80u8; MAX];
         assert_eq!(read(&exactly_max, 0), Err(Error::Overlong));
+    }
+
+    #[test]
+    fn a_padded_number_is_ten_bytes_and_reads_back_as_itself() {
+        // One short value, the boundaries, and the widest. A padded zero is the
+        // case a shortening encoder would get wrong.
+        for value in [0, 1, 127, 128, u64::from(u32::MAX), u64::MAX] {
+            let mut out = Vec::new();
+            write_padded(&mut out, value);
+            assert_eq!(out.len(), MAX, "a padded number is {MAX} bytes for {value}");
+            assert_eq!(read(&out, 0), Ok((value, MAX)));
+        }
     }
 
     #[test]
