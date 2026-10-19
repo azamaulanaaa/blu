@@ -2260,13 +2260,17 @@ async fn run_restore_remote(
         "packing a version to restore from"
     );
 
-    let work = tempfile::TempDir::new()?;
+    let mut work = tokio::task::spawn_blocking(tempfile::TempDir::new)
+        .await
+        .map_err(|join| {
+            std::io::Error::other(format!("a temporary-directory task failed: {join}"))
+        })??;
     let pack_path = work.path().join("pull.pack");
 
     // Everything from here on owns that file. Whether the run succeeded or
     // failed, it goes: a pack nobody named is not something to leave in a user's
     // directory, and a run that failed half-way has already said so.
-    pull_and_apply(
+    let applied = pull_and_apply(
         &remote,
         set,
         destination,
@@ -2277,7 +2281,51 @@ async fn run_restore_remote(
         dry_run,
         files,
     )
-    .await
+    .await;
+
+    // The pull ended. The directory that held the pack goes next.
+    // The removal of that directory runs on the blocking pool.
+    remove_work_dir(&mut work).await;
+
+    applied
+}
+
+/// Remove a temporary directory off the runtime thread.
+///
+/// The directory holds a whole pack on a remote restore.
+/// A remote backup stages a whole tree in it.
+/// Removing the directory removes every file inside it.
+/// That work does not belong on a runtime thread.
+///
+/// A [`tempfile::TempDir`] value removes the directory when the value drops.
+/// That stays the fallback for a run that returns early.
+/// The drop tries again when the removal here fails.
+///
+/// A removal that fails changes nothing about the run.
+/// The work is already done, and the run reports its own result.
+async fn remove_work_dir(work: &mut tempfile::TempDir) {
+    // The task that removes the directory owns the path.
+    let path = work.path().to_path_buf();
+
+    // The removal removes every file in the directory.
+    // A runtime worker must not do that work.
+    let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&path)).await;
+
+    // A removal that worked leaves the drop nothing to do.
+    // A removal that failed leaves the drop to try again.
+    match removed {
+        Ok(Ok(())) => work.disable_cleanup(true),
+        Ok(Err(error)) => tracing::warn!(
+            path = %work.path().display(),
+            %error,
+            "the temporary directory is still there. The drop tries again."
+        ),
+        Err(join) => tracing::warn!(
+            path = %work.path().display(),
+            task = %join,
+            "the temporary directory is still there. The drop tries again."
+        ),
+    }
 }
 
 /// Fetch the pack a remote restore needs, apply it, and report.
@@ -3334,11 +3382,15 @@ async fn run_backup_serve(
     token: Option<&str>,
 ) -> std::io::Result<()> {
     let push = Push::open(address, set, token)?;
-    let work = tempfile::TempDir::new()?;
+    let mut work = tokio::task::spawn_blocking(tempfile::TempDir::new)
+        .await
+        .map_err(|join| {
+            std::io::Error::other(format!("a temporary-directory task failed: {join}"))
+        })??;
     let staging = work.path().join(set);
     let pack_path = work.path().join("push.pack");
 
-    async {
+    let outcome = async {
         let outcome = run_backup(
             source,
             &staging,
@@ -3382,7 +3434,13 @@ async fn run_backup_serve(
         .await?;
         push.pack(&pack_path, KeepOrLevel::Keep).await
     }
-    .await
+    .await;
+
+    // The backup ended. The directory that held the staging tree goes next.
+    // The removal of that directory runs on the blocking pool.
+    remove_work_dir(&mut work).await;
+
+    outcome
 }
 
 /// Restore from a keyed store through staging.
