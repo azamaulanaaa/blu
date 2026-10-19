@@ -2187,6 +2187,13 @@ struct Opened {
 pub struct PackReader<'a> {
     pack: &'a Pack,
     file: tfs::File,
+    /// The bytes of the last record header read through this reader.
+    ///
+    /// A read keeps this buffer. It resizes the buffer when the next header is
+    /// wider than the last. This avoids one allocation for each header read.
+    /// Each read passes the decoder only the bytes it read, so bytes of an
+    /// earlier header never reach the decoder.
+    head: Vec<u8>,
 }
 
 impl<'a> PackReader<'a> {
@@ -2200,7 +2207,11 @@ impl<'a> PackReader<'a> {
     pub async fn open(pack: &'a Pack) -> io::Result<Self> {
         let file =
             crate::storage::at_async(pack.path(), "open", tfs::File::open(pack.path())).await?;
-        Ok(Self { pack, file })
+        Ok(Self {
+            pack,
+            file,
+            head: Vec::new(),
+        })
     }
 
     /// Read the stored form of a chunk.
@@ -2211,11 +2222,12 @@ impl<'a> PackReader<'a> {
     ///
     /// Returns an error if the pack misses the chunk. Returns an error if the header fails to decode. Returns an error if the header disagrees with the index. Returns an error if reading the payload fails.
     pub async fn read_stored(&mut self, id: &BlobId) -> io::Result<Stored> {
-        let (located, span, start) = self.pack.record_bounds(id)?;
-        let header =
-            read_header_at(&mut self.file, self.pack.path(), id, located, span, start).await?;
+        let bound = self.pack.record_bounds(id)?;
+        let header = self.read_header(id, &bound).await?;
         self.file
-            .seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
+            .seek(io::SeekFrom::Start(
+                bound.start.saturating_add(header.total_len),
+            ))
             .await?;
         let mut bytes = crate::storage::zeroed(
             header.stored_len,
@@ -2237,11 +2249,12 @@ impl<'a> PackReader<'a> {
     ///
     /// Returns an error if the pack misses the chunk. Returns an error if the header fails to decode. Returns an error if the header disagrees with the index. Returns an error if the frame fails to decode. Returns an error if reading the payload fails.
     pub async fn read_content(&mut self, id: &BlobId) -> io::Result<Vec<u8>> {
-        let (located, span, start) = self.pack.record_bounds(id)?;
-        let header =
-            read_header_at(&mut self.file, self.pack.path(), id, located, span, start).await?;
+        let bound = self.pack.record_bounds(id)?;
+        let header = self.read_header(id, &bound).await?;
         self.file
-            .seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
+            .seek(io::SeekFrom::Start(
+                bound.start.saturating_add(header.total_len),
+            ))
             .await?;
         match header.codec {
             Codec::Raw => {
@@ -2260,27 +2273,66 @@ impl<'a> PackReader<'a> {
             }
         }
     }
+
+    /// Return the checked header of `id`'s record.
+    ///
+    /// Read through this reader's file. Read into this reader's header buffer.
+    /// Keep no more of the buffer than this read filled.
+    async fn read_header(
+        &mut self,
+        id: &BlobId,
+        bound: &Bounds<'_>,
+    ) -> io::Result<crate::storage::RecordHeader> {
+        read_header_into(&mut self.file, &mut self.head, self.pack.path(), id, bound).await
+    }
 }
 
-/// Return the checked header of the record at `start`.
+/// Where a record sits: its index entry, the room the index gives it, and its
+/// first byte in the file.
 ///
-/// Seek to the record. Read the header bytes. Decode the header. Check the header against the index. Return the header.
-async fn read_header_at(
+/// The three answers [`Pack::record_bounds`] gives as one value, so a header
+/// read receives them as one argument.
+struct Bounds<'a> {
+    /// The index entry for the record.
+    located: &'a Located,
+    /// Room the index gives the record, in bytes.
+    span: u64,
+    /// Where the record begins, in file coordinates.
+    start: u64,
+}
+
+/// Return the checked header of the record in `bound`.
+///
+/// Seek to the record. Read the header bytes into `head`. Decode the header. Check the header against the index. Return the header.
+///
+/// The buffer is a parameter so a reader that reads many headers can keep one.
+/// The read fills `head[..head_len]`, and the decoder sees exactly that slice.
+///
+/// # Errors
+///
+/// Returns an error if the read fails. Returns an error if the bytes hold no record header. Returns an error if the header disagrees with the index.
+async fn read_header_into(
     file: &mut tfs::File,
+    head: &mut Vec<u8>,
     path: &Path,
     id: &BlobId,
-    located: &Located,
-    span: u64,
-    start: u64,
+    bound: &Bounds<'_>,
 ) -> io::Result<crate::storage::RecordHeader> {
-    file.seek(io::SeekFrom::Start(start)).await?;
-    let head_len = span.min(u64::try_from(MAX_RECORD_HEADER).unwrap_or(u64::MAX));
-    let mut head = crate::storage::zeroed(
-        head_len,
-        &format!("the record header of chunk {id} in {}", path.display()),
-    )?;
-    file.read_exact(&mut head).await?;
-    let Some(header) = crate::storage::decode_header(&head, 0) else {
+    file.seek(io::SeekFrom::Start(bound.start)).await?;
+    // The record's room bounds the read. The widest header bounds it too,
+    // because no decoder reads past one.
+    let head_len = usize::try_from(bound.span)
+        .unwrap_or(usize::MAX)
+        .min(MAX_RECORD_HEADER);
+    // Grow the buffer only when this header is wider than the last. Each byte
+    // below `head_len` is overwritten by the read, so the value `resize` fills
+    // in is never decoded.
+    if head.len() < head_len {
+        head.resize(head_len, 0);
+    }
+    let head = &mut head[..head_len];
+    file.read_exact(head).await?;
+    let Some(header) = crate::storage::decode_header(head, 0) else {
         return Err(not_a_pack(
             path,
             &format!(
@@ -2290,8 +2342,22 @@ async fn read_header_at(
             ),
         ));
     };
-    check_record(path, id, &header, located, span)?;
+    check_record(path, id, &header, bound)?;
     Ok(header)
+}
+
+/// Return the checked header of the record in `bound`, with a fresh buffer.
+///
+/// [`Pack::open_record`] reads one header behind a file handle it just opened,
+/// so it has no buffer to reuse. This is [`read_header_into`] with an empty one.
+async fn read_header_at(
+    file: &mut tfs::File,
+    path: &Path,
+    id: &BlobId,
+    bound: &Bounds<'_>,
+) -> io::Result<crate::storage::RecordHeader> {
+    let mut head = Vec::new();
+    read_header_into(file, &mut head, path, id, bound).await
 }
 
 /// Check a decoded header against the index entry.
@@ -2301,23 +2367,22 @@ fn check_record(
     path: &Path,
     id: &BlobId,
     header: &crate::storage::RecordHeader,
-    located: &Located,
-    span: u64,
+    bound: &Bounds<'_>,
 ) -> io::Result<()> {
     let total = header.total_len.saturating_add(header.stored_len);
     if header.kind != RecordKind::Blob
         || BlobId::from_bytes(header.hash) != *id
-        || total > span
-        || header.raw_len != located.content_len
+        || total > bound.span
+        || header.raw_len != bound.located.content_len
         || (header.codec == Codec::Raw && header.stored_len != header.raw_len)
     {
         return Err(not_a_pack(
             path,
             &format!(
                 "the record it holds for chunk {id} is not the one its index names: it \
-                 claims {total} bytes where the index gives it {span}, and {} bytes of \
+                 claims {total} bytes where the index gives it {}, and {} bytes of \
                  content where the index says {}, stored as {:?}",
-                header.raw_len, located.content_len, header.codec,
+                bound.span, header.raw_len, bound.located.content_len, header.codec,
             ),
         ));
     }
@@ -2414,23 +2479,23 @@ impl Pack {
     /// does not agree with the index. It returns an error if the file
     /// cannot be opened, seeked or read.
     async fn open_record(&self, id: &BlobId) -> io::Result<Opened> {
-        let (located, span, start) = self.record_bounds(id)?;
+        let bound = self.record_bounds(id)?;
         let mut file =
             crate::storage::at_async(self.path(), "open", tfs::File::open(self.path())).await?;
-        let header = read_header_at(&mut file, self.path(), id, located, span, start).await?;
+        let header = read_header_at(&mut file, self.path(), id, &bound).await?;
         Ok(Opened {
             file,
             header,
-            start,
+            start: bound.start,
         })
     }
 
     /// Return the bounds of the record for `id`.
     ///
-    /// Returns the index entry and the room the index gives the record and the
-    /// file offset where the record starts. Refuses a chunk the pack does not
-    /// hold.
-    fn record_bounds(&self, id: &BlobId) -> io::Result<(&Located, u64, u64)> {
+    /// Answer with the index entry, the room the index gives the record, and
+    /// the file offset where the record starts. Refuse a chunk the pack does
+    /// not hold.
+    fn record_bounds(&self, id: &BlobId) -> io::Result<Bounds<'_>> {
         let at = self.position(id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -2440,7 +2505,11 @@ impl Pack {
         let located = &self.chunks[at];
         let span = self.record_span(located.offset);
         let start = self.payload_start.saturating_add(located.offset);
-        Ok((located, span, start))
+        Ok(Bounds {
+            located,
+            span,
+            start,
+        })
     }
 }
 

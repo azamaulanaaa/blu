@@ -1051,18 +1051,25 @@ fn varint_len(bytes: &[u8], at: usize) -> usize {
 /// else. The record's own header is therefore the only place a test reads the
 /// number from. That is what makes a disagreement between the two visible.
 fn record_len(bytes: &[u8], payload_start: u64, offset: u64) -> u64 {
-    let at = usize::try_from(payload_start + offset).unwrap();
-    let stored_at = at + 6;
+    let stored_at = usize::try_from(payload_start + offset).unwrap() + 6;
     let stored_len = decode_varint(bytes, stored_at);
-    let raw_at = stored_at + varint_len(bytes, stored_at);
 
-    // The header is the two lengths, the hash and the check. The record is the
-    // header with the stored payload on the end.
-    let header_len = 6 + varint_len(bytes, stored_at) + varint_len(bytes, raw_at) + 32 + 8;
-
-    u64::try_from(header_len)
+    u64::try_from(header_len(bytes, payload_start, offset))
         .unwrap()
         .saturating_add(stored_len)
+}
+
+/// Bytes the header of the record at `offset` occupies, read out of the record
+/// itself.
+///
+/// The two lengths are varints, so the header is wider when either length
+/// needs more bytes.
+fn header_len(bytes: &[u8], payload_start: u64, offset: u64) -> usize {
+    let at = usize::try_from(payload_start + offset).unwrap();
+    let stored_at = at + 6;
+    let raw_at = stored_at + varint_len(bytes, stored_at);
+
+    6 + varint_len(bytes, stored_at) + varint_len(bytes, raw_at) + 32 + 8
 }
 
 /// A record header carrying `stored_len` and `raw_len` for `id`, check and all.
@@ -4520,6 +4527,72 @@ async fn reused_reader_returns_content_bytes() {
             .await
             .unwrap();
         assert_eq!(reused, single);
+    }
+}
+
+/// One header buffer serves many reads of different widths.
+///
+/// Build a pack that holds records of different header widths. Read every
+/// record through one reader. Expect each record to decode to the hash it is
+/// named by. Read the narrowest and the widest record in turn, again and again,
+/// through the same reader. Expect the same bytes every time. A buffer that
+/// held bytes of an earlier, longer header would fail here.
+#[tokio::test]
+async fn reuses_one_header_buffer_across_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = common::source(dir.path());
+    fs::write(source.join("small.bin"), common::noisy(64)).unwrap();
+    fs::write(source.join("large.bin"), common::noisy(200_000)).unwrap();
+
+    let blob = dir.path().join("store");
+    common::run_backup(&source, &blob).await;
+
+    let path = dir.path().join("v1.pack");
+    let pack = pack(&blob, &path).await;
+    let bytes = fs::read(&path).unwrap();
+    let payload_start = pack.payload_start();
+
+    // Every record with the width of its own header.
+    let mut records: Vec<_> = pack
+        .chunks()
+        .iter()
+        .map(|chunk| (chunk.id, header_len(&bytes, payload_start, chunk.offset)))
+        .collect();
+    records.sort_by_key(|(_, width)| *width);
+
+    let mut widths: Vec<usize> = records.iter().map(|(_, width)| *width).collect();
+    widths.dedup();
+    assert!(
+        widths.len() >= 2,
+        "the fixture should hold records of different header widths, and it holds {widths:?}"
+    );
+
+    // Every record decodes through one reader, in payload order.
+    let mut reader = PackReader::open(&pack).await.unwrap();
+    let mut order = pack.chunks().to_vec();
+    order.sort_by_key(|chunk| chunk.offset);
+    for chunk in &order {
+        let content = reader.read_content(&chunk.id).await.unwrap();
+        assert_eq!(
+            blake3::hash(&content),
+            chunk.id,
+            "a record decoded to bytes it is not named by"
+        );
+    }
+
+    // The narrowest and the widest header, one after the other, through the
+    // same reader. Each round leaves the buffer wide and reads it narrow.
+    let narrowest = records.first().unwrap().0;
+    let widest = records.last().unwrap().0;
+    for _ in 0..4 {
+        for id in [narrowest, widest] {
+            let content = reader.read_content(&id).await.unwrap();
+            assert_eq!(
+                blake3::hash(&content),
+                id,
+                "a reused header buffer decoded the wrong record"
+            );
+        }
     }
 }
 
