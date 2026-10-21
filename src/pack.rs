@@ -2252,12 +2252,12 @@ impl StorageGet for Pack {
     /// whose eight-byte check does not verify stops the chunk here. It is not
     /// read as content.
     ///
-    /// A compressed chunk is buffered whole and served from memory, which is the
-    /// same trade the store's read path makes for the same reason. A frame cannot
-    /// seek backwards, and every consumer of a [`StorageGet`] stream seeks. The
-    /// buffer is one chunk, bounded by the largest the chunker can produce. That
-    /// bound is `fastcdc`'s maximum, not this crate's to raise, and the buffer is
-    /// never the pack.
+    /// A compressed chunk comes back as **one decoded buffer**, served from
+    /// memory. A frame cannot seek backwards, and every consumer of a
+    /// [`StorageGet`] stream seeks. The frame itself is not buffered: the decoder
+    /// reads it out of the file in pieces. The buffer is one chunk, bounded by the
+    /// largest the chunker can produce. That bound is `fastcdc`'s maximum, not
+    /// this crate's to raise, and the buffer is never the pack.
     ///
     /// A raw chunk is streamed straight out of the file. The stream is bounded
     /// to the content length. There is nothing to decode. **The stream holds one
@@ -2266,6 +2266,12 @@ impl StorageGet for Pack {
     /// reuses it, so a caller that reads many chunks does not open the file for
     /// each chunk. See [`PackReader`] for a reader that holds one handle across
     /// many reads.
+    ///
+    /// The same is true of a compressed chunk. The read takes a handle from the
+    /// pool and a second handle on the same file. The decoder reads the frame
+    /// through the second handle. The first handle goes back to the pool when the
+    /// read is done, so a caller that reads many chunks does not open the file
+    /// for each chunk.
     ///
     /// For the same chunk as the pack stores it, without the decode, see
     /// [`StorageStored::stored`]. Both open the one record the same way. They seek,
@@ -2306,23 +2312,25 @@ impl StorageGet for Pack {
             Codec::Zstd => {
                 file.seek(io::SeekFrom::Start(start.saturating_add(header.total_len)))
                     .await?;
-                let mut frame = crate::storage::zeroed(
-                    header.stored_len,
-                    &format!("the compressed frame of chunk {id}"),
-                )?;
-                file.read_exact(&mut frame).await?;
 
-                // The frame is in hand, so the handle goes back before the
-                // decode. A zstd decode runs on a blocking thread. Holding a
-                // handle through it takes one out of the pool for no reason.
-                drop(file);
+                // The frame is read through a second handle on the same file. The
+                // decoder reads it in pieces, so the frame and its content are
+                // never two full-size buffers at the same time. Only the decoded
+                // content is held, and it is what the reader below serves.
+                //
+                // The second handle shares its position with the first one, so
+                // the first one stays out of the pool until the decode is done.
+                // The handle goes back to the pool when this read ends.
+                let frame = file.try_clone_std().await?;
 
                 // Through [`Zstd`] rather than through `DecompressReader::new`, so
                 // there is one implementation of "what a zstd frame means and what
                 // it must produce" rather than two that can disagree. This is the
                 // match on the codec byte. A read is answered by the record, not by
                 // whatever policy wrote it.
-                let bytes = Decompressor::decompress(&Zstd, frame, header.raw_len).await?;
+                let bytes =
+                    Decompressor::decompress(&Zstd, frame.take(header.stored_len), header.raw_len)
+                        .await?;
 
                 Ok(Box::new(crate::slice::DecompressReader::from_decoded(
                     bytes,
@@ -2443,28 +2451,19 @@ impl Drop for PooledFile {
 impl PooledFile {
     /// Take the file out of this handle and return it.
     ///
-    /// A read that needs the whole file takes the handle out of the pool this
-    /// way. The handle does not go back to the pool. The pool keeps its
-    /// behaviour for every other read. The pool loses one idle handle, because
-    /// the caller now holds the file.
+    /// The caller holds the file after this. The handle holds nothing, so it
+    /// gives nothing back to the pool. A handle that was in the pool leaves it,
+    /// because the caller now holds the file. The pool keeps its behaviour for
+    /// every other read.
     ///
     /// The handle goes back to the pool when this value drops and the file was
     /// not taken out. The pool then holds the same handle as before.
-    ///
-    /// **No call uses this yet.** A later change streams a compressed frame out
-    /// of the pack. That change needs an owned handle to the whole file, and
-    /// this method gives it one. The method is here so that change does not
-    /// have to open the pack file a second time.
     ///
     /// # Errors
     ///
     /// Returns an error if the handle is empty. Returns an error if the file
     /// cannot be taken out of its wrapper. The handle keeps the file in that
     /// case, and the pool gets it back.
-    #[allow(
-        dead_code,
-        reason = "a later change streams a compressed frame out of the pack"
-    )]
     fn into_std(mut self) -> io::Result<std::fs::File> {
         let file = self.file.take().ok_or_else(handle_is_gone)?;
         file.try_into_std().map_err(|file| {
@@ -2472,6 +2471,35 @@ impl PooledFile {
             self.file = Some(file);
             io::Error::other("a pack handle could not be taken out of its wrapper")
         })
+    }
+
+    /// Open a second handle on the same file, and return it as a blocking file.
+    ///
+    /// A read that hands the whole file to the decoder takes a second handle
+    /// rather than this one. This handle stays in the pool, and the pool keeps
+    /// its behaviour for every other read. The second handle is closed when the
+    /// caller drops it.
+    ///
+    /// **The two handles share the file's position.** The caller must keep this
+    /// handle out of the pool until the second handle has finished reading.
+    /// Every read seeks first, so the two cannot disagree about where they are.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handle is empty. Returns an error if the second
+    /// handle cannot be opened. Returns an error if the second handle cannot be
+    /// taken out of its wrapper.
+    async fn try_clone_std(&self) -> io::Result<std::fs::File> {
+        let file = self.file.as_ref().ok_or_else(handle_is_gone)?;
+        let clone = file.try_clone().await?;
+
+        // The second handle is a handle of its own, so it can be taken out of
+        // its wrapper. The pool does not get it back: the caller holds it.
+        PooledFile {
+            file: Some(clone),
+            idle: Arc::clone(&self.idle),
+        }
+        .into_std()
     }
 }
 
@@ -2600,6 +2628,8 @@ impl<'a> PackReader<'a> {
     ///
     /// Reuse the open file. Check the header against the index. Decode the frame where the record holds one. Return the content bytes.
     ///
+    /// The frame is not buffered whole. The decoder reads it from the file in pieces, so only the content bytes are held.
+    ///
     /// # Errors
     ///
     /// Returns an error if the pack misses the chunk. Returns an error if the header fails to decode. Returns an error if the header disagrees with the index. Returns an error if the frame fails to decode. Returns an error if reading the payload fails.
@@ -2619,12 +2649,12 @@ impl<'a> PackReader<'a> {
                 Ok(bytes)
             }
             Codec::Zstd => {
-                let mut frame = crate::storage::zeroed(
-                    header.stored_len,
-                    &format!("the compressed frame of chunk {id}"),
-                )?;
-                self.file.read_exact(&mut frame).await?;
-                Decompressor::decompress(&Zstd, frame, header.raw_len).await
+                // A second handle on the same file, so the decoder can read the
+                // frame in pieces. This reader keeps its own handle for the
+                // next read. The two share their position, and the next read
+                // seeks, so they cannot disagree about where they are.
+                let frame = self.file.try_clone_std().await?;
+                Decompressor::decompress(&Zstd, frame.take(header.stored_len), header.raw_len).await
             }
         }
     }
@@ -3664,7 +3694,7 @@ mod tests {
 
     use tokio::io::AsyncReadExt as _;
 
-    use super::{Pack, PackReader, StorageStored as _};
+    use super::{Codec, Pack, PackReader, StorageStored as _};
     use crate::{
         command::{BackupBuilder, Options},
         reader::ChunkerProfile,
@@ -3707,9 +3737,48 @@ mod tests {
             fs::write(source.join(format!("f{i}.bin")), noisy(48 * 1024, i + 1)).unwrap();
         }
 
+        pack_over(&source, dir).await
+    }
+
+    /// Bytes that compress well, and still give the chunker boundaries.
+    ///
+    /// A pseudo-random block and a fixed block, alternating. The random blocks
+    /// are seeded by their index, so nothing repeats, and the fixed block makes
+    /// the whole thing compress. `noisy` is the opposite: it never compresses.
+    fn mixed(len: usize, seed: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut block = seed;
+        while out.len() < len {
+            let mut x = block.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(b"ABCDEFGHIJKLMNOP");
+            block += 1;
+        }
+        out.truncate(len);
+
+        out
+    }
+
+    /// Build a pack over a few files of compressible bytes.
+    async fn compressed_pack_fixture(dir: &Path) -> Pack {
+        let source = dir.join("source");
+        fs::create_dir_all(&source).unwrap();
+
+        for i in 0..4u64 {
+            fs::write(source.join(format!("f{i}.bin")), mixed(48 * 1024, i + 1)).unwrap();
+        }
+
+        pack_over(&source, dir).await
+    }
+
+    /// Back up `source` into a store beside it, and build a pack of that store.
+    async fn pack_over(source: &Path, dir: &Path) -> Pack {
         let blob = dir.join("store");
         let store = BlobStore::builder(&blob).open_writer().await.unwrap();
-        BackupBuilder::new(&source, store)
+        BackupBuilder::new(source, store)
             .options(Options {
                 chunker: ChunkerProfile::Small.config(),
                 ..Options::default()
@@ -3728,6 +3797,60 @@ mod tests {
         Pack::write(&store, &plan, &snapshot, version, &dir.join("v1.pack"))
             .await
             .unwrap()
+    }
+
+    /// A compressed chunk reads back byte for byte, and the pack is opened once.
+    ///
+    /// The compressed read takes a second handle on the same file, and the
+    /// decoder reads the frame through it. The first handle goes back to the
+    /// pool, so a loop over the chunks of a compressed pack still opens the
+    /// file once.
+    #[tokio::test]
+    async fn a_compressed_pack_reads_back_and_opens_the_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = compressed_pack_fixture(dir.path()).await;
+        let ids: Vec<BlobId> = pack.chunks().iter().map(|chunk| chunk.id).collect();
+
+        assert!(ids.len() >= 4, "the fixture must hold several chunks");
+
+        // The records are frames, or the fixture proves nothing.
+        let store = BlobStore::builder(dir.path().join("store"))
+            .open_reader()
+            .await
+            .unwrap();
+        assert!(
+            ids.iter()
+                .all(|id| store.locate(id).unwrap().codec == Codec::Zstd),
+            "the fixture must hold records stored as frames"
+        );
+        drop(store);
+
+        // One stream per chunk. Each stream gives its handle back.
+        for id in &ids {
+            let mut bytes = Vec::new();
+            pack.get(id)
+                .await
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .await
+                .unwrap();
+            assert_eq!(blake3::hash(&bytes), *id, "a read returned other bytes");
+        }
+
+        // One reader over every chunk. The reader holds one handle.
+        let mut reader = PackReader::open(&pack).await.unwrap();
+        for id in &ids {
+            let bytes = reader.read_content(id).await.unwrap();
+            assert_eq!(blake3::hash(&bytes), *id, "a read returned other bytes");
+        }
+        drop(reader);
+
+        let reads = ids.len() * 2;
+        let opened = pack.handles.opened.load(Ordering::Relaxed);
+        assert_eq!(
+            opened, 1,
+            "the file opened {opened} times for {reads} reads, not once"
+        );
     }
 
     /// Many reads on one pack open one file handle.

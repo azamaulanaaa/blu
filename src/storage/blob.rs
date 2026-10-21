@@ -95,7 +95,10 @@ use tokio::{
 };
 use tracing::instrument;
 
-use super::record::{self, Kind, Placement, STORE_HEADER};
+use super::{
+    compression::{self, check_declared},
+    record::{self, Kind, Placement, STORE_HEADER},
+};
 use crate::{
     layout::IndexSet,
     metadata::{Snapshot, Timestamp},
@@ -1091,22 +1094,25 @@ impl<W: WriteMode, C: Compressor> storage::StorageGet for BlobStore<W, C> {
         match placement.codec {
             Codec::Raw => Ok(Box::new(SliceAsyncReader::new(file, placement.raw_len))),
             Codec::Zstd => {
-                // The code reads the frame, then decodes it. The read is bounded to
-                // the stored length, so a damaged record cannot pull in its
-                // neighbour. The decode is told the expected size, so a frame that
-                // does not produce it is refused rather than handed on short.
-                let mut frame = storage::zeroed(
-                    placement.stored_len,
-                    &format!("the compressed frame of chunk {id}"),
-                )?;
-                file.read_exact(&mut frame).await?;
-
+                // The open file goes to the decoder, bounded to the record's
+                // payload. The decoder reads the frame in pieces, so the frame
+                // and its content are never two full-size buffers at the same
+                // time. Only the decoded content is held, and it is what the
+                // reader below serves. A damaged record cannot pull in its
+                // neighbour, because the read stops at the stored length.
+                //
                 // Through [`Zstd`] rather than through `DecompressReader::new`. That
                 // leaves one implementation of "what a zstd frame means and what it
                 // must produce" rather than two that can disagree. This is the
                 // match on the codec byte. A read is answered by the record, not by
                 // whatever policy wrote it.
-                let bytes = Decompressor::decompress(&Zstd, frame, placement.raw_len).await?;
+                let stored = file.try_into_std().map_err(|_| {
+                    io::Error::other("a segment file could not be taken out of its wrapper")
+                })?;
+                // The reader stops at the stored length, so a damaged record
+                // cannot pull in its neighbour.
+                let stored = std::io::Read::take(stored, placement.stored_len);
+                let bytes = Decompressor::decompress(&Zstd, stored, placement.raw_len).await?;
 
                 Ok(Box::new(DecompressReader::from_decoded(bytes)))
             }
@@ -1184,14 +1190,19 @@ impl<C: Compressor> storage::StoragePut for BlobStore<Write, C> {
         let content: Vec<u8> = if keep {
             // The frame is written out again below, so the decode gets a copy of
             // it rather than the frame itself.
-            Decompressor::decompress(&Zstd, stored.clone(), raw_len).await?
+            Decompressor::decompress(&Zstd, std::io::Cursor::new(stored.clone()), raw_len).await?
         } else if matches!(codec, Codec::Raw) {
             // Nothing to decode: a `Raw` payload *is* the content.
             std::mem::take(&mut stored)
         } else {
             // Handed over rather than copied. A frame that is not kept is never
             // written, so the decode can take the only copy of it.
-            Decompressor::decompress(&Zstd, std::mem::take(&mut stored), raw_len).await?
+            Decompressor::decompress(
+                &Zstd,
+                std::io::Cursor::new(std::mem::take(&mut stored)),
+                raw_len,
+            )
+            .await?
         };
 
         // The identity check that `put` makes, on the same terms and for the same
@@ -1653,14 +1664,7 @@ fn verify_staged(
     // the frame carries about itself, and the record's `raw_len` is checked
     // against it rather than trusted by it.
     let declared = frame_content_size(&mut stored)?;
-    if declared != raw_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "a compressed payload declares {declared} bytes but its record claims {raw_len}"
-            ),
-        ));
-    }
+    check_declared(declared, raw_len)?;
 
     // A frame is kept only when it is strictly smaller than its content. The
     // decode runs either way: a kept frame is verified by it, and a frame that
@@ -1716,6 +1720,10 @@ fn verify_staged(
 ///
 /// A frame header is at most 18 bytes. A staged payload here is longer, so the
 /// read cannot come up short.
+///
+/// The header is read here and parsed by the codec's own helper. The read path
+/// parses the same bytes the same way, so the two paths refuse the same frames
+/// in the same words.
 fn frame_content_size(stored: &mut std::fs::File) -> io::Result<u64> {
     use std::io::{Read as _, Seek as _};
 
@@ -1724,19 +1732,7 @@ fn frame_content_size(stored: &mut std::fs::File) -> io::Result<u64> {
     stored.read_exact(&mut header)?;
     stored.seek(std::io::SeekFrom::Start(0))?;
 
-    zstd::zstd_safe::get_frame_content_size(&header)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("a compressed payload is not a readable zstd frame: {e}"),
-            )
-        })?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a compressed payload does not say how many bytes it decodes to",
-            )
-        })
+    compression::declared_size(&header)
 }
 
 /// Decode one frame from `stored`, hashing the content it produces.

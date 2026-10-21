@@ -308,7 +308,8 @@ impl DecompressReader {
     /// Whatever [`Zstd::decompress`] returns: the frame must be a readable zstd
     /// frame, must declare a size, and that size must be `raw_len`.
     pub async fn new(compressed: Vec<u8>, raw_len: u64) -> std::io::Result<Self> {
-        let bytes = Decompressor::decompress(&Zstd, compressed, raw_len).await?;
+        let bytes =
+            Decompressor::decompress(&Zstd, std::io::Cursor::new(compressed), raw_len).await?;
 
         Ok(Self { bytes, position: 0 })
     }

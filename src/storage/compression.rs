@@ -16,7 +16,10 @@
 //! `tests/compression.rs` holds the store's other properties true across a codec
 //! byte.
 
-use std::{borrow::Cow, io};
+use std::{
+    borrow::Cow,
+    io::{self, Read},
+};
 
 use super::record::Codec;
 
@@ -129,18 +132,22 @@ impl Compressor for Compression {
 /// module says what the codec means.
 ///
 /// [`Zstd`] is the only implementation, because [`Codec`] has only one
-/// non-trivial arm. The value is a trait rather than a call to
-/// `zstd::bulk::decompress` for two reasons. That call has more to it than the
-/// decode. It validates a frame against the length its record claims. That is a
-/// trust decision about the file and not a detail of the codec. The two places
-/// that decode were each doing that validation for themselves.
+/// non-trivial arm. The value is a trait rather than a call to a decoder for two
+/// reasons. The decode has more to it than the frame. It validates a frame
+/// against the length its record claims. That is a trust decision about the file
+/// and not a detail of the codec. The two places that decode were each doing that
+/// validation for themselves.
 ///
 /// Return-position `impl Future` for the `+ Send`, and for the same reason as
 /// [`super::StorageGet::get`](super::StorageGet). A decode runs on the blocking
 /// pool. Its future is awaited from a `get`, which is spawned.
 pub trait Decompressor: Send + Sync + 'static {
-    /// Decode `stored` into the payload, which must come back exactly `raw_len`
-    /// bytes long.
+    /// Decode the frame in `stored` into a payload of exactly `raw_len` bytes.
+    ///
+    /// `stored` is a reader over the frame. A caller with a file hands the file
+    /// over, bounded to the frame's length. The frame then never has to exist in
+    /// memory whole. The code reads the frame header first. It reads the rest of
+    /// the frame in pieces.
     ///
     /// `raw_len` is the record's claim, not a measurement. A record header carries
     /// a truncated hash rather than a MAC, so the frame is checked against
@@ -155,11 +162,13 @@ pub trait Decompressor: Send + Sync + 'static {
     /// code also returns an error if the frame does not say how many bytes it
     /// decodes to. It returns an error if that number is not `raw_len`. It
     /// returns an error if `raw_len` is not something this process can hold.
-    fn decompress(
+    fn decompress<R>(
         &self,
-        stored: Vec<u8>,
+        stored: R,
         raw_len: u64,
-    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send;
+    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send
+    where
+        R: Read + Send + 'static;
 }
 
 /// The only [`Decompressor`] this crate ships: zstd frames.
@@ -171,13 +180,162 @@ pub trait Decompressor: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Zstd;
 
+/// The widest zstd frame header, in bytes.
+///
+/// The decoder reads no more than this to learn the size a frame declares.
+/// A frame of this crate carries a known size, so its header is this wide or
+/// narrower.
+const FRAME_HEADER: usize = 18;
+
+/// The buffer a frame is read through, in bytes.
+///
+/// The frame is read in pieces of this size. A frame is therefore never one
+/// buffer. The buffer is the same size the store uses for a payload it copies,
+/// so the crate has one size for a piece of a payload.
+const FRAME_BUFFER: usize = 256 * 1024;
+
+/// The size a zstd frame declares, read from the bytes of its header.
+///
+/// - Parse the header bytes.
+/// - Return the size the frame declares.
+/// - Refuse a frame whose header cannot be parsed.
+/// - Refuse a frame that declares no size.
+///
+/// The header is a claim the frame carries about itself. The record's length is
+/// checked against this claim. The claim is never trusted on its own.
+///
+/// The write path reads this from a staged file, and the read path reads it from
+/// the frame's own reader. Both refuse the same frames in the same words.
+pub(crate) fn declared_size(header: &[u8]) -> io::Result<u64> {
+    // `None` means the frame does not declare a size, which is what a
+    // compressed *stream* looks like. Nothing here produces one, and accepting
+    // one would mean decoding blind.
+    zstd::zstd_safe::get_frame_content_size(header)
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("a compressed payload is not a readable zstd frame: {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a compressed payload does not say how many bytes it decodes to",
+            )
+        })
+}
+
+/// Check the size a frame declares against the length its record claims.
+///
+/// The two claims are about the same bytes, so they are checked against each
+/// other. A frame that declares a different size is a damaged record, whatever
+/// its contents look like.
+pub(crate) fn check_declared(declared: u64, claimed: u64) -> io::Result<()> {
+    if declared != claimed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "a compressed payload declares {declared} bytes but its record claims {claimed}"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Fill `out` from `reader`, and return how many bytes arrived.
+///
+/// A short read ends the fill. A caller compares the count against the length
+/// it asked for.
+fn fill<R: Read>(reader: &mut R, out: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < out.len() {
+        match reader.read(&mut out[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(filled)
+}
+
+/// Decode one zstd frame from `stored`, into exactly `expected` bytes.
+///
+/// The code reads the frame header first, so a frame that lies about its size
+/// is refused before an output buffer exists. The rest of the frame arrives
+/// through the reader in pieces. The frame therefore never exists in memory
+/// whole, and the caller holds only the decoded bytes.
+fn decode_frame<R>(mut stored: R, expected: usize) -> io::Result<Vec<u8>>
+where
+    R: Read,
+{
+    let mut head = [0u8; FRAME_HEADER];
+    let head_len = fill(&mut stored, &mut head)?;
+
+    let declared = declared_size(&head[..head_len])?;
+    check_declared(declared, u64::try_from(expected).unwrap_or(u64::MAX))?;
+
+    // The header bytes go back in front of the rest of the frame, so the
+    // decoder sees the frame the file holds and nothing else.
+    let source = std::io::Cursor::new(&head[..head_len]).chain(stored);
+
+    // The frame is read through a bounded buffer, so the frame and the content
+    // are never two full-size buffers at the same time. The window zstd keeps
+    // is its own, and it is far smaller than the frame.
+    let buffered = std::io::BufReader::with_capacity(FRAME_BUFFER, source);
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(buffered)?.single_frame();
+
+    // Frame and header agree, so the decode can come up neither short nor long.
+    // The count is still checked, because the frame is not trusted.
+    let mut bytes = vec![0u8; expected];
+    let filled = fill(&mut decoder, &mut bytes)?;
+    if filled != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "a compressed payload decoded to {filled} bytes but its record claims {expected}"
+            ),
+        ));
+    }
+
+    // The frame is read to its end, so the decoder has seen all of it. A frame
+    // that decodes to more than the record claims is refused here. The read is
+    // also what finishes an empty frame, whose content is nothing at all.
+    let mut extra = [0u8; 1];
+    if decoder.read(&mut extra)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "a compressed payload decoded to more than {expected} bytes but its record \
+                 claims {expected}"
+            ),
+        ));
+    }
+
+    // Every byte the record holds must belong to its one frame. Bytes past the
+    // frame sit in the decoder's read buffer, or in the reader below it.
+    let mut buffered = decoder.finish();
+    if !buffered.buffer().is_empty() || buffered.get_mut().read(&mut extra)? != 0 {
+        return Err(io::Error::other(
+            "a compressed payload carries bytes past its frame",
+        ));
+    }
+
+    Ok(bytes)
+}
+
 /// The body of [`Zstd::decompress`], split out so the trait method above can keep
 /// its return-position `impl Future`. The `manual_async_fn` lint points at a
 /// signature that names the future rather than an `async fn`. Here the naming is
 /// the point. The name says the future can cross a thread, which an `async fn` in
 /// a trait does not.
 impl Zstd {
-    async fn decode(&self, stored: Vec<u8>, raw_len: u64) -> io::Result<Vec<u8>> {
+    async fn decode<R>(&self, stored: R, raw_len: u64) -> io::Result<Vec<u8>>
+    where
+        R: Read + Send + 'static,
+    {
         let expected = usize::try_from(raw_len).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -185,58 +343,24 @@ impl Zstd {
             )
         })?;
 
-        // `None` means the frame does not declare a size, which is what a
-        // compressed *stream* looks like. Nothing here produces one, and accepting
-        // one would mean decoding blind.
-        let declared = zstd::zstd_safe::get_frame_content_size(&stored)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("a compressed payload is not a readable zstd frame: {e}"),
-                )
-            })?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "a compressed payload does not say how many bytes it decodes to",
-                )
-            })?;
-
-        if usize::try_from(declared).unwrap_or(usize::MAX) != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "a compressed payload declares {declared} bytes but its record claims \
-                     {expected}"
-                ),
-            ));
-        }
-
-        // Frame and header agree, so the decode can come up neither short nor long.
-        let bytes = tokio::task::spawn_blocking(move || zstd::bulk::decompress(&stored, expected))
+        // The decode runs on the blocking pool. The reader is a file, so the
+        // read of the frame and the decode of it belong there together. The
+        // frame never comes back to this thread.
+        tokio::task::spawn_blocking(move || decode_frame(stored, expected))
             .await
-            .map_err(|join| io::Error::other(format!("decompression panicked: {join}")))??;
-
-        if bytes.len() != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "a compressed payload decoded to {} bytes but its record claims {expected}",
-                    bytes.len()
-                ),
-            ));
-        }
-
-        Ok(bytes)
+            .map_err(|join| io::Error::other(format!("decompression panicked: {join}")))?
     }
 }
 
 impl Decompressor for Zstd {
-    fn decompress(
+    fn decompress<R>(
         &self,
-        stored: Vec<u8>,
+        stored: R,
         raw_len: u64,
-    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send {
+    ) -> impl Future<Output = io::Result<Vec<u8>>> + Send
+    where
+        R: Read + Send + 'static,
+    {
         self.decode(stored, raw_len)
     }
 }
@@ -473,14 +597,14 @@ mod compression_tests {
     ///
     /// The panic path below is deliberately not covered. The path is a decode that
     /// panics inside `spawn_blocking`. A test cannot reach it without contrivance.
-    /// Reaching it needs `zstd::bulk::decompress` itself to panic, and this API
-    /// gives a caller no way to arrange that. The path is mapped to
+    /// Reaching it needs the decode itself to panic, and this API gives a caller
+    /// no way to arrange that. The path is mapped to
     /// `"decompression panicked: …"` so a panic cannot take the run down with it.
     /// It is not mapped there because a test gets there.
     #[tokio::test]
     async fn bytes_that_are_not_a_frame_are_reported_as_such() {
         let err = Zstd
-            .decompress(NOT_A_FRAME.to_vec(), 1024)
+            .decompress(std::io::Cursor::new(NOT_A_FRAME.to_vec()), 1024)
             .await
             .unwrap_err();
 
@@ -508,7 +632,10 @@ mod compression_tests {
         let frame = zstd::bulk::compress(&raw, 1).unwrap();
         let short = u64::try_from(raw.len() - 1).unwrap();
 
-        let err = Zstd.decompress(frame, short).await.unwrap_err();
+        let err = Zstd
+            .decompress(std::io::Cursor::new(frame), short)
+            .await
+            .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
@@ -536,7 +663,10 @@ mod compression_tests {
         )
         .unwrap();
 
-        let err = Zstd.decompress(frame, 44).await.unwrap_err();
+        let err = Zstd
+            .decompress(std::io::Cursor::new(frame), 44)
+            .await
+            .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(
@@ -544,6 +674,107 @@ mod compression_tests {
                 .contains("does not say how many bytes it decodes to"),
             "a frame with no declared size should be refused in those words, and says {:?}",
             err.to_string()
+        );
+    }
+
+    /// A reader with a small limit per read, like a file under a bounded read.
+    struct Pieces {
+        bytes: Vec<u8>,
+        at: usize,
+        piece: usize,
+    }
+
+    impl std::io::Read for Pieces {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let take = out.len().min(self.piece).min(self.bytes.len() - self.at);
+            out[..take].copy_from_slice(&self.bytes[self.at..self.at + take]);
+            self.at += take;
+
+            Ok(take)
+        }
+    }
+
+    /// A frame that arrives in small pieces still decodes.
+    ///
+    /// A file is the shape this serves. The reader supplies a part of the frame
+    /// at a time. The decode pulls as it goes, so the whole frame is never one
+    /// buffer. The content comes back byte for byte.
+    #[tokio::test]
+    async fn decodes_a_frame_from_a_reader_with_small_pieces() {
+        let raw = b"the quick brown fox jumps over the lazy dog. ".repeat(3000);
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let frame_len = frame.len();
+        let len = u64::try_from(raw.len()).unwrap();
+
+        let bytes = Zstd
+            .decompress(
+                Pieces {
+                    bytes: frame,
+                    at: 0,
+                    piece: 7,
+                },
+                len,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bytes, raw,
+            "every piece of the {frame_len}-byte frame must reach the decode"
+        );
+    }
+
+    /// Bytes after a frame are refused, as the bulk decode refused them.
+    ///
+    /// The record's stored length must hold one frame and nothing else. The old
+    /// decode refused a padded frame with "Src size is incorrect". The streaming
+    /// decode must refuse the same input. A damaged record must not read back as
+    /// a good one.
+    #[tokio::test]
+    async fn bytes_after_a_frame_are_refused() {
+        let raw = vec![b'a'; 64 * 1024];
+        let mut frame = zstd::bulk::compress(&raw, 1).unwrap();
+        frame.extend_from_slice(b"TRAILING7");
+        let len = u64::try_from(raw.len()).unwrap();
+
+        let err = Zstd
+            .decompress(std::io::Cursor::new(frame), len)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Other,
+            "bytes past a frame are the refusal the decode gives, not damaged input"
+        );
+        assert!(
+            err.to_string().contains("past its frame"),
+            "the error should name the bytes past the frame, and says {:?}",
+            err.to_string()
+        );
+    }
+
+    /// A frame that is cut short is refused, as the bulk decode refused it.
+    ///
+    /// The frame says how many bytes it holds, and the bytes are not there. The
+    /// decode must not hand back a short payload. A short payload looks like the
+    /// end of a file, and a restore that trusts one writes a file that is quietly
+    /// incomplete.
+    #[tokio::test]
+    async fn a_frame_that_is_cut_short_is_refused() {
+        let raw = vec![b'a'; 64 * 1024];
+        let frame = zstd::bulk::compress(&raw, 1).unwrap();
+        let len = u64::try_from(raw.len()).unwrap();
+
+        let err = Zstd
+            .decompress(std::io::Cursor::new(frame[..16].to_vec()), len)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a frame that stops early is a short read, not a header that cannot be read"
         );
     }
 
