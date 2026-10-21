@@ -37,6 +37,7 @@ use blulib::{
     pack::{Pack, Range, Source, VirtualPack},
     storage::{BlobStore, Compression, Plan, SegmentLimit, StorageGet},
 };
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Read a version's snapshot out of a set.
@@ -480,7 +481,7 @@ async fn a_client_can_fetch_only_the_chunks_it_is_missing() {
         let mut at = range.start;
         for source in sources {
             let bytes = match source {
-                Source::Bytes(bytes) => bytes,
+                Source::Bytes(bytes) => bytes.to_vec(),
                 Source::Segment { path, len, .. } => {
                     let mut handle = tokio::fs::File::open(&path).await.unwrap();
                     let mut buffer = vec![0u8; usize::try_from(len).unwrap_or(0)];
@@ -746,6 +747,7 @@ async fn direct_index_matches_written_index() {
 
     let range = virtual_pack.index_range();
     let sources = virtual_pack.source(range).unwrap();
+    let listed = sources.len();
     let mut assembled = Vec::new();
     for source in sources {
         match source {
@@ -769,4 +771,26 @@ async fn direct_index_matches_written_index() {
         &written[from..to],
         "cached index bytes differ from the written pack"
     );
+
+    // The index range is one cached region, and every answer shares it.
+    // The same pointer in two answers proves that neither one copied.
+    // A `to_vec` per request would make two allocations instead.
+    assert_eq!(listed, 1, "the index range must be one source");
+    let first = one_bytes(virtual_pack.source(range).unwrap());
+    let second = one_bytes(virtual_pack.source(range).unwrap());
+    assert_eq!(
+        first.as_ptr(),
+        second.as_ptr(),
+        "two answers must share one buffer"
+    );
+    assert_eq!(&first[..], &written[from..to]);
+}
+
+/// The one shared region of a source list, for a range that is one region.
+fn one_bytes(sources: Vec<Source>) -> Bytes {
+    let mut sources = sources.into_iter();
+    match (sources.next(), sources.next()) {
+        (Some(Source::Bytes(bytes)), None) => bytes,
+        _ => panic!("the index range must be one shared region"),
+    }
 }
