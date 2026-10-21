@@ -1686,6 +1686,41 @@ async fn a_chunk_listed_twice_is_refused() {
     );
 }
 
+/// An index that repeats a hash is refused at any position.
+///
+/// The duplicate scan runs after the entries are sorted by hash. Two equal
+/// hashes then sit next to each other, whatever position the file gave them.
+/// This test copies the first entry's hash over the last entry's. The pair is
+/// far apart in the file and adjacent after the sort.
+#[tokio::test]
+async fn refuses_an_index_that_repeats_a_hash() {
+    let built = build(4, 150_000).await;
+    let path = built.dir.path().join("v1.pack");
+    built.pack(&path).await;
+
+    let good = fs::read(&path).unwrap();
+    let sections = sections(&good);
+    let index_at = sections.index_start;
+    let entries = index_entries(&good[index_at..index_at + sections.index_len]);
+    assert!(entries.len() >= 2, "the fixture should have a second entry");
+
+    // Copy the first entry's hash over the last entry's. Both entries keep
+    // their own numbers, so the index still describes a payload of the right
+    // size. The only thing wrong with it is the repetition.
+    let mut doubled = good.clone();
+    let first_hash: [u8; 32] = good[index_at..index_at + 32].try_into().unwrap();
+    let last = index_at + entries[entries.len() - 1];
+    doubled[last..last + 32].copy_from_slice(&first_hash);
+
+    let path = built.dir.path().join("repeated.pack");
+    fs::write(&path, &doubled).unwrap();
+    let err = Pack::open(&path).unwrap_err();
+    assert!(
+        err.to_string().contains("twice"),
+        "an index naming one chunk twice was accepted: {err}"
+    );
+}
+
 /// A `Range` a client built with its ends the wrong way round covers nothing.
 ///
 /// Both fields are public, and the type is part of the client protocol, so the

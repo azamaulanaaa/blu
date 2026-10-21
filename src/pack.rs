@@ -853,7 +853,10 @@ impl Pack {
         file.read_exact(&mut index)?;
 
         let mut chunks = decode_index(&index)?;
+        // Sorted by hash, so a repeated hash becomes a neighbouring pair for
+        // `refuse_repeated_hashes` below.
         chunks.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+        refuse_repeated_hashes(&chunks)?;
 
         // The header, for the payload geometry and the snapshot.
         let mut header = [0u8; HEADER + 1];
@@ -1715,19 +1718,27 @@ fn encode_index(entries: impl Iterator<Item = (BlobId, u64, u64)>) -> Vec<u8> {
     out
 }
 
-/// Seed for the fold behind the duplicate scan.
+/// Seed for the fold behind the opt-in lookup table.
 ///
-/// Standard sets pair random keys with a `SipHash` fold. The random keys block
+/// Standard maps pair random keys with a `SipHash` fold. The random keys block
 /// crafted input from forcing collisions. The `SipHash` fold costs more per
-/// hash than the scan around it. This keeps the random keys and replaces the
+/// hash than the map around it. This keeps the random keys and replaces the
 /// fold with a cheaper one.
 ///
-/// Each table takes one seed when the scan builds it. A later open never
+/// The index duplicate scan needs no hasher. It compares the hashes of two
+/// neighbouring entries after the sort by hash, so it builds no table.
+///
+/// Each table takes one seed when it is built. A later table never
 /// reuses that seed.
+//
+// The lookup table that uses this fold is not in the tree yet. The fold has no
+// user until it arrives, so the compiler is told to ignore it.
+#[allow(dead_code)]
 struct IndexSeed(u64);
 
+#[allow(dead_code)]
 impl IndexSeed {
-    /// Generate one fresh seed for one duplicate scan.
+    /// Generate one fresh seed for one lookup table.
     ///
     /// A throwaway standard builder supplies the seed.
     fn fresh() -> Self {
@@ -1747,8 +1758,10 @@ impl BuildHasher for IndexSeed {
 ///
 /// The fold mixes each 8-byte lane once with a rotate, a xor and a multiply.
 /// Short input spreads across buckets without further passes.
+#[allow(dead_code)]
 struct IndexFold(u64);
 
+#[allow(dead_code)]
 impl IndexFold {
     /// Mix one lane into the running state.
     ///
@@ -1759,6 +1772,7 @@ impl IndexFold {
     }
 }
 
+#[allow(dead_code)]
 impl Hasher for IndexFold {
     fn write(&mut self, bytes: &[u8]) {
         let (lanes, rest) = bytes.as_chunks::<8>();
@@ -1777,38 +1791,29 @@ impl Hasher for IndexFold {
     }
 }
 
-/// The index read back.
+/// The index read back, in the order the file lists it.
 ///
 /// # Errors
 ///
 /// Returns an error if a 32-byte hash runs past the end of `bytes`. It returns
 /// an error if either of the two varints runs past the end of `bytes`. It
-/// returns an error if a number is overlong or overflows. It returns an error
-/// if a hash is repeated. A repeated hash would mean two chunks at one offset.
+/// returns an error if a number is overlong or overflows.
 ///
-/// **The scan reserves the table up front.** The index length gives an upper
-/// bound on the number of entries. The table never regrows while the scan runs.
+/// **The vector reserves its room up front.** The index length gives an upper
+/// bound on the number of entries. The vector never regrows while the parse
+/// runs.
 ///
-/// **Each open seeds the fold.** The scan generates a fresh seed. A crafted
-/// pack cannot compute where a hash lands, so it cannot fill one bucket on
-/// purpose.
-///
-/// **The duplicate check does not change.** The table compares the hashes
-/// themselves, so a repeated hash is still reported at the same place with the
-/// same message. The fold only picks the bucket.
+/// A repeated hash is not refused here. [`Pack::open`] sorts the entries by
+/// hash, and [`refuse_repeated_hashes`] then finds a repeat in one pass.
 fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
-    let mut out = Vec::new();
     // An upper bound on the entry count. Each entry holds 32 bytes of hash
     // and two varints of at least one byte each, so this never undercounts.
-    // The table below then never regrows while the scan runs.
+    // The vector then does not regrow while the parse runs.
     //
     // The bound can overcount, because an entry with a long payload holds more
-    // than 34 bytes. The table then holds more buckets than it needs. The
+    // than 34 bytes. The vector then holds more room than it needs. The
     // memory it takes is a few percent of the index.
-    //
-    // A collision costs a probe, not a mistake. The table compares the hashes
-    // themselves, so a repeated hash is still a repeated hash.
-    let mut seen = HashSet::with_capacity_and_hasher(bytes.len() / 34, IndexSeed::fresh());
+    let mut out = Vec::with_capacity(bytes.len() / 34);
     let mut at = 0usize;
 
     while at < bytes.len() {
@@ -1827,16 +1832,6 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
         let (content_len, used) = read_varint(bytes, at)?;
         at = at.checked_add(used).ok_or_else(truncated)?;
 
-        // Two entries for one hash would mean the same chunk at two places, and
-        // `locate` answers with the first. A client asking for a chunk it already
-        // had would then be told to fetch a different one.
-        if !seen.insert(id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "a pack index lists the same chunk twice",
-            ));
-        }
-
         out.push(Located {
             id,
             offset,
@@ -1845,6 +1840,32 @@ fn decode_index(bytes: &[u8]) -> io::Result<Vec<Located>> {
     }
 
     Ok(out)
+}
+
+/// Refuse an index that lists the same chunk twice.
+///
+/// Two entries for one hash would mean the same chunk at two places. `locate`
+/// answers with the first entry, so a client asking for a chunk it already
+/// held would be told to fetch a different one.
+///
+/// [`Pack::open`] sorts the entries by hash before this call. Two equal hashes
+/// therefore sit next to each other. One pass over adjacent pairs finds a
+/// repeat. The pass builds no table and allocates nothing.
+///
+/// # Errors
+///
+/// Returns an error if two entries hold equal hashes.
+fn refuse_repeated_hashes(chunks: &[Located]) -> io::Result<()> {
+    for pair in chunks.windows(2) {
+        if pair[0].id == pair[1].id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a pack index lists the same chunk twice",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn write_varint(out: &mut Vec<u8>, value: u64) {
