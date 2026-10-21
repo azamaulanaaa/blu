@@ -137,7 +137,7 @@
 //! nothing reads a pack to answer that.
 
 use std::{
-    collections::{HashSet, hash_map::RandomState},
+    collections::{HashMap, HashSet, hash_map::RandomState},
     fs,
     hash::{BuildHasher, Hasher},
     io::{self, Read, Seek, SeekFrom},
@@ -1234,18 +1234,23 @@ impl Pack {
     ///
     /// A binary search over [`Pack::chunks`], which is why that is sorted by hash.
     ///
-    /// **Why not a hash map from chunk to position.** A hash map is the
-    /// obvious thing for a lookup table. It is worse on both counts that matter
-    /// here. Memory first. The index is already resident in full after
-    /// [`Pack::open`], because a client that only wants offsets pays for the whole
-    /// of it either way. A map would be a second copy of every key, not a
-    /// structure that exists instead of one. The index's own memory is not saved by
-    /// looking things up in something cheaper. A second structure is added to it.
-    /// Then speed. A map lookup hashes 32 bytes and chases a bucket. A binary
-    /// search here compares 32 bytes about `log2(n)` times. That data is
-    /// already in cache. For the sizes a pack reaches, thousands of chunks or tens
-    /// of thousands, the difference is a handful of cache lines. A restore pays
-    /// that difference on every chunk it reads.
+    /// **Why the search is the default.** Memory. The index is already resident in
+    /// full after [`Pack::open`], because a client that only wants offsets pays
+    /// for the whole of it either way. A map would be a second copy of every key,
+    /// not a structure that exists instead of one. The index's own memory is not
+    /// saved by looking things up in something cheaper. A second structure is
+    /// added to it. One map entry costs about 42 bytes per chunk at a full table,
+    /// against the 48 bytes of the entry its key names, so the pack's memory
+    /// roughly doubles. It also costs a walk of the whole index to build. A caller
+    /// that asks a few questions should incur neither cost.
+    ///
+    /// A caller that performs many lookups can opt in to [`PackLookup`]. That
+    /// structure builds the map on demand and answers in `O(1)`. A measurement
+    /// on a local harness found it faster at every size it tried: about
+    /// eight times at 1 340 chunks, about eight times at 21 355, and about four
+    /// times at 85 700. The fold it uses costs less per key than the standard
+    /// `SipHash` one. The binary search still has the smaller memory, and that is
+    /// what keeps it the default.
     #[must_use]
     pub fn locate(&self, id: &BlobId) -> Option<Located> {
         self.position(id).map(|at| self.chunks[at])
@@ -1299,6 +1304,89 @@ impl Pack {
     /// The bytes the record at `offset` occupies.
     fn record_span(&self, offset: u64) -> u64 {
         self.after(offset).saturating_sub(offset)
+    }
+}
+
+/// A lookup table for [`Pack::locate`], built on demand.
+///
+/// [`Pack::locate`] binary-searches the index. That is right for a few lookups
+/// and costly for many. This structure holds a hash map from each chunk's hash to
+/// its position in [`Pack::chunks`]. A lookup then follows one table slot, rather
+/// than comparing 32 bytes about `log2(n)` times.
+///
+/// **The cost is memory.** One map entry holds a 32-byte key, a four-byte value,
+/// and a share of the table's control bytes. A table with little slack costs about
+/// 42 bytes per chunk. The index entry the key names costs 48 bytes. A pack that
+/// opens this structure therefore costs about twice the memory it would
+/// otherwise. The table's capacity rounds up to a power of two, so the measured
+/// figure was about 60 bytes per chunk. The index itself is not saved, because the
+/// map holds positions into it rather than copies of it.
+///
+/// **It pays when lookups repeat.** Building the table walks every chunk once.
+/// A caller that resolves most of a pack's chunks recovers that cost after about
+/// as many lookups as the pack holds chunks. A caller that resolves a few chunks
+/// should call [`Pack::locate`] directly.
+///
+/// A measurement on a local harness found a lookup here takes about
+/// 26 ns against about 198 ns for the binary search, over a pack of 21 355
+/// chunks. Two other sizes agreed. The map won by about eight times at 1 340
+/// chunks and by about four times at 85 700.
+///
+/// The table is held in a [`HashMap`] with the pack's own fold as its hasher.
+/// The fold costs less per 32-byte key than the standard `SipHash` fold. Each
+/// table takes a fresh seed, so crafted input cannot force collisions.
+#[derive(Debug)]
+pub struct PackLookup<'a> {
+    /// The pack whose index the positions point into.
+    pack: &'a Pack,
+    /// Each chunk's hash and its position in [`Pack::chunks`].
+    index: HashMap<BlobId, u32, IndexSeed>,
+}
+
+impl<'a> PackLookup<'a> {
+    /// Build the lookup table for `pack`.
+    ///
+    /// Walks every chunk of the pack once. Every answer after that is a hash
+    /// lookup.
+    #[must_use]
+    pub fn new(pack: &'a Pack) -> Self {
+        let mut index = HashMap::with_capacity_and_hasher(pack.chunks.len(), IndexSeed::fresh());
+        // `order` names every chunk position as a `u32`, so the table takes the
+        // narrow positions from it rather than converting each one again.
+        for at in &pack.order {
+            index.insert(pack.chunks[position(*at)].id, *at);
+        }
+
+        Self { pack, index }
+    }
+
+    /// Where a chunk is, if the pack holds it.
+    ///
+    /// The answer agrees with [`Pack::locate`]. This is a hash table lookup, so
+    /// it costs `O(1)` rather than `O(log n)`.
+    #[must_use]
+    pub fn locate(&self, id: &BlobId) -> Option<Located> {
+        self.index.get(id).map(|at| self.pack.chunks[position(*at)])
+    }
+
+    /// Where a chunk sits in [`Pack::chunks`].
+    ///
+    /// A position, not an entry. [`PackLookup::locate`] turns it into the entry.
+    #[must_use]
+    pub fn position(&self, id: &BlobId) -> Option<usize> {
+        self.index.get(id).map(|at| position(*at))
+    }
+
+    /// How many chunks the table holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Whether the pack holds no chunks.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
     }
 }
 
@@ -1718,7 +1806,7 @@ fn encode_index(entries: impl Iterator<Item = (BlobId, u64, u64)>) -> Vec<u8> {
     out
 }
 
-/// Seed for the fold behind the opt-in lookup table.
+/// Seed for the fold behind [`PackLookup`].
 ///
 /// Standard maps pair random keys with a `SipHash` fold. The random keys block
 /// crafted input from forcing collisions. The `SipHash` fold costs more per
@@ -1730,13 +1818,8 @@ fn encode_index(entries: impl Iterator<Item = (BlobId, u64, u64)>) -> Vec<u8> {
 ///
 /// Each table takes one seed when it is built. A later table never
 /// reuses that seed.
-//
-// The lookup table that uses this fold is not in the tree yet. The fold has no
-// user until it arrives, so the compiler is told to ignore it.
-#[allow(dead_code)]
 struct IndexSeed(u64);
 
-#[allow(dead_code)]
 impl IndexSeed {
     /// Generate one fresh seed for one lookup table.
     ///
@@ -1758,10 +1841,8 @@ impl BuildHasher for IndexSeed {
 ///
 /// The fold mixes each 8-byte lane once with a rotate, a xor and a multiply.
 /// Short input spreads across buckets without further passes.
-#[allow(dead_code)]
 struct IndexFold(u64);
 
-#[allow(dead_code)]
 impl IndexFold {
     /// Mix one lane into the running state.
     ///
@@ -1772,7 +1853,6 @@ impl IndexFold {
     }
 }
 
-#[allow(dead_code)]
 impl Hasher for IndexFold {
     fn write(&mut self, bytes: &[u8]) {
         let (lanes, rest) = bytes.as_chunks::<8>();

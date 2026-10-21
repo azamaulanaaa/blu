@@ -24,7 +24,7 @@ use std::{
 
 use blulib::{
     metadata::{Attributes, File, FileChunk, Snapshot, Timestamp},
-    pack::{Pack, PackReader, Range, StorageStored, hash_file},
+    pack::{Pack, PackLookup, PackReader, Range, StorageStored, hash_file},
     storage::{BlobStore, Codec, Plan, StorageGet, StoragePut},
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -406,6 +406,38 @@ async fn a_pack_resolves_every_chunk_from_a_hash_ordered_index() {
     );
     assert_eq!(pack.needed_bytes(&HashSet::new()), pack.payload_len());
     assert_eq!(pack.chunks_covering(&needed).len(), pack.len());
+}
+
+/// The opt-in lookup table agrees with the binary search on every chunk.
+///
+/// The table is a second structure over the same index, so the danger is that it
+/// disagrees with the index. It must find every chunk and name the same entry.
+/// It must also refuse an id the pack does not hold.
+#[tokio::test]
+async fn lookup_answers_every_chunk_the_binary_search_finds() {
+    let built = build(12, 180_000).await;
+    let pack = built.pack(&built.dir.path().join("v1.pack")).await;
+    let lookup = PackLookup::new(&pack);
+
+    assert_eq!(lookup.len(), pack.len());
+    assert!(!lookup.is_empty());
+
+    for chunk in pack.chunks() {
+        let found = lookup
+            .locate(&chunk.id)
+            .unwrap_or_else(|| panic!("chunk {} is not in the table", chunk.id));
+        assert_eq!(found, *chunk, "the table and the index disagree");
+        assert_eq!(lookup.locate(&chunk.id), pack.locate(&chunk.id));
+        assert_eq!(
+            pack.chunks()[lookup.position(&chunk.id).unwrap()],
+            *chunk,
+            "the table's position names a different entry"
+        );
+    }
+
+    let absent = blulib::storage::BlobId::from_bytes([0xABu8; 32]);
+    assert_eq!(lookup.locate(&absent), None);
+    assert_eq!(lookup.position(&absent), None);
 }
 
 /// A client holding nothing needs the whole payload, as one range.
