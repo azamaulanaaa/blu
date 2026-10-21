@@ -157,6 +157,12 @@ impl FileRegistry {
 
 /// The files in `paths` presented as one continuous byte stream, as if
 /// concatenated in order.
+///
+/// # Blocking
+///
+/// This stream is synchronous. It opens each file with `std::fs::File::open`.
+/// It reads each file with a blocking call. A caller must run the stream on a
+/// blocking thread, for example `spawn_blocking` or a dedicated thread.
 #[derive(Debug)]
 pub struct GlobalStream {
     paths: VecDeque<PathBuf>,
@@ -443,6 +449,13 @@ impl std::str::FromStr for ChunkerProfile {
 
 /// Splits a set of files into chunks, yielding each chunk's contents along with
 /// the file slices it covers.
+///
+/// # Blocking
+///
+/// The chunker is synchronous. It opens files and reads them with blocking
+/// calls. A caller must run it on a blocking thread, for example
+/// `spawn_blocking` or a dedicated thread. [`Chunker::new`] blocks too, because
+/// it stats every file.
 pub struct Chunker {
     registry: Arc<FileRegistry>,
     cdc_iter: SimdStream<GlobalStream>,
