@@ -142,13 +142,19 @@ use std::{
     hash::{BuildHasher, Hasher},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
 };
 
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 use tokio::{
     fs as tfs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, ReadBuf},
 };
 use tracing::instrument;
 
@@ -449,6 +455,12 @@ pub struct Pack {
     /// its records in offset order, which produces exactly this. Nothing downstream
     /// sorts.
     order: Vec<u32>,
+    /// The open handles this pack reuses between reads.
+    ///
+    /// Every read through [`StorageGet::get`], [`StorageStored::stored`] or
+    /// [`PackReader`] takes a handle here and gives it back. See [`Handles`].
+    /// The pool and its open count are shared with any clone of this pack.
+    handles: Handles,
 }
 
 /// How the writer learns a header's payload length.
@@ -790,6 +802,7 @@ impl Pack {
             snapshot_len: u64::try_from(snapshot_bytes.len()).unwrap_or(0),
             chunks,
             order,
+            handles: Handles::new(),
         })
     }
     /// Open a pack, reading only its trailer and index.
@@ -958,6 +971,7 @@ impl Pack {
             snapshot_len,
             chunks,
             order,
+            handles: Handles::new(),
         })
     }
 
@@ -2104,8 +2118,12 @@ impl StorageGet for Pack {
     /// never the pack.
     ///
     /// A raw chunk is streamed straight out of the file. The stream is bounded
-    /// to the content length. There is nothing to decode. A file handle costs
-    /// nothing to keep.
+    /// to the content length. There is nothing to decode. **The stream holds one
+    /// of the pack's file handles for as long as the caller reads it.** The pack
+    /// takes that handle back when the stream drops. The next read on this pack
+    /// reuses it, so a caller that reads many chunks does not open the file for
+    /// each chunk. See [`PackReader`] for a reader that holds one handle across
+    /// many reads.
     ///
     /// For the same chunk as the pack stores it, without the decode, see
     /// [`StorageStored::stored`]. Both open the one record the same way. They seek,
@@ -2152,6 +2170,11 @@ impl StorageGet for Pack {
                 )?;
                 file.read_exact(&mut frame).await?;
 
+                // The frame is in hand, so the handle goes back before the
+                // decode. A zstd decode runs on a blocking thread. Holding a
+                // handle through it takes one out of the pool for no reason.
+                drop(file);
+
                 // Through [`Zstd`] rather than through `DecompressReader::new`, so
                 // there is one implementation of "what a zstd frame means and what
                 // it must produce" rather than two that can disagree. This is the
@@ -2167,11 +2190,195 @@ impl StorageGet for Pack {
     }
 }
 
+/// Handles a pack keeps idle for reuse.
+///
+/// The figure is the number of reads a restore or a verify keeps in flight by
+/// default. A burst larger than this opens its own handles. It closes the extra
+/// handles as they come back.
+const IDLE_HANDLES: usize = 8;
+
+/// The open file handles a pack keeps between reads.
+///
+/// A read takes a handle. No other read holds that handle while it is out. The
+/// read gives the handle back when its stream drops. The next read then takes
+/// that handle. It does not open the file again.
+///
+/// A pack with nothing in flight holds no handle until its first read. The
+/// handles it holds are the ones its reads in flight used. The list of idle
+/// handles is bounded by [`IDLE_HANDLES`].
+///
+/// **One mechanism, not one per caller.** [`StorageGet::get`],
+/// [`StorageStored::stored`] and [`PackReader`] all take from this pool, so a
+/// pass that mixes them still pays one open.
+#[derive(Debug, Clone)]
+struct Handles {
+    /// Handles no read holds, ready to be taken.
+    idle: Arc<Mutex<Vec<tfs::File>>>,
+    /// Handles the pack has opened since it was built.
+    ///
+    /// A clone of the pack shares this count, as it shares the pool.
+    opened: Arc<AtomicU64>,
+}
+
+impl Handles {
+    /// A pool with no handle open.
+    fn new() -> Self {
+        Self {
+            idle: Arc::new(Mutex::new(Vec::new())),
+            opened: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Take an open handle, or open one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened.
+    async fn take(&self, path: &Path) -> io::Result<PooledFile> {
+        // The guard is dropped before the open, or the future is not `Send`.
+        let idle = lock_idle(&self.idle).pop();
+
+        let file = if let Some(file) = idle {
+            file
+        } else {
+            let file = crate::storage::at_async(path, "open", tfs::File::open(path)).await?;
+            self.opened.fetch_add(1, Ordering::Relaxed);
+            file
+        };
+
+        Ok(PooledFile {
+            file: Some(file),
+            idle: Arc::clone(&self.idle),
+        })
+    }
+}
+
+/// Two pools are equal, whatever handles they hold.
+///
+/// An open handle is a state a pack is in. It is not what a pack is. So a pack
+/// read back from a file equals the pack that wrote it. That holds before either
+/// has read a chunk and after both have.
+impl PartialEq for Handles {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Handles {}
+
+/// Lock the idle list, ignoring poisoning.
+///
+/// The code under the lock pops, pushes or counts handles. None of that can
+/// panic.
+fn lock_idle(idle: &Mutex<Vec<tfs::File>>) -> MutexGuard<'_, Vec<tfs::File>> {
+    idle.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One handle taken from a pool, given back when this value drops.
+///
+/// Handing the handle back rather than closing it is the whole of the reuse.
+#[derive(Debug)]
+struct PooledFile {
+    /// The handle.
+    ///
+    /// `None` only inside [`Drop`], after the handle went back.
+    file: Option<tfs::File>,
+    /// The list of idle handles it goes back to.
+    idle: Arc<Mutex<Vec<tfs::File>>>,
+}
+
+impl Drop for PooledFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let mut idle = lock_idle(&self.idle);
+            if idle.len() < IDLE_HANDLES {
+                idle.push(file);
+            }
+        }
+    }
+}
+
+impl PooledFile {
+    /// Take the file out of this handle and return it.
+    ///
+    /// A read that needs the whole file takes the handle out of the pool this
+    /// way. The handle does not go back to the pool. The pool keeps its
+    /// behaviour for every other read. The pool loses one idle handle, because
+    /// the caller now holds the file.
+    ///
+    /// The handle goes back to the pool when this value drops and the file was
+    /// not taken out. The pool then holds the same handle as before.
+    ///
+    /// **No call uses this yet.** A later change streams a compressed frame out
+    /// of the pack. That change needs an owned handle to the whole file, and
+    /// this method gives it one. The method is here so that change does not
+    /// have to open the pack file a second time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handle is empty. Returns an error if the file
+    /// cannot be taken out of its wrapper. The handle keeps the file in that
+    /// case, and the pool gets it back.
+    #[allow(
+        dead_code,
+        reason = "a later change streams a compressed frame out of the pack"
+    )]
+    fn into_std(mut self) -> io::Result<std::fs::File> {
+        let file = self.file.take().ok_or_else(handle_is_gone)?;
+        file.try_into_std().map_err(|file| {
+            // The handle keeps the file, so the pool gets it back.
+            self.file = Some(file);
+            io::Error::other("a pack handle could not be taken out of its wrapper")
+        })
+    }
+}
+
+impl AsyncRead for PooledFile {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.file.as_mut() {
+            Some(file) => Pin::new(file).poll_read(cx, buf),
+            None => Poll::Ready(Err(handle_is_gone())),
+        }
+    }
+}
+
+impl AsyncSeek for PooledFile {
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => Pin::new(file).start_seek(position),
+            None => Err(handle_is_gone()),
+        }
+    }
+
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+        match self.file.as_mut() {
+            Some(file) => Pin::new(file).poll_complete(cx),
+            None => Poll::Ready(Err(handle_is_gone())),
+        }
+    }
+}
+
+/// The error for a pooled handle used after its stream dropped.
+///
+/// Unreachable: only [`Drop`] empties a [`PooledFile`], and nothing polls one
+/// after that. The handle is an `Option`, so the state exists in the type. This
+/// names it rather than panicking on it.
+fn handle_is_gone() -> io::Error {
+    io::Error::other("a pack handle was used after it went back to the pool")
+}
+
 /// A record opened out of the payload: the handle it is behind and the header
 /// that says how it is stored.
 struct Opened {
     /// The file, seeked to the record's first byte.
-    file: tfs::File,
+    ///
+    /// A pooled handle, so dropping this value hands the handle back rather than
+    /// closing it.
+    file: PooledFile,
     /// The record's own header, decoded and checked against the index.
     header: crate::storage::RecordHeader,
     /// Where the record begins, in file coordinates.
@@ -2183,10 +2390,17 @@ struct Opened {
 /// Open the pack once. Reuse the file for each read. Use this for a sequential pass over many chunks. Prefer this to opening the file for each chunk.
 ///
 /// This covers the passes that read records. A merge reads its chunks through one of these, and so does the verify pass of an apply. A pass that writes the records it reads opens the pack for each chunk instead: the write loop of an apply is one.
+///
+/// The reader takes a handle the pack keeps. It gives the handle back when the
+/// reader drops. A reader built after one drops reuses that handle.
 #[derive(Debug)]
 pub struct PackReader<'a> {
     pack: &'a Pack,
-    file: tfs::File,
+    /// The open file this reader reads through.
+    ///
+    /// A pooled handle, so dropping the reader hands the handle back rather than
+    /// closing it.
+    file: PooledFile,
     /// The bytes of the last record header read through this reader.
     ///
     /// A read keeps this buffer. It resizes the buffer when the next header is
@@ -2205,8 +2419,7 @@ impl<'a> PackReader<'a> {
     ///
     /// Returns an error if opening the file fails.
     pub async fn open(pack: &'a Pack) -> io::Result<Self> {
-        let file =
-            crate::storage::at_async(pack.path(), "open", tfs::File::open(pack.path())).await?;
+        let file = pack.handles.take(pack.path()).await?;
         Ok(Self {
             pack,
             file,
@@ -2312,7 +2525,7 @@ struct Bounds<'a> {
 ///
 /// Returns an error if the read fails. Returns an error if the bytes hold no record header. Returns an error if the header disagrees with the index.
 async fn read_header_into(
-    file: &mut tfs::File,
+    file: &mut PooledFile,
     head: &mut Vec<u8>,
     path: &Path,
     id: &BlobId,
@@ -2351,7 +2564,7 @@ async fn read_header_into(
 /// [`Pack::open_record`] reads one header behind a file handle it just opened,
 /// so it has no buffer to reuse. This is [`read_header_into`] with an empty one.
 async fn read_header_at(
-    file: &mut tfs::File,
+    file: &mut PooledFile,
     path: &Path,
     id: &BlobId,
     bound: &Bounds<'_>,
@@ -2410,6 +2623,9 @@ fn check_record(
 impl StorageStored for Pack {
     /// The chunk's payload as this pack stores it: a frame where the record says
     /// `Zstd`, and the content itself where it says `Raw`.
+    ///
+    /// The read takes one of the pack's file handles and gives it back. The next
+    /// read on this pack reuses it.
     ///
     /// # Errors
     ///
@@ -2480,8 +2696,7 @@ impl Pack {
     /// cannot be opened, seeked or read.
     async fn open_record(&self, id: &BlobId) -> io::Result<Opened> {
         let bound = self.record_bounds(id)?;
-        let mut file =
-            crate::storage::at_async(self.path(), "open", tfs::File::open(self.path())).await?;
+        let mut file = self.handles.take(self.path()).await?;
         let header = read_header_at(&mut file, self.path(), id, &bound).await?;
         Ok(Opened {
             file,
@@ -3299,4 +3514,121 @@ fn append_record_header(
         stored_len,
         raw_len,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path, sync::atomic::Ordering};
+
+    use tokio::io::AsyncReadExt as _;
+
+    use super::{Pack, PackReader, StorageStored as _};
+    use crate::{
+        command::{BackupBuilder, Options},
+        reader::ChunkerProfile,
+        storage::{BlobId, BlobStore, Plan, StorageGet as _},
+    };
+
+    /// Pseudo-random bytes with no long runs, so the chunker finds boundaries.
+    ///
+    /// A constant byte stream produces one enormous chunk. A short cycle
+    /// collapses to one deduplicated entry. Neither exercises what a multi-chunk
+    /// pack needs.
+    fn noisy(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            for byte in next().to_le_bytes() {
+                if out.len() == len {
+                    break;
+                }
+                out.push(byte);
+            }
+        }
+        out
+    }
+
+    /// Build a pack over a few files of distinct bytes.
+    async fn pack_fixture(dir: &Path) -> Pack {
+        let source = dir.join("source");
+        fs::create_dir_all(&source).unwrap();
+
+        for i in 0..4u64 {
+            fs::write(source.join(format!("f{i}.bin")), noisy(48 * 1024, i + 1)).unwrap();
+        }
+
+        let blob = dir.join("store");
+        let store = BlobStore::builder(&blob).open_writer().await.unwrap();
+        BackupBuilder::new(&source, store)
+            .options(Options {
+                chunker: ChunkerProfile::Small.config(),
+                ..Options::default()
+            })
+            .run()
+            .await
+            .unwrap();
+
+        let store = BlobStore::builder(&blob).open_reader().await.unwrap();
+        let (version, snapshot_id) = store.latest().unwrap();
+        let snapshot = crate::command::load_snapshot(&store, snapshot_id)
+            .await
+            .unwrap();
+        let plan = Plan::from_snapshot(&snapshot, |id| store.locate(id)).unwrap();
+
+        Pack::write(&store, &plan, &snapshot, version, &dir.join("v1.pack"))
+            .await
+            .unwrap()
+    }
+
+    /// Many reads on one pack open one file handle.
+    ///
+    /// A read through `get`, a read through `stored` and a read through a
+    /// [`PackReader`] all take a handle from the same pool. Each one gives the
+    /// handle back when its stream drops. So a loop over every chunk of a pack
+    /// opens the file once.
+    #[tokio::test]
+    async fn reuses_one_open_across_many_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_fixture(dir.path()).await;
+        let ids: Vec<BlobId> = pack.chunks().iter().map(|chunk| chunk.id).collect();
+
+        assert!(ids.len() >= 8, "the fixture must hold several chunks");
+
+        // One reader over every chunk. The reader holds one handle.
+        let mut reader = PackReader::open(&pack).await.unwrap();
+        for id in &ids {
+            reader.read_content(id).await.unwrap();
+        }
+        drop(reader);
+
+        // One stream per chunk. Each stream gives its handle back.
+        for id in &ids {
+            let mut bytes = Vec::new();
+            pack.get(id)
+                .await
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .await
+                .unwrap();
+            assert_eq!(blake3::hash(&bytes), *id, "a read returned other bytes");
+        }
+
+        // The stored path takes the same pool. One chunk is enough to tell.
+        pack.stored(&ids[0]).await.unwrap();
+
+        let reads = ids.len() * 2 + 1;
+        let opened = pack.handles.opened.load(Ordering::Relaxed);
+        assert_eq!(
+            opened, 1,
+            "the file opened {opened} times for {reads} reads, not once"
+        );
+    }
 }
