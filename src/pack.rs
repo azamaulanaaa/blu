@@ -639,6 +639,12 @@ impl Pack {
         let mut chunks = Vec::with_capacity(plan.len());
         let mut offset = 0u64;
 
+        // One header buffer for the whole run. `write_fetched` clears it before
+        // each record and encodes into it. A run over many small chunks then
+        // does not allocate one small buffer per record. The widest possible
+        // header fits, so the buffer does not grow after the first record.
+        let mut record = Vec::with_capacity(crate::storage::MAX_RECORD_HEADER);
+
         // The header is built before the payload starts, because its own length
         // decides where the payload starts.
         let header = Header {
@@ -681,7 +687,7 @@ impl Pack {
             let fetched = fetch_window(store, window).await?;
             for (planned, stored) in window.iter().zip(fetched) {
                 let (mut located, record_len) =
-                    write_fetched(&mut file, planned, &stored, route).await?;
+                    write_fetched(&mut file, planned, &stored, route, &mut record).await?;
                 located.offset = offset;
 
                 // Saturating, to match the count the header carries. The
@@ -1409,8 +1415,12 @@ where
 /// Write one fetched chunk.
 ///
 /// Compare the bytes with the plan.
-/// Encode the header.
+/// Encode the header into `record`.
 /// Append the record.
+///
+/// `record` is the caller's buffer rather than a fresh `Vec`, so a run over many
+/// chunks allocates nothing per record. The function clears it first and leaves
+/// it holding this record's header.
 ///
 /// **What the comparison can see depends on the route.** Under
 /// [`Route::Verbatim`] the record is the form the plan resolved. The check then
@@ -1428,6 +1438,7 @@ async fn write_fetched(
     planned: &PlannedChunk,
     stored: &Stored,
     route: Route,
+    record: &mut Vec<u8>,
 ) -> io::Result<(Located, u64)> {
     let stored_len = u64::try_from(stored.bytes.len()).unwrap_or(u64::MAX);
 
@@ -1470,11 +1481,9 @@ async fn write_fetched(
     // The store's own encoder, so these bytes are what a store
     // record would be. Hand-rolling the header here would make the pack a second
     // record format that agreed with the first until the first moved.
-    let mut record = Vec::with_capacity(
-        usize::try_from(crate::storage::header_len(stored_len, stored.raw_len)).unwrap_or(0),
-    );
+    record.clear();
     crate::storage::encode_header(
-        &mut record,
+        record,
         crate::storage::RecordKind::Blob,
         stored.codec,
         planned.id.as_bytes(),
@@ -1482,7 +1491,7 @@ async fn write_fetched(
         stored.raw_len,
     );
 
-    file.write_all(&record).await?;
+    file.write_all(record).await?;
     file.write_all(&stored.bytes).await?;
 
     Ok((
