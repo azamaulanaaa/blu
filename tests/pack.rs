@@ -4492,6 +4492,87 @@ async fn stop_the_window_at_the_first_error() {
         "the error should name the failing chunk, got: {error}"
     );
 }
+
+/// A store that never answers for one named chunk.
+///
+/// It reports every fetch it starts on a channel.
+struct HeldFetch<'a, S: ?Sized> {
+    store: &'a S,
+    held: blulib::storage::BlobId,
+    started: tokio::sync::mpsc::UnboundedSender<blulib::storage::BlobId>,
+}
+
+impl<S: StorageStored + ?Sized> StorageStored for HeldFetch<'_, S> {
+    async fn stored(&self, id: &blulib::storage::BlobId) -> std::io::Result<blulib::pack::Stored> {
+        // A failed send means the test dropped its receiver and abandoned
+        // the write.
+        let _ = self.started.send(*id);
+        if id == &self.held {
+            std::future::pending::<()>().await;
+        }
+        self.store.stored(id).await
+    }
+}
+
+/// Start a fetch past the window while an earlier chunk waits.
+///
+/// Hold the second chunk of the plan.
+/// Assert the writer starts a fetch for chunk 17.
+///
+/// The prefetch window is 16 chunks, so chunk 17 is the first chunk past it.
+/// A writer that fetches one window and waits for the whole window before it
+/// writes cannot start that fetch.
+/// `16` below is that window.
+#[tokio::test]
+async fn starts_a_fetch_past_the_window_while_an_earlier_chunk_waits() {
+    let built = build(6, 200_000).await;
+    let store = BlobStore::builder(&built.blob).open_reader().await.unwrap();
+    let snapshot = snapshot_of(&built.blob).await;
+
+    assert!(
+        built.plan.len() > 16,
+        "the fixture should hold more than sixteen chunks, got {}",
+        built.plan.len()
+    );
+
+    let held = built.plan.chunks()[1].id;
+    let later = built.plan.chunks()[16].id;
+    let (started, mut watching) = tokio::sync::mpsc::unbounded_channel();
+    let held_store = HeldFetch {
+        store: &store,
+        held,
+        started,
+    };
+
+    let at = built.dir.path().join("held.pack");
+    let mut write = std::pin::pin!(Pack::write(&held_store, &built.plan, &snapshot, 1, &at));
+
+    let saw_later = async {
+        while let Some(id) = watching.recv().await {
+            if id == later {
+                return;
+            }
+        }
+        panic!("the store was never asked for the later chunk");
+    };
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            biased;
+            result = &mut write => {
+                panic!("the writer finished while {held} was held: {result:?}");
+            }
+            () = saw_later => {}
+        }
+    })
+    .await;
+
+    assert!(
+        outcome.is_ok(),
+        "the writer did not start a fetch past the window while {held} was held"
+    );
+}
+
 /// Reused reader returns stored bytes.
 ///
 /// Open one reader. Read each chunk with it. Compare each result with reading once per chunk. Expect identical bytes and codes.

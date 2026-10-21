@@ -137,7 +137,7 @@
 //! nothing reads a pack to answer that.
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::RandomState},
+    collections::{HashMap, HashSet, VecDeque, hash_map::RandomState},
     fs,
     hash::{BuildHasher, Hasher},
     io::{self, Read, Seek, SeekFrom},
@@ -151,7 +151,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures_util::StreamExt as _;
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
 use tokio::{
     fs as tfs,
     io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, ReadBuf},
@@ -186,17 +186,19 @@ pub(crate) const MAX_CHUNK: u64 = crate::simd_cdc::MAXIMUM_MAX as u64;
 /// number is stated here because the refusal that enforces it must name it.
 const MAX_PACK_CHUNKS: u32 = u32::MAX;
 
-/// The writer fetches this many chunks at once.
+/// The writer keeps this many chunks in flight.
 ///
 /// The writer writes the records in plan order.
-/// A window holds at most this many chunks.
+/// The window holds at most this many chunks that wait for their turn.
+/// The chunk in hand is on its way out, so it does not count.
 const PREFETCH_WINDOW: usize = 16;
 
 /// The writer holds at most this many bytes of fetched chunks at once.
 ///
 /// The plan gives the size of every chunk, so the writer knows the size of a
-/// chunk before it reads the chunk. A window stops before it would hold more
-/// than this. The window fetches a chunk that is larger than this on its own.
+/// chunk before it reads the chunk. The window stops before it would hold more
+/// than this. The chunk in hand counts against the budget, because the writer
+/// still holds it. The window fetches a chunk that is larger than this on its own.
 ///
 /// The value is the size of the largest chunk the chunker can produce. A pack of
 /// large chunks therefore holds one chunk at a time. A pack of small chunks
@@ -497,8 +499,9 @@ impl Pack {
     /// not this run's to lose, and the pack's own path usually names one.
     /// The writer holds one window of chunks at a time, never a whole version.
     /// A window holds at most sixteen chunks and at most sixteen mebibytes of
-    /// fetched chunk data. The index and the snapshot both grow with what is
-    /// being packed.
+    /// fetched chunk data. The window slides as the writer takes each chunk, so
+    /// the writer writes a chunk as soon as it arrives. The index and the
+    /// snapshot both grow with what is being packed.
     ///
     /// `version` is the number the version has *in the set this is being packed
     /// from*. It goes in the header so a receiver can see where the pack came from.
@@ -689,28 +692,47 @@ impl Pack {
         })?;
 
         let planned_chunks = plan.chunks();
-        let mut start = 0usize;
-        while start < planned_chunks.len() {
-            let end = start + window_end(&planned_chunks[start..]);
-            let window = &planned_chunks[start..end];
 
-            // Fetch the window at the same time.
-            // The writes follow in plan order once the window is in hand.
-            // The first error in plan order wins.
-            let fetched = fetch_window(store, window).await?;
-            for (planned, stored) in window.iter().zip(fetched) {
-                let (mut located, record_len) =
-                    write_fetched(&mut file, planned, &stored, route, &mut record).await?;
-                located.offset = offset;
+        // The window slides over the plan.
+        // The writer takes a chunk as soon as it arrives, so it never holds a
+        // whole window of chunks while it waits for the last one of them.
+        // The window reports the first error in plan order.
+        let mut window = Window::new(planned_chunks);
 
-                // Saturating, to match the count the header carries. The
-                // header reports one total and the index is built on the other. A plain
-                // `+=` would panic where both would have clamped.
-                offset = offset.saturating_add(record_len);
-                chunks.push(located);
-            }
+        // The fetch of one chunk of the plan.
+        // The store's own future has a type only the store names, so the
+        // window takes this closure rather than the store.
+        let mut fetch = |at: usize| {
+            let planned = &planned_chunks[at];
+            async move { (at, store.stored(&planned.id).await) }
+        };
 
-            start = end;
+        window.fill(None, &mut fetch);
+
+        while window.has_more() {
+            // The next chunk in plan order.
+            // The window waits for it and reports the first error in plan order.
+            let (planned, stored) = window.take().await?;
+
+            // The chunk in hand is still held, so it counts against the byte
+            // budget while the window starts the next fetches.
+            window.fill(Some(planned.placement.stored_len), &mut fetch);
+
+            // Write the chunk.
+            // The window's fetches keep running while the write waits, so the
+            // next read overlaps this write.
+            let (mut located, record_len) = write_while_fetching(
+                write_fetched(&mut file, planned, &stored, route, &mut record),
+                &mut window,
+            )
+            .await?;
+            located.offset = offset;
+
+            // Saturating, to match the count the header carries. The
+            // header reports one total and the index is built on the other. A plain
+            // `+=` would panic where both would have clamped.
+            offset = offset.saturating_add(record_len);
+            chunks.push(located);
         }
 
         // Between the payloads and the index, so `index length` alone
@@ -1436,86 +1458,206 @@ pub(crate) fn planned_payload_len(plan: &Plan) -> u64 {
     })
 }
 
-/// Where a window of fetched chunks ends.
+/// The writer's window over the plan.
 ///
-/// The window holds at most [`PREFETCH_WINDOW`] chunks.
-/// The window holds at most [`PREFETCH_BYTES`] bytes of chunk data.
-/// The window fetches a chunk that is larger than the budget on its own.
+/// The window holds the fetches that are running and the chunks that have
+/// arrived and wait for their turn.
+/// The window holds at most [`PREFETCH_WINDOW`] chunks that wait for their turn.
+/// The window holds at most [`PREFETCH_BYTES`] of fetched data.
+/// The chunk in hand is on its way out, so it does not count against the first
+/// limit. It counts against the second, because the writer still holds it.
 ///
-/// The size of a chunk comes from the plan, so the writer knows it before it
-/// reads the chunk.
-fn window_end(window: &[PlannedChunk]) -> usize {
-    let mut bytes = 0u64;
-    for (at, planned) in window.iter().enumerate() {
-        if at == PREFETCH_WINDOW {
-            return at;
-        }
-        let len = planned.placement.stored_len;
-        if at > 0 && bytes.saturating_add(len) > PREFETCH_BYTES {
-            return at;
-        }
-        bytes = bytes.saturating_add(len);
-    }
-    window.len()
+/// **The window slides.** The writer takes a chunk as soon as it arrives and
+/// starts the next fetch, so the window never holds a whole set of chunks
+/// while the writer waits for the last one of them.
+///
+/// The window yields the chunks in plan order.
+/// The window reports the first error in plan order.
+/// The window drops the fetches it does not need once it reports an error.
+///
+/// The type of a fetch is the store's own, and the store's type does not name
+/// it. The window therefore takes a closure that starts a fetch, and the
+/// closure's own type is the type of the fetches the window holds.
+struct Window<'a, Fut> {
+    /// The plan, in plan order.
+    planned: &'a [PlannedChunk],
+    /// The fetches that are running.
+    ///
+    /// A fetch answers with the plan index it answers for, so the window can
+    /// put every answer in its own place.
+    running: FuturesUnordered<Fut>,
+    /// What each fetch in the window answered.
+    ///
+    /// The slots are in plan order. A slot is empty until its fetch answers.
+    slots: VecDeque<Option<io::Result<Stored>>>,
+    /// The plan index of the first slot.
+    head: usize,
+    /// The plan index of the next chunk to fetch.
+    tail: usize,
+    /// The planned bytes the slots hold.
+    bytes: u64,
 }
 
-/// Fetch the chunks of one window at the same time.
+impl<'a, Fut> Window<'a, Fut>
+where
+    Fut: Future<Output = (usize, io::Result<Stored>)>,
+{
+    /// A window over `planned`.
+    fn new(planned: &'a [PlannedChunk]) -> Self {
+        Self {
+            planned,
+            running: FuturesUnordered::new(),
+            slots: VecDeque::new(),
+            head: 0,
+            tail: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Whether the plan holds a chunk the writer has not written.
+    fn has_more(&self) -> bool {
+        self.head < self.planned.len()
+    }
+
+    /// Start the fetches the window allows.
+    ///
+    /// `held` is the size of the chunk in hand, if there is one. The writer
+    /// still holds that chunk, so it counts against the byte budget.
+    /// `fetch` starts the fetch for the chunk at a plan index.
+    fn fill(&mut self, held: Option<u64>, fetch: &mut impl FnMut(usize) -> Fut) {
+        while self.room(held) {
+            let at = self.tail;
+            let planned = &self.planned[at];
+
+            self.tail += 1;
+            self.slots.push_back(None);
+            self.bytes = self.bytes.saturating_add(planned.placement.stored_len);
+            self.running.push(fetch(at));
+        }
+    }
+
+    /// Whether another fetch may start.
+    ///
+    /// The window holds at most [`PREFETCH_WINDOW`] chunks that wait for their
+    /// turn.
+    /// The window holds at most [`PREFETCH_BYTES`] of fetched data.
+    /// The chunk in hand counts against the budget, because the writer holds it.
+    ///
+    /// The size of a chunk comes from the plan, so the window knows it before it
+    /// reads the chunk.
+    /// A chunk that is larger than the budget is fetched on its own.
+    fn room(&self, held: Option<u64>) -> bool {
+        if self.slots.len() >= PREFETCH_WINDOW {
+            return false;
+        }
+        let Some(next) = self.planned.get(self.tail) else {
+            return false;
+        };
+
+        // A chunk that is larger than the budget is fetched on its own.
+        if self.slots.is_empty() && held.is_none() {
+            return true;
+        }
+
+        self.bytes
+            .saturating_add(held.unwrap_or(0))
+            .saturating_add(next.placement.stored_len)
+            <= PREFETCH_BYTES
+    }
+
+    /// Poll the fetches that are running.
+    ///
+    /// An answer that has arrived goes into its own slot.
+    fn poll_fetches(&mut self, cx: &mut Context<'_>) {
+        loop {
+            match self.running.poll_next_unpin(cx) {
+                Poll::Ready(Some((at, answer))) => {
+                    let slot = at.saturating_sub(self.head);
+                    if let Some(slot) = self.slots.get_mut(slot) {
+                        *slot = Some(answer);
+                    }
+                }
+                Poll::Ready(None) | Poll::Pending => return,
+            }
+        }
+    }
+
+    /// The next chunk in plan order.
+    ///
+    /// The window waits for the chunk at the head of the window.
+    /// The window reports the first error in plan order.
+    /// The window drops the fetches it does not need once it reports an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a fetch fails.
+    /// The error is the first one in plan order.
+    async fn take(&mut self) -> io::Result<(&'a PlannedChunk, Stored)> {
+        loop {
+            // The head's answer, if its fetch has finished.
+            if self.slots.front().is_some_and(Option::is_some) {
+                let Some(answer) = self.slots.pop_front().flatten() else {
+                    return Err(io::Error::other(
+                        "the pack writer lost the answer to a fetch of its plan",
+                    ));
+                };
+                let at = self.head;
+                self.head += 1;
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(self.planned[at].placement.stored_len);
+                let planned = &self.planned[at];
+                return answer.map(|stored| (planned, stored));
+            }
+
+            // Wait for a fetch to answer.
+            let starved = futures_util::future::poll_fn(|cx| {
+                self.poll_fetches(cx);
+                if self.slots.front().is_some_and(Option::is_some) {
+                    Poll::Ready(false)
+                } else if self.running.is_empty() {
+                    Poll::Ready(true)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            if starved {
+                return Err(io::Error::other(
+                    "the pack writer has no fetch left for a chunk of its plan",
+                ));
+            }
+        }
+    }
+}
+
+/// Write one fetched chunk while the window's fetches keep running.
 ///
-/// The window holds every chunk it fetched, in plan order.
-/// The window reports the first error in plan order.
-/// The window stops waiting for the other fetches once it knows that error.
-/// The window drops the other fetches, so their results are not used.
+/// The write and the fetches are polled in the same cycle.
+/// A fetch that has started therefore runs while the write waits.
 ///
 /// # Errors
 ///
-/// Returns an error if a fetch fails.
-/// The error is the first one in plan order.
-async fn fetch_window<S>(store: &S, window: &[PlannedChunk]) -> io::Result<Vec<Stored>>
+/// Returns an error if the write fails.
+async fn write_while_fetching<Fut>(
+    write: impl Future<Output = io::Result<(Located, u64)>>,
+    window: &mut Window<'_, Fut>,
+) -> io::Result<(Located, u64)>
 where
-    S: StorageStored + ?Sized,
+    Fut: Future<Output = (usize, io::Result<Stored>)>,
 {
-    let mut pending = futures_util::stream::FuturesUnordered::new();
-    for (at, planned) in window.iter().enumerate() {
-        pending.push(async move { (at, store.stored(&planned.id).await) });
-    }
-
-    // The chunk of every fetch, in plan order.
-    // A slot stays empty until its fetch finishes.
-    let mut fetched: Vec<Option<Stored>> = vec![None; window.len()];
-    // The first failure in plan order, and the place it sits.
-    let mut first_failure: Option<(usize, io::Error)> = None;
-
-    while let Some((at, result)) = pending.next().await {
-        match result {
-            Ok(stored) => fetched[at] = Some(stored),
-            Err(error) => {
-                if first_failure
-                    .as_ref()
-                    .is_none_or(|(earlier, _)| at < *earlier)
-                {
-                    first_failure = Some((at, error));
-                }
-            }
+    let mut write = std::pin::pin!(write);
+    futures_util::future::poll_fn(|cx| {
+        // The write first.
+        if let Poll::Ready(result) = write.as_mut().poll(cx) {
+            return Poll::Ready(result);
         }
 
-        let Some((earlier, _)) = first_failure.as_ref() else {
-            continue;
-        };
-        // A fetch before the first failure may fail earlier in plan order, so
-        // the window waits for those fetches. A fetch after it cannot be the
-        // first failure, so the window stops as soon as the earlier fetches
-        // have finished. The window drops the fetches it does not wait for.
-        if fetched[..*earlier].iter().all(Option::is_some) {
-            break;
-        }
-    }
-
-    if let Some((_, error)) = first_failure {
-        return Err(error);
-    }
-
-    // Every fetch of the window finished, so every slot holds its chunk.
-    Ok(fetched.into_iter().flatten().collect())
+        // The fetches next, so a fetch starts while the write waits.
+        window.poll_fetches(cx);
+        Poll::Pending
+    })
+    .await
 }
 
 /// Write one fetched chunk.
