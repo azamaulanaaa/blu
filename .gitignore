@@ -4,6 +4,15 @@
 /.cargo/registry
 /.cargo/git
 
+# Reports. The tree carries no report directory: the project dropped the
+# earlier one from `main`, and the benchmark harness writes its output here.
+# The evidence of a measurement belongs in the commit message, which is in the
+# history, and in the file the harness leaves on the machine.
+#
+# `reports/perf-audit-v0.11.0.md` is the audit of the `perf` commits since
+# `v0.11.0`. It stays on the machine and out of the tree.
+/reports/
+
 # Store files. `blu backup <dir> <base>` writes `<base>.NNNN.bin` and
 # `<base>.vNNNN.idx` into the *current directory* when the base is a bare name,
 # and a test that runs the binary without setting a working directory leaves one
