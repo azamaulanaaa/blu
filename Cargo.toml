@@ -1,9 +1,9 @@
 [package]
 name = "blulib"
-# Both benches are declared by hand below, because criterion is not a libtest
-# harness. With auto-discovery left on, `benches/fixture.rs` — a module both
-# benches include for its byte generator, not a target — would be built as a
-# third benchmark and fail to link. Every target this package has is listed
+# Every bench is declared by hand below, because criterion is not a libtest
+# harness. With auto-discovery left on, `benches/fixture.rs` — a module every
+# bench includes for its byte generator, not a target — would be built as
+# another benchmark and fail to link. Every target this package has is listed
 # explicitly, so nothing is lost by saying so.
 autobenches = false
 # 0.2.0 introduced zstd compression, which changed the record format:
@@ -363,6 +363,10 @@ xattr = "1.6.1"
 # Criterion is not a libtest harness, so each bench target opts out of it.
 [[bench]]
 name = "hotpath"
+harness = false
+
+[[bench]]
+name = "pack"
 harness = false
 
 [[bench]]
