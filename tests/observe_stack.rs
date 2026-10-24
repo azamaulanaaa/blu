@@ -5,7 +5,7 @@
 //! Every other test of job progress builds the subscriber it needs. **`serve`’s
 //! own tests build one the library hands them** — the progress layer on its own,
 //! or the progress layer and its filter — because that is the seam they are
-//! testing. `src/main.rs::init_tracing` is a different seam: it is the *whole*
+//! testing. `src/cli/telemetry.rs::init_tracing` is a different seam: it is the *whole*
 //! stack, on the process-global subscriber, and it is the only place in the
 //! crate that builds one.
 //!
@@ -146,7 +146,7 @@ fn actix_like() -> tokio::runtime::Runtime {
 
 /// Install `init_tracing`’s stack, for a quiet server with telemetry on.
 ///
-/// **Mirrored from `src/main.rs::init_tracing`, line for line and layer for
+/// **Mirrored from `src/cli/telemetry.rs::init_tracing`, line for line and layer for
 /// layer**, and the mirroring is the point: a stack re-derived from the same idea
 /// rather than read off the same code proves only that the re-derivation agrees
 /// with itself. The order, the three filters and the three layers are that

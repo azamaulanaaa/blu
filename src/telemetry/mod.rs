@@ -19,7 +19,7 @@
 //! A `tracing` subscriber is process-global, and this crate is a library first:
 //! a caller embedding `blu` owns its own subscriber and would not find one
 //! installed under it. So [`layer`] builds the layer and returns it, and
-//! `init_tracing` in `main.rs` puts it on the subscriber. That is the same
+//! `init_tracing` in `src/cli/telemetry.rs` puts it on the subscriber. That is the same
 //! arrangement as [`crate::serve::progress_layer`].
 //!
 //! # Shutdown is not optional
@@ -31,7 +31,7 @@
 //! reports a whole run through telemetry and then discards it is worse than one
 //! that has no telemetry, because the operator is told they have it.
 //!
-//! So [`shutdown`] exists and `main.rs` calls it after its own `run` returns, on
+//! So [`shutdown`] exists and `src/cli/mod.rs` calls it after its own `run` returns, on
 //! every path out: the command succeeded, the command failed, and the process
 //! was asked to stop. All three are one place, because
 //! `main` computes an exit code and then returns it — see
@@ -230,7 +230,7 @@ impl Config {
 ///
 /// The `Filtered` is not incidental: it is where [`filter`] lives, and a layer
 /// without one is offered every span in the process. `S` is the subscriber the
-/// layer is being added to, which the caller never has to name — `main.rs`
+/// layer is being added to, which the caller never has to name — `src/cli/mod.rs`
 /// stacks this under [`crate::serve::progress_layer`] without writing a single
 /// type parameter.
 pub type Layer<S> = tracing_subscriber::filter::Filtered<
@@ -307,7 +307,7 @@ fn installed() -> Option<SdkTracerProvider> {
 /// Returns an error if the exporter cannot be built — a malformed endpoint, or
 /// an HTTP client that could not be created. It is an error rather than a
 /// silent `None`, because the operator asked for telemetry and not getting it
-/// is worth a warning; `main.rs` prints one and carries on, because a collector
+/// is worth a warning; `src/cli/telemetry.rs` prints one and carries on, because a collector
 /// being down is not a reason to refuse to back up a directory.
 pub fn layer<S>(config: &Config) -> io::Result<Option<Layer<S>>>
 where

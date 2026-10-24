@@ -123,7 +123,7 @@ pub fn filter() -> EnvFilter {
 
 /// A `tracing` layer forwarding job progress into the registry.
 ///
-/// Installed by `init_tracing` in `main.rs`, which is the only place that owns the
+/// Installed by `init_tracing` in `src/cli/telemetry.rs`, which is the only place that owns the
 /// subscriber. The library does not install it, so a library caller that wants
 /// progress over HTTP installs [`Handle`] itself.
 struct Progress {
@@ -259,7 +259,7 @@ impl Visit for CounterVisitor<'_> {
     }
 }
 
-/// The layer, as `main.rs` installs it and as a library caller would.
+/// The layer, as `src/cli/telemetry.rs` installs it and as a library caller would.
 ///
 /// **A newtype rather than an `impl` on `Arc<Progress>`.** A blanket
 /// `impl<S> Layer<S> for Arc<T>` is not permitted: the orphan rule needs a local

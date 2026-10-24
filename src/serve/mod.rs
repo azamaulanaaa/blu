@@ -98,7 +98,7 @@ pub use observe::Handle as ProgressLayer;
 pub use observe::filter as progress_filter;
 
 /// The `tracing` layer that forwards a running job's progress counters into its
-/// registry, for `main.rs` to install on the subscriber.
+/// registry, for `src/cli/telemetry.rs` to install on the subscriber.
 ///
 /// **The library does not install it.** A subscriber is process-global and this
 /// crate is a library first: a caller embedding `blu` owns its own tracing

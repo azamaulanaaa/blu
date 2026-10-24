@@ -98,7 +98,7 @@ metric = "wall_ms"
 
 [[scenario]]
 name = "merge.push"
-paths = ["src/main.rs"]
+paths = ["src/cli/merge.rs", "src/cli/push.rs", "src/cli/target.rs"]
 shape = "default"
 
 fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }

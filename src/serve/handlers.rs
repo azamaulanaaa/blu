@@ -858,7 +858,7 @@ async fn merge_pack(
 /// state this type has.
 ///
 /// The same shape as the CLI's `KeepOrLevel`, and for the same reason — see
-/// `KeepOrLevel::policy` in `main.rs`, which this is the server half of.
+/// `KeepOrLevel::policy` in `src/cli/compression.rs`, which this is the server half of.
 ///
 /// `keep` names neither, so it answers the default policy.
 /// The verbatim path does not compress a chunk; the only record it writes through
