@@ -1,0 +1,85 @@
+# The scenarios the two-revision driver measures.
+#
+# `paths` names the source files a scenario exercises.
+# `shape` is `default` or `forced`.
+# `fixture` names the shape that `examples/mktree.rs` writes.
+# `prepare` fills the store before the measured command, and the driver does not
+# time it.
+# `command` runs one time for the base arm and one time for the head arm.
+# `metric` is `wall_ms`, `cpu_ms` or `rss_kb`.
+# `unmeasurable` says why a scenario cannot run. The driver reports the reason
+# and skips the scenario.
+
+[[scenario]]
+name = "backup.many-small"
+paths = ["src/command/backup.rs", "src/storage/blob.rs"]
+shape = "default"
+fixture = { kind = "tree", files = 5000, bytes = 32768, shared = 16384 }
+command = ["--quiet", "backup", "{src}", "{store}"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "backup.one-large"
+paths = ["src/reader.rs", "src/storage/blob.rs"]
+shape = "default"
+fixture = { kind = "tree", files = 1, bytes = 268435456, shared = 0 }
+command = ["--quiet", "backup", "{src}", "{store}"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "restore.default"
+paths = ["src/command/restore.rs", "src/command/manifest.rs"]
+shape = "default"
+fixture = { kind = "identical", files = 400, bytes = 1048576 }
+prepare = [["--quiet", "backup", "{src}", "{store}"]]
+command = ["--quiet", "restore", "{dest}", "{store}"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "pack.default"
+paths = ["src/command/pack.rs", "src/pack.rs"]
+shape = "default"
+fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
+prepare = [["--quiet", "backup", "{src}", "{store}"]]
+command = ["--quiet", "pack", "{store}", "{pack}"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "pack.recompress"
+paths = ["src/command/pack.rs", "src/storage/compression.rs", "src/pack.rs"]
+shape = "forced"
+fixture = { kind = "compressible", files = 250, bytes = 1048576 }
+prepare = [["--quiet", "backup", "{src}", "{store}"]]
+command = ["--quiet", "pack", "{store}", "{pack}", "--compression", "3"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "apply.default"
+paths = ["src/command/apply.rs", "src/pack.rs"]
+shape = "default"
+fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
+prepare = [
+  ["--quiet", "backup", "{src}", "{store}"],
+  ["--quiet", "pack", "{store}", "{pack}"],
+]
+command = ["--quiet", "apply", "{pack}", "{dest}"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "store.open"
+paths = ["src/storage/blob.rs", "src/layout.rs"]
+shape = "default"
+fixture = { kind = "unique", files = 4000, bytes = 65536 }
+prepare = [["--quiet", "backup", "{src}", "{store}"]]
+command = ["--quiet", "versions", "{store}"]
+metric = "rss_kb"
+unmeasurable = "the blu binary has no store-level open command"
+
+[[scenario]]
+name = "store.put.8mib"
+paths = ["src/storage/blob.rs", "src/storage/compression.rs"]
+shape = "forced"
+fixture = { kind = "unique", files = 50, bytes = 8388608 }
+command = ["--quiet", "backup", "{src}", "{store}"]
+metric = "wall_ms"
+unmeasurable = "the blu binary has no store-level put command, and a backup cuts records at 64 KiB"

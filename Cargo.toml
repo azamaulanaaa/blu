@@ -351,6 +351,19 @@ experimental = []
 # it in parallel would only measure the sampler. Add the features back if the
 # plots are ever wanted.
 criterion = { version = "0.7", default-features = false }
+# TOML parser for the scenario table (`examples/bench.rs`).
+#
+# MIT OR Apache-2.0, both allowed by `deny.toml`.
+# The table is data, so the example reads it with a parser rather than with a
+# hand-written scanner. A malformed table then fails with a line number.
+toml = "1.1"
+# Host-wide lock around each cargo call of the two-revision driver
+# (`examples/bench.rs`).
+#
+# MIT OR Apache-2.0, both allowed by `deny.toml`.
+# The lock is one file in the system temporary directory, so two driver runs on
+# one host never build at the same time.
+fs2 = "0.4"
 
 [target.'cfg(unix)'.dev-dependencies]
 # Extended attributes in fidelity tests (`tests/fidelity.rs`).
