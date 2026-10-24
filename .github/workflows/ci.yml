@@ -14,6 +14,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The weekly run is for bench-verify. A pull request runs bench-fast, and a
+  # pull request with the `perf` label runs bench-pair.
+  schedule:
+    - cron: '0 4 * * 1'
   # So the release workflow can gate publishing on this having passed.
   workflow_call:
 
@@ -244,3 +248,135 @@ jobs:
           install: cargo-deny@0.20.2
       - name: Check wildcards and duplicate versions
         run: cargo deny check bans
+
+  # The component benchmarks, on the fixture each target builds for itself.
+  # Criterion's `--test` mode runs every benchmark one time and reports no
+  # number, so this job stays cheap enough for every pull request.
+  bench-fast:
+    name: bench-fast
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      # `hotpath` and `pack` are the component benches. Neither has a fixture
+      # size switch, and each builds its fixture once per process. `--test`
+      # runs one iteration of every benchmark, so this job shows that the
+      # component benches still build and run without spending minutes on
+      # measurement.
+      - name: Run the component benchmarks
+        run: cargo bench --locked --bench hotpath --bench pack -- --test
+      - name: Write the summary
+        if: always()
+        run: |
+          {
+            echo '## bench-fast'
+            echo
+            echo 'This job runs the component benchmarks `hotpath` and `pack` one time each.'
+            echo 'The run is advisory. It does not change the pull request result.'
+            echo
+            echo 'Ask a maintainer to add the `perf` label to this pull request.'
+            echo 'The `bench-pair` job starts on the next push.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The two-revision comparison. The `perf` label is the opt-in, so a normal
+  # pull request does not build two revisions for the paired run.
+  bench-pair:
+    name: bench-pair
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      # The driver builds both revisions in its own worktrees. It takes the
+      # host-wide lock around each inner cargo call, and the outer `cargo run`
+      # does not take that lock.
+      - name: Compare the pull request with main
+        run: |
+          cargo run --release --locked --example bench -- \
+            --base origin/main --head HEAD --diff origin/main..HEAD
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-pair-report
+          path: reports/bench/*.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Write the summary
+        if: always()
+        run: |
+          {
+            echo '## bench-pair'
+            echo
+            echo 'This job compares `origin/main` with `HEAD` and reports the noise floor.'
+            echo 'The run is advisory. It does not change the pull request result.'
+            echo 'The JSON report is in the `bench-pair-report` artifact.'
+            echo
+            echo 'Ask a maintainer to add the `perf` label to the pull request.'
+            echo 'The job starts on the next push.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The release range. This job runs when release.yml calls this workflow from
+  # a tag, and on the weekly schedule.
+  bench-verify:
+    name: bench-verify
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: ''
+      # A tag run compares the tag with the tag before it. A scheduled run
+      # compares the default branch with the last release.
+      - name: Find the previous release
+        id: previous
+        run: |
+          set -eu
+          if git describe --tags --exact-match HEAD > /dev/null 2>&1; then
+            revision=$(git describe --tags --abbrev=0 HEAD^)
+          else
+            revision=$(git describe --tags --abbrev=0 HEAD)
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "base revision: $revision"
+      - name: Compare the release range
+        run: |
+          cargo run --release --locked --example bench -- \
+            --base "${{ steps.previous.outputs.revision }}" \
+            --head HEAD \
+            --diff "${{ steps.previous.outputs.revision }}..HEAD"
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-verify-report
+          path: reports/bench/*.json
+          if-no-files-found: ignore
+          retention-days: 90
+      - name: Write the summary
+        if: always()
+        run: |
+          {
+            echo '## bench-verify'
+            echo
+            echo 'This job compares the previous release tag with `HEAD` and reports the noise floor.'
+            echo 'It runs before a release and on a schedule.'
+            echo 'The run is advisory. It does not change the release result.'
+            echo 'The JSON reports are in the `bench-verify-report` artifact.'
+          } >> "$GITHUB_STEP_SUMMARY"
