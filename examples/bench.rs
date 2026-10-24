@@ -92,8 +92,8 @@
 //! Three rounds put the same binary in both arms, and the paired differences
 //! of those rounds are the noise.
 //! The floor is the largest of those differences.
-//! An effect below the floor is not a result, because the machine reached
-//! that difference on its own.
+//! An effect at or below the floor is not a result, because the machine
+//! reached that difference on its own.
 //! The noise rounds run inside the loop of the arms, so the floor comes from
 //! the same conditions as the effect.
 
@@ -135,7 +135,7 @@ usage: bench --base REV --head REV [--scenario NAME]... [--diff FROM..TO]
 
 /// The three things a run records.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     /// The wall time of the run.
     Wall,
     /// The CPU time of the child.
@@ -189,13 +189,13 @@ impl Kind {
 }
 
 /// One run of one binary.
-struct Sample {
+pub(crate) struct Sample {
     /// The wall time of the run, in milliseconds.
-    wall_ms: f64,
+    pub(crate) wall_ms: f64,
     /// The CPU time of the child, in milliseconds.
-    cpu_ms: Option<f64>,
+    pub(crate) cpu_ms: Option<f64>,
     /// The peak resident memory of the child, in KiB.
-    rss_kb: Option<f64>,
+    pub(crate) rss_kb: Option<f64>,
 }
 
 /// What the command line asked for.
@@ -249,11 +249,11 @@ struct Measurement {
 }
 
 /// The paired differences of the noise rounds, for one measurement.
-struct Noise {
+pub(crate) struct Noise {
     /// The measurement itself.
-    kind: Kind,
+    pub(crate) kind: Kind,
     /// The paired difference of each noise round, as a percentage.
-    diffs: Vec<f64>,
+    pub(crate) diffs: Vec<f64>,
 }
 
 /// The state of the machine around the run.
@@ -690,7 +690,7 @@ fn peak_rss_kb(usage: &libc::rusage) -> f64 {
 }
 
 /// The paired difference of each round, as a percentage of the base.
-fn paired(base: &[Sample], head: &[Sample], kind: Kind) -> Vec<f64> {
+pub(crate) fn paired(base: &[Sample], head: &[Sample], kind: Kind) -> Vec<f64> {
     base.iter()
         .zip(head.iter())
         .filter_map(|(base, head)| {
@@ -755,7 +755,7 @@ fn values(samples: &[Sample], kind: Kind) -> Vec<f64> {
 /// a floor below the worst noise the machine reached cannot promise that.
 /// The tool prints the spread of the differences next to the floor, so the
 /// reader sees the whole picture.
-fn floor_of(noise: &[Noise], kind: Kind) -> f64 {
+pub(crate) fn floor_of(noise: &[Noise], kind: Kind) -> f64 {
     noise
         .iter()
         .find(|entry| entry.kind == kind)
@@ -769,7 +769,7 @@ fn floor_of(noise: &[Noise], kind: Kind) -> f64 {
 }
 
 /// How many rounds each arm won.
-fn sign_counts(diffs: &[f64]) -> (usize, usize) {
+pub(crate) fn sign_counts(diffs: &[f64]) -> (usize, usize) {
     let mut head_wins = 0;
     let mut base_wins = 0;
     for diff in diffs {
@@ -783,8 +783,13 @@ fn sign_counts(diffs: &[f64]) -> (usize, usize) {
 }
 
 /// The verdict of one measurement.
-fn verdict(median_diff: f64, floor: f64, head_wins: usize, base_wins: usize) -> &'static str {
-    if median_diff.abs() < floor {
+pub(crate) fn verdict(
+    median_diff: f64,
+    floor: f64,
+    head_wins: usize,
+    base_wins: usize,
+) -> &'static str {
+    if median_diff.abs() <= floor {
         return "unmeasurable";
     }
     if head_wins >= base_wins + MARGIN {
@@ -797,7 +802,7 @@ fn verdict(median_diff: f64, floor: f64, head_wins: usize, base_wins: usize) -> 
 }
 
 /// The median of a list of values.
-fn median(values: &[f64]) -> f64 {
+pub(crate) fn median(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
