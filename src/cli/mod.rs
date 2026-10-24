@@ -556,6 +556,8 @@ enum Command {
 }
 
 pub(crate) async fn entry() -> ExitCode {
+    blulib::install_crypto_provider();
+
     let args = Args::parse();
 
     // The registry the progress layer forwards into. It has to exist before

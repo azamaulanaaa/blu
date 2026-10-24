@@ -56,6 +56,22 @@
 //! # }
 //! ```
 
+/// Install the process-wide rustls crypto provider.
+///
+/// Two providers are in the graph: `ring` through `awc`, and `aws-lc-rs`
+/// through `reqwest` 0.13. `rustls` refuses to choose between them and panics
+/// when it builds its first TLS configuration. Every `ClientConfig` this crate
+/// builds by hand already names `ring`, so the process-wide default is `ring`
+/// as well.
+///
+/// The call is idempotent and cheap after the first one.
+pub fn install_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub mod client;
 pub mod command;
 pub mod fsattr;

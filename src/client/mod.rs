@@ -186,6 +186,8 @@ impl Remote {
 
     /// Build a client from a checked address and an optional token.
     fn build(base: String, token: Option<String>) -> Self {
+        crate::install_crypto_provider();
+
         Self {
             base,
             client: awc::Client::builder()

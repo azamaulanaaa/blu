@@ -48,13 +48,15 @@ allow = [
     # `Apache-2.0` is already allowed above.
     #
     # **`webpki-roots` is deliberately absent, and that is a decision rather than
-    # an omission.** TLS uses the operating system trust store, not Mozilla's
-    # compiled-in bundle. The bundle pulls `webpki-roots`, which is
-    # `CDLA-Permissive-2.0` — a licence this project
-    # does not take a compatibility position on to save a manifest line. The
-    # system store is also the behaviour a
-    # command-line tool keeps on a machine whose trust store its
-    # operator already maintains.
+    # an omission.** TLS uses the operating system trust store, not a
+    # compiled-in Mozilla bundle. Nothing in the graph pulls `webpki-roots`.
+    #
+    # `webpki-root-certs` is a different crate with the same licence family:
+    # `reqwest` 0.13 reaches it through `rustls-platform-verifier`, which still
+    # prefers the operating system store and keeps the bundled roots as a
+    # fallback for platforms that have no verifier. `CDLA-Permissive-2.0` is a
+    # permissive data licence, so it is allowed here.
+    "CDLA-Permissive-2.0",
     "ISC",
 ]
 # Some crates ship licence text without an SPDX expression. 0.9 rather than the

@@ -196,7 +196,7 @@ zstd = "0.13"
 # nothing in this one bridges `tracing` events into OTel logs and carrying the
 # signal API for a bridge that does not exist would be graph for nothing. Same
 # reason for `internal-logs`: this crate keeps its diagnostics on `tracing`.
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
 # `rt-tokio` is what makes an *asynchronous* OTLP client usable at all, and it
 # is not a detail. Without it the batch processor drives the exporter on its own
 # `std` thread with `futures_executor::block_on`, which has no tokio reactor:
@@ -227,16 +227,16 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 # and **the numbers are lost with no error anywhere and an exit code of 0** —
 # the same silent loss the span exporter has, in the same place. The
 # runtime-aware reader spawns its worker on the runtime `main` already runs.
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime"] }
 # Only the stable, non-experimental attribute constants, and only the three this
 # crate actually writes: `service.name`, `service.version` and
 # `process.executable.name`. `semconv_experimental` is off, so a naming change
 # upstream cannot move an attribute out from under the resource.
-opentelemetry-semantic-conventions = { version = "0.31", default-features = false }
+opentelemetry-semantic-conventions = { version = "0.33", default-features = false }
 # `default-features = false` drops `tracing-log` (this crate uses `tracing`
 # directly and has no `log` records to forward) and `metrics` (the layer's
 # metrics bridge, which would duplicate the instruments rather than feed them).
-tracing-opentelemetry = { version = "0.32", default-features = false }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 # **The exporter, and the whole of the TLS argument.**
 #
 # * `http-proto` sends OTLP over HTTP with protobuf bodies.
@@ -248,15 +248,18 @@ tracing-opentelemetry = { version = "0.32", default-features = false }
 # * `reqwest-rustls` enables TLS for the exporter.
 #   The client speaks plain HTTP and verified HTTPS.
 #   It verifies against the operating system roots.
-#   It uses rustls with ring, not `aws-lc-rs`, which needs `cmake`.
-#   It pulls no openssl and no compiled-in Mozilla bundle.
+#   `reqwest` 0.13's `rustls` feature brings `aws-lc-rs` as well as the
+#   `ring` that `awc` already selects. Both providers in one process make
+#   rustls refuse to choose, so `blulib::install_crypto_provider` installs
+#   `ring` as the process-wide default.
+#   It pulls no openssl.
 #
-# The feature resolves to `reqwest`'s `rustls-tls-native-roots`.
+# The feature resolves to `reqwest`'s `rustls` with the platform verifier.
 # A collector is verified against the operating system store.
 # An `https://` endpoint connects.
 # An `http://` endpoint still connects.
 # Nothing downgrades and nothing upgrades.
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-client", "reqwest-rustls"] }
 # Keyed stores beyond `file://` (`src/storage/operator.rs`).
 #
 # Every build speaks `file://`, `ftp://`, and `s3://`.
