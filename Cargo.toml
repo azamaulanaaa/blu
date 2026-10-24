@@ -359,6 +359,16 @@ criterion = { version = "0.7", default-features = false }
 # Unix-only like the `cfg(unix)` dependency above. Tests set `user`
 # attributes through these calls and read them back after a round trip.
 xattr = "1.6.1"
+# The usage of a child process in the paired measurement runner
+# (`examples/bench.rs`).
+#
+# MIT OR Apache-2.0, both allowed by `deny.toml`.
+# Unix-only like the `cfg(unix)` dependency above. The example reads the usage
+# of a child process, and only Unix has that usage. `wait4` returns it. The
+# usage of a child is gone the moment the parent waits for it, so `/proc`
+# cannot answer the question. This is the only reason the example calls
+# `libc`.
+libc = "0.2"
 
 # Criterion is not a libtest harness, so each bench target opts out of it.
 [[bench]]
@@ -392,7 +402,14 @@ debug = true
 missing_docs = "deny"
 missing_debug_implementations = "deny"
 unreachable_pub = "deny"
-unsafe_code = "forbid"
+# `deny`, and not `forbid`, because `examples/bench.rs` calls one libc
+# function: `wait4`, which returns the usage of one child process.
+# A `forbid` cannot be relaxed by an attribute in the source, and the
+# measurement needs that call.
+#
+# Only that example allows unsafe code, so the library and the binary keep the
+# ban. They have no `allow` for it anywhere.
+unsafe_code = "deny"
 
 [lints.rustdoc]
 broken_intra_doc_links = "deny"

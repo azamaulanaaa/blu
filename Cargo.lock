@@ -449,6 +449,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "jiff",
+ "libc",
  "opendal",
  "opendal-http-transport-reqwest",
  "opentelemetry",
