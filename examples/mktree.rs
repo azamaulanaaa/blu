@@ -82,7 +82,7 @@ const COMPRESSIBLE: u64 = 4;
 const MUTATE: u64 = 5;
 
 /// The bytes of the pattern that one block repeats.
-const PATTERN_BYTES: usize = 1024;
+pub(crate) const PATTERN_BYTES: usize = 1024;
 
 /// The bytes of one block of a `compressible` file.
 const BLOCK_BYTES: usize = 64 * 1024;
@@ -195,7 +195,7 @@ fn digest_word(bytes: &[u8]) -> u64 {
 
 /// New bytes of the same length as `old`.
 ///
-/// The seed comes from the old bytes, so two runs on one tree write the same
+/// The seed comes from the old bytes. Two runs on one tree write the same
 /// new bytes, and a second mutation of the same file changes it again.
 fn fresh_bytes(old: &[u8]) -> Vec<u8> {
     if old.is_empty() {
@@ -212,13 +212,13 @@ fn fresh_bytes(old: &[u8]) -> Vec<u8> {
 }
 
 /// What one run wrote.
-struct Written {
+pub(crate) struct Written {
     /// The first line: the shape and the counts.
     header: String,
     /// The directory that holds the tree.
     dir: PathBuf,
     /// One line per fact about the tree.
-    lines: Vec<String>,
+    pub(crate) lines: Vec<String>,
 }
 
 impl Written {
@@ -236,7 +236,7 @@ impl Written {
 
 /// Write the `tree` shape: a shared prefix, then bytes that no other file
 /// holds.
-fn write_tree(args: &[String]) -> Written {
+pub(crate) fn write_tree(args: &[String]) -> Written {
     let [dir, files, bytes, shared] = args else {
         usage();
     };
@@ -275,7 +275,7 @@ fn write_tree(args: &[String]) -> Written {
 }
 
 /// Write the `identical` shape: the same bytes in every file.
-fn write_identical(args: &[String]) -> Written {
+pub(crate) fn write_identical(args: &[String]) -> Written {
     let [dir, files, bytes] = args else {
         usage();
     };
@@ -301,7 +301,7 @@ fn write_identical(args: &[String]) -> Written {
 }
 
 /// Write the `unique` shape: bytes that no other file holds.
-fn write_unique(args: &[String]) -> Written {
+pub(crate) fn write_unique(args: &[String]) -> Written {
     let [dir, files, bytes] = args else {
         usage();
     };
@@ -328,7 +328,7 @@ fn write_unique(args: &[String]) -> Written {
 }
 
 /// Write the `compressible` shape: a pattern that repeats in every block.
-fn write_compressible(args: &[String]) -> Written {
+pub(crate) fn write_compressible(args: &[String]) -> Written {
     let [dir, files, bytes] = args else {
         usage();
     };
@@ -356,7 +356,7 @@ fn write_compressible(args: &[String]) -> Written {
 }
 
 /// Write the `mutate` shape: new bytes in one file of an existing tree.
-fn write_mutate(args: &[String]) -> Written {
+pub(crate) fn write_mutate(args: &[String]) -> Written {
     let [dir] = args else {
         usage();
     };
