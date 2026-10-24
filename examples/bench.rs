@@ -1248,6 +1248,10 @@ struct RevisionReport {
     changed_paths: Vec<String>,
     /// The changed paths that no scenario covers.
     uncovered_paths: Vec<String>,
+    /// The scenarios the command line did not select.
+    skipped: Vec<String>,
+    /// The rows whose paths do not exist at the head revision.
+    stale: Vec<String>,
     /// The state of the machine.
     host: Host,
     /// The directory that holds the worktrees and the fixtures.
@@ -1408,9 +1412,10 @@ fn run_revisions(options: &RevisionOptions) -> Result<(), String> {
         None => Vec::new(),
     };
     let selected = select_scenarios(&scenarios, options, &changed);
-    if selected.is_empty() {
+    if selected.is_empty() && options.diff.is_none() {
         return Err("no scenario matches the command line".to_owned());
     }
+    let skipped = skipped_scenarios(&scenarios, &selected);
 
     let base_short = short_revision(&repo, &options.base)?;
     let head_short = short_revision(&repo, &options.head)?;
@@ -1426,6 +1431,7 @@ fn run_revisions(options: &RevisionOptions) -> Result<(), String> {
         options.rounds,
     )?;
     let uncovered = uncovered_paths(&changed, &scenarios, built.head_tree.path());
+    let stale = stale_scenarios(&scenarios, built.head_tree.path());
 
     let report = RevisionReport {
         options: options.clone(),
@@ -1438,6 +1444,8 @@ fn run_revisions(options: &RevisionOptions) -> Result<(), String> {
         head_hash: built.head_hash,
         scenarios: results,
         uncovered_paths: uncovered,
+        skipped,
+        stale,
         changed_paths: changed,
         host,
         run_dir: run_dir.display().to_string(),
@@ -1596,6 +1604,26 @@ fn select_scenarios(
         }
     }
     selected
+}
+
+/// The scenarios the command line did not select.
+fn skipped_scenarios(scenarios: &[Scenario], selected: &[usize]) -> Vec<String> {
+    scenarios
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .map(|(_, scenario)| scenario.name.clone())
+        .collect()
+}
+
+/// The rows whose paths do not exist at the head revision.
+fn stale_scenarios(scenarios: &[Scenario], head: &Path) -> Vec<String> {
+    scenarios
+        .iter()
+        .filter_map(|scenario| {
+            stale_reason(head, scenario).map(|reason| format!("{}: {reason}", scenario.name))
+        })
+        .collect()
 }
 
 /// True when a scenario path covers a changed path.
@@ -2042,6 +2070,41 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
+/// Print what the command line selected, and the stale rows.
+fn print_selection(report: &RevisionReport, out: &mut String) {
+    let selected: Vec<&str> = report
+        .scenarios
+        .iter()
+        .map(|result| result.scenario.name.as_str())
+        .collect();
+    let skipped: Vec<&str> = report.skipped.iter().map(String::as_str).collect();
+    let _ = writeln!(
+        out,
+        "\n  selection: {} of {} scenarios",
+        selected.len(),
+        selected.len() + skipped.len()
+    );
+    let _ = writeln!(out, "    selected: {}", join_names(&selected));
+    let _ = writeln!(out, "    skipped: {}", join_names(&skipped));
+    if report.stale.is_empty() {
+        let _ = writeln!(out, "  stale rows: none");
+    } else {
+        let _ = writeln!(out, "  stale rows:");
+        for note in &report.stale {
+            let _ = writeln!(out, "    {note}");
+        }
+    }
+}
+
+/// The names of a selection, or `none`.
+fn join_names(names: &[&str]) -> String {
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(" ")
+    }
+}
+
 /// Print the two-revision report.
 fn print_revision_report(report: &RevisionReport) {
     let mut out = String::new();
@@ -2058,6 +2121,9 @@ fn print_revision_report(report: &RevisionReport) {
     );
     let _ = writeln!(out, "  base binary: blake3 {}", report.base_hash);
     let _ = writeln!(out, "  head binary: blake3 {}", report.head_hash);
+    if let Some(spec) = &report.options.diff {
+        let _ = writeln!(out, "  diff: {spec}");
+    }
     let _ = writeln!(
         out,
         "  rounds: {}, noise floor rounds: {}",
@@ -2077,6 +2143,7 @@ fn print_revision_report(report: &RevisionReport) {
     if report.host.noisy {
         let _ = writeln!(out, "  the host is noisy, so this run has no verdict");
     }
+    print_selection(report, &mut out);
     for result in &report.scenarios {
         let _ = writeln!(
             out,
@@ -2113,11 +2180,11 @@ fn print_revision_report(report: &RevisionReport) {
     if !report.changed_paths.is_empty() {
         let _ = writeln!(out, "\n  changed paths: {}", report.changed_paths.join(" "));
         if report.uncovered_paths.is_empty() {
-            let _ = writeln!(out, "  every changed path has a scenario");
+            let _ = writeln!(out, "  every changed path has a measurable scenario");
         } else {
             let _ = writeln!(
                 out,
-                "  changed paths with no scenario: {}",
+                "  changed paths with no measurable scenario: {}",
                 report.uncovered_paths.join(" ")
             );
         }
@@ -2205,7 +2272,15 @@ fn revision_json(report: &RevisionReport) -> serde_json::Value {
         },
         "rounds": report.options.rounds,
         "floor_rounds": FLOOR_ROUNDS,
+        "diff": report.options.diff,
         "scenarios": scenarios,
+        "selected_scenarios": report
+            .scenarios
+            .iter()
+            .map(|result| result.scenario.name.clone())
+            .collect::<Vec<String>>(),
+        "skipped_scenarios": report.skipped,
+        "stale_scenarios": report.stale,
         "changed_paths": report.changed_paths,
         "uncovered_paths": report.uncovered_paths,
         "host": {

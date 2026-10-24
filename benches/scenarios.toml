@@ -2,18 +2,20 @@
 #
 # `paths` names the source files a scenario exercises.
 # `shape` is `default` or `forced`.
+# A `forced` row needs a setting that the product does not use by default.
 # `fixture` names the shape that `examples/mktree.rs` writes.
-# `prepare` fills the store before the measured command, and the driver does not
-# time it.
+# `prepare` fills the store before the measured command.
+# The driver does not time a prepare step.
 # `command` runs one time for the base arm and one time for the head arm.
 # `metric` is `wall_ms`, `cpu_ms` or `rss_kb`.
-# `unmeasurable` says why a scenario cannot run. The driver reports the reason
-# and skips the scenario.
+# `unmeasurable` says why a scenario cannot run.
+# The driver reports the reason and skips the scenario.
 
 [[scenario]]
 name = "backup.many-small"
 paths = ["src/command/backup.rs", "src/storage/blob.rs"]
 shape = "default"
+
 fixture = { kind = "tree", files = 5000, bytes = 32768, shared = 16384 }
 command = ["--quiet", "backup", "{src}", "{store}"]
 metric = "wall_ms"
@@ -22,64 +24,213 @@ metric = "wall_ms"
 name = "backup.one-large"
 paths = ["src/reader.rs", "src/storage/blob.rs"]
 shape = "default"
+
 fixture = { kind = "tree", files = 1, bytes = 268435456, shared = 0 }
 command = ["--quiet", "backup", "{src}", "{store}"]
 metric = "wall_ms"
 
 [[scenario]]
-name = "restore.default"
-paths = ["src/command/restore.rs", "src/command/manifest.rs"]
+name = "backup.mixed"
+paths = ["src/command/backup.rs", "src/storage/operator.rs"]
 shape = "default"
+
+fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
+command = ["--quiet", "backup", "{src}", "{store}"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "restore.default"
+paths = ["src/command/restore.rs", "src/command/manifest.rs", "src/storage/compression.rs"]
+shape = "default"
+
+fixture = { kind = "compressible", files = 200, bytes = 1048576 }
+prepare = [["--quiet", "backup", "{src}", "{store}"]]
+
+command = ["--quiet", "restore", "{dest}", "{store}", "--clean"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "restore.shared-chunks"
+paths = ["src/command/restore.rs", "src/storage/blob.rs"]
+shape = "default"
+
 fixture = { kind = "identical", files = 400, bytes = 1048576 }
 prepare = [["--quiet", "backup", "{src}", "{store}"]]
-command = ["--quiet", "restore", "{dest}", "{store}"]
+
+command = ["--quiet", "restore", "{dest}", "{store}", "--clean"]
 metric = "wall_ms"
 
 [[scenario]]
 name = "pack.default"
 paths = ["src/command/pack.rs", "src/pack.rs"]
 shape = "default"
+
 fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
 prepare = [["--quiet", "backup", "{src}", "{store}"]]
+
 command = ["--quiet", "pack", "{store}", "{pack}"]
 metric = "wall_ms"
 
 [[scenario]]
 name = "pack.recompress"
-paths = ["src/command/pack.rs", "src/storage/compression.rs", "src/pack.rs"]
+paths = ["src/command/pack.rs", "src/storage/compression.rs", "src/pack.rs", "src/varint.rs"]
 shape = "forced"
+
 fixture = { kind = "compressible", files = 250, bytes = 1048576 }
-prepare = [["--quiet", "backup", "{src}", "{store}"]]
+prepare = [["--quiet", "backup", "{src}", "{store}", "--compression-level", "0"]]
+
 command = ["--quiet", "pack", "{store}", "{pack}", "--compression", "3"]
 metric = "wall_ms"
 
 [[scenario]]
 name = "apply.default"
-paths = ["src/command/apply.rs", "src/pack.rs"]
+paths = ["src/command/apply.rs", "src/pack.rs", "src/storage/blob.rs"]
 shape = "default"
+
 fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
 prepare = [
   ["--quiet", "backup", "{src}", "{store}"],
   ["--quiet", "pack", "{store}", "{pack}"],
 ]
+
 command = ["--quiet", "apply", "{pack}", "{dest}"]
 metric = "wall_ms"
 
 [[scenario]]
-name = "store.open"
-paths = ["src/storage/blob.rs", "src/layout.rs"]
+name = "merge.push"
+paths = ["src/main.rs"]
 shape = "default"
-fixture = { kind = "unique", files = 4000, bytes = 65536 }
-prepare = [["--quiet", "backup", "{src}", "{store}"]]
-command = ["--quiet", "versions", "{store}"]
-metric = "rss_kb"
-unmeasurable = "the blu binary has no store-level open command"
+
+fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
+prepare = [
+  ["--quiet", "backup", "{src}", "{store}"],
+  ["--quiet", "pack", "{store}", "{pack}"],
+]
+
+command = ["--quiet", "merge", "{pack}", "http://127.0.0.1:8480/bench"]
+metric = "wall_ms"
+
+unmeasurable = "the driver cannot start the serve process that receives the push"
 
 [[scenario]]
 name = "store.put.8mib"
-paths = ["src/storage/blob.rs", "src/storage/compression.rs"]
+paths = ["src/storage/blob.rs", "src/storage/compression.rs", "src/storage/record.rs"]
 shape = "forced"
+
 fixture = { kind = "unique", files = 50, bytes = 8388608 }
 command = ["--quiet", "backup", "{src}", "{store}"]
 metric = "wall_ms"
+
 unmeasurable = "the blu binary has no store-level put command, and a backup cuts records at 64 KiB"
+
+[[scenario]]
+name = "store.open"
+paths = ["src/storage/blob.rs", "src/layout.rs", "src/storage/record.rs"]
+shape = "default"
+
+fixture = { kind = "unique", files = 4000, bytes = 65536 }
+prepare = [["--quiet", "backup", "{src}", "{store}"]]
+
+command = ["--quiet", "versions", "{store}"]
+metric = "rss_kb"
+
+unmeasurable = "the blu binary has no store-level open command"
+
+[[scenario]]
+name = "store.sync.multi-segment"
+paths = ["src/storage/blob.rs", "src/storage/backend.rs"]
+shape = "forced"
+
+fixture = { kind = "unique", files = 24, bytes = 8388608 }
+command = ["--quiet", "backup", "{src}", "{store}", "--segment-size", "8MiB"]
+metric = "wall_ms"
+
+unmeasurable = "the blu binary has no sync command, and only a backup syncs a store"
+
+[[scenario]]
+name = "plan.from-snapshot.sparse"
+paths = ["src/storage/plan.rs"]
+shape = "forced"
+
+fixture = { kind = "tree", files = 1, bytes = 1048576, shared = 0 }
+prepare = [["--quiet", "backup", "{src}", "{store}"]]
+
+command = ["--quiet", "pack", "{store}", "{pack}"]
+metric = "wall_ms"
+
+unmeasurable = "the blu binary has no plan command, and only serve plans from a snapshot"
+
+[[scenario]]
+name = "plan.since"
+paths = ["src/storage/plan.rs", "src/command/pack.rs"]
+shape = "default"
+
+fixture = { kind = "tree", files = 2000, bytes = 65536, shared = 32768 }
+prepare = [
+  ["--quiet", "backup", "{src}", "{store}", "--exclude", "f00000.bin"],
+  ["--quiet", "backup", "{src}", "{store}"],
+]
+
+command = ["--quiet", "pack", "{store}", "{pack}", "--from", "1"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "pack.index.open"
+paths = ["src/pack.rs"]
+shape = "default"
+
+fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
+prepare = [
+  ["--quiet", "backup", "{src}", "{store}"],
+  ["--quiet", "pack", "{store}", "{pack}"],
+]
+
+command = ["--quiet", "apply", "{pack}", "{dest}", "--dry-run"]
+metric = "wall_ms"
+
+unmeasurable = "the blu binary has no command that opens a pack and stops, because every command that opens one reads its chunks"
+
+[[scenario]]
+name = "pack.covering"
+paths = ["src/pack.rs", "src/serve/pack.rs"]
+shape = "default"
+
+fixture = { kind = "tree", files = 800, bytes = 262144, shared = 131072 }
+prepare = [
+  ["--quiet", "backup", "{src}", "{store}"],
+  ["--quiet", "pack", "{store}", "{pack}"],
+]
+
+command = ["--quiet", "apply", "{pack}", "{dest}", "--dry-run"]
+metric = "wall_ms"
+
+unmeasurable = "the blu binary has no command that requests a range set, and only serve calls chunks_covering"
+
+[[scenario]]
+name = "history.report"
+paths = ["src/command/history.rs"]
+shape = "default"
+
+fixture = { kind = "unique", files = 20000, bytes = 256 }
+prepare = [
+  ["--quiet", "backup", "{src}", "{store}", "--chunk-profile", "large", "--exclude", "f00000.bin"],
+  ["--quiet", "backup", "{src}", "{store}", "--chunk-profile", "large"],
+]
+
+command = ["--quiet", "versions", "{store}", "--files", "f0*", "--numbers-only"]
+metric = "wall_ms"
+
+[[scenario]]
+name = "probe.check"
+paths = ["src/command/probe.rs", "src/command/apply.rs"]
+shape = "forced"
+
+fixture = { kind = "identical", files = 200, bytes = 1048576 }
+prepare = [
+  ["--quiet", "backup", "{src}", "{store}"],
+  ["--quiet", "pack", "{store}", "{pack}"],
+  ["--quiet", "apply", "{pack}", "{dest}"],
+]
+
+command = ["--quiet", "apply", "{pack}", "{dest}", "--dry-run", "--recheck"]
+metric = "wall_ms"
