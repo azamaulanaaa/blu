@@ -383,6 +383,10 @@ harness = false
 name = "throughput"
 harness = false
 
+[[bench]]
+name = "store"
+harness = false
+
 # Benchmarks are the one place a number gets compared against a previous run, so
 # the profile they are built with is part of the measurement.
 #
