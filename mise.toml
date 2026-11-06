@@ -25,7 +25,9 @@ rust = { version = "stable", components = "rust-analyzer" }
 # Advisories, licences and duplicate-version checks over the resolved graph.
 "cargo:cargo-deny" = "latest"
 # Release artifacts: builds the platform archives and drives the release CI.
-"cargo:cargo-dist" = "latest"
+# Pinned to the version in dist-workspace.toml, so the local tool and the
+# release config cannot drift apart.
+"cargo:cargo-dist" = "0.34.0"
 
 [tasks.build]
 run = "cargo build --all-targets --all-features"
