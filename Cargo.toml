@@ -101,7 +101,7 @@ actix-web = { version = "4.15", default-features = false, features = ["macros"] 
 # It also arrives with RUSTSEC-2026-0258, which `cargo deny check advisories`
 # denies and cannot be resolved.
 # `h2 0.3.27` is the last release of the unmaintained 0.3 line.
-# `actix-http 3.18` pins `h2 = "0.3.27"`, and the fix is in `0.4.16`.
+# `actix-http 3.20` pins `h2 = "0.3.27"`, and the fix is in `0.4.16`.
 # `blu serve` speaks HTTP/1.1 and neither end of the transfer uses `h2`,
 # so the vulnerable code is never reached.
 # That is an argument, not a mitigation.

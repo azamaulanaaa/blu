@@ -106,7 +106,7 @@ yanked = "deny"
 #
 # RUSTSEC-2026-0258 (Low), an HPACK-header flood in `h2` 0.3.x. It is here because
 # `awc`, the client behind `blu versions --remote`, enables `actix-http`'s
-# `http2` feature and offers no feature to turn it off; `actix-http` 3.18 pins
+# `http2` feature and offers no feature to turn it off; `actix-http` 3.20 pins
 # `h2 = "0.3.27"`, and the fix exists only in 0.4.x. So this cannot be upgraded
 # away, only designed around.
 #
